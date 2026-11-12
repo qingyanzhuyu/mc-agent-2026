@@ -1,51 +1,53 @@
 # mcagent — Minecraft Agent API 的最小骨架
 
 对应规范 **v1.3.1**（`https://mc-api.windywindie.top/api/v1`）。
-目标不是"能打的 bot"，而是**把管道接对**：认证 / ready 状态机 / 观察 / 串行动作 /
-错误分类 / 安全闸 / 打点。
+目标不是"能打的 bot"，而是**把管道接对**：认证与 Token 持久化复用 / ready 状态机 / 观察 /
+可抢占串行动作 / 非幂等超时判重 / 错误分类 / 安全闸 / 打点。
 
 ```
-client.py     HTTP 客户端：错误封装、token 自动重登、错误码分类、按动作给超时
-runtime.py    State（状态+事件增量）/ Safety（安全闸）/ Executor（单飞锁+重试+打点）
+client.py     HTTP 客户端：错误封装、.token.json 落盘复用、401 单点重登、429/5xx 退避、姿态合并
+runtime.py    State（单调时钟死亡去重 + 65s safe_mode）/ Safety / SafetyMonitor / Executor（可抢占单飞锁 + 非幂等判重 + 打点）
 smoke.py      冒烟：登录 -> ready -> 状态 -> 背包 -> 事件
 probe.py      基线：量 T_status / T_move20 / T_dig1，落盘 json
-planner/      决策契约 + 校验器（没有策略实现）
-skills/       Skill 基类 + 空注册表（没有具体技能）
+planner/      决策契约 + 强类型校验器（拦截 bool/NaN/非法槽位；暂无策略实现）
+skills/       Skill 基类 + 空注册表（暂无具体技能）
+../tests/     14 项离线故障注入与多线程抢占单测（无需账号与外网）
 ```
 
-> 所有命令在 **`code/`** 目录下执行（包名是 `mcagent`）。
+> 所有命令在 **`code/`** 目录下通过 `uv run` 执行（根目录 `pyproject.toml` + `uv.lock` 锁定依赖）。
 
 ## 三条必须遵守的约束（写代码时别退回原样）
 
-1. **业务错误一律 HTTP 200**，只看 `payload["ok"]`，别看状态码。
-2. **本机注册表有个死代理 127.0.0.1:7897**，`requests` 会读它 → 必须 `trust_env=False`
+1. **业务错误大多 HTTP 200，同时兼顾网关/认证 HTTP 401/429/5xx**：优先看 `payload["ok"]`，但 `call()` 亦统一兜底 HTTP 401 单点刷新与 429/5xx 重试。
+2. **本机注册表可能挂死代理 127.0.0.1:7897**，`requests` 默认会读它 → 必须 `trust_env=False`
    （`client.py` 已做）。要显式走代理就填 `MC_PROXY`。
-3. **动作互斥且同步阻塞**：一个动作没返回前不能发第二个（会 `busy`）。
-   所以 `Executor` 里有单飞锁；`/status`、`/events`、`/find_blocks` 不占锁，可以并行读。
+3. **动作互斥且同步阻塞，但紧急避险可抢占**：一个动作没返回前不能发第二个普通动作（会 `busy`）。
+   所以 `Executor` 内置条件变量单飞锁；后台 `SafetyMonitor` 发现危险时调 `Executor.emergency()` 立即发 `/stop` 并插队执行逃生动作；`/status`、`/events`、`/find_blocks` 不占锁，可以并行读。
 
 ## 快速开始
 
 ```bash
-cp .env.example .env      # 填 MC_USER / MC_PASS
-python -m mcagent.client          # 只验端点（不需要账号）
-python -m mcagent.smoke --dry     # 同上，输出更多
-python -m mcagent.smoke           # 登录 + ready（需要账号，且要先在 docs/05 占位）
-python -m mcagent.probe           # 量基线
+cp mcagent/.env.example mcagent/.env             # 填 MC_USER / MC_PASS（需要真机时）
+uv run python -m unittest discover -s tests -v   # 跑 14 项离线故障注入单测（无需账号）
+uv run python -m mcagent.client                  # 只验端点（不需要账号）
+uv run python -m mcagent.smoke --dry             # 同上，输出更多
+uv run python -m mcagent.smoke                   # 登录 + ready（需要账号，且要先在 docs/05 占位）
+uv run python -m mcagent.probe                   # 量基线
 ```
 
-## 什么算"已验证"
+## 什么算"已验证"（分级准入，见 `AGENTS.md` §2A.6）
 
-| 模块 | 状态 |
-|---|---|
-| `client.py` 端点/错误封装/`probe()` | 已验证（未授权 401，RTT ≈ 0.6s） |
-| `planner/decision.py` 校验器 | 已验证（9 个用例，纯函数） |
-| `runtime.py` | 编译通过，**未在真机跑过** |
-| `smoke.py` / `probe.py` | 编译通过 + `--dry` 通过，**登录路径未验证** |
+| 模块 | 验证等级 | 状态说明 |
+|---|---|---|
+| `client.py`（401 单点刷新 / `.token.json` 复用 / 姿态合并 / `chat` 防 `/` 注入 / `ensure_connected` ≥30s） | `verified: offline` | 实测未授权 401（RTT ≈ 0.6s）+ 离线故障注入单测全过；**真实账号登录待验** |
+| `planner/decision.py` 校验器（反射签名 + 拦截 `bool`/NaN/非法槽位） | `verified: offline` | 单测全覆盖，纯函数 |
+| `runtime.py`（单调时钟死亡去重 + 65s `safe_mode` + 非幂等超时判重 + `emergency()` 抢占锁） | `verified: offline` | 14 项离线故障注入与多线程抢占单测通过；**真机未跑** |
+| `smoke.py` / `probe.py` | `--dry` 已验 / `live` 待验 | 编译通过 + `--dry` 退 0，**登录真机路径等皮肤站账号** |
 
-**没跑通的东西不进 main**（`AGENTS.md` §2 第 6 条）。这也是为什么现在没有 `loop.py`、
-没有 `planner/llm.py`、没有具体 skill——它们都得等真机。
+耦合世界物理的模块（`loop.py`、`planner/llm.py`、具体 `skills/*`）属于 `verified: live` 范畴，等真机验证跑通后再进 `main`。
 
 ## 目录约定
 
-- `probe/*.json` — 每次测量的原始数据，别删，后面调参要用
-- `logs/*.jsonl` — 每个动作一行（含 ms、错误码、重试次数），是复盘的原料
+- `mcagent/.token.json` — 自动持久化的登录凭证（`0600` 权限，已 gitignore，切勿提交）
+- `mcagent/probe/*.json` — 每次测量的原始数据，别删，后面调参要用
+- `mcagent/logs/*.jsonl` — 每个动作一行（含 ms、错误码、重试次数），是复盘的原料

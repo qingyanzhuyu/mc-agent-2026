@@ -12,11 +12,13 @@
 
 ## 自检（DoD，见 AGENTS.md §5）
 
+- [ ] 在 `docs/06-工作日志.md` 追加了一条记录
 - [ ] 文档改动都附了来源；新判断写了推翻条件
-- [ ] `cd code && python -m compileall mcagent` 通过
-- [ ] `cd code && python -m mcagent.smoke --dry` 返回 0
-- [ ] 提交信息格式正确，一次提交只做一件事
-- [ ] 没有多出来的 `.env` / `sk-...` / `logs/` / `__pycache__`
+- [ ] `cd code && uv run python -m compileall -q mcagent tests` 通过
+- [ ] `cd code && uv run python -m unittest discover -s tests` 全绿
+- [ ] `cd code && uv run python -m mcagent.smoke --dry` 返回 0
+- [ ] 提交信息格式正确，代码与文档尽量分提交以便独立回滚
+- [ ] 没有多出来的 `.env` / `.token.json` / `sk-...` / `logs/` / `__pycache__`
 
 ## 有没有碰冻结面
 
@@ -25,10 +27,10 @@
 
 <!-- 动了冻结面必须写理由，并由人类批准后才能合 -->
 
-## 跑过真实 bot 吗
+## 验证等级（见 AGENTS.md §2A.6）
 
-- [ ] 没跑（只用 `--dry`）
-- [ ] 跑了，占位在 `docs/05` 账号表里登记的账号是：____
+- [ ] `verified: offline`（纯协议/状态机/校验逻辑，已附 `code/tests/` 离线单测并跑通，`smoke --dry` 通过）
+- [ ] `verified: live`（上过真实 bot，占位在 `docs/05` 账号表里登记的账号是：____）
 
 ## 影响面
 

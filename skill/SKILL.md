@@ -1,13 +1,13 @@
 ---
 name: mc-agent-repo
-description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for Minecraft" competition, Harness track) — writing docs, adding planner/skills code, or answering open questions. Covers where each kind of knowledge lives, the frozen module surfaces, the five repo-specific traps, and the definition of done.
+description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for Minecraft" competition, Harness track) — writing docs, adding planner/skills code, running offline tests, or answering open questions. Covers where each kind of knowledge lives, the frozen module surfaces, the five repo-specific traps, compliance red lines, and the definition of done.
 ---
 
 # 在 mc-agent-2026 仓库工作
 
 ## 何时使用
 
-- 要在 `mc-agent-2026` 里改文档、加代码、回答待确认问题
+- 要在 `mc-agent-2026` 里改文档、加代码、补测试、回答待确认问题
 - 要判断"这条信息该写到哪个文件"
 - 要接手别人没做完的活，需要快速知道现在到哪一步了
 
@@ -26,8 +26,8 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 
 ## 开工必读（按顺序）
 
-1. `AGENTS.md` — **硬规则**，文件所有权 / 五条禁令 / DoD。违反会被回退。
-2. `docs/01-关键判断.md` — J1–J10 当前共识。**别重推已经定下的判断。**
+1. `AGENTS.md` — **硬规则**，文件所有权 / 协作禁令与官方合规红线 / 分级验证 / DoD。违反会被回退。
+2. `docs/01-关键判断.md` — J1–J13 当前共识。**别重推已经定下的判断。**
 3. `docs/04-待确认.md` — 别问已经有人认领的问题。
 4. `docs/05-分工与契约.md` — 你能改哪些文件、模块冻结面。
 
@@ -39,8 +39,9 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 | 有依据的推论 | `docs/01-关键判断.md` | 编号顺延，**必带"推翻条件"** |
 | 实测数字 | `docs/03` 或 `plan/` | 附命令 + `code/mcagent/probe/*.json` 路径 |
 | 拿不准的 | `docs/04-待确认.md` | 写清"为什么重要"+"临时假设" |
-| 决策逻辑 | `code/mcagent/planner/` | 输出 dict，交 `validate()`；**没跑通不合入** |
-| 一个目标的动作序列 | `code/mcagent/skills/` | `step()` 一次最多一个动作；**没跑通不合入** |
+| 协议/恢复/校验单测 | `code/tests/` | 无网离线可跑（`verified: offline`） |
+| 决策逻辑 | `code/mcagent/planner/` | 输出 dict，交 `validate()`；策略/LLM 需真机验（`verified: live`） |
+| 一个目标的动作序列 | `code/mcagent/skills/` | `step()` 一次最多一个动作；真机跑通再进 `main`（`verified: live`） |
 | 每次改动 | `docs/06-工作日志.md` | 追加不改历史；能证明工程能力的标 `评审价值：有` |
 | 评审材料 | `docs/07-评审材料.md` | 从 06 里筛，别另起炉灶 |
 | 规划/排期 | `plan/` | 只追加不重写 |
@@ -50,44 +51,45 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 ## 常用命令
 
 ```bash
-cd mc-agent-2026/code          # 包名是 mcagent，必须在 code/ 下跑
+cd mc-agent-2026/code                            # 包名是 mcagent，在 code/ 下通过 uv 运行
 
-python -m mcagent.client       # 验端点（不需要账号）
-python -m mcagent.smoke --dry  # 同上，带更多输出
-python -m mcagent.smoke        # 登录 + 等 ready（需要 .env，且要占账号）
-python -m mcagent.probe        # 量基线，落盘 probe/*.json
+uv run python -m unittest discover -s tests -v   # 离线故障注入与边界单测（不需要账号与网络）
+uv run python -m mcagent.client                  # 验端点（不需要账号）
+uv run python -m mcagent.smoke --dry             # 同上，带更多输出
+uv run python -m mcagent.smoke                   # 登录 + 等 ready（需要 .env，且要占账号）
+uv run python -m mcagent.probe                   # 量基线，落盘 probe/*.json
 ```
 
 ## 改代码的流程
 
-1. 读 `docs/05` 的冻结面：`client.Client` 的方法签名、`runtime` 的三个类。**不改已有返回结构。**
+1. 读 `docs/05` 的冻结面：`client.Client` 的方法签名、`runtime` 的类契约。**不改已有返回结构。**
 2. 改完跑：
    ```bash
-   cd code && python -m compileall mcagent && python -m mcagent.smoke --dry
+   cd code && uv run python -m compileall -q mcagent tests && uv run python -m unittest discover -s tests && uv run python -m mcagent.smoke --dry
    ```
-3. 提交信息 `范围: 做了什么`，一次提交一件事。
+3. 提交信息 `范围: 做了什么`，一次提交一件事（代码与文档分开提交以便独立 `git revert`）。
 
 ## 五个坑（本仓库特有，踩过的）
 
 1. **注册表里挂了死代理 `127.0.0.1:7897`** → `requests` 默认会读它，报 `ProxyError` 看着像断网。
    所以 `trust_env = False` 是必须的。而且两个端点的最优路径相反：
    **MC API 直连快（666ms）、LLM 端点走代理快（219ms vs 1520ms）**。
-2. **动作互斥且阻塞**：同一 bot 一次只能跑一个动作，重复调用返回 `busy`。
-   所以 24 并发只能用来"想"，不能用来"做"。别设计成并行执行。
+2. **动作互斥且阻塞 + 危险必须可抢占**：同一 bot 一次只能跑一个动作，重复调用返回 `busy`。
+   24 并发只能用来"想"，不能用来"做"；遇到危险时必须走 `Executor.emergency()` 先发 `/stop` 中断当前阻塞动作并插队逃生。
 3. **思考模型的静默失败**：`max_tokens` 给小了，token 全花在 `reasoning_content` 上，
    拿到 `finish_reason=length` + `content=""`。必须把空 content 当失败重试。
    关思考的正确写法是 `chat_template_kwargs={"enable_thinking": False}`，顶层开关无效。
-4. **登录会踢人**：同一角色重复登录让旧 token 立即失效。登录前必须去 `docs/05` 账号表占位。
-5. **死亡循环是一票否决**：60s 死 3 次 → 自动下线 5 分钟。Safety 闸的优先级高于任何计划。
+4. **登录会踢人**：同一角色重复登录让旧 token 立即失效。客户端已实现 `.token.json` 落盘复用与 401 单点刷新，登录前必须去 `docs/05` 账号表占位，调试时别循环调 `login()`。
+5. **死亡循环是一票否决**：60s 死 3 次 → 自动下线 5 分钟。`State` 已用单调时钟去重并锁存 ≥65s `safe_mode`，Safety 闸优先级高于任何计划。
 
 ## 不要做的事
 
-- **不把没跑通的代码合进 main**：没有真机验证的技能/策略/LLM 接入，先放 `docs/04` 或分支
-
-- 不提交密钥（`.env` / `sk-...` / 皮肤站密码），仓库里只放 `.env.example`
-- 不动三处代码：`client.py` 的 `trust_env`、`CODE_CLASS`、`Executor` 的单飞锁
+- **不混入未达验证等级的代码**：底层协议/运行时修改必须过 `code/tests/` 单测（`verified: offline`）；世界物理耦合的技能/策略/LLM 没真机跑通前先放分支（`verified: live`）
+- 不提交密钥与会话文件（`.env` / `.token.json` / `sk-...` / 皮肤站密码），仓库里只放 `.env.example`
+- 不破坏三项底层不变量：`client.py` 的 `trust_env=False`、`CODE_CLASS` 非致命容错边界、`Executor` 的可抢占单飞锁
+- 不触碰赛事红线：不人工代打/硬编码当场坐标、不绕过 REST API 或发 `/` 命令、不接外部非官方大模型、不持续恶意阻挠其他 Agent
 - 不 `push --force`、不 rebase 别人分支、不删别人的判断条目
-- 不绕过 `Executor` 直接调 `client` 的动作方法（会丢日志、丢错误分类、破坏互斥）
+- 不绕过 `Executor` 直接调 `client` 的动作方法（会丢日志、丢非幂等判重、破坏抢占互斥）
 
 ## 收尾四件事
 

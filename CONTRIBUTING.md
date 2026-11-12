@@ -1,15 +1,15 @@
 # 参与方式
 
-仓库只有三类内容，改法各不相同。
+仓库只有三类内容，改法各不相同。动工前必读 [AGENTS.md](AGENTS.md)（含协作禁令与赛事官方四条合规红线）。
 
 ## 1. 改事实（`docs/00-赛事事实.md`）
 
 这是共识底座，**改必须附来源**：链接、群聊截图、会议纪要，写在该条目的"来源"列里。
-拿不准的先写进 `04-待确认.md`，别直接改事实。
+拿不准的先写进 `04-待确认.md`，别直接改事实；口头消息与书面细则不一致时并列标注状态，不擅自抹掉原文。
 
 ## 2. 提判断（`docs/01-关键判断.md`）
 
-- 新判断编号顺延（J11、J12…），**不要复用已废弃的编号**。
+- 新判断编号顺延（J14、J15…），**不要复用已废弃的编号**。
 - 每条必须写「**推翻条件**」——写不出推翻条件的，说明它不是判断而是信仰，别放进来。
 - 判断被推翻时，用 ~~删除线~~ 保留原文并注明推翻依据和日期，不要直接删。
 
@@ -25,19 +25,27 @@
 
 `⬆️` = 阻塞主线，优先认领；`⏰` = 有截止时间。
 
-## 4. 改代码（`code/mcagent/`）
+## 4. 改代码（`code/mcagent/` 与 `code/tests/`）
 
-先读 `code/mcagent/README.md` 的三条约束。**不要动**：
+先读 `code/mcagent/README.md` 的三条约束。**不要破坏这三项不变量**：
 
-- `client.py` 里的 `trust_env=False`（本机注册表有死代理，去掉必然踩坑）
-- `client.py` 里的错误码分类表 `CODE_CLASS`（补可以，删不行）
-- `Executor` 的单飞锁（动作互斥是接口的硬约束，不是我们的选择）
+- `client.py` 里的 `trust_env=False`（本机环境可能挂死代理，去掉必然踩坑）
+- `client.py` 里的错误码分类表 `CODE_CLASS`（补和细化可以，删码或把 `bad_args` 改回 `FATAL` 不行）
+- `Executor` 的可抢占单飞锁（动作互斥是接口硬约束，紧急抢占 `emergency()` 优先于普通动作）
 
-## 5. 三条禁令
+验证分两级（详见 `AGENTS.md` §2A.6）：
+- `verified: offline`：协议/状态机/校验器改动必须配 `code/tests/` 离线单测并全绿；
+- `verified: live`：依赖世界物理的具体技能/阈值/提示词，真机跑通前先放分支。
 
-1. **不提交密钥**：`.env`、`sk-...`、皮肤站密码、任何 token。仓库里只放 `.env.example`。
+## 5. 四条禁令
+
+1. **不提交密钥与会话文件**：`.env`、`.token.json`、`sk-...`、皮肤站密码、任何 token。仓库里只放 `.env.example`。
 2. **不提交比赛服原始日志里的私人信息**（如果日志里出现别人的 bot 名/聊天，先脱敏）。
-3. **不在 `main` 上直接堆大改**：大改开分支，改完自己跑一遍 `python -m compileall` 和 `python -m mcagent.smoke --dry`。
+3. **不在 `main` 上直接堆大改**：大改开分支，改完自己跑一遍：
+   ```bash
+   cd code && uv run python -m compileall -q mcagent tests && uv run python -m unittest discover -s tests && uv run python -m mcagent.smoke --dry
+   ```
+4. **严守赛事合规红线**：不人工代打、不硬编码当场坐标、不绕过官方 REST API、不接外部非官方大模型、不持续恶意阻挠其他队伍（见 `AGENTS.md` §2B）。
 
 ## 提交信息格式
 
