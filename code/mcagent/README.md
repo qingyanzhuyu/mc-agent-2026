@@ -21,6 +21,8 @@ loop.py      D2+ 管道演示：木->工作台->木镐（不是策略）
 
 ## 快速开始
 
+> 所有命令在 **`code/`** 目录下执行（包名是 `mcagent`）。
+
 ```bash
 cp .env.example .env      # 填 MC_USER / MC_PASS
 python -m mcagent.client          # 只验端点
