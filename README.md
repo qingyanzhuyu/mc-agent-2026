@@ -31,6 +31,7 @@
 
 ```
 AGENTS.md            多 agent 协作的硬规则（文件所有权/禁令/DoD）—— 开工前必读
+skill/SKILL.md       仓库使用手册（定位/任务路由/五个坑/DoD）—— 同上，先读这个
 docs/
   00-赛事事实.md      客观条款（公告 + 细则 + 群聊补充），带来源
   01-关键判断.md      J1–J10，每条可被证伪
@@ -41,8 +42,13 @@ docs/
   99-原始记录/        v1/v2/v3 原始分析 + 官方接口规范原文
 plan/
   11-12到11-22执行计划.md
-code/
-  mcagent/           最小骨架：client / runtime(safety,executor) / smoke / probe / loop
+code/mcagent/
+  client.py          HTTP 客户端（冻结面）
+  runtime.py         State / Safety / Executor（冻结面）
+  smoke.py probe.py  冒烟与基线测量
+  loop.py            管道演示
+  planner/           决策层：Decision 契约 + 校验器 + LLM 端点
+  skills/            执行层：一个目标一串动作，step() 一次一个动作
 ```
 
 ## 怎么参与
