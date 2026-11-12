@@ -1,15 +1,19 @@
 # mcagent — Minecraft Agent API 的最小骨架
 
-对应规范 **v1.3.1**（`https://mc-api.windywindie.top/api/v1`）。目标不是"能打的 bot"，
-而是**先把管道接对**：认证 / ready 状态机 / 观察 / 串行动作 / 错误分类 / 安全闸 / 打点。
+对应规范 **v1.3.1**（`https://mc-api.windywindie.top/api/v1`）。
+目标不是"能打的 bot"，而是**把管道接对**：认证 / ready 状态机 / 观察 / 串行动作 /
+错误分类 / 安全闸 / 打点。
 
 ```
-client.py    HTTP 客户端：错误封装、token 自动重登、错误码分类、按动作给超时
-runtime.py   State（状态+事件增量）/ Safety（安全闸）/ Executor（单飞锁+重试+打点）
-smoke.py     D0 冒烟：登录 -> ready -> 状态 -> 背包 -> 事件
-probe.py     D1 基线：量 T_status / T_move20 / T_dig1，落盘 json
-loop.py      D2+ 管道演示：木->工作台->木镐（不是策略）
+client.py     HTTP 客户端：错误封装、token 自动重登、错误码分类、按动作给超时
+runtime.py    State（状态+事件增量）/ Safety（安全闸）/ Executor（单飞锁+重试+打点）
+smoke.py      冒烟：登录 -> ready -> 状态 -> 背包 -> 事件
+probe.py      基线：量 T_status / T_move20 / T_dig1，落盘 json
+planner/      决策契约 + 校验器（没有策略实现）
+skills/       Skill 基类 + 空注册表（没有具体技能）
 ```
+
+> 所有命令在 **`code/`** 目录下执行（包名是 `mcagent`）。
 
 ## 三条必须遵守的约束（写代码时别退回原样）
 
@@ -21,24 +25,27 @@ loop.py      D2+ 管道演示：木->工作台->木镐（不是策略）
 
 ## 快速开始
 
-> 所有命令在 **`code/`** 目录下执行（包名是 `mcagent`）。
-
 ```bash
 cp .env.example .env      # 填 MC_USER / MC_PASS
-python -m mcagent.client          # 只验端点
-python -m mcagent.smoke           # 登录 + ready
+python -m mcagent.client          # 只验端点（不需要账号）
+python -m mcagent.smoke --dry     # 同上，输出更多
+python -m mcagent.smoke           # 登录 + ready（需要账号，且要先在 docs/05 占位）
 python -m mcagent.probe           # 量基线
-python -m mcagent.loop --max-steps 12
 ```
 
-## 待验证的两件事（`probe` 里没覆盖）
+## 什么算"已验证"
 
-- **`craft` 的 `count` 语义**：是"合成几次"还是"合成几个"？
-  第一次跑 `loop.py` 时看 `craft oak_planks, count=16` 到底给了多少木板。
-- **`/events` 的 `seq` 跨重连是否连续**：断线重连后 `since` 还能不能接上。
-  测法：记下 `last_seq`，`/disconnect` + `/connect`，再用同一个 `since` 拉一次。
+| 模块 | 状态 |
+|---|---|
+| `client.py` 端点/错误封装/`probe()` | 已验证（未授权 401，RTT ≈ 0.6s） |
+| `planner/decision.py` 校验器 | 已验证（9 个用例，纯函数） |
+| `runtime.py` | 编译通过，**未在真机跑过** |
+| `smoke.py` / `probe.py` | 编译通过 + `--dry` 通过，**登录路径未验证** |
+
+**没跑通的东西不进 main**（`AGENTS.md` §2 第 6 条）。这也是为什么现在没有 `loop.py`、
+没有 `planner/llm.py`、没有具体 skill——它们都得等真机。
 
 ## 目录约定
 
 - `probe/*.json` — 每次测量的原始数据，别删，后面调参要用
-- `logs/*.jsonl` — 每个动作一行（含 ms、错误码、重试次数），是 D6 分析的原料
+- `logs/*.jsonl` — 每个动作一行（含 ms、错误码、重试次数），是复盘的原料

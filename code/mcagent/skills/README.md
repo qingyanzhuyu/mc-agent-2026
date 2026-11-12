@@ -3,9 +3,8 @@
 **职责**：一个目标 → 一串 `Executor` 动作。**不写 HTTP，不写决策**。
 
 ```
-base.py    Skill 基类：name / goal / can_start / step / 失败冷却
-basic.py   ChopLogs / MakeTable / CraftItem（未在真机验证）
-__init__.py  注册表 REGISTRY
+base.py       Skill 基类：name / goal / can_start / step / 失败冷却（已验：编译 + 导入）
+__init__.py   空注册表 + register()/get()
 ```
 
 ## 唯一的架构约束
@@ -53,18 +52,17 @@ class GetStone(Skill):
         return True
 ```
 
-然后加进 `__init__.py` 的 `REGISTRY`。
+然后在 `__init__.py` 里 `register(GetStone)`。
 
 ## 失败处理
 
-- 前置条件不成立（找不到目标、缺材料）→ 抛 `runtime.Replan`，循环换下一个技能。
-- 认证/接口级错误 → 抛 `runtime.Fatal`，整个停。
-- 同一个目标反复失败 → 基类的 `mark_failed()` / `is_cooling()` 会自动冷却 30 秒。
+- 前置条件不成立（找不到目标、缺材料）→ 抛 `runtime.Replan`，循环换下一个技能
+- 认证/接口级错误 → 抛 `runtime.Fatal`，整个停
+- 同一目标反复失败 → 基类 `mark_failed()` / `is_cooling()` 自动冷却 30 秒
 
-## 现在的状态
+## 现在**没有**具体技能（故意的）
 
-三个技能都**没在真机跑过**。第一次跑 `loop.py` 时优先验证：
+写技能必然要依赖真实世界的反馈：`dist` 阈值多少合适、`craft` 的 `count` 是次数还是个个数、
+`place` 不给坐标会不会放到脚下。这些**只有真机跑过才知道**，所以先空着。
 
-1. `ChopLogs` 的 `dist > 3.0` 阈值是否合适（`move_to` 的 `range` 是水平距离）
-2. `craft` 的 `count` 到底是次数还是个数（见 `docs/04` C2）
-3. `place` 不给坐标时自动选点，会不会把工作台放在脚下
+第一次验证的顺序见 `docs/04` 的 C 组。

@@ -46,9 +46,8 @@ code/mcagent/
   client.py          HTTP 客户端（冻结面）
   runtime.py         State / Safety / Executor（冻结面）
   smoke.py probe.py  冒烟与基线测量
-  loop.py            管道演示
-  planner/           决策层：Decision 契约 + 校验器 + LLM 端点
-  skills/            执行层：一个目标一串动作，step() 一次一个动作
+  planner/           决策层：Decision 契约 + 校验器（无策略实现）
+  skills/            执行层：Skill 基类 + 空注册表（无具体技能）
 ```
 
 ## 怎么参与

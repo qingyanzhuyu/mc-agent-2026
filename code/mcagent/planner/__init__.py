@@ -1,29 +1,17 @@
-"""planner —— 把状态变成"下一个动作"。
+"""planner —— 决策层（只放契约，不放未验证的实现）。
 
-分工（别混淆）：
-    planner/   决策：看状态 + 目标 → 输出一个 Decision（JSON）
-    skills/    执行：一个目标 → 一串 Executor 动作，自带中间状态
-    runtime/   执行器：单飞锁、错误分类、重试、打点
+契约：
+    Decision(goal, action, args, why, expect, abort_if)
+    validate(obj) -> (ok, errors)
+    from_dict(obj) -> Decision
+    bind(client, decision) -> Callable[[], dict]
 
-一个典型循环：
+`action` 只能是 `client.Client` 上真实存在的动作方法，`args` 的键必须是该方法的参数名。
+校验器用 `inspect.signature` 反射客户端，**客户端加方法后自动跟上**，不需要维护两份名单。
 
-    from .planner import Decision, validate, bind
-    from .planner.llm import LLMClient, decide
-
-    d_dict = decide(llm, state.summary(), list(ALLOWED_ACTIONS))
-    ok, errs = validate(d_dict)
-    if not ok: ...           # 把 errs 回喂给模型重问一次，第二次还不合法就退规则兜底
-    d = from_dict(d_dict)
-    ex.act(d.action, bind(client, d))
-
-两条不许破的规矩：
-1. 模型只输出 JSON，绝不直接调接口。校验不通过就重问，不要"猜它的意思"。
-2. 执行永远走 `Executor.act`，不要绕过它直接调 client。
+本包当前**只有校验器**（纯函数，9 个用例验过）。LLM 接入、策略选择等实现，
+跑通之后再进仓库——见 `AGENTS.md` §2 第 6 条。
 """
 from .decision import ALLOWED_ACTIONS, Decision, bind, from_dict, validate
-from .llm import LLMClient, LLMError, decide, extract_json
 
-__all__ = [
-    "ALLOWED_ACTIONS", "Decision", "bind", "from_dict", "validate",
-    "LLMClient", "LLMError", "decide", "extract_json",
-]
+__all__ = ["ALLOWED_ACTIONS", "Decision", "bind", "from_dict", "validate"]

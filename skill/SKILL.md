@@ -39,8 +39,8 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 | 有依据的推论 | `docs/01-关键判断.md` | 编号顺延，**必带"推翻条件"** |
 | 实测数字 | `docs/03` 或 `plan/` | 附命令 + `code/mcagent/probe/*.json` 路径 |
 | 拿不准的 | `docs/04-待确认.md` | 写清"为什么重要"+"临时假设" |
-| 决策逻辑 | `code/mcagent/planner/` | 输出 dict，交 `validate()` |
-| 一个目标的动作序列 | `code/mcagent/skills/` | `step()` 一次最多一个动作 |
+| 决策逻辑 | `code/mcagent/planner/` | 输出 dict，交 `validate()`；**没跑通不合入** |
+| 一个目标的动作序列 | `code/mcagent/skills/` | `step()` 一次最多一个动作；**没跑通不合入** |
 | 规划/排期 | `plan/` | 只追加不重写 |
 
 **绝不允许**把猜测写成陈述句。这个仓库里唯一比"没写"更糟的是"写错了但看起来很确定"。
@@ -54,8 +54,6 @@ python -m mcagent.client       # 验端点（不需要账号）
 python -m mcagent.smoke --dry  # 同上，带更多输出
 python -m mcagent.smoke        # 登录 + 等 ready（需要 .env，且要占账号）
 python -m mcagent.probe        # 量基线，落盘 probe/*.json
-python -m mcagent.loop --max-steps 12
-python -m mcagent.planner.llm  # 单测 LLM 端点是否通
 ```
 
 ## 改代码的流程
@@ -81,6 +79,8 @@ python -m mcagent.planner.llm  # 单测 LLM 端点是否通
 5. **死亡循环是一票否决**：60s 死 3 次 → 自动下线 5 分钟。Safety 闸的优先级高于任何计划。
 
 ## 不要做的事
+
+- **不把没跑通的代码合进 main**：没有真机验证的技能/策略/LLM 接入，先放 `docs/04` 或分支
 
 - 不提交密钥（`.env` / `sk-...` / 皮肤站密码），仓库里只放 `.env.example`
 - 不动三处代码：`client.py` 的 `trust_env`、`CODE_CLASS`、`Executor` 的单飞锁
