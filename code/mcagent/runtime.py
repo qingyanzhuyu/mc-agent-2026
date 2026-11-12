@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import deque
 from typing import Any, Callable, Optional
@@ -258,9 +259,39 @@ class Safety:
         return None
 
 
+# 响应丢失时不可盲目重发的非幂等动作（可能再次消耗材料、弹药或耐久）
+NON_IDEMPOTENT_ACTIONS: frozenset[str] = frozenset({
+    "craft", "window/act", "window_act", "use_item", "place", "interact", "drop", "shoot",
+})
+# 超时或网络中断后需主动发 /stop 清理服务端持续寻路/挖掘/追击的动作
+STOP_ON_TIMEOUT_ACTIONS: frozenset[str] = frozenset({
+    "move_to", "dig", "attack", "use_item",
+})
+
+
+def _inv_fingerprint(inv: Optional[dict]) -> Optional[dict[str, int]]:
+    if not isinstance(inv, dict):
+        return None
+    tmp = State()
+    tmp.set_inventory(inv)
+    names: set[str] = set()
+    for it in (inv.get("items") or []):
+        if isinstance(it, dict) and it.get("name"):
+            names.add(it["name"])
+    armor = inv.get("armor") or {}
+    if isinstance(armor, dict):
+        for eq in armor.values():
+            if isinstance(eq, dict) and eq.get("name"):
+                names.add(eq["name"])
+    off = inv.get("offhand")
+    if isinstance(off, dict) and off.get("name"):
+        names.add(off["name"])
+    return {n: tmp.count(n) for n in names if tmp.count(n) > 0}
+
+
 # ---------------------------------------------------------------- 执行器
 class Executor:
-    """串行执行动作：单飞锁 + 错误分类 + 超时兜底 /stop + 打点。"""
+    """串行执行动作：可抢占单飞锁 + 错误分类 + 非幂等超时判重 + 超时兜底 /stop + 打点。"""
 
     def __init__(self, client: Client, state: State, log_path: Optional[str] = None, log=print):
         self.client = client
@@ -269,23 +300,159 @@ class Executor:
         self.log_path = log_path
         self.n_actions = 0
         self.n_errors = 0
+        self._cond = threading.Condition()
         self._busy = False
+        self._owner_tid: Optional[int] = None
+        self._emergency_pending = 0
+        self._emergency_tid: Optional[int] = None
+        self._preempt_epoch = 0
+        self._preempt_reason = ""
 
     def _record(self, row: dict) -> None:
         if not self.log_path:
             return
-        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        parent = os.path.dirname(self.log_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def act(self, name: str, fn: Callable[[], dict], retries: int = 2, backoff: float = 0.6) -> dict:
-        if self._busy:
-            raise RuntimeError(f"动作互斥：上一个动作还没结束就想发 {name}")
-        self._busy = True
+    def _snapshot_before_non_idempotent(self, name: str) -> Optional[dict[str, int]]:
+        if name not in NON_IDEMPOTENT_ACTIONS:
+            return None
+        if not self.state.inventory:
+            try:
+                self.state.set_inventory(self.client.inventory())
+            except Exception:
+                return None
+        return _inv_fingerprint(self.state.inventory)
+
+    def _check_ambiguous_effect(
+        self,
+        name: str,
+        before_fp: Optional[dict[str, int]],
+        verify_done: Optional[Callable[[dict[str, int], dict[str, int]], bool]],
+        busy_polls: int = 3,
+        busy_interval_s: float = 0.4,
+    ) -> tuple[str, Optional[dict]]:
+        """网络超时/断流后核实服务端状态：先等 busy 结束，再比对背包确认副作用是否已发生。"""
+        still_busy = False
+        for _ in range(busy_polls):
+            try:
+                st = self.client.status()
+                self.state.set_status(st)
+                if not st.get("busy"):
+                    still_busy = False
+                    break
+                still_busy = True
+            except Exception:
+                break
+            time.sleep(busy_interval_s)
+
+        if still_busy or name in STOP_ON_TIMEOUT_ACTIONS:
+            self.stop()
+
+        if name not in NON_IDEMPOTENT_ACTIONS:
+            return "unchanged", None
+
+        try:
+            after_inv = self.client.inventory()
+            self.state.set_inventory(after_inv)
+        except Exception:
+            return "unknown", None
+
+        after_fp = _inv_fingerprint(after_inv) or {}
+        base_fp = before_fp or {}
+        if verify_done is not None and before_fp is not None and verify_done(base_fp, after_fp):
+            return "done", {"recovered": True, "inventory": after_inv}
+        if before_fp is not None and after_fp != base_fp:
+            return "changed", None
+        return "unchanged", None
+
+    def _recover_session_if_needed(self, e: ApiError, backoff: float, attempt: int) -> Optional[float]:
+        """处理会话态错误（掉线/切服大厅/死亡冷却/限流），返回还需额外 sleep 的秒数（None 表示已处置完毕）。"""
+        if e.code == "wrong_server":
+            self.log("  [session] wrong_server（在代理大厅），等待 ready...")
+            self.client.wait_ready(timeout=45)
+            return 0.0
+        if e.code == "not_connected":
+            self.log("  [session] not_connected，按 ≥30s 间隔重连并等待 ready...")
+            self.client.ensure_connected()
+            self.client.wait_ready(timeout=60)
+            return 0.0
+        if e.code == "death_loop_cooldown":
+            rem = float(e.extra.get("cooldown_remaining_seconds", 60) or 60)
+            wait_s = min(310.0, max(1.0, rem + 2.0))
+            self.log(f"  [session] death_loop_cooldown，休眠 {wait_s:.1f}s 后重连")
+            time.sleep(wait_s)
+            self.client.connect(timeout=20)
+            self.client.wait_ready(timeout=60)
+            return 0.0
+        if e.code == "rate_limited":
+            ra = e.extra.get("retry_after_s")
+            if isinstance(ra, (int, float)) and ra > 0:
+                return float(ra)
+        wait = backoff * (2 ** (attempt - 1))
+        if e.code == "dead":
+            wait = min(15.0, wait * 3)
+        return wait
+
+    def emergency(self, reason: str, escape_fn: Optional[Callable[["Executor"], Any]] = None) -> Any:
+        """安全层最高优先级抢占：挂起后续普通动作 -> 立即 POST /stop -> 独占执行逃生动作序列。"""
+        tid = threading.get_ident()
+        with self._cond:
+            self._emergency_pending += 1
+            self._preempt_epoch += 1
+            self._preempt_reason = reason
+            prev_em_tid = self._emergency_tid
+            self._emergency_tid = tid
+        try:
+            self.log(f"  [safety] 紧急抢占 ({reason}) -> /stop")
+            self.stop()
+            if escape_fn is not None:
+                return escape_fn(self)
+            return None
+        finally:
+            with self._cond:
+                self._emergency_tid = prev_em_tid
+                self._emergency_pending -= 1
+                self._cond.notify_all()
+
+    def act(
+        self,
+        name: str,
+        fn: Callable[[], dict],
+        retries: int = 2,
+        backoff: float = 0.6,
+        *,
+        verify_done: Optional[Callable[[dict[str, int], dict[str, int]], bool]] = None,
+        priority: str = "normal",
+    ) -> dict:
+        tid = threading.get_ident()
+        with self._cond:
+            eff_priority = "emergency" if tid == self._emergency_tid else priority
+            if self._busy and self._owner_tid == tid:
+                raise RuntimeError(f"动作互斥：同一线程重入动作 {name}")
+            if eff_priority == "emergency":
+                while self._busy:
+                    self._cond.wait()
+            else:
+                if self._emergency_pending > 0:
+                    while self._emergency_pending > 0 or self._busy:
+                        self._cond.wait()
+                elif self._busy:
+                    raise RuntimeError(f"动作互斥：上一个动作还没结束就想发 {name}")
+            self._busy = True
+            self._owner_tid = tid
+            start_epoch = self._preempt_epoch
+
         t0 = time.time()
         attempt = 0
         try:
+            before_fp = self._snapshot_before_non_idempotent(name)
             while True:
+                if eff_priority != "emergency" and self._preempt_epoch != start_epoch:
+                    raise Replan(f"动作被安全层抢占: {self._preempt_reason}")
                 attempt += 1
                 try:
                     result = fn()
@@ -294,8 +461,9 @@ class Executor:
                         "t": round(t0, 3), "name": name, "ms": round((time.time() - t0) * 1000),
                         "ok": True, "attempt": attempt, "result": _shrink(result),
                     })
-                    if isinstance(result, dict) and result.get("pos"):
-                        self.state.st["pos"] = result["pos"]
+                    if isinstance(result, dict):
+                        if result.get("pos"):
+                            self.state.st["pos"] = result["pos"]
                     return result
                 except ApiError as e:
                     self.n_errors += 1
@@ -304,25 +472,53 @@ class Executor:
                         "ok": False, "attempt": attempt, "code": e.code, "msg": e.message,
                         "kind": e.kind, "extra": _shrink(e.extra),
                     })
+                    if eff_priority != "emergency" and self._preempt_epoch != start_epoch:
+                        raise Replan(f"动作被安全层抢占: {self._preempt_reason}") from e
                     if e.kind == FATAL:
                         raise Fatal(str(e)) from e
+
+                    # 超时 / 网络断流：先止动 /stop，再核对非幂等动作是否已在服务端生效
+                    if e.code == "timeout" and name in STOP_ON_TIMEOUT_ACTIONS:
+                        self.stop()
+                    elif e.code == "network":
+                        status_tag, recovered = self._check_ambiguous_effect(name, before_fp, verify_done)
+                        if status_tag == "done" and recovered is not None:
+                            self.n_actions += 1
+                            self._record({
+                                "t": round(t0, 3), "name": name, "ms": round((time.time() - t0) * 1000),
+                                "ok": True, "attempt": attempt, "recovered": True,
+                            })
+                            return recovered
+                        if status_tag == "changed":
+                            raise Replan(f"{name} 响应丢失但服务端背包已变化，停止重试防重复消耗") from e
+
                     if e.kind == RETRY and attempt <= retries:
-                        wait = backoff * (2 ** (attempt - 1))
-                        if e.code == "dead":
-                            wait = min(15.0, wait * 3)
-                        self.log(f"  [{name}] {e} -> {wait:.1f}s 后重试 ({attempt}/{retries})")
-                        time.sleep(wait)
+                        try:
+                            wait_s = self._recover_session_if_needed(e, backoff, attempt)
+                        except ApiError as rec_err:
+                            if rec_err.kind == FATAL:
+                                raise Fatal(str(rec_err)) from rec_err
+                            raise Replan(f"会话恢复失败: {rec_err}") from rec_err
+                        if wait_s and wait_s > 0:
+                            self.log(f"  [{name}] {e} -> {wait_s:.1f}s 后重试 ({attempt}/{retries})")
+                            time.sleep(wait_s)
                         continue
                     raise Replan(str(e)) from e
         finally:
-            self._busy = False
+            with self._cond:
+                self._busy = False
+                self._owner_tid = None
+                self._cond.notify_all()
 
-    # ---- 常用包装（顺便统一超时/参数） --------------------------------
-    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1) -> dict:
-        return self.act("move_to", lambda: self.client.move_to(x, z, y=y, entity_id=entity_id, rng=rng))
+    # ---- 常用包装（顺便统一超时/参数与非幂等判重） --------------------
+    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None) -> dict:
+        return self.act(
+            "move_to",
+            lambda: self.client.move_to(x, z, y=y, entity_id=entity_id, rng=rng, pos=pos),
+        )
 
-    def dig(self, pos) -> dict:
-        return self.act("dig", lambda: self.client.dig(pos))
+    def dig(self, pos, collect: bool = True) -> dict:
+        return self.act("dig", lambda: self.client.dig(pos, collect=collect))
 
     def place(self, item, pos=None) -> dict:
         return self.act("place", lambda: self.client.place(item, pos))
@@ -330,20 +526,117 @@ class Executor:
     def interact(self, pos=None, entity_id=None, item=None) -> dict:
         return self.act("interact", lambda: self.client.interact(pos, entity_id, item))
 
+    def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None) -> dict:
+        return self.act(
+            "use_item",
+            lambda: self.client.use_item(item, target=target, ms=ms, timeout_ms=timeout_ms, source=source),
+        )
+
     def craft(self, item, count=1) -> dict:
-        return self.act("craft", lambda: self.client.craft(item, count))
+        return self.act(
+            "craft",
+            lambda: self.client.craft(item, count),
+            verify_done=lambda before, after: after.get(item, 0) > before.get(item, 0),
+        )
 
     def attack(self, entity_id, timeout_ms=20000) -> dict:
         return self.act("attack", lambda: self.client.attack(entity_id, timeout_ms))
 
+    def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100) -> dict:
+        return self.act(
+            "shoot",
+            lambda: self.client.shoot(entity_id=entity_id, pos=pos, weapon=weapon, charge_ms=charge_ms),
+        )
+
+    def window_view(self, target) -> dict:
+        return self.act("window/view", lambda: self.client.window_view(target))
+
+    def window_act(self, target, ops) -> dict:
+        return self.act("window/act", lambda: self.client.window_act(target, ops))
+
     def equip(self, item, slot="hand") -> dict:
         return self.act("equip", lambda: self.client.equip(item, slot))
+
+    def posture(self, sneak=None, shield=None) -> dict:
+        # 规范 §4.11：/posture 不占动作锁，可在动作阻塞中途调用
+        t0 = time.time()
+        res = self.client.posture(sneak=sneak, shield=shield)
+        self._record({
+            "t": round(t0, 3), "name": "posture", "ms": round((time.time() - t0) * 1000),
+            "ok": True, "attempt": 1, "result": _shrink(res),
+        })
+        return res
+
+    def dismount(self) -> dict:
+        return self.act("dismount", lambda: self.client.dismount())
+
+    def drop(self, item, count=1) -> dict:
+        return self.act("drop", lambda: self.client.drop(item, count))
+
+    def chat(self, message) -> dict:
+        return self.act("chat", lambda: self.client.chat(message))
 
     def stop(self) -> None:
         try:
             self.client.stop()
         except Exception as e:
             self.log(f"  [stop] 失败: {e}")
+
+
+# ---------------------------------------------------------------- 后台监控与抢占闭环
+class SafetyMonitor:
+    """动作阻塞期间的后台观察与紧急抢占守护线程（观察接口与 /stop 不占服务端动作锁）。"""
+
+    def __init__(
+        self,
+        client: Client,
+        state: State,
+        executor: Executor,
+        safety: Optional[Safety] = None,
+        on_hazard: Optional[Callable[[dict, Executor, State], None]] = None,
+        interval_s: float = 1.0,
+    ):
+        self.client = client
+        self.state = state
+        self.executor = executor
+        self.safety = safety or Safety()
+        self.on_hazard = on_hazard
+        self.interval_s = interval_s
+        self._stop_ev = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def tick(self) -> Optional[dict]:
+        st = self.client.status()
+        self.state.set_status(st)
+        self.state.drain(self.client)
+        hazard = self.safety.check(self.state)
+        if hazard and hazard.get("kind") not in ("no_status", "wait_respawn"):
+            reason = f"{hazard.get('kind')}: {hazard.get('why', '')}"
+            if self.on_hazard is not None:
+                self.executor.emergency(reason, lambda ex: self.on_hazard(hazard, ex, self.state))  # type: ignore[misc]
+            else:
+                self.executor.emergency(reason)
+        return hazard
+
+    def _loop(self) -> None:
+        while not self._stop_ev.is_set():
+            try:
+                self.tick()
+            except Exception as e:
+                self.executor.log(f"  [monitor] 轮询异常: {e}")
+            self._stop_ev.wait(self.interval_s)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_ev.clear()
+        self._thread = threading.Thread(target=self._loop, name="mcagent-safety-monitor", daemon=True)
+        self._thread.start()
+
+    def close(self, timeout: float = 3.0) -> None:
+        self._stop_ev.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
 
 
 def _shrink(obj: Any, depth: int = 0) -> Any:

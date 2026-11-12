@@ -26,19 +26,21 @@ REPLAN = "replan"  # 前置条件不成立，换计划
 FATAL = "fatal"    # 别继续了
 
 CODE_CLASS: dict[str, str] = {
-    # 瞬时：隔一下再试
+    # 瞬时/会话可恢复：由客户端或执行器按协议退避恢复后重试
     "busy": RETRY,
     "timeout": RETRY,
     "not_loaded": RETRY,
     "rate_limited": RETRY,
     "not_ready": RETRY,
     "not_connected": RETRY,
+    "wrong_server": RETRY,
+    "death_loop_cooldown": RETRY,
     "network": RETRY,
     "bad_json": RETRY,
-    # 目标/条件不成立：重规划
+    # 目标/条件不成立：重规划（注意 bad_args 是单次参数不合法，绝不能当 FATAL 杀掉整场进程）
+    "bad_args": REPLAN,
     "path_not_found": REPLAN,
     "interrupted": REPLAN,
-    "death_loop_cooldown": REPLAN,
     "no_such_entity": REPLAN,
     "out_of_reach": REPLAN,
     "out_of_range": REPLAN,
@@ -61,18 +63,16 @@ CODE_CLASS: dict[str, str] = {
     "not_hungry": REPLAN,
     "not_in_vehicle": REPLAN,
     "dismount_failed": REPLAN,
-    "wrong_server": REPLAN,
     "protected_region": REPLAN,
     "drive_timeout": REPLAN,
     "dismounted": REPLAN,
     "dead": RETRY,  # 等重生，executor 里用长退避
-    # 致命
+    # 致命：凭据或接口路径本身错误，继续重试只会触发限流封禁
     "unauthorized": FATAL,
-    "invalid_token": FATAL,  # client 内部会先尝试重登
+    "invalid_token": FATAL,  # client 内部会先尝试单飞重登
     "invalid_credentials": FATAL,
     "no_profile": FATAL,
     "unknown_api": FATAL,
-    "bad_args": FATAL,
 }
 
 # 每个动作的 HTTP 超时（秒）：API 是阻塞式，超时 < 动作时长会误判失败
@@ -186,6 +186,8 @@ class Client:
         self.bot_username: Optional[str] = None
         self._auth_lock = threading.RLock()
         self._posture: dict[str, bool] = {"sneak": False, "shield": False}
+        self._last_disconnect_mono: Optional[float] = None
+        self.auto_wait_ready_on_relogin: bool = True
         self._load_cached_token()
 
     # ---- Token 缓存落盘 ------------------------------------------------
@@ -302,6 +304,10 @@ class Client:
             raise ApiError("bad_json", r.text[:200], http=r.status_code)
         return payload
 
+    def _is_game_action_path(self, path: str) -> bool:
+        p = path.lstrip("/")
+        return p in ACTION_TIMEOUT or p in ("equip", "dismount", "drop", "chat", "posture")
+
     def call(self, path: str, body: Any = None, method: str = "POST", timeout: float = 30) -> dict:
         """发一次调用，返回 result；失败抛 ApiError。401 / invalid_token 会单飞自动重登一次。"""
         used_token = self._ensure_token()
@@ -309,7 +315,9 @@ class Client:
             payload = self._send(method, path, body, timeout, token=used_token)
         except ApiError as e:
             if e.http == 401 or e.code in ("invalid_token", "unauthorized"):
-                self._refresh_token(failed_token=used_token, reason=e.code)
+                relogged = self._refresh_token(failed_token=used_token, reason=e.code)
+                if relogged and self.auto_wait_ready_on_relogin and self._is_game_action_path(path):
+                    self.wait_ready(timeout=60)
                 payload = self._send(method, path, body, timeout, token=self.token)
             else:
                 raise
@@ -318,7 +326,9 @@ class Client:
             err = payload.get("error") or {}
             code = err.get("code", "unknown")
             if code in ("invalid_token", "unauthorized"):
-                self._refresh_token(failed_token=used_token, reason=code)
+                relogged = self._refresh_token(failed_token=used_token, reason=code)
+                if relogged and self.auto_wait_ready_on_relogin and self._is_game_action_path(path):
+                    self.wait_ready(timeout=60)
                 payload = self._send(method, path, body, timeout, token=self.token)
                 if payload.get("ok") is False:
                     err2 = payload.get("error") or {}
@@ -328,6 +338,8 @@ class Client:
                         {k: v for k, v in err2.items() if k not in ("code", "message")},
                     )
                 return payload.get("result") or {}
+            if code == "not_connected" and self._last_disconnect_mono is None:
+                self._last_disconnect_mono = time.monotonic()
             raise ApiError(code, err.get("message", ""), {k: v for k, v in err.items() if k not in ("code", "message")})
         return payload.get("result") or {}
 
@@ -391,29 +403,71 @@ class Client:
         self.log(f"[auth] 登录成功 bot={self.bot_username} token 到期={payload.get('expires_at')}")
 
     # ---- 连接 ----------------------------------------------------------
-    def wait_ready(self, timeout: float = 120, interval: float = 1.0) -> dict:
+    def ensure_connected(self, min_interval_s: float = 31.0, timeout: float = 20) -> dict:
+        """遵守规范 §2.1 断线重连间隔 ≥30s 的硬限制后发起 /connect。"""
+        if self._last_disconnect_mono is not None and min_interval_s > 0:
+            elapsed = time.monotonic() - self._last_disconnect_mono
+            if elapsed < min_interval_s:
+                wait_s = min_interval_s - elapsed
+                self.log(f"[connect] 距断线 {elapsed:.1f}s，等待 {wait_s:.1f}s 满足 ≥30s 重连间隔")
+                time.sleep(wait_s)
+        res = self.connect(timeout=timeout)
+        self._last_disconnect_mono = None
+        return res
+
+    def wait_ready(
+        self,
+        timeout: float = 120,
+        interval: float = 1.0,
+        min_reconnect_s: float = 31.0,
+    ) -> dict:
         """登录后要经过代理大厅，5-15s 才真正进比赛服。ready=true 前发动作会 wrong_server。"""
-        t0 = time.time()
-        tried_connect = False
-        last = {}
-        while time.time() - t0 < timeout:
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        last_connect_try = 0.0
+        last: dict = {}
+        while time.monotonic() < deadline:
             try:
                 last = self.status()
             except ApiError as e:
-                if e.code in ("not_connected", "not_ready") and not tried_connect:
+                if e.code == "not_connected":
+                    if self._last_disconnect_mono is None:
+                        self._last_disconnect_mono = time.monotonic()
                     try:
-                        self.call("connect", timeout=20)
-                        tried_connect = True
+                        self.ensure_connected(min_interval_s=min_reconnect_s)
+                        last_connect_try = time.monotonic()
                     except ApiError as e2:
                         if e2.code == "death_loop_cooldown":
-                            self.log(f"[ready] 死亡循环冷却中: {e2.extra}")
-                            time.sleep(min(30, float(e2.extra.get("cooldown_remaining_seconds", 30) or 30)))
+                            rem = float(e2.extra.get("cooldown_remaining_seconds", 30) or 30)
+                            self.log(f"[ready] 死亡循环冷却中，剩余 {rem:.0f}s")
+                            deadline = max(deadline, time.monotonic() + rem + 30.0)
+                            time.sleep(min(max(interval, 1.0), rem))
+                            continue
+                elif e.code == "not_ready" and (time.monotonic() - last_connect_try >= 15.0):
+                    try:
+                        self.connect(timeout=20)
+                        last_connect_try = time.monotonic()
+                    except ApiError:
+                        pass
                 self.log(f"[ready] 等待中: {e}")
                 time.sleep(interval)
                 continue
+
             if last.get("ready"):
-                self.log(f"[ready] 已进比赛服 ({time.time() - t0:.1f}s) pos={last.get('pos')}")
+                self._last_disconnect_mono = None
+                self.log(f"[ready] 已进比赛服 ({time.monotonic() - t0:.1f}s) pos={last.get('pos')}")
                 return last
+
+            # 规范 §2.1：已在线但 ready=false（卡在代理大厅），调一次 /connect 立刻重发 /server 切服
+            now_m = time.monotonic()
+            if (now_m - t0 >= min(5.0, interval * 3)) and (now_m - last_connect_try >= 15.0):
+                try:
+                    self.connect(timeout=20)
+                    last_connect_try = time.monotonic()
+                except ApiError as e2:
+                    if e2.code == "death_loop_cooldown":
+                        rem = float(e2.extra.get("cooldown_remaining_seconds", 30) or 30)
+                        deadline = max(deadline, time.monotonic() + rem + 30.0)
             time.sleep(interval)
         raise ApiError("not_ready", f"{timeout}s 内没 ready，最后状态: {json.dumps(last, ensure_ascii=False)[:300]}")
 
@@ -570,6 +624,7 @@ class Client:
     def disconnect(self) -> dict:
         res = self.call("disconnect", {}, timeout=20)
         self._posture = {"sneak": False, "shield": False}
+        self._last_disconnect_mono = time.monotonic()
         return res
 
 
