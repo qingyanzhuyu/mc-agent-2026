@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -72,7 +73,7 @@ def validate(obj: Any) -> tuple[bool, list[str]]:
         ]
         if missing:
             errs.append(f"{action} 缺少必填参数: {missing}")
-        if "pos" in args:
+        if "pos" in args and args["pos"] is not None:
             errs.extend(_check_pos(args["pos"]))
         errs.extend(_cross_rules(action, args))
 
@@ -86,25 +87,86 @@ def validate(obj: Any) -> tuple[bool, list[str]]:
     return (len(errs) == 0), errs
 
 
+_VALID_EQUIP_SLOTS = frozenset(
+    {"hand", "off-hand", "offhand", "head", "torso", "chest", "legs", "feet"}
+)
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def _cross_rules(action: str, args: dict) -> list[str]:
-    """跨参数的语义约束：签名全是默认值的方法（move_to/shoot/interact）靠签名查不出来。"""
+    """跨参数与值类型约束：防止 None/字符串/错误槽位透传到服务端触发 bad_args。"""
+    errs: list[str] = []
     if action == "move_to":
-        if not (("x" in args and "z" in args) or "entity_id" in args):
-            return ["move_to 需要 (x, z) 或 entity_id"]
+        has_xz = "x" in args and "z" in args and args["x"] is not None and args["z"] is not None
+        has_pos = "pos" in args and args["pos"] is not None
+        has_ent = "entity_id" in args and args["entity_id"] is not None
+        if not (has_xz or has_pos or has_ent):
+            errs.append("move_to 需要有效的 (x, z)、pos 或 entity_id")
+        if has_xz and not (_is_num(args["x"]) and _is_num(args["z"])):
+            errs.append("move_to 的 x, z 必须是有限数字")
+        if args.get("y") is not None and not _is_num(args["y"]):
+            errs.append("move_to 的 y 必须是有限数字")
+        if has_ent and not _is_int(args["entity_id"]):
+            errs.append("move_to 的 entity_id 必须是整数")
     elif action == "shoot":
-        if "entity_id" not in args and "pos" not in args:
-            return ["shoot 需要 entity_id 或 pos"]
+        has_ent = "entity_id" in args and args["entity_id"] is not None
+        has_pos = "pos" in args and args["pos"] is not None
+        if not (has_ent or has_pos):
+            errs.append("shoot 需要有效的 entity_id 或 pos")
+        if has_ent and not _is_int(args["entity_id"]):
+            errs.append("shoot 的 entity_id 必须是整数")
     elif action == "interact":
-        if "pos" not in args and "entity_id" not in args:
-            return ["interact 需要 pos 或 entity_id"]
-    return []
+        has_pos = "pos" in args and args["pos"] is not None
+        has_ent = "entity_id" in args and args["entity_id"] is not None
+        if not (has_pos or has_ent):
+            errs.append("interact 需要有效的 pos 或 entity_id")
+        if has_ent and not _is_int(args["entity_id"]):
+            errs.append("interact 的 entity_id 必须是整数")
+    elif action == "dig":
+        if args.get("pos") is None:
+            errs.append("dig 的 pos 不能为空")
+    elif action == "attack":
+        if not _is_int(args.get("entity_id")):
+            errs.append("attack 的 entity_id 必须是整数")
+    elif action in ("craft", "drop", "place", "use_item", "equip"):
+        item = args.get("item")
+        if not isinstance(item, str) or not item.strip():
+            errs.append(f"{action} 的 item 必须是非空字符串")
+        if action in ("craft", "drop") and "count" in args:
+            if not _is_int(args["count"]) or args["count"] < 1:
+                errs.append(f"{action} 的 count 必须是 >=1 的整数")
+        if action == "equip" and "slot" in args and args["slot"] not in _VALID_EQUIP_SLOTS:
+            errs.append(f"equip 的 slot 不合法: {args['slot']!r}")
+    elif action == "chat":
+        msg = args.get("message")
+        if not isinstance(msg, str) or not msg.strip():
+            errs.append("chat 的 message 必须是非空字符串")
+    elif action == "posture":
+        for k in ("sneak", "shield"):
+            if k in args and args[k] is not None and not isinstance(args[k], bool):
+                errs.append(f"posture 的 {k} 必须是布尔值")
+    elif action in ("window_view", "window_act"):
+        if not isinstance(args.get("target"), dict) or not args["target"]:
+            errs.append(f"{action} 的 target 必须是非空对象")
+        if action == "window_act":
+            ops = args.get("ops")
+            if not isinstance(ops, list) or not ops:
+                errs.append("window_act 的 ops 必须是非空数组")
+    return errs
 
 
 def _check_pos(pos: Any) -> list[str]:
     if not isinstance(pos, (list, tuple)) or len(pos) != 3:
         return [f"pos 必须是 [x, y, z]；收到 {pos!r}"]
-    if not all(isinstance(v, (int, float)) for v in pos):
-        return [f"pos 的三个分量必须是数字；收到 {pos!r}"]
+    if not all(_is_num(v) for v in pos):
+        return [f"pos 的三个分量必须是有限数字；收到 {pos!r}"]
     return []
 
 

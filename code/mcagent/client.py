@@ -117,28 +117,44 @@ class ApiError(Exception):
 
 # ---------------------------------------------------------------- 配置
 class Config:
-    def __init__(self, base: str, username: str, password: str, proxy: Optional[str] = None):
+    def __init__(
+        self,
+        base: str,
+        username: str,
+        password: str,
+        proxy: Optional[str] = None,
+        token_file: Optional[str] = None,
+    ):
         self.base = base.rstrip("/")
         self.username = username
         self.password = password
         self.proxy = proxy
+        self.token_file = token_file
 
     @classmethod
     def load(cls, env_file: str | None = None) -> "Config":
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
         if env_file is None:
-            env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            env_file = os.path.join(pkg_dir, ".env")
         if os.path.exists(env_file):
-            for line in open(env_file, encoding="utf-8"):
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            with open(env_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        raw_tf = os.environ.get("MC_TOKEN_FILE")
+        if raw_tf is None:
+            token_file: Optional[str] = os.path.join(pkg_dir, ".token.json")
+        else:
+            token_file = raw_tf.strip() or None
         return cls(
             base=os.environ.get("MC_API_BASE", DEFAULT_BASE),
             username=os.environ.get("MC_USER", ""),
             password=os.environ.get("MC_PASS", ""),
             proxy=os.environ.get("MC_PROXY") or None,
+            token_file=token_file,
         )
 
     @property
@@ -168,14 +184,76 @@ class Client:
         self.token: Optional[str] = None
         self.expires_at: Optional[float] = None
         self.bot_username: Optional[str] = None
-        self._auth_lock = threading.Lock()
+        self._auth_lock = threading.RLock()
+        self._posture: dict[str, bool] = {"sneak": False, "shield": False}
+        self._load_cached_token()
+
+    # ---- Token 缓存落盘 ------------------------------------------------
+    def _load_cached_token(self) -> None:
+        path = self.cfg.token_file
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        if self.cfg.username and data.get("username") != self.cfg.username:
+            return
+        if data.get("base") and data.get("base") != self.cfg.base:
+            return
+        tok = data.get("token")
+        exp = data.get("expires_at_ts")
+        if not isinstance(tok, str) or not tok:
+            return
+        if isinstance(exp, (int, float)) and time.time() > float(exp) - 120:
+            return
+        self.token = tok
+        self.expires_at = float(exp) if isinstance(exp, (int, float)) else None
+        self.bot_username = data.get("bot_username")
+
+    def _save_cached_token(self, raw_expires: Optional[str] = None) -> None:
+        path = self.cfg.token_file
+        if not path or not self.token:
+            return
+        try:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = f"{path}.tmp.{os.getpid()}"
+            payload = {
+                "base": self.cfg.base,
+                "username": self.cfg.username,
+                "token": self.token,
+                "expires_at": raw_expires,
+                "expires_at_ts": self.expires_at,
+                "bot_username": self.bot_username,
+                "saved_at": time.time(),
+            }
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            self.log(f"[auth] token 落盘失败（不影响运行）: {e}")
 
     # ---- 底层 ----------------------------------------------------------
-    def _send(self, method: str, path: str, body: Any = None, timeout: float = 30, auth: bool = True) -> dict:
+    def _send(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        timeout: float = 30,
+        auth: bool = True,
+        token: Optional[str] = None,
+    ) -> dict:
         url = f"{self.cfg.base}/{path.lstrip('/')}"
         headers = {"Content-Type": "application/json"}
-        if auth and self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        use_token = self.token if token is None else token
+        if auth and use_token:
+            headers["Authorization"] = f"Bearer {use_token}"
         try:
             if method == "GET":
                 r = self.session.get(url, headers=headers, params=body, timeout=timeout)
@@ -186,15 +264,38 @@ class Client:
 
         if r.status_code == 401:
             code = "invalid_token"
+            msg = "token 无效或过期"
+            extra: dict = {}
             try:
-                code = r.json().get("error", {}).get("code", code)
+                err = r.json().get("error") or {}
+                code = err.get("code", code)
+                msg = err.get("message", msg)
+                extra = {k: v for k, v in err.items() if k not in ("code", "message")}
             except ValueError:
                 pass
-            raise ApiError(code, "token 无效或过期", http=401)
+            raise ApiError(code, msg, extra, http=401)
+        if r.status_code == 429:
+            msg = "请求过于频繁"
+            extra = {}
+            try:
+                err = r.json().get("error") or {}
+                msg = err.get("message", msg)
+                extra = {k: v for k, v in err.items() if k not in ("code", "message")}
+            except ValueError:
+                pass
+            hdr_retry = r.headers.get("Retry-After")
+            if "retry_after_s" not in extra and hdr_retry:
+                try:
+                    extra["retry_after_s"] = float(hdr_retry)
+                except ValueError:
+                    pass
+            raise ApiError("rate_limited", msg, extra, http=429)
         if r.status_code == 404:
             raise ApiError("unknown_api", f"路径不存在: {path}", http=404)
         if r.status_code == 400:
             raise ApiError("bad_json", "请求体不是合法 JSON", http=400)
+        if r.status_code >= 500:
+            raise ApiError("network", f"HTTP {r.status_code}: {r.text[:160]}", http=r.status_code)
         try:
             payload = r.json()
         except ValueError:
@@ -202,19 +303,31 @@ class Client:
         return payload
 
     def call(self, path: str, body: Any = None, method: str = "POST", timeout: float = 30) -> dict:
-        """发一次调用，返回 result；失败抛 ApiError。401 会自动重登一次。"""
-        self._ensure_token()
-        payload = self._send(method, path, body, timeout)
+        """发一次调用，返回 result；失败抛 ApiError。401 / invalid_token 会单飞自动重登一次。"""
+        used_token = self._ensure_token()
+        try:
+            payload = self._send(method, path, body, timeout, token=used_token)
+        except ApiError as e:
+            if e.http == 401 or e.code in ("invalid_token", "unauthorized"):
+                self._refresh_token(failed_token=used_token, reason=e.code)
+                payload = self._send(method, path, body, timeout, token=self.token)
+            else:
+                raise
+
         if payload.get("ok") is False:
             err = payload.get("error") or {}
             code = err.get("code", "unknown")
             if code in ("invalid_token", "unauthorized"):
-                self.log(f"[auth] {code}，尝试重登")
-                self.login()
-                payload = self._send(method, path, body, timeout)
+                self._refresh_token(failed_token=used_token, reason=code)
+                payload = self._send(method, path, body, timeout, token=self.token)
                 if payload.get("ok") is False:
-                    err = payload.get("error") or {}
-                    raise ApiError(err.get("code", "unknown"), err.get("message", ""), err)
+                    err2 = payload.get("error") or {}
+                    raise ApiError(
+                        err2.get("code", "unknown"),
+                        err2.get("message", ""),
+                        {k: v for k, v in err2.items() if k not in ("code", "message")},
+                    )
+                return payload.get("result") or {}
             raise ApiError(code, err.get("message", ""), {k: v for k, v in err.items() if k not in ("code", "message")})
         return payload.get("result") or {}
 
@@ -228,30 +341,54 @@ class Client:
             return e.code
 
     # ---- 认证 ----------------------------------------------------------
-    def _ensure_token(self) -> None:
-        if not self.token:
-            self.login()
-            return
-        if self.expires_at and time.time() > self.expires_at - 120:
-            self.log("[auth] token 快过期，提前重登")
-            self.login()
+    def _ensure_token(self) -> str:
+        with self._auth_lock:
+            if not self.token:
+                self._login_unlocked()
+            elif self.expires_at and time.time() > self.expires_at - 120:
+                self.log("[auth] token 快过期，提前重登")
+                self._login_unlocked()
+            return self.token or ""
+
+    def _refresh_token(self, failed_token: Optional[str], reason: str = "invalid_token") -> bool:
+        """并发安全单点刷新：若其他线程已刷新出新 token，直接复用不重复登录互踢。"""
+        with self._auth_lock:
+            now = time.time()
+            if (
+                self.token
+                and self.token != failed_token
+                and (not self.expires_at or now <= self.expires_at - 120)
+            ):
+                return False
+            self.log(f"[auth] {reason}，尝试重登")
+            self._login_unlocked()
+            return True
 
     def login(self) -> None:
+        with self._auth_lock:
+            self._login_unlocked()
+
+    def _login_unlocked(self) -> None:
         if not self.cfg.has_credentials:
             raise ApiError("invalid_credentials", "没配 MC_USER / MC_PASS（见 mcagent/.env.example）")
-        with self._auth_lock:
-            payload = self._send(
-                "POST", "auth/login",
-                {"username": self.cfg.username, "password": self.cfg.password},
-                timeout=20, auth=False,
+        payload = self._send(
+            "POST", "auth/login",
+            {"username": self.cfg.username, "password": self.cfg.password},
+            timeout=20, auth=False,
+        )
+        if payload.get("ok") is False:
+            err = payload.get("error") or {}
+            raise ApiError(
+                err.get("code", "invalid_credentials"),
+                err.get("message", ""),
+                {k: v for k, v in err.items() if k not in ("code", "message")},
             )
-            if payload.get("ok") is False:
-                err = payload.get("error") or {}
-                raise ApiError(err.get("code", "invalid_credentials"), err.get("message", ""), err)
-            self.token = payload["token"]
-            self.expires_at = _parse_iso(payload.get("expires_at"))
-            self.bot_username = payload.get("bot_username")
-            self.log(f"[auth] 登录成功 bot={self.bot_username} token 到期={payload.get('expires_at')}")
+        self.token = payload["token"]
+        self.expires_at = _parse_iso(payload.get("expires_at"))
+        self.bot_username = payload.get("bot_username")
+        self._posture = {"sneak": False, "shield": False}
+        self._save_cached_token(payload.get("expires_at"))
+        self.log(f"[auth] 登录成功 bot={self.bot_username} token 到期={payload.get('expires_at')}")
 
     # ---- 连接 ----------------------------------------------------------
     def wait_ready(self, timeout: float = 120, interval: float = 1.0) -> dict:
@@ -282,7 +419,16 @@ class Client:
 
     # ---- 观察 ----------------------------------------------------------
     def status(self, timeout: float = 10) -> dict:
-        return self.call("status", method="GET", timeout=timeout)
+        res = self.call("status", method="GET", timeout=timeout)
+        if isinstance(res, dict):
+            if not res.get("alive", True):
+                self._posture = {"sneak": False, "shield": False}
+            else:
+                if "sneaking" in res:
+                    self._posture["sneak"] = bool(res.get("sneaking"))
+                if "blocking" in res:
+                    self._posture["shield"] = bool(res.get("blocking"))
+        return res
 
     def inventory(self, timeout: float = 10) -> dict:
         return self.call("inventory", method="GET", timeout=timeout)
@@ -316,10 +462,13 @@ class Client:
     def action(self, name: str, body: Any = None, timeout: Optional[float] = None) -> dict:
         return self.call(name, body or {}, timeout=timeout or ACTION_TIMEOUT.get(name, 30))
 
-    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, timeout=None) -> dict:
+    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None) -> dict:
         body: dict = {"range": rng}
         if entity_id is not None:
             body["entity_id"] = entity_id
+        elif pos is not None:
+            p = list(pos)
+            body["x"], body["y"], body["z"] = p[0], p[1], p[2]
         else:
             body["x"], body["z"] = x, z
             if y is not None:
@@ -331,13 +480,13 @@ class Client:
 
     def place(self, item, pos=None) -> dict:
         body: dict = {"item": item}
-        if pos:
+        if pos is not None:
             body["pos"] = list(pos)
         return self.action("place", body)
 
     def interact(self, pos=None, entity_id=None, item=None) -> dict:
         body: dict = {}
-        if pos:
+        if pos is not None:
             body["pos"] = list(pos)
         if entity_id is not None:
             body["entity_id"] = entity_id
@@ -347,7 +496,7 @@ class Client:
 
     def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None) -> dict:
         body: dict = {"item": item}
-        if target:
+        if target is not None:
             body["target"] = target
         if ms is not None:
             body["ms"] = ms
@@ -364,7 +513,7 @@ class Client:
         body: dict = {"weapon": weapon, "charge_ms": charge_ms}
         if entity_id is not None:
             body["entity_id"] = entity_id
-        if pos:
+        if pos is not None:
             body["pos"] = list(pos)
         return self.action("shoot", body)
 
@@ -378,15 +527,26 @@ class Client:
         return self.action("window/act", {"target": target, "ops": ops})
 
     def equip(self, item, slot="hand") -> dict:
-        return self.action("equip", {"item": item, "slot": slot})
+        slot_norm = {"chest": "torso", "offhand": "off-hand"}.get(slot, slot)
+        return self.action("equip", {"item": item, "slot": slot_norm})
 
     def posture(self, sneak=None, shield=None) -> dict:
-        body = {}
-        if sneak is not None:
-            body["sneak"] = sneak
-        if shield is not None:
-            body["shield"] = shield
-        return self.call("posture", body, timeout=10)
+        # 规范 §4.11：/posture 是全量覆盖，未写字段在服务端会复位为 false。
+        # 无参调用保持 `{}` 全量复位语义；单参调用则合并当前已知姿态，防潜行搭桥时误松键坠落。
+        if sneak is None and shield is None:
+            body: dict = {}
+            target_sneak, target_shield = False, False
+        else:
+            target_sneak = self._posture["sneak"] if sneak is None else bool(sneak)
+            target_shield = self._posture["shield"] if shield is None else bool(shield)
+            body = {"sneak": target_sneak, "shield": target_shield}
+        res = self.call("posture", body, timeout=10)
+        if isinstance(res, dict):
+            self._posture["sneak"] = bool(res.get("sneaking", target_sneak))
+            self._posture["shield"] = bool(res.get("blocking", target_shield))
+        else:
+            self._posture = {"sneak": target_sneak, "shield": target_shield}
+        return res
 
     def dismount(self) -> dict:
         return self.action("dismount")
@@ -395,7 +555,11 @@ class Client:
         return self.action("drop", {"item": item, "count": count})
 
     def chat(self, message) -> dict:
-        return self.action("chat", {"message": message[:100]})
+        # 规范 §4.14：禁止以 / 开头（含前置空格），否则触发 bad_args
+        msg = str(message).lstrip()
+        if msg.startswith("/"):
+            msg = "／" + msg.lstrip("/")
+        return self.action("chat", {"message": msg[:100]})
 
     def stop(self) -> dict:
         return self.call("stop", {}, timeout=15)
@@ -404,7 +568,9 @@ class Client:
         return self.call("connect", {}, timeout=timeout)
 
     def disconnect(self) -> dict:
-        return self.call("disconnect", {}, timeout=20)
+        res = self.call("disconnect", {}, timeout=20)
+        self._posture = {"sneak": False, "shield": False}
+        return res
 
 
 # ---------------------------------------------------------------- 自检

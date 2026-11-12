@@ -1,4 +1,5 @@
 .env
+.token.json
 logs/
 probe/
 __pycache__/

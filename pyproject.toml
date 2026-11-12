@@ -1,0 +1,17 @@
+[project]
+name = "mcagent"
+version = "0.1.0"
+description = "NJU AI Agent for Minecraft (2026) · Harness Track Runtime & Planner"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["code"]
+include = ["mcagent*"]

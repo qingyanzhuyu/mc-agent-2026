@@ -26,31 +26,100 @@ class Fatal(Exception):
 
 # ---------------------------------------------------------------- 状态
 class State:
+    #: 触发接近死亡循环（60s 内 ≥2 死）后的强制避险冷却时长（秒，留 5s 缓冲防窗口边界抖动）
+    SAFE_COOLDOWN_S: float = 65.0
+
     def __init__(self):
         self.st: dict = {}
         self.last_seq: int = 0
         self.events: deque = deque(maxlen=400)
-        self.deaths: deque = deque(maxlen=10)  # 死亡时间戳，用来算死亡循环
+        self.deaths: deque = deque(maxlen=20)  # 本机 monotonic 秒时间戳，免疫客户端/服务端时钟差
         self.inventory: dict = {}
+        self.safe_mode_until: float = 0.0
+        self._status_booted: bool = False
+        self._events_booted: bool = False
+        self._seen_death_t_ms: set[int] = set()
+        self._seen_death_seqs: set[int] = set()
+        self._unlinked_alive_death_mono: Optional[float] = None
+
+    def _record_death(
+        self,
+        mono_ts: Optional[float] = None,
+        server_t_ms: Optional[int] = None,
+        seq: Optional[int] = None,
+    ) -> bool:
+        """去重记录一次真实死亡（融合 status.alive 翻转、status.last_death.t 与 events.death）。"""
+        if seq is not None and seq in self._seen_death_seqs:
+            return False
+        if server_t_ms is not None:
+            for seen_t in self._seen_death_t_ms:
+                if abs(seen_t - server_t_ms) <= 2000:
+                    if seq is not None:
+                        self._seen_death_seqs.add(seq)
+                    self._seen_death_t_ms.add(server_t_ms)
+                    return False
+            self._seen_death_t_ms.add(server_t_ms)
+        if seq is not None:
+            self._seen_death_seqs.add(seq)
+
+        now_mono = time.monotonic()
+        ts = now_mono if mono_ts is None else mono_ts
+
+        # 若前一拍刚因 alive: True->False 先记了一次未绑定 server_t 的死亡，10s 内合并为同一次
+        if (
+            server_t_ms is not None
+            and self._unlinked_alive_death_mono is not None
+            and abs(ts - self._unlinked_alive_death_mono) <= 10.0
+        ):
+            self._unlinked_alive_death_mono = None
+            return False
+
+        self.deaths.append(ts)
+        if self.deaths_in(60) >= 2:
+            self.safe_mode_until = max(self.safe_mode_until, now_mono + self.SAFE_COOLDOWN_S)
+        return True
 
     # ---- 更新
     def set_status(self, st: dict) -> None:
+        was_booted = self._status_booted
         prev_alive = self.st.get("alive", True)
         self.st = st
-        if not st.get("alive", True) and prev_alive:
-            self.deaths.append(time.time())
-        # last_death 里的时间戳也记一份，避免 alive 抖动漏记
+        self._status_booted = True
+
+        now_mono = time.monotonic()
         ld = st.get("last_death") or {}
-        if ld.get("t"):
-            ts = ld["t"] / 1000.0
-            if ts > time.time() - 300:
-                self.deaths.append(ts)
+        raw_t = ld.get("t")
+        ld_t_ms: Optional[int] = int(raw_t) if isinstance(raw_t, (int, float)) and raw_t > 0 else None
+
+        alive_now = st.get("alive", True)
+        if not alive_now and prev_alive:
+            if ld_t_ms is not None and ld_t_ms not in self._seen_death_t_ms:
+                self._record_death(mono_ts=now_mono, server_t_ms=ld_t_ms)
+            else:
+                # 死亡刚发生但服务端尚未刷新 last_death.t：先记一笔待合并的本地死亡
+                if self._record_death(mono_ts=now_mono):
+                    self._unlinked_alive_death_mono = now_mono
+            return
+
+        if ld_t_ms is not None and ld_t_ms not in self._seen_death_t_ms:
+            if was_booted:
+                # 运行期 last_death.t 变成新值 = 刚刚发生一次新死亡（完全不依赖本机/服务端时钟对齐）
+                self._record_death(mono_ts=now_mono, server_t_ms=ld_t_ms)
+            else:
+                # 首次拉状态：标记该历史 last_death.t 已见，防后续轮询重复追加；
+                # 若死亡刚在重启前不久发生（按墙钟 0~300s 内），按相对秒数折算进窗口以衔接崩溃恢复
+                age_s = time.time() - (ld_t_ms / 1000.0)
+                if -5.0 <= age_s <= 300.0:
+                    self._record_death(mono_ts=now_mono - max(0.0, age_s), server_t_ms=ld_t_ms)
+                else:
+                    self._seen_death_t_ms.add(ld_t_ms)
 
     def set_inventory(self, inv: dict) -> None:
         self.inventory = inv
 
     def drain(self, client: Client, limit: int = 200) -> list[dict]:
-        """按 seq 增量拉事件，一直拉到没有积压。"""
+        """按 seq 增量拉事件，一直拉到没有积压，并同步消费死亡与死亡循环事件。"""
+        was_booted = self._events_booted
         out: list[dict] = []
         for _ in range(20):  # 防止死循环
             r = client.events(since=self.last_seq, limit=limit)
@@ -60,6 +129,35 @@ class State:
             self.events.extend(evs)
             if not r.get("has_more"):
                 break
+        self._events_booted = True
+
+        if out:
+            now_mono = time.monotonic()
+            # 首批事件用同批最大服务端时间戳做相对年龄参照，彻底消除客户端时钟偏差
+            ref_t_ms = max(
+                (int(e["t"]) for e in out if isinstance(e.get("t"), (int, float))),
+                default=None,
+            )
+            for ev in out:
+                etype = ev.get("type")
+                seq = ev.get("seq") if isinstance(ev.get("seq"), int) else None
+                raw_t = ev.get("t")
+                ev_t_ms = int(raw_t) if isinstance(raw_t, (int, float)) else None
+                if etype == "death":
+                    if was_booted:
+                        self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
+                    elif ev_t_ms is not None and ref_t_ms is not None:
+                        age_s = max(0.0, (ref_t_ms - ev_t_ms) / 1000.0)
+                        if age_s <= 300.0:
+                            self._record_death(mono_ts=now_mono - age_s, server_t_ms=ev_t_ms, seq=seq)
+                        else:
+                            if seq is not None:
+                                self._seen_death_seqs.add(seq)
+                            self._seen_death_t_ms.add(ev_t_ms)
+                    else:
+                        self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
+                elif etype == "death_loop":
+                    self.safe_mode_until = max(self.safe_mode_until, now_mono + self.SAFE_COOLDOWN_S)
         return out
 
     # ---- 便捷读
@@ -75,13 +173,44 @@ class State:
     def ready(self) -> bool:
         return bool(self.st.get("ready"))
 
+    @property
+    def in_safe_mode(self) -> bool:
+        return time.monotonic() < self.safe_mode_until
+
+    @property
+    def safe_mode_remaining(self) -> float:
+        return max(0.0, self.safe_mode_until - time.monotonic())
+
     def count(self, item: str) -> int:
-        items = (self.inventory or {}).get("items") or []
-        return sum(i.get("count", 0) for i in items if i.get("name") == item)
+        inv = self.inventory or {}
+        total = 0
+        seen_slots: set[int] = set()
+        for it in (inv.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            slot = it.get("slot")
+            if isinstance(slot, int):
+                seen_slots.add(slot)
+            if it.get("name") == item:
+                total += int(it.get("count", 0))
+        # 穿在身上的护甲与副手盾牌不一定出现在 items 列表，按 slot 去重合并统计
+        armor = inv.get("armor") or {}
+        extra_slots = list(armor.values()) if isinstance(armor, dict) else []
+        extra_slots.append(inv.get("offhand"))
+        for eq in extra_slots:
+            if not isinstance(eq, dict) or eq.get("name") != item:
+                continue
+            slot = eq.get("slot")
+            if isinstance(slot, int) and slot in seen_slots:
+                continue
+            if isinstance(slot, int):
+                seen_slots.add(slot)
+            total += int(eq.get("count", 1))
+        return total
 
     def deaths_in(self, window_s: float = 60) -> int:
-        now = time.time()
-        return sum(1 for t in self.deaths if now - t <= window_s)
+        now = time.monotonic()
+        return sum(1 for t in self.deaths if 0 <= now - t <= window_s)
 
     def summary(self) -> str:
         st = self.st
@@ -106,8 +235,15 @@ class Safety:
             return {"kind": "no_status"}
         if not st.get("alive", True):
             return {"kind": "wait_respawn", "why": "已死亡，等重生"}
-        if s.deaths_in(60) >= 2:
-            return {"kind": "safe_mode", "why": f"60s 内已死 {s.deaths_in(60)} 次，接近死亡循环"}
+        recent_deaths = s.deaths_in(60)
+        if recent_deaths >= 2:
+            s.safe_mode_until = max(s.safe_mode_until, time.monotonic() + s.SAFE_COOLDOWN_S)
+        if s.in_safe_mode:
+            return {
+                "kind": "safe_mode",
+                "remaining_s": round(s.safe_mode_remaining, 1),
+                "why": f"60s 内已死 {recent_deaths} 次，强制避险冷却剩 {s.safe_mode_remaining:.0f}s",
+            }
         if st.get("in_lava"):
             return {"kind": "escape_lava", "why": "在岩浆里"}
         if st.get("submerged") and int(st.get("oxygen", 300)) < self.OXY_WARN:

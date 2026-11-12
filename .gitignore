@@ -1,12 +1,19 @@
 # 密钥与本地环境
 .env
 **/.env
+.token.json
+**/.token.json
 *.key
 *.pem
 
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+code/*.egg-info/
+build/
+dist/
+.pytest_cache/
 .venv/
 venv/
 
