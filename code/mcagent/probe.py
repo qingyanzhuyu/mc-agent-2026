@@ -37,12 +37,13 @@ def _unwrap_api_error(e: BaseException) -> tuple[str, dict]:
     return type(e).__name__.lower(), {}
 
 
-def bench(fn: Callable[[], object], n: int = 10, warmup: int = 1) -> dict:
+def bench(fn: Callable[[], object], n: int = 10, warmup: int = 1, pause_s: float = 0.26) -> dict:
     for _ in range(warmup):
         try:
             fn()
         except ApiError:
             pass
+        time.sleep(pause_s)
     lat, errs = [], 0
     for _ in range(n):
         t0 = time.time()
@@ -52,7 +53,7 @@ def bench(fn: Callable[[], object], n: int = 10, warmup: int = 1) -> dict:
         except ApiError:
             errs += 1
             lat.append((time.time() - t0) * 1000)
-        time.sleep(0.05)
+        time.sleep(pause_s)
     return {
         "n": n,
         "err": errs,
@@ -151,15 +152,23 @@ def main(argv: list[str]) -> int:
 
     # ---- 5. 动作类：挖一块
     if do_dig:
-        print("\n[5] dig 一块（挑最近的 dirt/stone/grass）")
+        import math
+        print("\n[5] dig 一块（挑最近的非脚下 dirt/stone/grass）")
         target = None
+        fx, fy, fz = math.floor(s.pos[0]), s.pos[1], math.floor(s.pos[2])
         for types in (["dirt", "grass_block", "coarse_dirt"], ["stone", "cobblestone"], ["oak_log", "birch_log"]):
             try:
-                r = c.find_blocks(types=types, radius=12, limit=3)
+                r = c.find_blocks(types=types, radius=12, limit=8)
                 blocks = r.get("blocks") or []
-                if isinstance(blocks, list) and blocks:
-                    target = blocks[0]
-                    break
+                if isinstance(blocks, list):
+                    cand = [
+                        b for b in blocks
+                        if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
+                        and not (b["pos"][0] == fx and b["pos"][2] == fz and b["pos"][1] < fy)
+                    ]
+                    if cand:
+                        target = cand[0]
+                        break
             except ApiError as e:
                 print(f"  find {types} 失败: {e}")
         if target:
@@ -405,7 +414,12 @@ def pathfinding_main(argv: list[str]) -> int:
         state.set_status(c.wait_ready())
         connected = True
         status_samples = []
+        lim = getattr(c, "_limiter", None)
         for _ in range(args.samples):
+            if lim is not None:
+                rem = getattr(lim, "_next", 0.0) - time.monotonic()
+                if rem > 0:
+                    time.sleep(rem + 0.002)
             t = time.monotonic()
             state.refresh_status(c, max_age_s=0)
             status_samples.append(round((time.monotonic()-t)*1000, 2))
