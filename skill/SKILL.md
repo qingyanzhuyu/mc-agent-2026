@@ -67,7 +67,7 @@ uv run python -m mcagent.probe                   # 量基线，落盘 probe/*.js
    ```bash
    cd code && uv run python -m compileall -q mcagent tests && uv run python -m unittest discover -s tests && uv run python -m mcagent.smoke --dry
    ```
-3. 提交信息 `范围: 做了什么`，一次提交一件事（代码与文档分开提交以便独立 `git revert`）。
+3. 在自己的分支上提交，格式与合入条件见 `AGENTS.md` §6。
 
 ## 五个坑（本仓库特有，踩过的）
 
@@ -82,18 +82,16 @@ uv run python -m mcagent.probe                   # 量基线，落盘 probe/*.js
 4. **登录会踢人**：同一角色重复登录让旧 token 立即失效。客户端已实现 `.token.json` 落盘复用与 401 单点刷新，登录前必须去 `docs/05` 账号表占位，调试时别循环调 `login()`。
 5. **死亡循环是一票否决**：60s 死 3 次 → 自动下线 5 分钟。`State` 已用单调时钟去重并锁存 ≥65s `safe_mode`，Safety 闸优先级高于任何计划。
 
-## 不要做的事
+## 规则在哪里
 
-- **不混入未达验证等级的代码**：底层协议/运行时修改必须过 `code/tests/` 单测（`verified: offline`）；世界物理耦合的技能/策略/LLM 没真机跑通前先放分支（`verified: live`）
-- 不提交密钥与会话文件（`.env` / `.token.json` / `sk-...` / 皮肤站密码），仓库里只放 `.env.example`
-- 不破坏三项底层不变量：`client.py` 的 `trust_env=False`、`CODE_CLASS` 非致命容错边界、`Executor` 的可抢占单飞锁
-- 不触碰赛事红线：不人工代打/硬编码当场坐标、不绕过 REST API 或发 `/` 命令、不接外部非官方大模型、不持续恶意阻挠其他 Agent
-- 不 `push --force`、不 rebase 别人分支、不删别人的判断条目
-- 不绕过 `Executor` 直接调 `client` 的动作方法（会丢日志、丢非幂等判重、破坏抢占互斥）
+对所有工作 agent 生效的规则只写在仓库根目录的 `AGENTS.md`，本手册不再重复，免得两处口径漂移：
 
-## 收尾四件事
-
-1. 在 `docs/06-工作日志.md` 追加一条（含"试过什么没成"，那部分比成功更有说服力）
-2. 更新 `docs/05` 里你那一行的状态（不在做了写"空闲"）
-3. 没做完的写进 `docs/04`，别留半成品
-4. `git status` 干净再走——下一个人可能就在同一个目录开工
+| 规则 | `AGENTS.md` |
+|---|---|
+| 禁令、底层不变量（含"不绕过 `Executor`"）、分级验证 | §2A |
+| 赛事合规红线（含比赛当天切回官方端点） | §2B |
+| 登录占位、`MC_USER` 每人不同、用完下线 | §3 |
+| 事实 / 判断 / 猜测分层、`local-target` 标注 | §4 |
+| 完成定义（DoD） | §5 |
+| **先在自己分支提交、先 commit 再同步**、禁用的 git 命令 | §6 |
+| 会话结束四件事 | §8 |

@@ -13,11 +13,12 @@ description: Use when you need to pull the latest mc-agent-2026 repo and run a l
 
 ## 三条铁律（先读，再动手）
 
-1. **靶场 ≠ 比赛预算。** 本地网关 RTT ≈ 1.5 ms，官方端点 500–700 ms，差约 400 倍。
-   靶场能验证"做不做得成"，**不能**验证"来不来得及"。靶场数据一律标 `local-target`。
-2. **合规。** 网关是自建 MC 协议客户端（§2B.2 禁止项），它靠 `auth:"offline"` 连不上正式比赛服。
-   比赛当天 `MC_API_BASE` 必须切回官方，**没有任何例外**。
-3. **`MC_USER` 每人不同。** 同名会按规范 §1.1 踢掉旧 token——那是正确行为，不是 bug。
+规则本体在仓库根目录 `AGENTS.md`，这里只说和真机实验的关系：
+
+1. **靶场 ≠ 比赛预算**（`AGENTS.md` §4）。本地网关 RTT ≈ 1.5 ms，官方端点 500–700 ms，差约 400 倍。
+   靶场能验证"做不做得成"，**不能**验证"来不来得及"。
+2. **比赛当天切回官方端点**（`AGENTS.md` §2B.2）。网关靠 `auth:"offline"` 连的是队内测试服，连不上正式比赛服。
+3. **`MC_USER` 每人不同**（`AGENTS.md` §3）。
 
 ## 前置三查（每查 5 秒，跳过任一查都会浪费半小时）
 
@@ -35,9 +36,9 @@ curl -s http://127.0.0.1:8787/healthz
 ## 五步流程
 
 ```bash
-# 1) 同步（可选，且必须先保证工作区干净）
+# 1) 同步（可选；规则见 AGENTS.md §6：先在自己分支 commit，再同步）
 cd mc-agent-2026
-git status --short        # 有改动 -> 先 commit（commit 不是推送，不动远端）
+git status --short        # 有改动 -> 先在自己的分支上 commit（commit 不是推送，不动远端）
 git fetch --dry-run 2>&1  # 先干跑，看远端到底有没有新东西
 git pull                  # 只有确实有新提交时才拉；没有就别做无效 pull
 
@@ -66,6 +67,8 @@ python -m mcagent.probe        # 落盘 probe/probe-*.json
 > 装了 `uv` 就用 `uv run python -m ...`；没装就直接 `python -m ...`，两者等价。
 
 ## 第 1 步为什么不是"无脑 git pull"
+
+规则（先 commit 再同步、三条禁用命令）在 `AGENTS.md` §6，这里只解释原因。
 
 **pull 不会覆盖你的改动，它只会拒绝。** 默认的 `git pull` 是 fail-closed 的：
 
@@ -101,9 +104,10 @@ python -m mcagent.probe        # 落盘 probe/probe-*.json
 
 ## 收尾（每次都做）
 
-1. `docs/06-工作日志.md` 追加一条：改了什么 / 为什么 / **测到什么数**（附 probe json 路径）/ 遗留
-2. 数字写进 `docs/03` 时**必须标 `local-target`**，不得进时间预算表
-3. 关掉网关，别把 bot 挂在共享世界线上
+按 `AGENTS.md` §3（下线、关网关、账号表改回空闲）和 §8（日志、`docs/05`、`docs/04`、`git status`）做完，另外：
+
+1. 日志里写清**测到什么数**，并附 probe json 路径
+2. 数字写进 `docs/03` 时标 `local-target`（`AGENTS.md` §4）
 
 ## 本机专属参数
 
