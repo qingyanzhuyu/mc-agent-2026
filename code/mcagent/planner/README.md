@@ -3,9 +3,22 @@
 **职责**：看状态 → 输出**一个** `Decision`。不直接发 HTTP，不调 `Executor`。
 
 ```
-decision.py    Decision 数据结构 + 校验器（已用 9 个用例验过，纯函数）
-__init__.py    对外只暴露 5 个名字
+skill_choice.py  技能菜单 + 选择校验 + choose()        ← 常规路径：模型从菜单里选一个技能
+decision.py      Decision 数据结构 + 校验器（纯函数）   ← 兜底路径：没有技能覆盖时出一个原子动作
+llm.py           LLM 客户端 + 通用重问循环 ask_json()
+scheduler.py     不阻塞动作的模型预取槽
 ```
+
+## 两条决策路径
+
+| | 常规：选技能 | 兜底：原子动作 |
+|---|---|---|
+| 模型输出 | `{"skill", "args", "why"}` | `{"goal", "action", "args", "why", "expect", "abort_if"}` |
+| 校验器 | `skill_choice.validate_choice()`，读 `skills.REGISTRY` 的声明 | `decision.validate()`，反射 `Client` 签名 |
+| 模型碰坐标吗 | 不碰（技能参数注册时就限制为标量） | 会碰，执行前要按 J17 二次核对 |
+| 入口 | `skill_choice.choose(llm, summary, state)` | `LLMClient.decide(summary)` |
+
+两个校验器都**不维护名单**：一个读技能自己的声明，一个反射客户端签名。完整规则见 `AGENTS.md` §9.5。
 
 ## 为什么要校验器
 
@@ -34,7 +47,8 @@ runtime/   执行器        单飞锁 / 错误分类 / 重试 / 打点
 | 文件 | 状态 |
 |---|---|
 | `decision.py` | 校验器，纯函数，9 个用例 |
-| `llm.py` | LLM 客户端 + 决策重问循环；**15 个离线单测 + 真机 3/3 抽测** |
+| `llm.py` | LLM 客户端 + 决策重问循环；**15 个离线单测 + 真机 3/3 抽测**（`decide()`） |
+| `skill_choice.py` | 菜单 / 校验 / `choose()`；离线单测覆盖，**提示词措辞未在真模型上抽测** |
 
 `llm.py` 的三个实测结论已写进代码注释：
 1. `model` 只能写 `default`（后端是 qwen3.6-35b-a3b，字面写模型名会 403）

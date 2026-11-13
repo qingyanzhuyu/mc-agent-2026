@@ -13,6 +13,7 @@
 3. `docs/01-关键判断.md` — 当前共识，**别重复论证已经定下的判断**
 4. `docs/04-待确认.md` — **别问已经有人认领的问题**
 5. `docs/05-分工与契约.md` — 你能改哪些文件、模块接口是什么
+6. 要动 `skills/` `planner/` `probe*.py` 时，再读本文件 **§9 Harness 框架规则**（三层动作抽象）
 
 ---
 
@@ -28,10 +29,11 @@
 | `docs/06-工作日志.md` | 任何人，**只追加不改历史** |
 | `docs/07-评审材料.md` | 工程评审负责人汇总，其他人只提建议 |
 | `code/mcagent/client.py` `runtime.py` | 接口负责人 |
-| `code/mcagent/planner/` `skills/` | 策略负责人（见 §2A.6 分级验证要求） |
+| `code/mcagent/planner/` `skills/` | 策略负责人（见 §2A.6 分级验证要求、§9 框架规则） |
+| `code/mcagent/skills/nav.py` `items.py` | 策略负责人；**改了动作顺序或常量必须重跑 `probe --pathfinding --manual-only`**（§9.2 第 6 条） |
 | `code/tests/` | 接口负责人 / 策略负责人（各自模块的离线单测，必须无网可跑） |
 | `pyproject.toml` `uv.lock` | 接口负责人（改依赖必须同步更新 `uv.lock`） |
-| `code/mcagent/probe.py` `smoke.py` | 任何人（**加功能可以，改行为要先说**） |
+| `code/mcagent/probe.py` `probe_path.py` `probe_fixture.py` `smoke.py` | 任何人（**加功能可以，改行为要先说**） |
 | `tools/local-api-bridge/` | 接口负责人 / 任何人（赛前本地/局域网联调 Mock 网关，须与 `code/mcagent/` 保持零耦合） |
 | `plan/` | 任何人，只追加不重写 |
 
@@ -101,13 +103,14 @@
 
 ## 5. 完成定义（DoD）
 
-一个改动要算完成，下面七条必须全过：
+一个改动要算完成，下面几条必须全过：
 
 - [ ] **在 `docs/06-工作日志.md` 追加了一条**（改了什么 / 为什么 / 验证到什么程度）
 - [ ] 文档改动：附了来源；新判断写了推翻条件
 - [ ] 代码改动：`cd code && uv run python -m compileall -q mcagent tests` 通过
 - [ ] 代码改动：`cd code && uv run python -m unittest discover -s tests` 全绿（改底层逻辑须补对应单测）
 - [ ] 代码改动：`cd code && uv run python -m mcagent.smoke --dry` 返回码 0
+- [ ] 新增/改动技能或原语：配了用 `skills.testing.drive()` 驱动的离线单测（§9.4）
 - [ ] 提交信息符合格式（见下），代码与文档尽量分提交以便独立 `git revert`
 - [ ] `git status` 里没有多出来的密钥/`.token.json`/日志/`__pycache__`
 
@@ -151,3 +154,133 @@
 2. 把 `docs/05` 里你那一行的"当前状态"更新掉（不在做了就写"空闲"）
 3. 没做完的事写进 `docs/04`，别留半成品在工作区
 4. `git status` 干净后再离开——**下一个人可能就在同一个目录里开工**
+
+---
+
+## 9. Harness 框架规则：三层动作抽象
+
+写 `skills/`、`planner/`、`probe*.py` 之前读这一节。它回答三个问题：**一段新代码该放哪一层、
+谁能调它、怎样才算接好了**。背后的判断是 J8（模型尾延迟 30s+）、J11（确定性技能推进）、
+J16（虚空防坠）、J17（模型会编坐标和实体 id），这里不重复论证。
+
+### 9.1 三层，调用只能向下
+
+```
+模型 / 规则队列 ──选一个技能──▶ L3 意图技能 ──yield from──▶ L2 战术原语 ──ex.动作()──▶ L1 Executor ──▶ HTTP
+  planner/skill_choice.py        skills/<领域>.py              skills/nav.py              runtime.py
+```
+
+| 层 | 放哪 | 谁能调 | 接口长什么样 | 例子 |
+|---|---|---|---|---|
+| **L3 意图技能** | `skills/<领域>.py`，类上加 `@register` | 模型、规则队列 | 只收语义参数（物品名、数量），**不收坐标** | `mine_ore(target, count)`（待写） |
+| **L2 战术原语** | `skills/nav.py`，普通生成器函数 | 只有 L3 和 probe | 收当场观察到的方块坐标列表 | `breach_1x2` `sneak_bridge` `step_up_1x2` |
+| **L1 原子执行** | `runtime.Executor` | 只有 L2 / L3 | 一次一个阻塞动作 | `ex.move_to` `ex.dig` `ex.place` |
+
+**"用了 `@register`" 就等于"模型能选到"。** 所以 L2 永远不注册；想让模型用一个原语，就写一个 L3 技能包住它。
+
+### 9.2 七条硬规则（括号里是谁在替你检查）
+
+1. **每发一个阻塞动作就 `yield` 一次**。Safety 只能在动作之间抢占；一步里连发两个动作，中间掉血没人知道。
+   （`skills.testing.drive()`：一步内发两个动作直接断言失败。`posture` 和所有观察不占动作锁，不算。）
+2. **模型不碰坐标和实体 id**。技能参数只许 `str/int/float/bool`，名字不许是 `pos/x/y/z/entity_id`。
+   坐标一律由技能自己用 `find_blocks` / `get_block` / `get_entities` 当场观察得到。（`@register` 时强制，违反则启动报错。）
+3. **注册即接入，不维护名单**。技能菜单和模型输出校验都从 `skills.REGISTRY` 里各技能自己的声明读。
+   新增技能 = 新增一个文件；不要在任何地方手写技能白名单。（`skills/__init__.py` 启动时自动导入包内所有文件。）
+4. **调用只能向下，动作只走 `ex.<动作>()`**。`skills/` 里不出现 HTTP、不直接调 `client` 的动作方法（观察方法可以：
+   `ex.client.get_block(...)`、`state.refresh_status(ex.client)`）；`planner/` 里不出现 `Executor`。（人工评审；§2A.3。）
+5. **被切走的技能不续跑**。循环换技能时调 `skill.abort()`，下次要做就新建实例从观察重来——世界已经变了。
+   需要收尾的状态（潜行、举盾）写在 `run()` 的 `finally` 里，而且**从进入该状态的那一行起就要在 `try` 里面**。
+6. **原语先过 probe，再给技能用；两边导入同一份代码**。`probe_path.py` 直接 `from .skills import nav`。
+   往 `nav.py` 加新原语时同步在 probe 里加一个 case；改了已有原语的动作顺序或常量（如 `PLACE_REACH`），
+   必须重跑 `uv run python -m mcagent.probe --pathfinding --manual-only ...` 并把证据路径写进 `docs/06`。
+7. **`verified` 如实标**。技能类默认 `verified = "offline"`；真机跑通、`docs/06` 留了日志路径之后才改成 `"live"`。
+   赛中菜单默认只收 `"live"`（联调时传 `min_verified="offline"`）。这是 §2A.6 在代码里的落点，不是它的替代品：
+   没上过真机的技能仍然不进 `main`。
+
+### 9.3 一文件一职责
+
+目标是每个文件 150–300 行、只有一个改它的理由——编码 agent 读写省上下文，几个人并行改也不撞。
+
+```
+code/mcagent/
+  skills/base.py        Skill 基类、Param 声明、rec()、failure()
+  skills/registry.py    @register、REGISTRY、make()、契约检查、自动发现
+  skills/items.py       只读选择器：最好的镐、垫块、空气判断
+  skills/nav.py         L2 原语（真机验过的三段手动兜底序列）
+  skills/testing.py     离线夹具：GridWorld 替身 + drive()
+  skills/<领域>.py       L3 技能：wood / stone_iron / survival / explore ……（待写，一个领域一个文件）
+  planner/skill_choice.py  技能菜单、选择校验、choose()      ← 常规决策路径
+  planner/decision.py      原子动作 Decision 校验            ← 只给没有技能覆盖的场景兜底
+  planner/llm.py           LLM 客户端 + 通用重问循环 ask_json()
+  probe.py              基线测量（T_status / T_move20 / T_dig1）+ 命令行入口
+  probe_path.py         寻路与手动兜底探测（跑的是 nav.py 的原语）
+  probe_fixture.py      寻路夹具模板与离线校验
+```
+
+已知超标、暂不拆的：`runtime.py`、`client.py`（冻结面，拆了会波及所有人）、`probe_path.py` 里的
+`pathfinding_main()`（一个 360 行的函数，刚做完真机验收，等官方测试场复核完再拆）。
+新代码不要以它们为榜样。
+
+### 9.4 加一个 L3 技能
+
+```python
+# skills/stone_iron.py
+from ..runtime import Replan
+from . import nav
+from .base import Param, Skill, rec
+from .items import best_pickaxe
+from .registry import register
+
+@register
+class MineOre(Skill):
+    name = "mine_ore"                      # 模型输出里的 skill 字段
+    description = "挖指定矿石并捡起掉落"        # 进菜单，≤60 字
+    params = {
+        "target": Param(str, "矿石名", choices=("coal_ore", "iron_ore")),
+        "count": Param(int, "要几块", default=1, min=1, max=16),
+    }
+    goal = "acq:{target}"                  # 失败冷却按它计，可用参数名做模板
+
+    @classmethod
+    def blocked(cls, state) -> str:        # 与参数无关的前置检查；返回的原因会给模型看
+        return "" if best_pickaxe(state) else "背包没有镐"
+
+    def run(self, ex, state):
+        found = ex.client.find_blocks(types=[self.args["target"]], radius=32, limit=4)   # 观察，不用 yield
+        if not found.get("blocks"):
+            raise Replan(f"半径 32 内没有裸露的 {self.args['target']}")                    # 这句话会回喂给模型
+        pos = found["blocks"][0]["pos"]
+        yield rec("move_to", ex.move_to(pos=pos, rng=3), pos=pos)                        # 一个动作，一个 yield
+        yield from nav.breach_1x2(ex, state, [pos])                                      # 组合 L2 原语
+```
+
+上面是**写法示例，不是已验证的技能**（仓库里目前没有任何 L3 技能）。步骤：
+
+1. 选对文件（按领域），照上面的形状写；先想清楚失败时抛什么 `Replan` 文案——那是模型下一轮唯一能看到的线索。
+2. 在 `code/tests/` 里用 `GridWorld` + `drive()` 写离线单测：发了哪些动作、顺序对不对、被 `abort()` 后有没有收尾。
+3. 跑 §5 的自检。此时是 `verified: offline`，留在分支上。
+4. 占账号上真机跑通，把日志路径写进 `docs/06`，`verified` 改成 `"live"`，再合 `main`。
+
+`GridWorld` 没有重力、挖掘时间和寻路失败，**过了离线单测不等于技能能用**。别往替身里加猜出来的服务端行为（§2A.2）。
+
+### 9.5 模型看到什么、输出什么
+
+常规路径（`planner.skill_choice.choose()`）：
+
+- **输入**：主循环给的一屏状态摘要 + 现算的技能菜单（可启动的带签名，不可启动的带原因）+ 最近失败原因。
+- **输出**：`{"skill": "mine_ore", "args": {"target": "iron_ore", "count": 3}, "why": "..."}`
+- **校验**：技能名在菜单里、参数符合声明、`blocked()` 为空、该目标不在冷却中、`can_start()` 为真；
+  任何一条不过，错误原文回喂重问一次，仍不过返回 `None`，由调用方走规则兜底，**不等待**（J8）。
+
+兜底路径（`LLMClient.decide()` → `Decision`）：只在没有技能覆盖的场景让模型出**一个**原子动作。
+这条路径上模型会接触坐标，所以执行前必须按 J17 二次核对。能写成技能的就不要走这条路。
+
+### 9.6 现在有什么、没有什么（2026-11-14）
+
+| 部件 | 状态 |
+|---|---|
+| 技能契约、注册表、菜单、选择校验、通用重问循环 | `verified: offline`（`code/tests/test_skills_framework.py`） |
+| `nav.py` 三个原语 | 动作序列在本地 1.21.11 靶场跑通过（probe 旧实现）；改成生成器后离线逐步证据与旧实现一致，**真机尚未重跑** |
+| `SKILL_SYSTEM_PROMPT` 的措辞 | **未在真模型上抽测** |
+| 任何 L3 技能、主循环、状态摘要、`reach_pos`（由起终点自动算出要挖/要放哪些格） | **还没有** |
+

@@ -8,11 +8,15 @@
 client.py     HTTP 客户端：错误封装、.token.json 落盘复用、401 单点重登、429/5xx 退避、姿态合并
 runtime.py    State（单调时钟死亡去重 + 65s safe_mode）/ Safety / SafetyMonitor / Executor（可抢占单飞锁 + 非幂等判重 + 打点）
 smoke.py      冒烟：登录 -> ready -> 状态 -> 背包 -> 事件
-probe.py      基线：量 T_status / T_move20 / T_dig1，落盘 json
-planner/      决策契约 + 强类型校验器（拦截 bool/NaN/非法槽位；暂无策略实现）
-skills/       Skill 基类 + 空注册表（暂无具体技能）
-../tests/     14 项离线故障注入与多线程抢占单测（无需账号与外网）
+probe.py      基线：量 T_status / T_move20 / T_dig1，落盘 json；也是 --pathfinding 的入口
+probe_path.py     寻路与手动兜底探测（跑的是 skills/nav.py 的原语）
+probe_fixture.py  寻路夹具模板与离线校验
+planner/      技能菜单与选择校验（常规路径）+ 原子动作 Decision 校验（兜底路径）+ LLM 客户端
+skills/       三层动作抽象的 L3/L2：Skill 声明式契约、自注册表、nav 战术原语、离线夹具（暂无 L3 技能）
+../tests/     离线故障注入、多线程抢占、技能框架单测（无需账号与外网）
 ```
+
+分层与写技能的规则见仓库根 `AGENTS.md` §9。
 
 > 所有命令在 **`code/`** 目录下通过 `uv run` 执行（根目录 `pyproject.toml` + `uv.lock` 锁定依赖）。
 
