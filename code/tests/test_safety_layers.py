@@ -43,6 +43,45 @@ class FakeClient:
 
 
 class CacheTests(unittest.TestCase):
+    def test_forced_status_refresh_with_unchanged_clock(self):
+        c, s = FakeClient(), State()
+        with patch("mcagent.runtime.time.monotonic", return_value=100.0):
+            s.refresh_status(c)
+            c.st["pos"] = [2, 64, 0]
+            for ttl in (0, -1):
+                with self.subTest(max_age_s=ttl):
+                    before = c.status_calls
+                    self.assertEqual(s.refresh_status(c, max_age_s=ttl)["pos"], c.st["pos"])
+                    self.assertEqual(c.status_calls, before + 1)
+            s.refresh_status(c)
+            s.refresh_status(c, max_age_s=1)
+            self.assertEqual(c.status_calls, 3)
+
+    def test_place_keeps_player_pos_but_updates_other_state_fields(self):
+        c, s = FakeClient(), State()
+        s.set_status(c.st)
+        before = s.status_at
+        ex = Executor(c, s, log=lambda *_: None)
+        result = {"placed": "cobblestone", "pos": [1, 63, 0], "health": 18, "food": 19}
+        c.place = Mock(return_value=result)
+        self.assertEqual(ex.place("cobblestone", pos=[1, 63, 0]), result)
+        self.assertEqual(s.pos, c.st["pos"])
+        self.assertEqual(s.st["health"], 18)
+        self.assertEqual(s.st["food"], 19)
+        self.assertEqual(s.status_at, before)
+        self.assertEqual(result["pos"], [1, 63, 0])
+
+    def test_dismount_still_updates_player_pos(self):
+        c, s = FakeClient(), State()
+        s.set_status(c.st)
+        ex = Executor(c, s, log=lambda *_: None)
+        result = {"dismounted": True, "pos": [12.5, 64, 10.5]}
+        c.dismount = Mock(return_value=result)
+        self.assertEqual(ex.dismount(), result)
+        self.assertEqual(s.pos, result["pos"])
+        result["pos"][0] = 99
+        self.assertEqual(s.pos[0], 12.5)
+
     def test_simultaneous_status_reads_coalesce_and_expire(self):
         c, s = FakeClient(), State()
         entered, release = threading.Event(), threading.Event()
@@ -124,6 +163,21 @@ class MonitorTests(unittest.TestCase):
         self.c.st.update(status)
         self.s.status_at = float("-inf")
         return self.mon.tick()
+
+    def test_place_does_not_trigger_false_void_stop_before_next_status(self):
+        self.s.set_risk_context(void_guard=True)
+        self.c.st["pos"] = [0.5, 64, 0.5]
+        blocks = {(0, 63, 0): "stone", (1, 63, 0): "cobblestone"}
+        self.c.get_block = Mock(side_effect=lambda p: {"name": blocks.get(tuple(p), "air")})
+        self.c.place = Mock(return_value={"placed": "cobblestone", "pos": [1, 63, 0]})
+        with patch("mcagent.runtime.time.monotonic", return_value=100.0):
+            self.mon.tick()
+            self.ex.place("cobblestone", pos=[1, 63, 0])
+            self.mon.tick()
+        self.assertEqual(self.c.status_calls, 1)  # 下一次真实 /status 之前的缓存窗口
+        self.assertEqual(self.c.stops, 0)
+        self.assertIsNone(self.s.safety_intent)
+        self.assertEqual(self.s.pos, [0.5, 64, 0.5])
 
     def test_sustained_lava_stops_once_even_after_cooldown(self):
         self.tick(in_lava=True)
@@ -351,7 +405,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             with patch("mcagent.probe_path.Client", return_value=client), patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "", "")), patch("mcagent.runtime.SafetyMonitor.start"), patch("builtins.print"):
                 rc = pathfinding_main(["--pathfinding", "--live", "--local-target", "--fixture", str(source),
                                        "--case", "move20", "--samples", "1", "--output", str(output)])
-            report = json.loads(output.read_text())
+            report = json.loads(output.read_text(encoding="utf-8"))
         client.disconnect.assert_called_once()
         return rc, report
 
@@ -439,7 +493,7 @@ class ProbeIntegrationTests(unittest.TestCase):
                     "--case", "wall", "--case", "pillar", "--case", "pearl", "--case", "move20",
                     "--pearl-trials", "3", "--samples", "1", "--output", str(output),
                 ])
-            report = json.loads(output.read_text())
+            report = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(rc, 0)
         self.assertTrue(report["complete"])
@@ -725,7 +779,7 @@ class AuditRegressionTests(unittest.TestCase):
                     "--pathfinding", "--manual-only", "--live", "--local-target",
                     "--fixture", str(source), "--samples", "1", "--output", str(output),
                 ])
-            report = json.loads(output.read_text())
+            report = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(rc, 0)
         self.assertTrue(report["complete"])

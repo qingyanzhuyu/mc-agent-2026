@@ -191,10 +191,13 @@ class State:
         self._inventory_generation += 1
 
     @_locked
-    def patch_action(self, result: dict) -> None:
+    def patch_action(self, result: dict, *, action: str = "") -> None:
         # 动作返回只更新已知字段，不能把整份旧 status 冒充为新鲜状态。
         self._status_generation += 1
         for key in ("pos", "health", "food"):
+            # 规范 §4.3：place.pos 是方块坐标；§4.12 的 dismount.pos 才是玩家坐标。
+            if key == "pos" and action == "place":
+                continue
             if key in result:
                 self.st = {**self.st, key: copy.deepcopy(result[key])}
 
@@ -203,7 +206,8 @@ class State:
         # 锁内再次判断，合并主循环与 monitor 的并发补读。
         with self._status_fetch:
             with self._lock:
-                if self.st and time.monotonic() - self.status_at <= ttl:
+                # 非正 TTL 显式强制补读，即使粗时钟下两次读数完全相同。
+                if ttl > 0 and self.st and time.monotonic() - self.status_at <= ttl:
                     return copy.deepcopy(self.st)
                 generation = self._status_generation
             result = client.status()
@@ -651,7 +655,7 @@ class Executor:
                         "ok": True, "attempt": attempt, "result": _shrink(result),
                     })
                     if isinstance(result, dict) and any(k in result for k in ("pos", "health", "food")):
-                        self.state.patch_action(result)
+                        self.state.patch_action(result, action=name)
                     return result
                 except ApiError as e:
                     self.n_errors += 1
