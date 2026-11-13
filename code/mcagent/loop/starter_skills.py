@@ -1,0 +1,540 @@
+"""首批高性价比基础生存 L3 技能（对应 docs/11 §二/§七 T1 底仓前置）。
+
+遵守 AGENTS.md §9.2 全部硬规则：
+- 只收标量参数，绝不收坐标与实体 id；
+- 每发一个阻塞动作立即 `yield rec(...)`；
+- 动作一律经由 `Executor`，绝不直调 `Client` 动作方法；
+- 每个技能自带 `verify_done(state, before_counts)` 声明自己的成功判据，供主循环核对；
+- 默认 `verified = "offline"`，真机验收留档前不混入正式赛默认菜单。
+"""
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING, Iterator, Optional
+
+from ..client import ApiError
+from ..runtime import Replan
+from ..skills.base import Param, Skill, failure, rec
+from ..skills.items import AIR, PICKAXE_ORDER, bare, best_pickaxe
+from ..skills.registry import register
+
+if TYPE_CHECKING:
+    from ..runtime import Executor, State
+
+ALL_LOGS: tuple[str, ...] = (
+    "oak_log", "birch_log", "spruce_log", "jungle_log",
+    "acacia_log", "dark_oak_log", "cherry_log", "mangrove_log",
+)
+ALL_PLANKS: tuple[str, ...] = (
+    "oak_planks", "birch_planks", "spruce_planks", "jungle_planks",
+    "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks",
+)
+AXE_ORDER: tuple[str, ...] = (
+    "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "golden_axe", "wooden_axe",
+)
+STONE_Targets: tuple[str, ...] = ("stone", "cobblestone", "deepslate", "cobbled_deepslate")
+PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol")
+SAFE_GROUND: tuple[str, ...] = (
+    "grass_block", "dirt", "coarse_dirt", "stone", "cobblestone",
+    "sand", "sandstone", "gravel", "andesite", "diorite", "granite", "oak_planks",
+)
+EDIBLE_FOODS: tuple[str, ...] = (
+    "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod",
+    "cooked_salmon", "bread", "baked_potato", "golden_carrot", "apple", "carrot",
+    "melon_slice", "sweet_berries", "glow_berries", "beef", "porkchop", "mutton", "chicken",
+)
+STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
+    "village": ("hay_block", "bell", "composter", "lectern"),
+    "stronghold": ("stone_bricks", "mossy_stone_bricks", "cracked_stone_bricks", "end_portal_frame"),
+    "ruined_portal": ("crying_obsidian", "obsidian", "gold_block"),
+    "bee_nest": ("bee_nest",),
+}
+
+# 运行期动态记录触发过 protected_region 的点位与已放置工作台（非硬编码坐标，符合 §2B.1）
+PROTECTED_ZONES: list[tuple[float, float]] = []
+VISITED_ANCHORS: list[tuple[float, float]] = []
+KNOWN_TABLES: list[tuple[float, float, float]] = []
+
+
+def reset_world_memo() -> None:
+    PROTECTED_ZONES.clear()
+    VISITED_ANCHORS.clear()
+    KNOWN_TABLES.clear()
+
+
+def _record_known_table(pos) -> None:
+    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+        pt = (float(pos[0]), float(pos[1]), float(pos[2]))
+        if all(math.dist(pt, old) > 1.0 for old in KNOWN_TABLES):
+            KNOWN_TABLES.append(pt)
+
+
+def has_known_table(pos, radius: float = 16.0) -> bool:
+    if not (isinstance(pos, (list, tuple)) and len(pos) >= 3):
+        return False
+    p = (float(pos[0]), float(pos[1]), float(pos[2]))
+    return any(math.dist(p, t) <= radius and not _is_protected(t) for t in KNOWN_TABLES)
+
+
+def _mark_protected(pos) -> None:
+    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+        PROTECTED_ZONES.append((float(pos[0]), float(pos[2])))
+
+
+def _is_protected(pos, radius: float = 6.0) -> bool:
+    if not (isinstance(pos, (list, tuple)) and len(pos) >= 3):
+        return False
+    x, z = float(pos[0]), float(pos[2])
+    return any(math.hypot(x - px, z - pz) <= radius for px, pz in PROTECTED_ZONES)
+
+
+def _is_under_feet(player_pos: list[float], block_pos: list) -> bool:
+    fx, fy, fz = math.floor(player_pos[0]), player_pos[1], math.floor(player_pos[2])
+    return int(block_pos[0]) == fx and int(block_pos[2]) == fz and float(block_pos[1]) <= fy
+
+
+def total_logs(state: "State") -> int:
+    return sum(state.count(x) for x in ALL_LOGS)
+
+
+def total_planks(state: "State") -> int:
+    return sum(state.count(x) for x in ALL_PLANKS)
+
+
+def total_cobble(state: "State") -> int:
+    return state.count("cobblestone") + state.count("cobbled_deepslate")
+
+
+def best_axe(state: "State") -> Optional[str]:
+    return next((a for a in AXE_ORDER if state.count(a) >= 1), None)
+
+
+def best_food(state: "State") -> Optional[str]:
+    return next((f for f in EDIBLE_FOODS if state.count(f) >= 1), None)
+
+
+def _planks_for_log(log_name: str) -> str:
+    prefix = log_name.removesuffix("_log")
+    cand = f"{prefix}_planks"
+    return cand if cand in ALL_PLANKS else "oak_planks"
+
+
+# 配方需求：(所需木板数, 所需木棍数, 所需圆石数)
+_GEAR_NEEDS: dict[str, tuple[int, int, int]] = {
+    "wooden_pickaxe": (3, 2, 0),
+    "stone_pickaxe": (0, 2, 3),
+    "stone_sword": (0, 1, 2),
+    "furnace": (0, 0, 8),
+}
+
+
+def can_afford_gear(state: "State", item: str, *, assume_no_table: bool = True) -> bool:
+    if item not in _GEAR_NEEDS:
+        return False
+    p_need, s_need, c_need = _GEAR_NEEDS[item]
+    if total_cobble(state) < c_need:
+        return False
+    sticks = state.count("stick")
+    missing_sticks = max(0, s_need - sticks)
+    planks_for_sticks = math.ceil(missing_sticks / 4) * 2
+    table_planks = 0 if (state.count("crafting_table") >= 1 or not assume_no_table) else 4
+    potential_planks = total_planks(state) + total_logs(state) * 4
+    return potential_planks >= (p_need + planks_for_sticks + table_planks)
+
+
+@register
+class EatFood(Skill):
+    name = "eat_food"
+    description = "食用背包食物恢复饱食度与血量"
+    params = {}
+    goal = "survive:eat"
+    cooldown_s = 10.0
+    verified = "offline"
+
+    @classmethod
+    def blocked(cls, state: "State") -> str:
+        food = float(state.st.get("food", 20))
+        if food >= 20:
+            return "饱食度已满"
+        return "" if best_food(state) else "背包没有可食用食物"
+
+    def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        state.refresh_inventory(ex.client)
+        item = best_food(state)
+        if not item:
+            raise Replan("背包没有可食用食物")
+        yield rec("use_item", ex.use_item(item), item=item)
+
+    def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
+        before_food = sum(before_counts.get(f, 0) for f in EDIBLE_FOODS)
+        after_food = sum(state.count(f) for f in EDIBLE_FOODS)
+        if after_food >= before_food and float(state.st.get("food", 0)) < 20:
+            return "eat_food 结束但食物未消耗且饱食度未满"
+        return ""
+
+
+@register
+class ScoutIsland(Skill):
+    name = "scout_island"
+    description = "扫描周边资源与结构指纹并沿实心陆地向外探索"
+    params = {"radius": Param(int, "扫描半径", default=32, min=12, max=64)}
+    goal = "explore:island"
+    cooldown_s = 12.0
+    verified = "offline"
+
+    def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        st = state.refresh_status(ex.client, max_age_s=0)
+        cur = st.get("pos") or state.pos
+        r = int(self.args["radius"])
+        summary = ex.client.find_blocks(radius=r, limit=40)
+        blocks_map = (summary.get("blocks") or {}) if isinstance(summary, dict) else {}
+        hits = {
+            tag: [b for b in names if b in blocks_map]
+            for tag, names in STRUCTURE_FINGERPRINTS.items()
+            if any(b in blocks_map for b in names)
+        }
+
+        # limit 取 250 以覆盖近处 5 格地表之外的远端陆地（limit=40 在普通森林地形会被脚边草方块占满）
+        land = ex.client.find_blocks(types=list(SAFE_GROUND), radius=min(r, 28), limit=250)
+        cands = []
+        for b in (land.get("blocks") or []):
+            p = b.get("pos")
+            if not (isinstance(p, list) and len(p) == 3):
+                continue
+            dist = math.hypot(p[0] - cur[0], p[2] - cur[2])
+            if dist < 5.0 or abs(p[1] - cur[1]) > 10.0 or _is_protected(p, radius=8.0):
+                continue
+            visited_pen = sum(1 for vx, vz in VISITED_ANCHORS[-6:] if math.hypot(p[0] - vx, p[2] - vz) < 8.0)
+            cands.append((visited_pen, -dist, p))
+
+        if not cands:
+            raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
+        cands.sort(key=lambda item: (item[0], item[1]))
+        chosen = cands[0][2]
+        dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
+        VISITED_ANCHORS.append((float(dest[0]), float(dest[2])))
+        yield rec("move_to", ex.move_to(pos=dest, rng=2), pos=dest, fingerprints=hits)
+
+    def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
+        return "" if state.st.get("alive", True) else "探索途中角色死亡"
+
+
+@register
+class GatherWood(Skill):
+    name = "gather_wood"
+    description = "寻找附近裸露原木并砍伐收集"
+    params = {"count": Param(int, "要砍几块原木", default=3, min=1, max=16)}
+    goal = "acq:wood"
+    cooldown_s = 20.0
+    verified = "offline"
+
+    def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        state.refresh_status(ex.client, max_age_s=0)
+        state.refresh_inventory(ex.client)
+        start_logs = total_logs(state)
+        want = int(self.args["count"])
+
+        axe = best_axe(state)
+        if axe and bare((state.st.get("held") or {}).get("name")) != axe:
+            yield rec("equip", ex.equip(axe, "hand"), item=axe)
+
+        preferred_species: Optional[str] = next(
+            (lg for lg in ALL_LOGS if state.count(lg) >= 1), None
+        )
+        bad_positions: set[tuple[int, int, int]] = set()
+        last_nav_err: Optional[Replan] = None
+        attempts = 0
+        while total_logs(state) - start_logs < want and attempts < want + 6:
+            attempts += 1
+            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            found = ex.client.find_blocks(types=list(ALL_LOGS), radius=32, limit=32)
+            cands = []
+            for b in (found.get("blocks") or []):
+                p = b.get("pos")
+                if not (isinstance(p, list) and len(p) == 3):
+                    continue
+                pt = (int(p[0]), int(p[1]), int(p[2]))
+                if pt in bad_positions or _is_under_feet(cur, p) or _is_protected(p):
+                    continue
+                # 跳过头顶已悬空的高树冠原木（水平 <3 格且高于脚底 >4 格时地面寻路 GoalNear 必报 path_not_found）
+                if math.hypot(p[0] - cur[0], p[2] - cur[2]) < 3.0 and (p[1] - cur[1]) > 4.0:
+                    bad_positions.add(pt)
+                    continue
+                cands.append(b)
+
+            if not cands:
+                if total_logs(state) > start_logs:
+                    return
+                if last_nav_err is not None:
+                    raise last_nav_err
+                raise Replan("半径 32 内没有可砍的裸露原木（或均在保护区/不可达处）")
+
+            if preferred_species is None:
+                preferred_species = bare(cands[0].get("name", "")) or None
+            cands.sort(
+                key=lambda b: (
+                    0 if (preferred_species and bare(b.get("name", "")) == preferred_species and float(b.get("dist", 99)) <= 18.0) else 1,
+                    float(b.get("dist", math.dist(cur, b["pos"]))),
+                )
+            )
+            target = cands[0]["pos"]
+            t_key = (int(target[0]), int(target[1]), int(target[2]))
+            if math.dist(cur, target) > 4.2:
+                try:
+                    yield rec("move_to", ex.move_to(pos=target, rng=3), pos=target)
+                except Replan as e:
+                    code, _ = failure(e)
+                    if code in ("path_not_found", "unreachable", "move_timeout"):
+                        bad_positions.add(t_key)
+                        if target[1] > cur[1] + 3:
+                            for dy in range(0, 5):
+                                bad_positions.add((t_key[0], t_key[1] + dy, t_key[2]))
+                        last_nav_err = e
+                        continue
+                    raise
+            try:
+                yield rec("dig", ex.dig(target, collect=True), pos=target)
+            except Replan as e:
+                code, _ = failure(e)
+                if code == "protected_region":
+                    _mark_protected(target)
+                    raise Replan(f"原木 {target} 位于出生点保护区，已标记外迁") from e
+                if code in ("unreachable", "dig_timeout", "path_not_found"):
+                    bad_positions.add(t_key)
+                    last_nav_err = e
+                    continue
+                raise
+            state.refresh_inventory(ex.client)
+
+        if total_logs(state) <= start_logs and last_nav_err is not None:
+            raise last_nav_err
+
+    def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
+        before = sum(before_counts.get(k, 0) for k in ALL_LOGS)
+        if total_logs(state) <= before:
+            return f"gather_wood 正常结束但原木未增加（before={before}, after={total_logs(state)}）"
+        return ""
+
+
+@register
+class CraftGear(Skill):
+    name = "craft_gear"
+    description = "自动补齐木板木棍、放置或复用工作台并合成基础工具与熔炉"
+    params = {
+        "item": Param(
+            str,
+            "要合成的物品",
+            choices=("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace"),
+            default="wooden_pickaxe",
+        ),
+    }
+    goal = "craft:{item}"
+    cooldown_s = 20.0
+    verified = "offline"
+
+    @classmethod
+    def blocked(cls, state: "State") -> str:
+        if total_logs(state) + total_planks(state) + total_cobble(state) < 2:
+            return "缺少原木、木板或圆石原料"
+        return ""
+
+    def can_start(self, state: "State") -> bool:
+        return can_afford_gear(state, self.args["item"], assume_no_table=False)
+
+    def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        target = str(self.args["item"])
+        p_need, s_need, c_need = _GEAR_NEEDS[target]
+        state.refresh_status(ex.client, max_age_s=0)
+        state.refresh_inventory(ex.client)
+
+        if total_cobble(state) < c_need:
+            raise Replan(f"合成 {target} 圆石不足：需 {c_need}，现 {total_cobble(state)}")
+
+        nearby_tables = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5).get("blocks") or []
+        valid_tables = [b for b in nearby_tables if isinstance(b.get("pos"), list) and not _is_protected(b["pos"])]
+        for tb in valid_tables:
+            _record_known_table(tb["pos"])
+        need_table = not valid_tables and state.count("crafting_table") < 1
+
+        missing_sticks = max(0, s_need - state.count("stick"))
+        planks_needed = p_need + math.ceil(missing_sticks / 4) * 2 + (4 if need_table else 0)
+
+        while total_planks(state) < planks_needed:
+            # 优先转化存量最多的同种原木，避免杂木森林里木板分散成不同树种无法拼满单配方
+            avail_logs = [(state.count(lg), lg) for lg in ALL_LOGS if state.count(lg) >= 1]
+            if not avail_logs:
+                raise Replan(f"合成 {target} 木板不足：需 {planks_needed}，现 {total_planks(state)}")
+            avail_logs.sort(reverse=True)
+            log_item = avail_logs[0][1]
+            plank_item = _planks_for_log(log_item)
+            yield rec("craft", ex.craft(plank_item, 1), item=plank_item)
+            state.refresh_inventory(ex.client)
+
+        while state.count("stick") < s_need:
+            yield rec("craft", ex.craft("stick", 1), item="stick")
+            state.refresh_inventory(ex.client)
+
+        if not valid_tables:
+            if state.count("crafting_table") < 1:
+                yield rec("craft", ex.craft("crafting_table", 1), item="crafting_table")
+                state.refresh_inventory(ex.client)
+            try:
+                placed = ex.place("crafting_table")
+                if isinstance(placed, dict) and isinstance(placed.get("pos"), list):
+                    _record_known_table(placed["pos"])
+                else:
+                    _record_known_table(state.pos)
+                yield rec("place", placed, item="crafting_table")
+            except Replan as e:
+                code, _ = failure(e)
+                if code == "protected_region":
+                    _mark_protected(state.pos)
+                    raise Replan("当前位置处于出生点保护区，无法放置工作台") from e
+                raise
+        else:
+            tpos = valid_tables[0]["pos"]
+            if math.dist(state.pos, tpos) > 3.5:
+                yield rec("move_to", ex.move_to(pos=tpos, rng=2), pos=tpos)
+
+        yield rec("craft", ex.craft(target, 1), item=target)
+        state.refresh_inventory(ex.client)
+
+    def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
+        target = str(self.args["item"])
+        if state.count(target) <= before_counts.get(target, 0):
+            return f"craft_gear({target}) 结束但背包数量未增加"
+        return ""
+
+
+@register
+class MineStone(Skill):
+    name = "mine_stone"
+    description = "装备镐安全挖掘石头收集圆石（自动剥离表土并严禁挖脚下）"
+    params = {"count": Param(int, "期望新增圆石数", default=8, min=1, max=32)}
+    goal = "acq:cobblestone"
+    cooldown_s = 20.0
+    verified = "offline"
+
+    @classmethod
+    def blocked(cls, state: "State") -> str:
+        return "" if best_pickaxe(state) else "背包没有镐"
+
+    def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        state.refresh_status(ex.client, max_age_s=0)
+        state.refresh_inventory(ex.client)
+        pick = best_pickaxe(state)
+        if not pick:
+            raise Replan("背包没有镐")
+        if bare((state.st.get("held") or {}).get("name")) != pick:
+            yield rec("equip", ex.equip(pick, "hand"), item=pick)
+
+        start_cobble = total_cobble(state)
+        want = int(self.args["count"])
+        budget = want + 18
+        bad_positions: set[tuple[int, int, int]] = set()
+        stair_origin: Optional[tuple[int, int, int, int, int]] = None
+        stair_step = 0
+
+        for _ in range(budget):
+            if total_cobble(state) - start_cobble >= want:
+                return
+            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            stones = ex.client.find_blocks(types=list(STONE_Targets), radius=16, limit=24).get("blocks") or []
+            # 仅选与当前脚底高差在 [-1.5, +2.5] 内的平层/浅层石头，避开地下洞穴暴露块（否则寻路卡 8s 且掉落物掉入洞底捡不到）
+            cands = [
+                b["pos"] for b in stones
+                if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
+                and (int(b["pos"][0]), int(b["pos"][1]), int(b["pos"][2])) not in bad_positions
+                and (cur[1] - 1.5) <= float(b["pos"][1]) <= (cur[1] + 2.5)
+                and not _is_under_feet(cur, b["pos"])
+                and not _is_protected(b["pos"])
+            ]
+            target = cands[0] if cands else None
+
+            if target is None:
+                # 地表无平层裸露石头：从脚边安全方向向下开凿阶梯式探槽（每步先核对底板非空气/岩浆/水，防挖穿虚空，且人物随阶梯下行贴身拾取）
+                if stair_origin is None:
+                    ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
+                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        sx1, sz1 = ix + dx, iz + dz
+                        if _is_protected([sx1, fy - 1, sz1]):
+                            continue
+                        head1 = bare(ex.client.get_block([sx1, fy, sz1]).get("name", ""))
+                        if head1 == "crafting_table":
+                            continue
+                        b1 = bare(ex.client.get_block([sx1, fy - 2, sz1]).get("name", ""))
+                        if b1 and b1 not in AIR and b1 not in ("lava", "water"):
+                            stair_origin = (ix, fy, iz, dx, dz)
+                            stair_step = 1
+                            break
+                if stair_origin is not None and stair_step <= 6:
+                    ox, ofy, oz, dx, dz = stair_origin
+                    sx, sy, sz = ox + stair_step * dx, ofy - stair_step, oz + stair_step * dz
+                    floor_blk = bare(ex.client.get_block([sx, sy - 1, sz]).get("name", ""))
+                    if floor_blk and floor_blk not in AIR and floor_blk not in ("lava", "water"):
+                        # 清理阶梯头顶与落脚格（3 格净空满足斜向下台阶碰撞箱）
+                        for clear_y in (sy + 2, sy + 1, sy):
+                            if _is_under_feet(cur, [sx, clear_y, sz]):
+                                continue
+                            bname = bare(ex.client.get_block([sx, clear_y, sz]).get("name", ""))
+                            if bname and bname not in AIR and bname not in ("water", "lava", "crafting_table"):
+                                cur_pick = best_pickaxe(state)
+                                if bname in STONE_Targets and cur_pick and bare((state.st.get("held") or {}).get("name")) not in PICKAXE_ORDER:
+                                    yield rec("equip", ex.equip(cur_pick, "hand"), item=cur_pick)
+                                yield rec("dig", ex.dig([sx, clear_y, sz], collect=True), pos=[sx, clear_y, sz])
+                                state.refresh_inventory(ex.client)
+                                if total_cobble(state) - start_cobble >= want:
+                                    return
+                        try:
+                            yield rec("move_to", ex.move_to(pos=[sx + 0.5, sy, sz + 0.5], rng=1), pos=[sx + 0.5, sy, sz + 0.5])
+                        except Replan:
+                            pass
+                        stair_step += 1
+                        continue
+
+                if total_cobble(state) > start_cobble:
+                    return
+                raise Replan("附近未找到可安全挖掘的石头或非悬空表土")
+
+            t_key = (int(target[0]), int(target[1]), int(target[2]))
+            if math.dist(cur, target) > 4.0:
+                try:
+                    yield rec("move_to", ex.move_to(pos=target, rng=2), pos=target)
+                except Replan as e:
+                    code, _ = failure(e)
+                    if code in ("path_not_found", "unreachable", "move_timeout"):
+                        bad_positions.add(t_key)
+                        continue
+                    raise
+            try:
+                cur_pick = best_pickaxe(state)
+                if cur_pick and bare((state.st.get("held") or {}).get("name")) not in PICKAXE_ORDER:
+                    yield rec("equip", ex.equip(cur_pick, "hand"), item=cur_pick)
+                before_dig_cobble = total_cobble(state)
+                dug_res = ex.dig(target, collect=True)
+                yield rec("dig", dug_res, pos=target)
+            except Replan as e:
+                code, _ = failure(e)
+                if code == "protected_region":
+                    _mark_protected(target)
+                    raise Replan(f"方块 {target} 位于出生点保护区，已标记外迁") from e
+                if code in ("unreachable", "dig_timeout", "path_not_found"):
+                    bad_positions.add(t_key)
+                    continue
+                raise
+            state.refresh_inventory(ex.client)
+            # 若挖开了石头但掉落物掉入悬崖/深坑未能拾取，拉黑该崖边区域改走阶梯探槽
+            if total_cobble(state) <= before_dig_cobble:
+                for bx in range(t_key[0] - 2, t_key[0] + 3):
+                    for by in range(t_key[1] - 2, t_key[1] + 3):
+                        for bz in range(t_key[2] - 2, t_key[2] + 3):
+                            bad_positions.add((bx, by, bz))
+
+        if total_cobble(state) <= start_cobble:
+            raise Replan("剥离表土后仍未采集到圆石")
+
+    def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
+        before = before_counts.get("cobblestone", 0) + before_counts.get("cobbled_deepslate", 0)
+        if total_cobble(state) <= before:
+            return f"mine_stone 结束但圆石未增加（before={before}, after={total_cobble(state)}）"
+        return ""
