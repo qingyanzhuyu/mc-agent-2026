@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -124,12 +125,16 @@ class Config:
         password: str,
         proxy: Optional[str] = None,
         token_file: Optional[str] = None,
+        max_rps: Optional[float] = None,
     ):
         self.base = base.rstrip("/")
         self.username = username
         self.password = password
         self.proxy = proxy
         self.token_file = token_file
+        self.max_rps = float(os.environ.get("MC_MAX_RPS", "4")) if max_rps is None else max_rps
+        if not math.isfinite(self.max_rps) or not 0 < self.max_rps <= 4:
+            raise ValueError("MC_MAX_RPS 必须在 (0, 4]，4 是客户端硬上限")
 
     @classmethod
     def load(cls, env_file: str | None = None) -> "Config":
@@ -172,9 +177,34 @@ def _parse_iso(s: Optional[str]) -> Optional[float]:
 
 
 # ---------------------------------------------------------------- 客户端
+class RequestLimiter:
+    """所有请求共用的无突发限速；等待者不持锁睡眠，/stop 优先取下一槽。"""
+
+    def __init__(self, rate: float):
+        self.spacing = 1.0 / rate
+        self._next = 0.0
+        self._cond = threading.Condition()
+        self._urgent = 0
+
+    def acquire(self, urgent: bool = False) -> None:
+        with self._cond:
+            self._urgent += int(urgent)
+            try:
+                while True:
+                    delay = self._next - time.monotonic()
+                    if delay <= 0 and (urgent or not self._urgent):
+                        self._next = time.monotonic() + self.spacing
+                        return
+                    self._cond.wait(max(0.001, delay) if delay > 0 else self.spacing)
+            finally:
+                self._urgent -= int(urgent)
+                self._cond.notify_all()
+
+
 class Client:
     def __init__(self, cfg: Config, log=print):
         self.cfg = cfg
+        self._limiter = RequestLimiter(cfg.max_rps)
         self.log = log
         self.session = requests.Session()
         # 关键：不读环境/注册表里的代理
@@ -256,6 +286,7 @@ class Client:
         use_token = self.token if token is None else token
         if auth and use_token:
             headers["Authorization"] = f"Bearer {use_token}"
+        self._limiter.acquire(urgent=path.lstrip("/") == "stop")
         try:
             if method == "GET":
                 r = self.session.get(url, headers=headers, params=body, timeout=timeout)
@@ -513,10 +544,19 @@ class Client:
         return self.call("advancements", {"status": status, "include_recipes": include_recipes}, timeout=20)
 
     # ---- 动作 ----------------------------------------------------------
-    def action(self, name: str, body: Any = None, timeout: Optional[float] = None) -> dict:
-        return self.call(name, body or {}, timeout=timeout or ACTION_TIMEOUT.get(name, 30))
+    def action(self, name: str, body: Any = None, timeout: Optional[float] = None,
+               *, stop_on=None) -> dict:
+        # 规范 §4：显式声明服务端反射，不依赖轮询发现 hurt/death。
+        body = dict(body or {})
+        conditions = stop_on if stop_on is not None else body.get("stop_on")
+        if conditions is None:
+            conditions = ["death"] if name in ("attack", "shoot") else ["hurt", "death"]
+        if not isinstance(conditions, (list, tuple)) or any(v not in ("hurt", "death") for v in conditions):
+            raise ValueError("stop_on 必须是 hurt/death 数组")
+        body["stop_on"] = list(conditions)
+        return self.call(name, body, timeout=timeout or ACTION_TIMEOUT.get(name, 30))
 
-    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None) -> dict:
+    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None, *, stop_on=None) -> dict:
         body: dict = {"range": rng}
         if entity_id is not None:
             body["entity_id"] = entity_id
@@ -527,10 +567,10 @@ class Client:
             body["x"], body["z"] = x, z
             if y is not None:
                 body["y"] = y
-        return self.action("move_to", body, timeout)
+        return self.action("move_to", body, timeout, stop_on=stop_on)
 
-    def dig(self, pos, collect=True) -> dict:
-        return self.action("dig", {"pos": list(pos), "collect": collect})
+    def dig(self, pos, collect=True, *, stop_on=None) -> dict:
+        return self.action("dig", {"pos": list(pos), "collect": collect}, stop_on=stop_on)
 
     def place(self, item, pos=None) -> dict:
         body: dict = {"item": item}

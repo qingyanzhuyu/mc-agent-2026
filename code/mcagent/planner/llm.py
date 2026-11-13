@@ -144,8 +144,10 @@ class LLMClient:
 
         url = f"{self.base}/chat/completions"
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
-        status, text = self._poster(url, headers, json.dumps(body),
-                                    timeout or self.timeout, self.proxy_for(thinking))
+        request_timeout = timeout
+        if request_timeout is None:
+            request_timeout = self.timeout if thinking else float(os.environ.get("MC_MODEL_TIMEOUT_S", "8"))
+        status, text = self._poster(url, headers, json.dumps(body), request_timeout, self.proxy_for(thinking))
         if status != 200:
             raise LLMError(f"HTTP {status}: {text[:200]}")
         try:

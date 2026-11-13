@@ -103,6 +103,8 @@ def _is_int(v: Any) -> bool:
 def _cross_rules(action: str, args: dict) -> list[str]:
     """跨参数与值类型约束：防止 None/字符串/错误槽位透传到服务端触发 bad_args。"""
     errs: list[str] = []
+    if "stop_on" in args and (not isinstance(args["stop_on"], list) or any(v not in ("hurt", "death") for v in args["stop_on"])):
+        errs.append("stop_on 必须是 hurt/death 数组")
     if action == "move_to":
         has_xz = "x" in args and "z" in args and args["x"] is not None and args["z"] is not None
         has_pos = "pos" in args and args["pos"] is not None
