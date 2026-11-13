@@ -519,6 +519,8 @@ class MineStone(Skill):
         bad_positions: set[tuple[int, int, int]] = set()
         stair_origin: Optional[tuple[int, int, int, int, int]] = None
         stair_step = 0
+        stair_steps_taken = 0
+        stair_columns: set[tuple[int, int]] = set()
 
         for _ in range(budget):
             if total_cobble(state) - start_cobble >= want:
@@ -538,11 +540,12 @@ class MineStone(Skill):
 
             if target is None:
                 # 地表无平层裸露石头：从脚边安全方向向下开凿阶梯式探槽（每步先核对底板非空气/岩浆/水，防挖穿虚空，且人物随阶梯下行贴身拾取）
-                if stair_origin is None:
+                if stair_origin is None and stair_steps_taken < 6:
                     ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
+                    stair_columns.add((ix, iz))
                     for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         sx1, sz1 = ix + dx, iz + dz
-                        if _is_protected([sx1, fy - 1, sz1]):
+                        if (sx1, sz1) in stair_columns or _is_protected([sx1, fy - 1, sz1]):
                             continue
                         head1 = bare(ex.client.get_block([sx1, fy, sz1]).get("name", ""))
                         if head1 == "crafting_table":
@@ -552,11 +555,13 @@ class MineStone(Skill):
                             stair_origin = (ix, fy, iz, dx, dz)
                             stair_step = 1
                             break
-                if stair_origin is not None and stair_step <= 6:
+                if stair_origin is not None and stair_steps_taken < 6:
                     ox, ofy, oz, dx, dz = stair_origin
                     sx, sy, sz = ox + stair_step * dx, ofy - stair_step, oz + stair_step * dz
                     floor_blk = bare(ex.client.get_block([sx, sy - 1, sz]).get("name", ""))
-                    if floor_blk and floor_blk not in AIR and floor_blk not in ("lava", "water"):
+                    if ((sx, sz) not in stair_columns and floor_blk
+                            and floor_blk not in AIR and floor_blk not in ("lava", "water")):
+                        stair_columns.add((sx, sz))
                         # 清理阶梯头顶与落脚格（3 格净空满足斜向下台阶碰撞箱）
                         for clear_y in (sy + 2, sy + 1, sy):
                             if _is_under_feet(cur, [sx, clear_y, sz]):
@@ -577,7 +582,12 @@ class MineStone(Skill):
                             code, _ = failure(e)
                             yield rec("move_to", pos=[sx + 0.5, sy, sz + 0.5], error_code=code)
                         stair_step += 1
+                        stair_steps_taken += 1
                         continue
+                    # 直线探槽遇到洞口时，从下一拍实测站位核查其它方向；
+                    # 不回挖已走列，且转向不会重置总共六步的下探上限。
+                    stair_origin = None
+                    continue
 
                 if total_cobble(state) > start_cobble:
                     return
