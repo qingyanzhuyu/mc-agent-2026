@@ -504,6 +504,15 @@ class MineStone(Skill):
             raise Replan(f"挖掘工具告警，停止采石：{result['warning']}")
         self._require_pickaxe(state)
 
+    @staticmethod
+    def _safe_stair_column(ex: "Executor", x: int, y: int, z: int) -> bool:
+        floor = bare(ex.client.get_block([x, y - 1, z]).get("name", ""))
+        if not floor or floor in AIR or floor in ("lava", "water"):
+            return False
+        # 三格净空上方若是落沙/砾石，挖开后会重新填入槽内；底板实心仍不足以安全下行。
+        roof = bare(ex.client.get_block([x, y + 3, z]).get("name", ""))
+        return bool(roof) and roof not in ("sand", "red_sand", "gravel")
+
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.refresh_status(ex.client, max_age_s=0)
         state.refresh_inventory(ex.client)
@@ -550,32 +559,34 @@ class MineStone(Skill):
                         head1 = bare(ex.client.get_block([sx1, fy, sz1]).get("name", ""))
                         if head1 == "crafting_table":
                             continue
-                        b1 = bare(ex.client.get_block([sx1, fy - 2, sz1]).get("name", ""))
-                        if b1 and b1 not in AIR and b1 not in ("lava", "water"):
+                        if self._safe_stair_column(ex, sx1, fy - 1, sz1):
                             stair_origin = (ix, fy, iz, dx, dz)
                             stair_step = 1
                             break
                 if stair_origin is not None and stair_steps_taken < 6:
                     ox, ofy, oz, dx, dz = stair_origin
                     sx, sy, sz = ox + stair_step * dx, ofy - stair_step, oz + stair_step * dz
-                    floor_blk = bare(ex.client.get_block([sx, sy - 1, sz]).get("name", ""))
-                    if ((sx, sz) not in stair_columns and floor_blk
-                            and floor_blk not in AIR and floor_blk not in ("lava", "water")):
+                    if ((sx, sz) not in stair_columns
+                            and self._safe_stair_column(ex, sx, sy, sz)):
                         stair_columns.add((sx, sz))
                         # 清理阶梯头顶与落脚格（3 格净空满足斜向下台阶碰撞箱）
                         for clear_y in (sy + 2, sy + 1, sy):
-                            if _is_under_feet(cur, [sx, clear_y, sz]):
-                                continue
                             bname = bare(ex.client.get_block([sx, clear_y, sz]).get("name", ""))
                             if bname and bname not in AIR and bname not in ("water", "lava", "crafting_table"):
                                 if bname in STONE_Targets:
                                     yield from self._prepare_pickaxe(ex, state)
+                                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                                if _is_under_feet(cur, [sx, clear_y, sz]):
+                                    raise Replan("开凿中站位发生变化，停止挖脚下并重新观察阶梯")
                                 dug_res = ex.dig([sx, clear_y, sz], collect=True)
                                 yield rec("dig", dug_res, pos=[sx, clear_y, sz])
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
                                     return
                                 self._check_dig_tool(state, dug_res)
+                        for clear_y in (sy + 2, sy + 1, sy):
+                            if bare(ex.client.get_block([sx, clear_y, sz]).get("name", "")) not in AIR:
+                                raise Replan("阶梯净空发生变化，停止进入并重新观察")
                         try:
                             yield rec("move_to", ex.move_to(pos=[sx + 0.5, sy, sz + 0.5], rng=1), pos=[sx + 0.5, sy, sz + 0.5])
                         except Replan as e:
