@@ -10,18 +10,28 @@
    所以两条路径用不同的连接方式：快路径走代理，慢路径直连。
 4. **模型 JSON 约束不强**：实测 3 个状态里 2 个输出不合法（`goal` 给了数字、`attack` 用了不存在的
    `entity` 参数）。所以决策必须过 `validate()`，失败要带错误回去重问。
+
+降级（2026-11-14 补，机制有离线单测，阈值是工程默认值、未经真机标定）：
+
+5. **代理坏了就直连**：快路径经本机代理连不上/被网关拒（502/503/504）时，同一次调用里用剩余时间
+   改直连重试；代理连续坏 `LLM_BREAKER_FAILS` 次后熔断 `LLM_BREAKER_COOLDOWN_S` 秒，期间直接走直连。
+   "直连"仍是同一个官方端点、同一把 key，只是不经本机代理——**没有也不允许有第二个模型端点**（AGENTS §2B.3）。
+6. **端点坏了就别等**：所有线路都失败连续达到同一阈值后整体熔断，期间 `chat()` 立刻抛
+   `LLMError(kind="circuit_open")`，`ask_json()` 不重试不睡眠直接返回 None，调用方走规则兜底（J8）。
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import threading
 import time
 from typing import Any, Callable, Optional
 
 import requests
 
 from .decision import ALLOWED_ACTIONS, Decision, from_dict, validate
+from .llm_fault import MIN_FAIR_TIMEOUT_S, MIN_FALLBACK_BUDGET_S, Breaker, LLMError
 
 DEFAULT_BASE = "https://api.nju-aia.com/v1"
 DEFAULT_MODEL = "default"
@@ -29,10 +39,6 @@ DEFAULT_FAST_PROXY = "http://127.0.0.1:7897"
 
 #: poster(url, headers, data, timeout, proxy) -> (status_code, body_text)
 Poster = Callable[[str, dict, str, float, Optional[str]], "tuple[int, str]"]
-
-
-class LLMError(Exception):
-    pass
 
 
 SYSTEM_PROMPT = """你是 Minecraft 生存 Agent 的决策器。每次只输出一个 JSON 对象，不要输出任何其他文字、不要用 Markdown 代码块。
@@ -89,6 +95,12 @@ class LLMClient:
         fast_proxy: Optional[str] = None,
         timeout: float = 90,
         poster: Optional[Poster] = None,
+        *,
+        fallback_direct: Optional[bool] = None,
+        breaker_fails: Optional[int] = None,
+        breaker_cooldown_s: Optional[float] = None,
+        clock: Callable[[], float] = time.monotonic,
+        log: Optional[Callable[[str], None]] = print,
     ):
         self.base = (base or os.environ.get("LLM_BASE") or DEFAULT_BASE).rstrip("/")
         self.key = key or os.environ.get("LLM_KEY") or ""
@@ -100,6 +112,23 @@ class LLMClient:
         self.timeout = timeout
         self._poster = poster or self._requests_poster
         self._sessions: dict[Optional[str], requests.Session] = {}
+
+        # ---- 降级：代理线路熔断 + 端点整体熔断（J13：阈值走配置，不写死在调用点）
+        env = os.environ.get
+        self.fallback_direct = (env("LLM_FALLBACK_DIRECT", "1") != "0") if fallback_direct is None else fallback_direct
+        fails = int(env("LLM_BREAKER_FAILS", "3")) if breaker_fails is None else breaker_fails
+        cooldown = float(env("LLM_BREAKER_COOLDOWN_S", "60")) if breaker_cooldown_s is None else breaker_cooldown_s
+        self._clock = clock
+        self._log = log or (lambda _msg: None)
+        self._lock = threading.Lock()   # 预取线程与主线程可能同时调用
+        self._proxy_breaker = Breaker(fails, cooldown, clock)
+        self._endpoint_breaker = Breaker(fails, cooldown, clock)
+        #: 最近一次成功调用走的线路："proxy" / "direct" / None
+        self.last_route: Optional[str] = None
+        self.stats: dict[str, int] = {
+            "proxy_ok": 0, "direct_ok": 0, "fallback_direct": 0,
+            "proxy_opened": 0, "endpoint_opened": 0, "short_circuited": 0,
+        }
 
     # ---- 传输层（可注入，便于离线单测） ------------------------------
     def _session(self, proxy: Optional[str]) -> requests.Session:
@@ -115,13 +144,59 @@ class LLMClient:
                          proxy: Optional[str]) -> tuple[int, str]:
         try:
             r = self._session(proxy).post(url, headers=headers, data=data, timeout=timeout)
+        except requests.Timeout as e:
+            raise LLMError(f"timeout(proxy={proxy}, {timeout:.1f}s): {type(e).__name__}", kind="timeout") from e
         except requests.RequestException as e:
-            raise LLMError(f"net(proxy={proxy}): {type(e).__name__}: {e}") from e
+            raise LLMError(f"net(proxy={proxy}): {type(e).__name__}: {e}", kind="net") from e
         return r.status_code, r.text
 
     def proxy_for(self, thinking: bool) -> Optional[str]:
-        """快路径走代理，慢路径直连——这是实测出来的，不是随手写的。"""
+        """首选线路：快路径走代理，慢路径直连——这是实测出来的，不是随手写的。"""
         return None if thinking else self.fast_proxy
+
+    def routes_for(self, thinking: bool) -> list[Optional[str]]:
+        """这一次调用按顺序尝试的线路。首选线路是代理时，后面跟一条直连作降级。"""
+        first = self.proxy_for(thinking)
+        if not first:
+            return [None]
+        if not self.fallback_direct:
+            return [first]
+        with self._lock:
+            proxy_usable = self._proxy_breaker.allow()
+        return [first, None] if proxy_usable else [None]
+
+    def health(self) -> dict:
+        """降级状态快照，给主循环/观察者打点用。"""
+        with self._lock:
+            return {
+                **self.stats,
+                "last_route": self.last_route,
+                "proxy_open_s": round(self._proxy_breaker.remaining(), 1),
+                "endpoint_open_s": round(self._endpoint_breaker.remaining(), 1),
+            }
+
+    def _post_once(self, url: str, headers: dict, data: str, timeout: float, proxy: Optional[str]) -> str:
+        """发一次请求并取出 content；任何失败都抛带 `kind` 的 LLMError。"""
+        status, text = self._poster(url, headers, data, timeout, proxy)
+        if status != 200:
+            raise LLMError(f"HTTP {status}: {text[:200]}", kind="http", status=status)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise LLMError(f"回复不是 JSON: {text[:160]}", kind="bad_body") from e
+        if payload.get("error"):
+            raise LLMError(str(payload["error"])[:300], kind="api")
+
+        choice = (payload.get("choices") or [{}])[0]
+        content = ((choice.get("message") or {}).get("content") or "").strip()
+        if content:
+            return content
+
+        # 空回复：多半是思考把 token 吃光了
+        usage = payload.get("usage") or {}
+        raise LLMError(
+            f"空 content（finish={choice.get('finish_reason')}, "
+            f"completion={usage.get('completion_tokens')}）", kind="empty")
 
     # ---- 单次调用 ----------------------------------------------------
     def chat(
@@ -132,7 +207,11 @@ class LLMClient:
         timeout: Optional[float] = None,
     ) -> str:
         if not self.key:
-            raise LLMError("没有 LLM_KEY（见 .env.example）")
+            raise LLMError("没有 LLM_KEY（见 .env.example）", kind="config")
+        with self._lock:
+            if not self._endpoint_breaker.allow():
+                self.stats["short_circuited"] += 1
+                raise LLMError(f"模型端点熔断中，还剩 {self._endpoint_breaker.remaining():.0f}s", kind="circuit_open")
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -148,26 +227,54 @@ class LLMClient:
         if request_timeout is None:
             env_fast = float(os.environ.get("MC_MODEL_TIMEOUT_S", "8"))
             request_timeout = self.timeout if thinking else min(self.timeout, env_fast)
-        status, text = self._poster(url, headers, json.dumps(body), request_timeout, self.proxy_for(thinking))
-        if status != 200:
-            raise LLMError(f"HTTP {status}: {text[:200]}")
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise LLMError(f"回复不是 JSON: {text[:160]}") from e
-        if payload.get("error"):
-            raise LLMError(str(payload["error"])[:300])
+        data = json.dumps(body)
 
-        choice = (payload.get("choices") or [{}])[0]
-        content = ((choice.get("message") or {}).get("content") or "").strip()
-        if content:
+        # 两条线路共用这一次调用的时间预算：降级直连只用剩下的时间，不让调用方多等
+        deadline = self._clock() + request_timeout
+        routes = self.routes_for(thinking)
+        error: Optional[LLMError] = None
+        failed_via: Optional[str] = None
+        for i, proxy in enumerate(routes):
+            budget = request_timeout if i == 0 else deadline - self._clock()
+            if i > 0 and budget < MIN_FALLBACK_BUDGET_S:
+                break
+            try:
+                content = self._post_once(url, headers, data, budget, proxy)
+            except LLMError as e:
+                error, failed_via = e, proxy
+                if proxy and e.route_fault:
+                    with self._lock:
+                        opened = self._proxy_breaker.fail()
+                        if opened:
+                            self.stats["proxy_opened"] += 1
+                    if opened:
+                        self._log(f"  [llm] 代理 {proxy} 连续失败，{self._proxy_breaker.cooldown_s:.0f}s 内改走直连: {e}")
+                    if i + 1 < len(routes):
+                        continue  # 换直连再试一次
+                break
+            with self._lock:
+                if proxy:
+                    self._proxy_breaker.ok()
+                self._endpoint_breaker.ok()
+                self.last_route = "proxy" if proxy else "direct"
+                self.stats["proxy_ok" if proxy else "direct_ok"] += 1
+                if i > 0:
+                    self.stats["fallback_direct"] += 1
             return content
 
-        # 空回复：多半是思考把 token 吃光了
-        usage = payload.get("usage") or {}
-        raise LLMError(
-            f"空 content（finish={choice.get('finish_reason')}, "
-            f"completion={usage.get('completion_tokens')}）")
+        assert error is not None
+        starved = error.kind == "timeout" and request_timeout < MIN_FAIR_TIMEOUT_S
+        # 只坏在代理这一段、且下次还能改走直连：这不是端点的错，不计入端点熔断。
+        # 否则一个"慢慢失败"的代理会让两个熔断器同开同关，永远轮不到直连。
+        proxy_only = bool(failed_via) and error.route_fault and self.fallback_direct
+        if error.endpoint_fault and not starved and not proxy_only:
+            with self._lock:
+                opened = self._endpoint_breaker.fail()
+                if opened:
+                    self.stats["endpoint_opened"] += 1
+            if opened:
+                self._log(f"  [llm] 模型端点连续失败，熔断 {self._endpoint_breaker.cooldown_s:.0f}s，期间走规则兜底: {error}")
+        raise error
 
     # ---- 带校验回喂的重问循环（原子动作决策与技能选择共用） ------------
     def ask_json(
@@ -208,6 +315,11 @@ class LLMClient:
                 text = self.chat(messages, thinking=thinking, timeout=call_timeout)
             except LLMError as e:
                 errors = [f"调用失败: {e}"]
+                if e.kind == "circuit_open":
+                    used_attempts = attempt - 1  # 熔断中没有发出请求：不重试、不睡眠，立刻交还给规则兜底
+                    break
+                if attempt == attempts:
+                    break  # 后面没有重试了，不必再等
                 sleep_s = min(2.0, 0.5 * attempt)
                 if deadline is not None:
                     sleep_s = min(sleep_s, max(0.0, deadline - time.monotonic() - 0.05))
