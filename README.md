@@ -32,6 +32,7 @@
 ```
 AGENTS.md            多 agent 协作硬规则（文件所有权 / 协作禁令与赛事红线 / 分级验证 / DoD）—— 开工前必读
 skill/SKILL.md       仓库使用手册（定位 / 任务路由 / 五个坑 / DoD）—— 同上，先读这个
+skill/live-experiment/SKILL.md  真机实验流程（同步 → 起网关 → smoke → probe）
 pyproject.toml       Python 依赖声明（配合 uv.lock 锁定可复现测试环境）
 docs/
   00-赛事事实.md      客观条款（公告 + 细则 + 群聊补充），带来源
