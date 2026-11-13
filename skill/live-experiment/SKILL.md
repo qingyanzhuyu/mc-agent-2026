@@ -35,8 +35,11 @@ curl -s http://127.0.0.1:8787/healthz
 ## 五步流程
 
 ```bash
-# 1) 同步
-cd mc-agent-2026 && git pull
+# 1) 同步（可选，且必须先保证工作区干净）
+cd mc-agent-2026
+git status --short        # 有改动 -> 先 commit（commit 不是推送，不动远端）
+git fetch --dry-run 2>&1  # 先干跑，看远端到底有没有新东西
+git pull                  # 只有确实有新提交时才拉；没有就别做无效 pull
 
 # 2) 起网关（第一次要装依赖）
 cd tools/local-api-bridge
@@ -61,6 +64,29 @@ python -m mcagent.probe        # 落盘 probe/probe-*.json
 ```
 
 > 装了 `uv` 就用 `uv run python -m ...`；没装就直接 `python -m ...`，两者等价。
+
+## 第 1 步为什么不是"无脑 git pull"
+
+**pull 不会覆盖你的改动，它只会拒绝。** 默认的 `git pull` 是 fail-closed 的：
+
+| 你的本地状态 | 远端同一文件也改了 | 实际行为 |
+|---|---|---|
+| 未提交改动 | 是 | **拒绝**：`Your local changes would be overwritten`，一个字节都不动 |
+| 未提交改动 | 否 | 正常合并，你的改动原样保留 |
+| 未跟踪文件 | 远端新增同名 | **拒绝**：`untracked working tree files would be overwritten` |
+| 已提交未推送 | 是 | merge/rebase，可能冲突——不会丢，但容易乱 |
+
+会真正丢数据的只有 `reset --hard`、`pull --force`、`checkout -- .`——这三条**任何时候都不要用**。
+
+所以顺序是：**先 commit，再 pull**。commit 是本地操作，不推送、不影响远端；
+反过来做（先 pull 再 commit）会卡在“工作区脏”上，而 agent 往往把这个报错误读成“需要强制覆盖”。
+
+另外 `code/mcagent/.env`、`.token.json`、`probe/`、`logs/`、`tools/local-api-bridge/.env`
+都在 `.gitignore` 里，**pull 永远不碰它们**，实验配置和 token 缓存是安全的。
+
+> 在 Windows 上如果 `git pull` 报 `SEC_E_NO_CREDENTIALS`（schannel 坏），
+> 改用 GitHub Desktop 点 **Pull origin**，不要为了绕过它去 `--force`。
+
 
 ## 故障对照表
 
