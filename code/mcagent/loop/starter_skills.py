@@ -69,6 +69,10 @@ def _record_known_table(pos) -> None:
             KNOWN_TABLES.append(pt)
 
 
+def _forget_known_table(pos) -> None:
+    KNOWN_TABLES[:] = [t for t in KNOWN_TABLES if math.dist(t, pos) > 1.0]
+
+
 def has_known_table(pos, radius: float = 16.0) -> bool:
     if not (isinstance(pos, (list, tuple)) and len(pos) >= 3):
         return False
@@ -351,10 +355,33 @@ class CraftGear(Skill):
             raise Replan(f"合成 {target} 圆石不足：需 {c_need}，现 {total_cobble(state)}")
 
         nearby_tables = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5).get("blocks") or []
-        valid_tables = [b for b in nearby_tables if isinstance(b.get("pos"), list) and not _is_protected(b["pos"])]
+        valid_tables = [b for b in nearby_tables if isinstance(b.get("pos"), list)
+                        and len(b["pos"]) == 3 and not _is_protected(b["pos"])]
+        table_ready = False
         for tb in valid_tables:
-            _record_known_table(tb["pos"])
-        need_table = not valid_tables and state.count("crafting_table") < 1
+            tpos = tb["pos"]
+            if math.dist(state.pos, tpos) > 3.5:
+                try:
+                    moved = ex.move_to(pos=tpos, rng=2)
+                except Replan as e:
+                    code, _ = failure(e)
+                    if code not in ("path_not_found", "unreachable", "move_timeout"):
+                        raise
+                    _forget_known_table(tpos)
+                    # 失败动作也必须让出一步，给 Safety 抢占与状态刷新留出边界。
+                    yield rec("move_to", pos=tpos, error_code=code)
+                    state.refresh_status(ex.client, max_age_s=0)
+                    continue
+                yield rec("move_to", moved, pos=tpos)
+                state.refresh_status(ex.client, max_age_s=0)
+                if math.dist(state.pos, tpos) > 3.5:
+                    # 成功响应也要核对实际到达位置，不能把仍够不到的台当作可用锚点。
+                    _forget_known_table(tpos)
+                    continue
+            _record_known_table(tpos)
+            table_ready = True
+            break
+        need_table = not table_ready and state.count("crafting_table") < 1
 
         missing_sticks = max(0, s_need - state.count("stick"))
         planks_needed = p_need + math.ceil(missing_sticks / 4) * 2 + (4 if need_table else 0)
@@ -374,7 +401,7 @@ class CraftGear(Skill):
             yield rec("craft", ex.craft("stick", 1), item="stick")
             state.refresh_inventory(ex.client)
 
-        if not valid_tables:
+        if not table_ready:
             if state.count("crafting_table") < 1:
                 yield rec("craft", ex.craft("crafting_table", 1), item="crafting_table")
                 state.refresh_inventory(ex.client)
@@ -391,11 +418,6 @@ class CraftGear(Skill):
                     _mark_protected(state.pos)
                     raise Replan("当前位置处于出生点保护区，无法放置工作台") from e
                 raise
-        else:
-            tpos = valid_tables[0]["pos"]
-            if math.dist(state.pos, tpos) > 3.5:
-                yield rec("move_to", ex.move_to(pos=tpos, rng=2), pos=tpos)
-
         yield rec("craft", ex.craft(target, 1), item=target)
         state.refresh_inventory(ex.client)
 
