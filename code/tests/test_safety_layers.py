@@ -311,7 +311,7 @@ class ProbeTests(unittest.TestCase):
         fixture = path_template()
         with self.assertRaises(ValueError):
             validate_fixture(fixture, ["wall"])
-        with patch("mcagent.probe.Client") as client, patch("builtins.print"):
+        with patch("mcagent.probe_path.Client") as client, patch("builtins.print"):
             self.assertEqual(pathfinding_main(["--pathfinding", "--dry"]), 0)
             client.assert_not_called()
 
@@ -348,7 +348,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source, output = Path(tmp)/"fixture.json", Path(tmp)/"report.json"
             source.write_text(json.dumps(fixture))
-            with patch("mcagent.probe.Client", return_value=client), patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "", "")), patch("mcagent.runtime.SafetyMonitor.start"), patch("builtins.print"):
+            with patch("mcagent.probe_path.Client", return_value=client), patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "", "")), patch("mcagent.runtime.SafetyMonitor.start"), patch("builtins.print"):
                 rc = pathfinding_main(["--pathfinding", "--live", "--local-target", "--fixture", str(source),
                                        "--case", "move20", "--samples", "1", "--output", str(output)])
             report = json.loads(output.read_text())
@@ -429,7 +429,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             source, output = Path(tmp) / "fixture.json", Path(tmp) / "report.json"
             source.write_text(json.dumps(fixture))
             with (
-                patch("mcagent.probe.Client", return_value=client),
+                patch("mcagent.probe_path.Client", return_value=client),
                 patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "u", "p")),
                 patch("builtins.print"),
             ):
@@ -716,7 +716,7 @@ class AuditRegressionTests(unittest.TestCase):
             source, output = Path(tmp) / "fixture.json", Path(tmp) / "report.json"
             source.write_text(json.dumps(fixture))
             with (
-                patch("mcagent.probe.Client", return_value=client),
+                patch("mcagent.probe_path.Client", return_value=client),
                 patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "u", "p")),
                 patch("mcagent.runtime.SafetyMonitor.start"),
                 patch("builtins.print"),

@@ -169,23 +169,22 @@ class LLMClient:
             f"空 content（finish={choice.get('finish_reason')}, "
             f"completion={usage.get('completion_tokens')}）")
 
-    # ---- 决策：带校验回喂的重问循环 ----------------------------------
-    def decide(
+    # ---- 带校验回喂的重问循环（原子动作决策与技能选择共用） ------------
+    def ask_json(
         self,
-        state_summary: str,
-        allowed: Optional[list[str]] = None,
-        extra: str = "",
+        system: str,
+        user: str,
+        check: Callable[[Any], "tuple[bool, list[str]]"],
         attempts: int = 2,
         thinking: bool = False,
         total_timeout: Optional[float] = None,
-    ) -> tuple[Optional[Decision], list[str], int]:
-        """返回 (决策或 None, 最后一次的错误列表, 实际调用次数)。
+    ) -> tuple[Optional[dict], list[str], int]:
+        """问模型要一个 JSON 对象，用 `check` 校验；不合法就把错误原文回喂重问。
 
-        失败处理：把 `validate()` 的错误原文回喂给模型重问一次；仍不合法就返回 None，
-        由上层走规则兜底——**绝不让非法决策进入执行器**。
+        返回 (通过校验的对象或 None, 最后一次的错误列表, 实际调用次数)。
+        仍不合法就返回 None，由上层走规则兜底——**绝不让非法输出进入执行器**。
         """
-        allowed = list(allowed or ALLOWED_ACTIONS)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": system}]
         errors: list[str] = []
         deadline = (time.monotonic() + total_timeout) if total_timeout is not None else None
         used_attempts = 0
@@ -198,14 +197,12 @@ class LLMClient:
                     break
                 call_timeout = rem
             used_attempts = attempt
-            user = f"当前状态：\n{state_summary}\n\n可用动作：\n{', '.join(allowed)}\n"
-            if extra:
-                user += f"\n补充：\n{extra}\n"
+            content = user
             if errors:
-                user += ("\n上次输出被校验拒绝，错误如下，请修正后重新输出完整 JSON：\n- "
-                         + "\n- ".join(errors[:8]) + "\n")
-            user += "\n输出下一步的 JSON。"
-            messages.append({"role": "user", "content": user})
+                content += ("\n上次输出被校验拒绝，错误如下，请修正后重新输出完整 JSON：\n- "
+                            + "\n- ".join(errors[:8]) + "\n")
+            content += "\n输出下一步的 JSON。"
+            messages.append({"role": "user", "content": content})
 
             try:
                 text = self.chat(messages, thinking=thinking, timeout=call_timeout)
@@ -224,10 +221,31 @@ class LLMClient:
                 messages.append({"role": "assistant", "content": text[:800]})
                 continue
 
-            ok, errs = validate(obj)
+            ok, errs = check(obj)
             if ok:
-                return from_dict(obj), [], attempt
+                return obj, [], attempt
             errors = errs
             messages.append({"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)})
 
         return None, errors, used_attempts
+
+    def decide(
+        self,
+        state_summary: str,
+        allowed: Optional[list[str]] = None,
+        extra: str = "",
+        attempts: int = 2,
+        thinking: bool = False,
+        total_timeout: Optional[float] = None,
+    ) -> tuple[Optional[Decision], list[str], int]:
+        """原子动作决策。返回 (决策或 None, 最后一次的错误列表, 实际调用次数)。
+
+        这是 uncovered 兜底路径；常规路径是选技能，见 `skill_choice.choose()`。
+        """
+        allowed = list(allowed or ALLOWED_ACTIONS)
+        user = f"当前状态：\n{state_summary}\n\n可用动作：\n{', '.join(allowed)}\n"
+        if extra:
+            user += f"\n补充：\n{extra}\n"
+        obj, errors, used = self.ask_json(SYSTEM_PROMPT, user, validate, attempts=attempts,
+                                          thinking=thinking, total_timeout=total_timeout)
+        return (from_dict(obj) if obj is not None else None), errors, used

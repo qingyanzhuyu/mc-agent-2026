@@ -1,50 +1,50 @@
-"""skills —— 执行层（目前只有基类和注册表，没有具体技能）。
+"""skills —— 执行层：L3 意图技能 + L2 战术原语。完整规则见仓库根 `AGENTS.md` §9。
+
+    base.py       Skill 基类 / Param 参数声明 / rec() / failure()
+    registry.py   @register、REGISTRY、make()、自动发现
+    items.py      选择器：最好的镐、垫块、空气判断（只读）
+    nav.py        L2 原语：breach_1x2 / sneak_bridge / step_up_1x2（probe 直接导入验收）
+    testing.py    离线夹具：GridWorld 替身 + drive()（强制"一步一动作"）
+    <领域>.py      L3 技能，一个文件一个领域，`@register` 即接入
 
 硬约束（架构性的，不是风格问题）：
 
-    step() 每次最多做一个动作，然后把状态存在 self 里。
+    每发一个阻塞动作就 yield 一次。
 
-原因：Safety 闸必须在**每个动作之间**都有机会抢占。如果 `step()` 里连做 20 个动作，
-中间血量掉到 2 也不会有人知道——而 60 秒死 3 次就会下线 5 分钟。
+原因：Safety 闸只能在**动作之间**抢占。一步里连做 20 个动作，中间血量掉到 2 也不会有人
+知道——而 60 秒死 3 次就会下线 5 分钟。
 
 写新 skill：
 
-    from .base import Skill
+    from .base import Param, Skill, rec
+    from .registry import register
 
-    class MySkill(Skill):
-        name = "my_skill"
-        goal = "goal:my_skill"
+    @register
+    class GetStone(Skill):
+        name = "get_stone"
+        description = "挖圆石并捡起"
+        params = {"count": Param(int, "要几块", default=3, min=1, max=64)}
+        goal = "acq:cobblestone"
 
-        def can_start(self, state) -> bool:
-            return True
+        @classmethod
+        def blocked(cls, state) -> str:
+            return "" if best_pickaxe(state) else "背包没有镐"
 
-        def step(self, ex, state) -> bool:
-            ...          # 最多一个 ex.xxx() 动作
-            return True  # True = 目标完成
+        def run(self, ex, state):
+            ...                                   # 观察随便调，不用 yield
+            yield rec("dig", ex.dig(pos), pos=pos)  # 每个阻塞动作后 yield
 
 规则：
-- 观察（`find_blocks` / `inventory` / `events`）不占动作锁，可以在 step 里随便调。
-- 动作失败抛 `runtime.Replan`，循环换下一个技能；抛 `runtime.Fatal` 就整个停。
-- 不要在这里写 HTTP，只用 `Executor`。
-- **没在真机跑通的技能不要合进 main**（`AGENTS.md` §2 第 6 条）。
+- 观察（`ex.client.find_blocks/get_block`、`state.refresh_*`）不占动作锁，可以随便调。
+- 动作只走 `ex.<动作>()`；前置条件不成立抛 `runtime.Replan`，循环换下一个技能。
+- 参数只许标量，不许坐标/实体 id（注册时强制）。
+- **没在真机跑通的技能不要合进 main**（`AGENTS.md` §2A.6）；跑通后把 `verified` 改成 "live"。
 """
-from .base import Skill
+from .base import Param, Skill, bind_args, failure, rec
+from .registry import REGISTRY, all_names, contract_errors, get, load_all, make, register
 
-#: name -> Skill 子类。加技能时在这里登记，并在真机验证过之后再合入。
-REGISTRY: dict[str, type[Skill]] = {}
+# 导入包内所有技能文件，触发各自的 @register。坏文件在这里就炸——启动时发现好过赛中才发现。
+load_all()
 
-
-def register(cls: type[Skill]) -> type[Skill]:
-    REGISTRY[cls.name] = cls
-    return cls
-
-
-def get(name: str) -> type[Skill] | None:
-    return REGISTRY.get(name)
-
-
-def all_names() -> list[str]:
-    return sorted(REGISTRY)
-
-
-__all__ = ["Skill", "REGISTRY", "register", "get", "all_names"]
+__all__ = ["Skill", "Param", "REGISTRY", "register", "get", "all_names", "make",
+           "contract_errors", "bind_args", "load_all", "rec", "failure"]
