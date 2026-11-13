@@ -211,7 +211,8 @@ code/mcagent/
   skills/<领域>.py       L3 技能：wood / stone_iron / survival / explore ……（待写，一个领域一个文件）
   planner/skill_choice.py  技能菜单、选择校验、choose()      ← 常规决策路径
   planner/decision.py      原子动作 Decision 校验            ← 只给没有技能覆盖的场景兜底
-  planner/llm.py           LLM 客户端 + 通用重问循环 ask_json()
+  planner/llm.py           LLM 客户端 + 通用重问循环 ask_json() + 代理坏了改直连
+  planner/llm_fault.py     模型调用失败的分类与熔断器
   probe.py              基线测量（T_status / T_move20 / T_dig1）+ 命令行入口
   probe_path.py         寻路与手动兜底探测（跑的是 nav.py 的原语）
   probe_fixture.py      寻路夹具模板与离线校验
