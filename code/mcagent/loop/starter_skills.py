@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 from ..client import ApiError
 from ..runtime import Replan
 from ..skills.base import Param, Skill, failure, rec
-from ..skills.items import AIR, PICKAXE_ORDER, bare, best_pickaxe
+from ..skills.items import AIR, bare, best_pickaxe
 from ..skills.registry import register
 
 if TYPE_CHECKING:
@@ -480,6 +480,30 @@ class MineStone(Skill):
     def blocked(cls, state: "State") -> str:
         return "" if best_pickaxe(state) else "背包没有镐"
 
+    @staticmethod
+    def _require_pickaxe(state: "State") -> str:
+        pick = best_pickaxe(state)
+        if not pick:
+            raise Replan("背包已无镐，停止采石并重新准备工具")
+        return pick
+
+    def _prepare_pickaxe(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        # equip/dig 会使背包失效；不能凭旧 status.held 或技能启动时的工具继续挖石。
+        inv = state.refresh_inventory(ex.client)
+        pick = self._require_pickaxe(state)
+        held = inv.get("held", state.st.get("held")) or {}
+        if bare(held.get("name")) != pick:
+            yield rec("equip", ex.equip(pick, "hand"), item=pick)
+            inv = state.refresh_inventory(ex.client)
+            self._require_pickaxe(state)
+            if "held" in inv and bare((inv.get("held") or {}).get("name")) != pick:
+                raise Replan("装备镐后手持未确认，停止采石并重新观察工具")
+
+    def _check_dig_tool(self, state: "State", result: dict) -> None:
+        if result.get("warning"):
+            raise Replan(f"挖掘工具告警，停止采石：{result['warning']}")
+        self._require_pickaxe(state)
+
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.refresh_status(ex.client, max_age_s=0)
         state.refresh_inventory(ex.client)
@@ -539,17 +563,19 @@ class MineStone(Skill):
                                 continue
                             bname = bare(ex.client.get_block([sx, clear_y, sz]).get("name", ""))
                             if bname and bname not in AIR and bname not in ("water", "lava", "crafting_table"):
-                                cur_pick = best_pickaxe(state)
-                                if bname in STONE_Targets and cur_pick and bare((state.st.get("held") or {}).get("name")) not in PICKAXE_ORDER:
-                                    yield rec("equip", ex.equip(cur_pick, "hand"), item=cur_pick)
-                                yield rec("dig", ex.dig([sx, clear_y, sz], collect=True), pos=[sx, clear_y, sz])
+                                if bname in STONE_Targets:
+                                    yield from self._prepare_pickaxe(ex, state)
+                                dug_res = ex.dig([sx, clear_y, sz], collect=True)
+                                yield rec("dig", dug_res, pos=[sx, clear_y, sz])
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
                                     return
+                                self._check_dig_tool(state, dug_res)
                         try:
                             yield rec("move_to", ex.move_to(pos=[sx + 0.5, sy, sz + 0.5], rng=1), pos=[sx + 0.5, sy, sz + 0.5])
-                        except Replan:
-                            pass
+                        except Replan as e:
+                            code, _ = failure(e)
+                            yield rec("move_to", pos=[sx + 0.5, sy, sz + 0.5], error_code=code)
                         stair_step += 1
                         continue
 
@@ -565,12 +591,11 @@ class MineStone(Skill):
                     code, _ = failure(e)
                     if code in ("path_not_found", "unreachable", "move_timeout"):
                         bad_positions.add(t_key)
+                        yield rec("move_to", pos=target, error_code=code)
                         continue
                     raise
             try:
-                cur_pick = best_pickaxe(state)
-                if cur_pick and bare((state.st.get("held") or {}).get("name")) not in PICKAXE_ORDER:
-                    yield rec("equip", ex.equip(cur_pick, "hand"), item=cur_pick)
+                yield from self._prepare_pickaxe(ex, state)
                 before_dig_cobble = total_cobble(state)
                 dug_res = ex.dig(target, collect=True)
                 yield rec("dig", dug_res, pos=target)
@@ -581,9 +606,13 @@ class MineStone(Skill):
                     raise Replan(f"方块 {target} 位于出生点保护区，已标记外迁") from e
                 if code in ("unreachable", "dig_timeout", "path_not_found"):
                     bad_positions.add(t_key)
+                    yield rec("dig", pos=target, error_code=code)
                     continue
                 raise
             state.refresh_inventory(ex.client)
+            if total_cobble(state) - start_cobble >= want:
+                return
+            self._check_dig_tool(state, dug_res)
             # 若挖开了石头但掉落物掉入悬崖/深坑未能拾取，拉黑该崖边区域改走阶梯探槽
             if total_cobble(state) <= before_dig_cobble:
                 for bx in range(t_key[0] - 2, t_key[0] + 3):
