@@ -89,7 +89,8 @@ class MiningCeilingTests(unittest.TestCase):
         }, items={"wooden_pickaxe": 1})
         world.st["held"] = {"name": "wooden_pickaxe"}
         ex, state = world.session()
-        with self.assertRaisesRegex(Replan, "站位.*变化"):
+        # 站位变更后重新观察；此夹具没有安全侧路，仍必须保留脚下并退出。
+        with self.assertRaisesRegex(Replan, "附近未找到可安全挖掘"):
             drive(make("mine_stone", {"count": 1}), ex, state)
         self.assertEqual(ex.acts, ["dig"])
         self.assertEqual(world.blocks[(-12, 63, 68)], "sand")

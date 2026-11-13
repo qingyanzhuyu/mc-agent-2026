@@ -136,7 +136,10 @@ class MiningToolsTests(unittest.TestCase):
                 if kwargs["pos"] == [5, 64, 0]:
                     self.calls.append(("move_to", kwargs))
                     raise ApiError("path_not_found", "injected navigation failure")
-                return super().move_to(*args, **kwargs)
+                result = super().move_to(*args, **kwargs)
+                # 成功靠近矿旁，不把稀疏替身放进即将挖的支撑列。
+                self.st["pos"][0] -= 1.0
+                return {**result, "pos": list(self.st["pos"])}
 
         world = FailedMoveWorld(blocks={(5, 64, 0): "stone", (6, 64, 0): "stone"})
         ex, state = world.session()

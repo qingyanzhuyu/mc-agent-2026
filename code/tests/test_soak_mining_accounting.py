@@ -4,7 +4,9 @@ The episode had three position-change Replans, successful scouts between them
 (3/3/4), then a successful sand dig at the run's 40-step limit. That cancellation
 created fingerprint 8a936dfcdc; the real three failures belong to 5c7e937cc1.
 The third attempt's recorded collection movement is explicitly injected below,
-not simulated physics. Earlier attempts share its diagnostic, not this fixture.
+not simulated physics. With safe re-observation it still has no supported route;
+that genuine failure must still count. Earlier attempts share the original
+diagnostic, not this fixture.
 """
 import json
 import tempfile
@@ -53,7 +55,7 @@ class MiningAccountingTests(unittest.TestCase):
                 ex, state = world.session()
                 skill = make("mine_stone", {"count": 8})
                 obs.on_skill_start(skill, "rule", "ep39 position-change failure", state)
-                with self.assertRaisesRegex(Replan, "站位.*变化") as caught:
+                with self.assertRaisesRegex(Replan, "附近未找到可安全挖掘") as caught:
                     drive(skill, ex, state)
                 code, _ = failure(caught.exception)
                 skill.abort()

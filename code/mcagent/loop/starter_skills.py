@@ -513,6 +513,30 @@ class MineStone(Skill):
         roof = bare(ex.client.get_block([x, y + 3, z]).get("name", ""))
         return bool(roof) and roof not in ("sand", "red_sand", "gravel")
 
+    def _shallow_stone_approach(self, ex: "Executor", cur, stones, tried) -> Optional[list]:
+        # 两格下方的暴露石头可能在浅岸边；先观察相邻承重格和净空，
+        # 不能直接放宽挖掘高差，把深洞内的暴露石头当作可收集目标。
+        for block in stones[:4]:
+            p = block.get("pos")
+            if not (isinstance(p, list) and len(p) == 3
+                    and math.floor(cur[1]) - 2 <= p[1] < cur[1] - 1.5
+                    and not _is_protected(p)):
+                continue
+            x, y, z = map(int, p)
+            sides = sorted(((x + dx, z + dz) for dx, dz in
+                            ((1, 0), (-1, 0), (0, 1), (0, -1))),
+                           key=lambda q: math.hypot(q[0] + 0.5 - cur[0], q[1] + 0.5 - cur[2]))
+            for sx, sz in sides:
+                key = (sx, y + 1, sz)
+                if key in tried or _is_protected(key):
+                    continue
+                tried.add(key)
+                if (self._safe_stair_column(ex, sx, y + 1, sz)
+                        and all(bare(ex.client.get_block([sx, y + dy, sz]).get("name", ""))
+                                in AIR for dy in (1, 2, 3))):
+                    return [sx + 0.5, y + 1, sz + 0.5]
+        return None
+
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.refresh_status(ex.client, max_age_s=0)
         state.refresh_inventory(ex.client)
@@ -530,6 +554,8 @@ class MineStone(Skill):
         stair_step = 0
         stair_steps_taken = 0
         stair_columns: set[tuple[int, int]] = set()
+        tried_approaches: set[tuple[int, int, int]] = set()
+        approach_moves = 0
 
         for _ in range(budget):
             if total_cobble(state) - start_cobble >= want:
@@ -569,6 +595,9 @@ class MineStone(Skill):
                     if ((sx, sz) not in stair_columns
                             and self._safe_stair_column(ex, sx, sy, sz)):
                         stair_columns.add((sx, sz))
+                        # collect 会带动站位；未走完的列也消耗同一个六列预算。
+                        stair_steps_taken += 1
+                        reobserve_stair = False
                         # 清理阶梯头顶与落脚格（3 格净空满足斜向下台阶碰撞箱）
                         for clear_y in (sy + 2, sy + 1, sy):
                             bname = bare(ex.client.get_block([sx, clear_y, sz]).get("name", ""))
@@ -577,13 +606,18 @@ class MineStone(Skill):
                                     yield from self._prepare_pickaxe(ex, state)
                                 cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
                                 if _is_under_feet(cur, [sx, clear_y, sz]):
-                                    raise Replan("开凿中站位发生变化，停止挖脚下并重新观察阶梯")
+                                    # 保留当前支撑，丢弃旧直线，从下一拍实测位置建槽。
+                                    stair_origin = None
+                                    reobserve_stair = True
+                                    break
                                 dug_res = ex.dig([sx, clear_y, sz], collect=True)
                                 yield rec("dig", dug_res, pos=[sx, clear_y, sz])
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
                                     return
                                 self._check_dig_tool(state, dug_res)
+                        if reobserve_stair:
+                            continue
                         for clear_y in (sy + 2, sy + 1, sy):
                             if bare(ex.client.get_block([sx, clear_y, sz]).get("name", "")) not in AIR:
                                 raise Replan("阶梯净空发生变化，停止进入并重新观察")
@@ -591,9 +625,10 @@ class MineStone(Skill):
                             yield rec("move_to", ex.move_to(pos=[sx + 0.5, sy, sz + 0.5], rng=1), pos=[sx + 0.5, sy, sz + 0.5])
                         except Replan as e:
                             code, _ = failure(e)
+                            if code not in ("path_not_found", "unreachable", "move_timeout"):
+                                raise
                             yield rec("move_to", pos=[sx + 0.5, sy, sz + 0.5], error_code=code)
                         stair_step += 1
-                        stair_steps_taken += 1
                         continue
                     # 直线探槽遇到洞口时，从下一拍实测站位核查其它方向；
                     # 不回挖已走列，且转向不会重置总共六步的下探上限。
@@ -602,6 +637,21 @@ class MineStone(Skill):
 
                 if total_cobble(state) > start_cobble:
                     return
+                if approach_moves < 3:
+                    dest = self._shallow_stone_approach(ex, cur, stones, tried_approaches)
+                    if dest is not None:
+                        approach_moves += 1
+                        try:
+                            moved = ex.move_to(pos=dest, rng=1)
+                        except Replan as e:
+                            code, _ = failure(e)
+                            if code not in ("path_not_found", "unreachable", "move_timeout"):
+                                raise
+                            yield rec("move_to", pos=dest, error_code=code)
+                        else:
+                            yield rec("move_to", moved, pos=dest)
+                        stair_origin = None
+                        continue
                 raise Replan("附近未找到可安全挖掘的石头或非悬空表土")
 
             t_key = (int(target[0]), int(target[1]), int(target[2]))
@@ -617,6 +667,10 @@ class MineStone(Skill):
                     raise
             try:
                 yield from self._prepare_pickaxe(ex, state)
+                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                if _is_under_feet(cur, target):
+                    bad_positions.add(t_key)
+                    continue
                 before_dig_cobble = total_cobble(state)
                 dug_res = ex.dig(target, collect=True)
                 yield rec("dig", dug_res, pos=target)
