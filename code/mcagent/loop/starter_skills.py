@@ -213,11 +213,50 @@ class ScoutIsland(Skill):
 
         if not cands:
             raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
-        cands.sort(key=lambda item: (item[0], item[1]))
-        chosen = cands[0][2]
-        dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
-        VISITED_ANCHORS.append((float(dest[0]), float(dest[2])))
-        yield rec("move_to", ex.move_to(pos=dest, rng=2), pos=dest, fingerprints=hits)
+        # 落水时先找最近的干燥落脚点；在陆地上仍优先未访问过的远端区域。
+        cands.sort(key=(lambda item: (-item[1], item[0])) if st.get("in_water")
+                   else (lambda item: (item[0], item[1])))
+        checked: list[list] = []
+        attempts = 0
+        last_nav_err: Optional[Replan] = None
+        for _, _, chosen in cands:
+            dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
+            # 相邻方块通常属于同一片地形，失败后换一片；同时限制额外观察与动作预算。
+            if any(math.dist(dest, old) < 3.0 for old in checked):
+                continue
+            if len(checked) >= 16:
+                break
+            checked.append(dest)
+            # 规范 §3.3 的“暴露”只保证某一面可见，侧露石壁和水底都不是干燥站位。
+            try:
+                if any(bare(ex.client.get_block([chosen[0], chosen[1] + dy, chosen[2]]).get("name"))
+                       not in AIR for dy in (1, 2)):
+                    continue
+            except ApiError as e:
+                if e.code == "not_loaded":
+                    continue
+                raise
+            attempts += 1
+            try:
+                moved = ex.move_to(pos=dest, rng=2)
+            except Replan as e:
+                code, _ = failure(e)
+                if code not in ("path_not_found", "unreachable", "move_timeout"):
+                    raise
+                last_nav_err = e
+                # 失败动作也让出一步，不能在同一个 Safety 边界内直接发下一个动作。
+                yield rec("move_to", pos=dest, fingerprints=hits, error_code=code)
+                state.refresh_status(ex.client, max_age_s=0)
+                if attempts >= 3:
+                    break
+                continue
+            yield rec("move_to", moved, pos=dest, fingerprints=hits)
+            arrived = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
+            return
+        if last_nav_err is not None:
+            raise last_nav_err
+        raise Replan("周边未找到有两格空气的安全新陆地站位（防虚空不盲走）")
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         return "" if state.st.get("alive", True) else "探索途中角色死亡"
