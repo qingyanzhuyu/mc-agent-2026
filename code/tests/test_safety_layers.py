@@ -183,7 +183,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_void_guard_negative_coords_half_slab_and_unknown(self):
         self.s.set_risk_context(void_guard=True)
-        self.tick(pos=[-0.2, 64.5, -1.2])
+        self.tick(pos=[-0.5, 64.5, -1.5])
         self.assertEqual(self.c.block_calls[-1], [-1, 64, -2])
         self.assertEqual(self.s.safety_intent["kind"], "void_risk")
         self.c.block = {"name": "stone_slab"}
@@ -192,6 +192,25 @@ class MonitorTests(unittest.TestCase):
         self.c.block = ApiError("not_loaded")
         self.tick()
         self.assertIn("查询失败", self.s.safety_intent["why"])
+
+    def test_void_guard_aabb_overhang_on_bridge_edge(self):
+        # 复现 1.21.11 靶场实测：非潜行走上单格桥时中心点 [-46.3, 64, 102.5] 落在空气格 [-47, 63, 102]，
+        # 但 on_ground=True 且碰撞箱 +0.35 角踩在邻格 [-46, 63, 102] 实心块上，不应误触发 void_risk /stop。
+        self.s.set_risk_context(void_guard=True)
+        blocks = {
+            (-47, 63, 102): "air",
+            (-46, 63, 102): "dirt",
+        }
+        self.c.get_block = Mock(side_effect=lambda p: {"name": blocks.get(tuple(p), "air")})
+        self.tick(pos=[-46.3, 64.0, 102.5], on_ground=True, sneaking=False)
+        self.assertEqual(self.c.stops, 0)
+        self.assertIsNone(self.s.safety_intent)
+        self.assertEqual(self.s.support.get("aabb_support"), {"pos": [-46, 63, 102], "name": "dirt"})
+
+        # 若一旦真离地（on_ground=False）或四角全为空气，则必须立即触发 void_risk 急停
+        self.tick(pos=[-46.3, 64.0, 102.5], on_ground=False, sneaking=False)
+        self.assertEqual(self.c.stops, 1)
+        self.assertEqual(self.s.safety_intent["kind"], "void_risk")
 
     def test_jump_not_void_but_descent_without_support_is_risk(self):
         self.tick(on_ground=False, pos=[0, 65, 0])
@@ -615,3 +634,109 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertIsNone(d)
         self.assertLessEqual(used, 2)
         self.assertTrue(all(t <= 0.09 for t in seen_timeouts))
+
+    def test_manual_sequences_and_climb_xz_in_pathfinding_probe(self):
+        import json
+        import math
+        import tempfile
+        from pathlib import Path
+        from mcagent.client import DEFAULT_BASE
+
+        fixture = path_template()
+        fixture["cases"]["climb_xz"].update(start=[0.5, 64, 0.5], target=[4.5, 66, 0.5], witness_blocks=[])
+        fixture["cases"]["manual_breach"].update(
+            start=[0.5, 64, 0.5],
+            target=[3.5, 64, 0.5],
+            witness_blocks=[[1, 65, 0], [1, 64, 0]],
+        )
+        fixture["cases"]["manual_bridge"].update(
+            start=[0.5, 64, 0.5],
+            target=[3.5, 64, 0.5],
+            witness_blocks=[[1, 63, 0], [2, 63, 0]],
+        )
+        fixture["cases"]["manual_step_up"].update(
+            start=[0.5, 64, 0.5],
+            target=[0.5, 66, 0.5],
+            witness_blocks=[[1, 64, 0], [0, 64, 0], [0, 65, 0]],
+        )
+
+        world = {(1, 65, 0): "stone", (1, 64, 0): "stone"}
+        inv_counts = {"wooden_pickaxe": 1, "dirt": 10}
+        client = FakeClient()
+        client.st["pos"] = [0.5, 64.0, 0.5]
+        client.wait_ready = lambda: dict(client.st)
+        client.disconnect = Mock(return_value={})
+        client.posture = lambda sneak=None, shield=None: {"sneaking": bool(sneak), "blocking": bool(shield)}
+        equipped = []
+
+        def inventory():
+            return {"items": [{"name": k, "count": v, "slot": i} for i, (k, v) in enumerate(inv_counts.items()) if v > 0]}
+
+        def get_block(pos):
+            return {"name": world.get(tuple(pos), "air")}
+
+        def equip(item, slot="hand", stop_on=None):
+            equipped.append((item, slot))
+            return {"equipped": item, "slot": slot}
+
+        def dig(pos, collect=True, stop_on=None):
+            key = tuple(pos)
+            dug = world.pop(key, "air")
+            return {"dug": dug, "dig_ms": 500, "gained": {}}
+
+        def place(item, pos=None, stop_on=None):
+            p = client.st["pos"]
+            feet = [math.floor(p[0]), math.floor(p[1]), math.floor(p[2])]
+            if list(pos) == feet:
+                raise ApiError("blocked_by_self", "inside own hitbox")
+            inv_counts[item] -= 1
+            world[tuple(pos)] = item
+            return {"placed": item, "pos": list(pos), "sneaked": True}
+
+        move_calls = []
+
+        def move_to(x=None, z=None, y=None, entity_id=None, rng=1, pos=None, stop_on=None):
+            move_calls.append({"x": x, "z": z, "y": y, "pos": pos})
+            if pos is not None:
+                dest = [float(pos[0]), float(pos[1]), float(pos[2])]
+            else:
+                # 模拟省略 y 时自动爬上地面高度 66
+                dest = [float(x), 66.0 if x == 4.5 else float(client.st["pos"][1]), float(z)]
+            client.st["pos"] = dest
+            return {"pos": dest}
+
+        client.inventory = inventory
+        client.get_block = get_block
+        client.equip = equip
+        client.dig = dig
+        client.place = place
+        client.move_to = move_to
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "fixture.json", Path(tmp) / "report.json"
+            source.write_text(json.dumps(fixture))
+            with (
+                patch("mcagent.probe.Client", return_value=client),
+                patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "u", "p")),
+                patch("mcagent.runtime.SafetyMonitor.start"),
+                patch("builtins.print"),
+            ):
+                rc = pathfinding_main([
+                    "--pathfinding", "--manual-only", "--live", "--local-target",
+                    "--fixture", str(source), "--samples", "1", "--output", str(output),
+                ])
+            report = json.loads(output.read_text())
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["complete"])
+        by_case = {r["case"]: r for r in report["cases"]}
+        self.assertEqual(set(by_case), {"climb_xz", "manual_breach", "manual_bridge", "manual_step_up"})
+        self.assertTrue(all(r["status"] == "observed" and r["outcome"] == "ok" for r in by_case.values()))
+        # climb_xz 动作调用必须省略 pos 与 y，仅传 x/z
+        self.assertIsNone(by_case["climb_xz"]["action"]["args"].get("pos"))
+        self.assertEqual(by_case["climb_xz"]["actual_y_gain"], 2.0)
+        # manual_breach 应先显式装备 wooden_pickaxe 再挖开两格石墙
+        self.assertIn(("wooden_pickaxe", "hand"), equipped)
+        # manual_step_up 应记录脚底碰撞箱 place 被拒，并用 1x2 交替垫块登上 y=66
+        self.assertEqual(by_case["manual_step_up"]["self_feet_place"]["code"], "blocked_by_self")
+        self.assertEqual(by_case["manual_step_up"]["after"]["status"]["pos"][1], 66.0)

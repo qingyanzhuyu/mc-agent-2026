@@ -243,9 +243,141 @@ def main(argv: list[str]) -> int:
             print(f"  -> 若每动作配 {k} 次观察: 纯开销 {k * st50 / 1000:.1f}s/动作")
     return 0
 
-# ---------------------------------------------------------------- 官方寻路能力探测（独立于旧基线输出结构）
-# 先测无损的 move20 / dig1（采集 C1），再测障碍寻路与会产生摔伤的 pearl
-PATH_CASES = ("move20", "dig1", "wall", "gap", "pillar", "climb_y", "water", "pearl")
+# ---------------------------------------------------------------- 官方寻路与手动兜底探测（独立于旧基线输出结构）
+# 先测无损的 move20 / dig1（采集 C1），再测裸 move_to 障碍能力、手动组合兜底动作序列，最后测会摔伤的 pearl
+PATH_CASES = (
+    "move20", "dig1", "wall", "gap", "pillar", "climb_y", "climb_xz", "water",
+    "manual_breach", "manual_bridge", "manual_step_up", "pearl",
+)
+MANUAL_CASES = ("climb_xz", "manual_breach", "manual_bridge", "manual_step_up")
+PLACEABLE_BLOCKS = (
+    "cobblestone", "dirt", "stone", "cobbled_deepslate", "netherrack",
+    "oak_planks", "birch_planks", "spruce_planks", "jungle_planks",
+    "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks",
+    "sandstone", "andesite", "diorite", "granite",
+)
+PICKAXE_ORDER = (
+    "netherite_pickaxe", "diamond_pickaxe", "iron_pickaxe",
+    "stone_pickaxe", "golden_pickaxe", "wooden_pickaxe",
+)
+
+
+def _total_placeable(state: State, preferred: Optional[str] = None) -> int:
+    if preferred:
+        return state.count(preferred)
+    return sum(state.count(b) for b in PLACEABLE_BLOCKS)
+
+
+def _pick_placeable_item(state: State, preferred: Optional[str] = None) -> str:
+    if preferred:
+        if state.count(preferred) >= 1:
+            return preferred
+        raise ValueError(f"缺少指定垫块 {preferred}")
+    best_name, best_cnt = "", 0
+    for b in PLACEABLE_BLOCKS:
+        cnt = state.count(b)
+        if cnt > best_cnt:
+            best_name, best_cnt = b, cnt
+    if best_cnt < 1:
+        raise ValueError("背包缺少可放置方块，不能执行手动搭块探测")
+    return best_name
+
+
+def _pick_best_pickaxe(state: State) -> Optional[str]:
+    for p in PICKAXE_ORDER:
+        if state.count(p) >= 1:
+            return p
+    return None
+
+
+def _run_manual_case(
+    name: str,
+    case: dict,
+    witnesses: list[list[float]],
+    rng: float,
+    before_pos: list[float],
+    c: Client,
+    state: State,
+    ex: Executor,
+    row: dict,
+) -> dict:
+    import math
+    steps: list[dict] = []
+    row["manual_steps"] = steps
+
+    if name == "manual_breach":
+        pick = _pick_best_pickaxe(state)
+        if pick:
+            r_eq = ex.act("equip", lambda p=pick: c.equip(p, "hand"), retries=0)
+            steps.append({"op": "equip", "item": pick, "result": r_eq})
+        for wpos in witnesses:
+            bname = c.get_block(wpos).get("name", "").removeprefix("minecraft:")
+            if bname and bname not in ("air", "cave_air", "void_air"):
+                r_dig = ex.act("dig", lambda p=wpos: c.dig(pos=p), retries=0)
+                steps.append({"op": "dig", "pos": wpos, "result": r_dig})
+        res = ex.act("move_to", lambda: c.move_to(pos=case["target"], rng=rng), retries=0)
+        steps.append({"op": "move_to", "pos": case["target"], "result": res})
+        return res
+
+    if name == "manual_bridge":
+        r_snk = ex.posture(sneak=True)
+        steps.append({"op": "posture", "sneak": True, "result": r_snk})
+        try:
+            for idx, wpos in enumerate(witnesses):
+                cur_pos = state.refresh_status(c, max_age_s=0).get("pos") or before_pos
+                center = [wpos[0] + 0.5, wpos[1] + 0.5, wpos[2] + 0.5]
+                if idx > 0 and math.dist(cur_pos, center) > 3.5:
+                    prev = witnesses[idx - 1]
+                    edge_pos = [prev[0] + 0.5, prev[1] + 1, prev[2] + 0.5]
+                    r_mv = ex.act("move_to", lambda p=edge_pos: c.move_to(pos=p, rng=1), retries=0)
+                    steps.append({"op": "move_to_bridge", "pos": edge_pos, "result": r_mv})
+                    ex.posture(sneak=True)
+                state.refresh_inventory(c)
+                item = _pick_placeable_item(state, case.get("item"))
+                r_pl = ex.act("place", lambda it=item, p=wpos: c.place(it, pos=p), retries=0)
+                steps.append({"op": "place", "item": item, "pos": wpos, "result": r_pl})
+        finally:
+            try:
+                ex.posture(sneak=False)
+                steps.append({"op": "posture", "sneak": False})
+            except Exception:
+                pass
+        res = ex.act("move_to", lambda: c.move_to(pos=case["target"], rng=rng), retries=0)
+        steps.append({"op": "move_to", "pos": case["target"], "result": res})
+        return res
+
+    if name == "manual_step_up":
+        # 先验证往自身脚部碰撞箱直接 place 是否被拒（测试能否原地跳柱 vs 必须 1x2 交替垫高）
+        feet_pos = [math.floor(before_pos[0]), math.floor(before_pos[1]), math.floor(before_pos[2])]
+        probe_item = _pick_placeable_item(state, case.get("item"))
+        try:
+            r_self = ex.act("place", lambda: c.place(probe_item, pos=feet_pos), retries=0)
+            row["self_feet_place"] = {"ok": True, "pos": feet_pos, "result": r_self}
+        except (ApiError, Replan) as self_err:
+            sc, sex = _unwrap_api_error(self_err)
+            row["self_feet_place"] = {"ok": False, "pos": feet_pos, "code": sc, "extra": sex}
+
+        last_placed: Optional[list[float]] = None
+        for wpos in witnesses:
+            cur_pos = state.refresh_status(c, max_age_s=0).get("pos") or before_pos
+            horiz_overlap = abs(cur_pos[0] - (wpos[0] + 0.5)) < 0.81 and abs(cur_pos[2] - (wpos[2] + 0.5)) < 0.81
+            vert_overlap = (cur_pos[1] < wpos[1] + 1.0) and (cur_pos[1] + 1.8 > wpos[1])
+            if horiz_overlap and vert_overlap and last_placed is not None:
+                step_top = [last_placed[0] + 0.5, last_placed[1] + 1, last_placed[2] + 0.5]
+                r_mv = ex.act("move_to", lambda p=step_top: c.move_to(pos=p, rng=1), retries=0)
+                steps.append({"op": "step_up_to", "pos": step_top, "result": r_mv})
+            cur_b = c.get_block(wpos).get("name", "").removeprefix("minecraft:")
+            if cur_b in ("air", "cave_air", "void_air"):
+                state.refresh_inventory(c)
+                item = _pick_placeable_item(state, case.get("item"))
+                r_pl = ex.act("place", lambda it=item, p=wpos: c.place(it, pos=p), retries=0)
+                steps.append({"op": "place", "item": item, "pos": wpos, "result": r_pl})
+            last_placed = list(wpos)
+        res = ex.act("move_to", lambda: c.move_to(pos=case["target"], rng=rng), retries=0)
+        steps.append({"op": "move_to", "pos": case["target"], "result": res})
+        return res
+
+    raise ValueError(f"未知手动探测类型: {name}")
 
 
 def path_template() -> dict:
@@ -256,11 +388,15 @@ def path_template() -> dict:
         "cases": {name: {
             "start": None, "target": None, "witness_blocks": [],
             "description": {
-                "wall": "石墙两侧，witness_blocks 列出挡路的 stone；记录是否绕行或挖开",
-                "gap": "有安全底板的坑两侧，witness_blocks 列出待填的空气格；包内有垫块",
-                "pillar": "同 x/z 高处目标，witness_blocks 列出待搭柱空气格；包内有垫块",
-                "climb_y": "现成阶梯/坡道顶部，目标 y 高于起点；与 pillar 分开测",
+                "wall": "石墙两侧，witness_blocks 列出挡路的 stone；记录裸 move_to 是否绕行或挖开",
+                "gap": "有安全底板的坑两侧，witness_blocks 列出待填的空气格；测裸 move_to 能否跨坑/垫块",
+                "pillar": "同 x/z 高处目标，witness_blocks 列出待搭柱空气格；测裸 move_to 能否原地搭柱",
+                "climb_y": "现成阶梯/坡道顶部，传 pos=[x,y,z] 带 y 爬高；与 pillar 分开测",
+                "climb_xz": "现成阶梯/高低差目标，仅传 (x,z) 省略 y，对比带 y 寻路行为差异",
                 "water": "浅水池内起点到池外安全岸边；witness_blocks 含水格",
+                "manual_breach": "手动装备镐 + 按序 dig witness_blocks 开 1x2 通道 + move_to 穿墙兜底",
+                "manual_bridge": "手动 posture(sneak=True) + 按序向悬空侧面 place witness_blocks 搭桥 + move_to 过坑",
+                "manual_step_up": "先测自身脚底碰撞箱 place 是否被拒，再按 witness_blocks 执行 1x2 交替垫块上高处",
                 "pearl": "可见的宽大安全落地区，目标为瞄准点；包内有 ender_pearl",
                 "move20": "平坦已观察通路，水平距离严格 20 格",
                 "dig1": "可达的单块 stone，脚下及承重块除外；记录工具",
@@ -286,12 +422,12 @@ def validate_fixture(fixture: dict, selected: list[str]) -> None:
         witnesses = case.get("witness_blocks")
         if not isinstance(witnesses, list) or not all(pos_ok(v) for v in witnesses):
             raise ValueError(f"{name}: witness_blocks 必须为坐标数组")
-        if name in ("wall", "gap", "pillar", "water") and not witnesses:
+        if name in ("wall", "gap", "pillar", "water", "manual_breach", "manual_bridge", "manual_step_up") and not witnesses:
             raise ValueError(f"{name}: 必须提供要对比的 witness_blocks")
         start, target = case["start"], case["target"]
         if name == "move20" and not math.isclose(math.hypot(target[0]-start[0], target[2]-start[2]), 20, abs_tol=0.01):
             raise ValueError("move20 起点到目标的水平距离必须为 20 格")
-        if name in ("pillar", "climb_y") and target[1] <= start[1]:
+        if name in ("pillar", "climb_y", "manual_step_up") and target[1] <= start[1]:
             raise ValueError(f"{name}: 目标必须高于起点")
         if name == "pillar" and start[::2] != target[::2]:
             raise ValueError("pillar 必须同 x/z，避免把爬坡当成搭柱")
@@ -309,16 +445,17 @@ def pathfinding_main(argv: list[str]) -> int:
     parser.add_argument("--pathfinding", action="store_true")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--case", choices=PATH_CASES, action="append", dest="cases")
+    parser.add_argument("--manual-only", action="store_true", help="仅运行 climb_xz 与三项手动兜底序列")
     parser.add_argument("--dry", action="store_true")
     parser.add_argument("--snapshot", action="store_true", help="只读采集当前坐标与周边方块并输出夹具草稿（不移动、不挖放）")
     parser.add_argument("--live", action="store_true", help="已获人类账号登录授权并在 docs/05 占位后使用")
     parser.add_argument("--local-target", action="store_true", help="仅允许联调，永不计入官方结论")
-    parser.add_argument("--void-guard", action="store_true", help="显式对 gap/pillar 开启虚空支撑护栏标定（默认关闭防误掐寻路）")
+    parser.add_argument("--void-guard", action="store_true", help="显式对跨坑/搭桥/搭柱开启虚空支撑护栏标定（默认关闭防误掐寻路）")
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--pearl-trials", type=int, default=3)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
-    selected = args.cases or list(PATH_CASES)
+    selected = args.cases or (list(MANUAL_CASES) if args.manual_only else list(PATH_CASES))
     if not 1 <= args.pearl_trials <= 20:
         parser.error("pearl-trials 必须为 1..20")
     if args.samples < 1 or args.samples > 100:
@@ -459,8 +596,14 @@ def pathfinding_main(argv: list[str]) -> int:
                 names = [b["block"].get("name", "").removeprefix("minecraft:") for b in row["blocks_before"]]
                 if name == "wall" and "stone" not in names:
                     raise ValueError("石墙夹具没有观察到挡路 stone")
-                if name in ("gap", "pillar") and any(n not in ("air", "cave_air", "void_air") for n in names):
-                    raise ValueError("坑/柱待填格不是空气，夹具需重置")
+                if name == "manual_breach" and all(n in ("air", "cave_air", "void_air", "water") for n in names):
+                    raise ValueError("manual_breach 的 witness_blocks 没有待挖实心障碍块")
+                if name in ("gap", "pillar", "manual_bridge", "manual_step_up") and any(
+                    n not in ("air", "cave_air", "void_air") for n in names
+                ):
+                    raise ValueError("待填格不是空气，夹具需重置")
+                if name in ("manual_bridge", "manual_step_up") and _total_placeable(state, case.get("item")) < len(witnesses):
+                    raise ValueError(f"{name} 需要至少 {len(witnesses)} 块可放置方块")
                 if name == "water" and not any(n in ("water", "bubble_column") for n in names):
                     raise ValueError("水池夹具没有观察到水")
                 if name == "dig1":
@@ -481,18 +624,33 @@ def pathfinding_main(argv: list[str]) -> int:
                 state.set_risk_context(
                     near_water=name == "water",
                     near_void=False,
-                    void_guard=bool(args.void_guard and name in ("gap", "pillar")),
+                    void_guard=bool(args.void_guard and name in ("gap", "pillar", "manual_bridge", "manual_step_up")),
                 )
-                action = "dig" if name == "dig1" else "use_item" if name == "pearl" else "move_to"
-                action_args = ({"pos": case["target"]} if name == "dig1" else
-                               {"item": "ender_pearl", "target": {"pos": case["target"]}} if name == "pearl" else
-                               {"pos": case["target"], "rng": rng})
+                is_seq = name in ("manual_breach", "manual_bridge", "manual_step_up")
+                if is_seq:
+                    action = name
+                    action_args = {"target": case["target"], "witness_blocks": witnesses, "rng": rng}
+                elif name == "climb_xz":
+                    action = "move_to"
+                    action_args = {"x": case["target"][0], "z": case["target"][2], "rng": rng}
+                elif name == "dig1":
+                    action = "dig"
+                    action_args = {"pos": case["target"]}
+                elif name == "pearl":
+                    action = "use_item"
+                    action_args = {"item": "ender_pearl", "target": {"pos": case["target"]}}
+                else:
+                    action = "move_to"
+                    action_args = {"pos": case["target"], "rng": rng}
                 row["action"] = {"name": action, "args": action_args}
                 phase = "action"
                 epoch_before = ex._preempt_epoch
                 t = time.monotonic()
                 try:
-                    result = ex.act(action, lambda: getattr(c, action)(**action_args), retries=0)
+                    if is_seq:
+                        result = _run_manual_case(name, case, witnesses, rng, before_pos, c, state, ex, row)
+                    else:
+                        result = ex.act(action, lambda: getattr(c, action)(**action_args), retries=0)
                     row["result"] = result
                     row["api_ok"] = True
                     row["outcome"] = "ok"
@@ -513,13 +671,39 @@ def pathfinding_main(argv: list[str]) -> int:
                     row["target_error_3d"] = math.dist(actual, case["target"])
                     row["target_error_horizontal"] = math.hypot(actual[0]-case["target"][0], actual[2]-case["target"][2])
                     row["target_error_y"] = actual[1]-case["target"][1]
+                    row["actual_y_gain"] = round(actual[1]-before_pos[1], 2)
                     row["walked_horizontal"] = math.hypot(actual[0]-before_pos[0], actual[2]-before_pos[2])
 
+                after_names = [b["block"].get("name", "").removeprefix("minecraft:") for b in row["blocks_after"]]
                 if name == "pearl":
                     row["teleported"] = (row.get("result") or {}).get("teleported")
                     row["status"] = "observed" if (row["api_ok"] and row["teleported"] is True) else "inconclusive"
                 elif name in ("move20", "dig1"):
                     row["status"] = "observed" if row["api_ok"] else "inconclusive"
+                elif name == "climb_xz":
+                    err_code = (row.get("error") or {}).get("code")
+                    arrived_xz = row["api_ok"] and row.get("target_error_horizontal", 99) <= tol_h
+                    row["status"] = "observed" if (
+                        arrived_xz or err_code in ("path_not_found", "timeout", "out_of_reach")
+                    ) else "inconclusive"
+                elif is_seq:
+                    err_code = (row.get("error") or {}).get("code")
+                    arrived_3d = (
+                        row["api_ok"]
+                        and row.get("target_error_horizontal", 99) <= tol_h
+                        and abs(row.get("target_error_y", 99)) <= 1.5
+                    )
+                    blocks_verified = (
+                        all(n in ("air", "cave_air", "void_air") for n in after_names)
+                        if name == "manual_breach"
+                        else all(n and n not in ("air", "cave_air", "void_air") for n in after_names)
+                    )
+                    known_reject = err_code in (
+                        "blocked_by_self", "no_support", "place_failed", "cannot_place",
+                        "path_not_found", "timeout", "out_of_reach", "protected_region",
+                        "occupied", "undiggable",
+                    )
+                    row["status"] = "observed" if ((arrived_3d and blocks_verified) or known_reject) else "inconclusive"
                 else:
                     # 障碍寻路能力测试：服务端正常返回 path_not_found/timeout 同样是明确的能力观测结论
                     err_code = (row.get("error") or {}).get("code")

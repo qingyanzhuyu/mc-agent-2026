@@ -856,7 +856,29 @@ class SafetyMonitor:
             name = str(block.get("name", "")).removeprefix("minecraft:")
             if name in ("air", "cave_air", "void_air"):
                 if guard:
-                    evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
+                    # 玩家水平碰撞箱 0.6×0.6（半宽 0.3，叠加上 /status 一位小数四舍五入容差 0.05 → ±0.35）：
+                    # 非潜行走过单格桥/窄边且服务端物理判定 on_ground=True 时，中心点可能落在相邻空气格，
+                    # 需核对碰撞箱四角是否存在实心承重块，避免把正常贴边行走误判为悬空并误发 /stop。
+                    has_aabb_support = False
+                    if on_ground is True and not falling:
+                        corners = sorted({
+                            (math.floor(pos[0] + dx), under[1], math.floor(pos[2] + dz))
+                            for dx in (-0.35, 0.35) for dz in (-0.35, 0.35)
+                        } - {tuple(under)})
+                        aabb_checked = []
+                        for cx, cy, cz in corners:
+                            cpos = [cx, cy, cz]
+                            cb = self.client.get_block(cpos)
+                            cname = str(cb.get("name", "")).removeprefix("minecraft:")
+                            aabb_checked.append({"pos": cpos, "name": cname})
+                            if cname and cname not in ("air", "cave_air", "void_air", "lava"):
+                                has_aabb_support = True
+                                evidence["aabb_support"] = {"pos": cpos, "name": cname}
+                                break
+                        if aabb_checked:
+                            evidence["aabb_checked"] = aabb_checked
+                    if not has_aabb_support:
+                        evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
                 elif falling:
                     # 普通地形下落时再往下探 2 格，区分正常下 1~2 格台阶与真悬空/深坑
                     has_near_ground = False
