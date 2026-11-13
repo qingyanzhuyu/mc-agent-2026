@@ -9,9 +9,11 @@
 `action` 只能是 `client.Client` 上真实存在的动作方法，`args` 的键必须是该方法的参数名。
 校验器用 `inspect.signature` 反射客户端，**客户端加方法后自动跟上**，不需要维护两份名单。
 
-本包当前**只有校验器**（纯函数，9 个用例验过）。LLM 接入、策略选择等实现，
-跑通之后再进仓库——见 `AGENTS.md` §2 第 6 条。
+本包现在有：校验器（纯函数）+ LLM 客户端（带离线单测与真机抽测）。
+策略选择仍待写——见 `AGENTS.md` §2A.6 分级准入。
 """
 from .decision import ALLOWED_ACTIONS, Decision, bind, from_dict, validate
+from .llm import LLMClient, LLMError, extract_json
 
-__all__ = ["ALLOWED_ACTIONS", "Decision", "bind", "from_dict", "validate"]
+__all__ = ["ALLOWED_ACTIONS", "Decision", "bind", "from_dict", "validate",
+           "LLMClient", "LLMError", "extract_json"]

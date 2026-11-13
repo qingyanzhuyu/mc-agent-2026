@@ -27,7 +27,7 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 ## 开工必读（按顺序）
 
 1. `AGENTS.md` — **硬规则**，文件所有权 / 协作禁令与官方合规红线 / 分级验证 / DoD。违反会被回退。
-2. `docs/01-关键判断.md` — J1–J19 当前共识（J2 已作废）。**别重推已经定下的判断。**
+2. `docs/01-关键判断.md` — J1–J20 当前共识（J2 已作废）。**别重推已经定下的判断。**
 3. `docs/04-待确认.md` — 别问已经有人认领的问题。
 4. `docs/05-分工与契约.md` — 你能改哪些文件、模块冻结面。
 
