@@ -14,7 +14,7 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 ## 60 秒定位
 
 南大「AI Agent for Minecraft 开发大赛」**Harness 赛道**备赛仓库。目标：写一个 harness，
-让一个 Minecraft bot 在共享世界里自主生存 **8 小时**，按原版 advancement 计分。
+让一个 Minecraft bot 在自己的虚空岛上自主生存 **8 小时**，按原版 advancement 计分（v2 草案；末地全服共用）。
 
 | 关键 | 值 |
 |---|---|
@@ -27,7 +27,7 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 ## 开工必读（按顺序）
 
 1. `AGENTS.md` — **硬规则**，文件所有权 / 协作禁令与官方合规红线 / 分级验证 / DoD。违反会被回退。
-2. `docs/01-关键判断.md` — J1–J13 当前共识。**别重推已经定下的判断。**
+2. `docs/01-关键判断.md` — J1–J19 当前共识（J2 已作废）。**别重推已经定下的判断。**
 3. `docs/04-待确认.md` — 别问已经有人认领的问题。
 4. `docs/05-分工与契约.md` — 你能改哪些文件、模块冻结面。
 
