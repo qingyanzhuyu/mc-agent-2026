@@ -11,57 +11,37 @@
 
 ---
 
-## 1. 两种团队协作联调模式
+## 1. 团队联调快速上手（默认直连队内共享测试服 `frp-net.com:64463`）
 
 网关内部按 `MC_USER` 维护独立的 `BotSession`：
-- **不同 `MC_USER`**（例如 `alice_bot`、`bob_bot`）可在**同一个网关、同一个局域网测试世界**里同时在线独立运行，互不抢锁、互不踢 Token；
+- **不同 `MC_USER`**（例如 `alice_bot`、`bob_bot`）可在**同一个测试世界**里同时在线独立运行，互不抢锁、互不踢 Token；
 - **相同 `MC_USER`** 重复登录会严格复现规范 §1.1 的“踢掉旧 Token（返回 HTTP 401 `invalid_token`）”行为，方便验证单点重登容错。
 
-### 模式 A：一人起网关，全队零配置直连（推荐局域网联调）
+### 方式一（推荐，异地/全队通用）：队友各自本机一键启动网关
 
-只需在运行测试服（或任意局域网机器）上装有 **Node.js ≥ 18** 启动一次网关：
-
-```bash
-cd mc-agent-2026/tools/local-api-bridge
-npm ci
-cp .env.example .env
-# 编辑 .env：
-#   BRIDGE_HOST=0.0.0.0          # 对局域网队友开放 HTTP 端口
-#   BRIDGE_PORT=8787
-#   MC_HOST=<MC测试服IP或127.0.0.1>
-#   MC_PORT=25565
-npm start
-```
-
-**其他队友完全不需要安装 Node.js**，直接在各自机器的 `mc-agent-2026/code/mcagent/.env` 中配置：
-
-```ini
-MC_API_BASE=http://<网关机器局域网IP>:8787/api/v1
-MC_USER=你的专属bot英文名   # 2~16 位字母数字下划线，每人取不同名字即可同服并发！
-MC_PASS=localdev            # 本地模式任意非空字符串即可
-MC_PROXY=                   # 必须留空（直连局域网/本机）
-```
-
-### 模式 B：队友各自在本机起网关
-
-如果你自己在本机开了 `1.21.11` 服务端（或想在本机起网关连远端测试服）：
+网关默认已指向队内穿透测试服 `frp-net.com:64463`（Minecraft `1.21.11`），**无需改任何网关配置**，装有 **Node.js ≥ 18** 即可直接跑：
 
 ```bash
 cd mc-agent-2026/tools/local-api-bridge
 npm ci
-cp .env.example .env
-# 编辑 .env，将 MC_HOST 设为 127.0.0.1（本机服）或局域网测试服 IP
 npm start
+# 看到 listening on http://127.0.0.1:8787/api/v1 -> MC frp-net.com:64463 即成功
 ```
 
-然后在 `mc-agent-2026/code/mcagent/.env` 填写：
+然后在 `mc-agent-2026/code/mcagent/.env` 填写（**注意每人取不同的 `MC_USER` 避免同角色互踢**）：
 
 ```ini
 MC_API_BASE=http://127.0.0.1:8787/api/v1
-MC_USER=dev_bot_1
-MC_PASS=localdev
-MC_PROXY=
+MC_USER=你的专属bot英文名   # 2~16 位字母数字下划线，每人取不同名字即可同服并发！
+MC_PASS=localdev            # 本地模式任意非空字符串即可
+MC_PROXY=                   # 必须留空（直连本机网关）
 ```
+
+> 若你想改连自己本机另开的 `1.21.11` 服，只需 `cp .env.example .env` 并把 `MC_HOST=127.0.0.1`、`MC_PORT=25565` 填进去即可。
+
+### 方式二（同局域网可选）：一人起网关，队友免装 Node.js 直连
+
+若大家在同一局域网，也可只由一台机器启动 `BRIDGE_HOST=0.0.0.0 npm start`，其余队友直接在 `mc-agent-2026/code/mcagent/.env` 将 `MC_API_BASE` 设为 `http://<网关机器局域网IP>:8787/api/v1` 并填各自不同的 `MC_USER`。
 
 ---
 
