@@ -31,6 +31,7 @@
 | `code/tests/` | 接口负责人 / 策略负责人（各自模块的离线单测，必须无网可跑） |
 | `pyproject.toml` `uv.lock` | 接口负责人（改依赖必须同步更新 `uv.lock`） |
 | `code/mcagent/probe.py` `smoke.py` | 任何人（**加功能可以，改行为要先说**） |
+| `tools/local-api-bridge/` | 接口负责人 / 任何人（赛前本地/局域网联调 Mock 网关，须与 `code/mcagent/` 保持零耦合） |
 | `plan/` | 任何人，只追加不重写 |
 
 未列出的文件默认**只读**。要改先到 `docs/05` 认领一行。

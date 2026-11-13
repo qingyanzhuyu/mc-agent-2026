@@ -53,6 +53,8 @@ code/
     planner/         决策层：Decision 契约 + 强类型反射校验器（无策略实现）
     skills/          执行层：Skill 基类 + 空注册表（无具体技能）
   tests/             14 项离线故障注入与多线程抢占单测（verified: offline）
+tools/
+  local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，与比赛代码零耦合）
 ```
 
 ## 怎么参与
