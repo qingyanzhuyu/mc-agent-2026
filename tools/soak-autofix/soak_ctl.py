@@ -160,11 +160,12 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _uv_env(repo_root: Path) -> dict[str, str]:
+def _uv_env(wt_dir: Path) -> dict[str, str]:
+    """为指定 worktree 构造独立运行环境，显式锁定 PYTHONPATH 防 editable .pth 跨目录串包。"""
     env = dict(os.environ)
-    primary_venv = repo_root / "code" / ".venv"
-    if primary_venv.exists():
-        env["UV_PROJECT_ENVIRONMENT"] = str(primary_venv.resolve())
+    env.pop("UV_PROJECT_ENVIRONMENT", None)
+    env.setdefault("UV_LINK_MODE", "copy")
+    env["PYTHONPATH"] = str((wt_dir / "code").resolve())
     return env
 
 
@@ -490,7 +491,7 @@ def verify_and_promote(
 
     attempt_dir = Path(inc_rec.get("active_attempt_dir") or (session_dir / "fixer_runs" / "manual"))
     attempt_dir.mkdir(parents=True, exist_ok=True)
-    uv_env = _uv_env(repo_root)
+    uv_env = _uv_env(fixer_wt)
 
     def _fail(gate: str, detail: str) -> dict[str, Any]:
         _clean_fixer_worktree(fixer_wt)
@@ -663,7 +664,7 @@ def run_runner_loop(
             cmd.extend(["--baseline", prev_good["run_dir"]])
 
         print(f"[runner] 启动 {ep_id} @ {tip_sha[:7]} (bot={bot_user}, max={episode_seconds}s)...")
-        subprocess.run(cmd, cwd=str(runner_wt / "code"), env=_uv_env(repo_root), check=False)
+        subprocess.run(cmd, cwd=str(runner_wt / "code"), env=_uv_env(runner_wt), check=False)
         meta = ingest_episode_and_check_rollback(session_dir, ep_id, ep_dir, tip_sha, bot_user)
         results.append(meta)
         print(
@@ -705,7 +706,7 @@ def run_fixer_once(
         proc = subprocess.run(
             ["bash", "-lc", cmd_str],
             cwd=str(fixer_wt),
-            env=_uv_env(repo_root),
+            env=_uv_env(fixer_wt),
             capture_output=True,
             text=True,
             timeout=fixer_timeout_s,
