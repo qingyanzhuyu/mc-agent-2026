@@ -1,0 +1,18 @@
+{
+  "name": "local-nmo-api-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local NMO Agent API v1.3.1 compatible HTTP mock bridge backed by Mineflayer for offline/LAN testing",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5"
+  }
+}

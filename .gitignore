@@ -20,6 +20,12 @@ venv/
 # 运行时产物（跑起来才有的东西，不进仓库）
 code/mcagent/logs/
 code/mcagent/probe/
+tools/local-api-bridge/logs/
+
+# Node.js（tools/local-api-bridge 本地联调网关依赖）
+node_modules/
+**/node_modules/
+npm-debug.log*
 
 # 编辑器/系统
 .vscode/
