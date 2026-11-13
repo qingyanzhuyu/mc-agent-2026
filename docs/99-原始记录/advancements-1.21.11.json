@@ -1,0 +1,1263 @@
+{
+ "ref": "1.21.11-data",
+ "count": 125,
+ "byTab": {
+  "story": 16,
+  "nether": 23,
+  "end": 9,
+  "adventure": 47,
+  "husbandry": 30
+ },
+ "advancements": [
+  {
+   "id": "minecraft:adventure/adventuring_time",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/sleep_in_bed",
+   "title": "advancements.adventure.adventuring_time.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/arbalistic",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/ol_betsy",
+   "title": "advancements.adventure.arbalistic.title",
+   "frame": "challenge",
+   "hidden": true,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/avoid_vibration",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.avoid_vibration.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/blowback",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/minecraft_trials_edition",
+   "title": "advancements.adventure.blowback.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/brush_armadillo",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.brush_armadillo.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/bullseye",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/shoot_arrow",
+   "title": "advancements.adventure.bullseye.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:adventure/craft_decorated_pot_using_only_sherds",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/salvage_sherd",
+   "title": "advancements.adventure.craft_decorated_pot_using_only_sherds.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/crafters_crafting_crafters",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.crafters_crafting_crafters.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/fall_from_world_height",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.fall_from_world_height.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/heart_transplanter",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.heart_transplanter.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/hero_of_the_village",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/voluntary_exile",
+   "title": "advancements.adventure.hero_of_the_village.title",
+   "frame": "challenge",
+   "hidden": true,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/honey_block_slide",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.honey_block_slide.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/kill_a_mob",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.kill_a_mob.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/kill_all_mobs",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/kill_a_mob",
+   "title": "advancements.adventure.kill_all_mobs.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/kill_mob_near_sculk_catalyst",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/kill_a_mob",
+   "title": "advancements.adventure.kill_mob_near_sculk_catalyst.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/lighten_up",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/minecraft_trials_edition",
+   "title": "advancements.adventure.lighten_up.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/lightning_rod_with_villager_no_fire",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.lightning_rod_with_villager_no_fire.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/minecraft_trials_edition",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.minecraft_trials_edition.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/ol_betsy",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.ol_betsy.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/overoverkill",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/minecraft_trials_edition",
+   "title": "advancements.adventure.overoverkill.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/play_jukebox_in_meadows",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/sleep_in_bed",
+   "title": "advancements.adventure.play_jukebox_in_meadows.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/read_power_of_chiseled_bookshelf",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.read_power_from_chiseled_bookshelf.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/revaulting",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/under_lock_and_key",
+   "title": "advancements.adventure.revaulting.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:adventure/root",
+   "tab": "adventure",
+   "parent": null,
+   "title": "advancements.adventure.root.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 0,
+   "structural": 0
+  },
+  {
+   "id": "minecraft:adventure/salvage_sherd",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.salvage_sherd.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/shoot_arrow",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/kill_a_mob",
+   "title": "advancements.adventure.shoot_arrow.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/sleep_in_bed",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.sleep_in_bed.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/sniper_duel",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/shoot_arrow",
+   "title": "advancements.adventure.sniper_duel.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:adventure/spear_many_mobs",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/kill_a_mob",
+   "title": "advancements.adventure.spear_many_mobs.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/spyglass_at_dragon",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/spyglass_at_ghast",
+   "title": "advancements.adventure.spyglass_at_dragon.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:adventure/spyglass_at_ghast",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/spyglass_at_parrot",
+   "title": "advancements.adventure.spyglass_at_ghast.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/spyglass_at_parrot",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.spyglass_at_parrot.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/summon_iron_golem",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/trade",
+   "title": "advancements.adventure.summon_iron_golem.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/throw_trident",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/kill_a_mob",
+   "title": "advancements.adventure.throw_trident.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/totem_of_undying",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/kill_a_mob",
+   "title": "advancements.adventure.totem_of_undying.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/trade",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.trade.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/trade_at_world_height",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/trade",
+   "title": "advancements.adventure.trade_at_world_height.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/trim_with_all_exclusive_armor_patterns",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/trim_with_any_armor_pattern",
+   "title": "advancements.adventure.trim_with_all_exclusive_armor_patterns.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/trim_with_any_armor_pattern",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.trim_with_any_armor_pattern.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/two_birds_one_arrow",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/ol_betsy",
+   "title": "advancements.adventure.two_birds_one_arrow.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/under_lock_and_key",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/minecraft_trials_edition",
+   "title": "advancements.adventure.under_lock_and_key.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/use_lodestone",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.use_lodestone.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/very_very_frightening",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/throw_trident",
+   "title": "advancements.adventure.very_very_frightening.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:adventure/voluntary_exile",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/root",
+   "title": "advancements.adventure.voluntary_exile.title",
+   "frame": "task",
+   "hidden": true,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:adventure/walk_on_powder_snow_with_leather_boots",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/sleep_in_bed",
+   "title": "advancements.adventure.walk_on_powder_snow_with_leather_boots.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/who_needs_rockets",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/minecraft_trials_edition",
+   "title": "advancements.adventure.who_needs_rockets.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:adventure/whos_the_pillager_now",
+   "tab": "adventure",
+   "parent": "minecraft:adventure/ol_betsy",
+   "title": "advancements.adventure.whos_the_pillager_now.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:end/dragon_breath",
+   "tab": "end",
+   "parent": "minecraft:end/kill_dragon",
+   "title": "advancements.end.dragon_breath.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:end/dragon_egg",
+   "tab": "end",
+   "parent": "minecraft:end/kill_dragon",
+   "title": "advancements.end.dragon_egg.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:end/elytra",
+   "tab": "end",
+   "parent": "minecraft:end/find_end_city",
+   "title": "advancements.end.elytra.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:end/enter_end_gateway",
+   "tab": "end",
+   "parent": "minecraft:end/kill_dragon",
+   "title": "advancements.end.enter_end_gateway.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:end/find_end_city",
+   "tab": "end",
+   "parent": "minecraft:end/enter_end_gateway",
+   "title": "advancements.end.find_end_city.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:end/kill_dragon",
+   "tab": "end",
+   "parent": "minecraft:end/root",
+   "title": "advancements.end.kill_dragon.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:end/levitate",
+   "tab": "end",
+   "parent": "minecraft:end/find_end_city",
+   "title": "advancements.end.levitate.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:end/respawn_dragon",
+   "tab": "end",
+   "parent": "minecraft:end/kill_dragon",
+   "title": "advancements.end.respawn_dragon.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:end/root",
+   "tab": "end",
+   "parent": null,
+   "title": "advancements.end.root.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 0,
+   "structural": 0
+  },
+  {
+   "id": "minecraft:husbandry/allay_deliver_cake_to_note_block",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/allay_deliver_item_to_player",
+   "title": "advancements.husbandry.allay_deliver_cake_to_note_block.title",
+   "frame": "task",
+   "hidden": true,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/allay_deliver_item_to_player",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.allay_deliver_item_to_player.title",
+   "frame": "task",
+   "hidden": true,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/axolotl_in_a_bucket",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/tactical_fishing",
+   "title": "advancements.husbandry.axolotl_in_a_bucket.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:husbandry/balanced_diet",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/plant_seed",
+   "title": "advancements.husbandry.balanced_diet.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/bred_all_animals",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/breed_an_animal",
+   "title": "advancements.husbandry.breed_all_animals.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/breed_an_animal",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.breed_an_animal.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/complete_catalogue",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/tame_an_animal",
+   "title": "advancements.husbandry.complete_catalogue.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/feed_snifflet",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/obtain_sniffer_egg",
+   "title": "advancements.husbandry.feed_snifflet.title",
+   "frame": "task",
+   "hidden": true,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/fishy_business",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.fishy_business.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/froglights",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/leash_all_frog_variants",
+   "title": "advancements.husbandry.froglights.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:husbandry/kill_axolotl_target",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/axolotl_in_a_bucket",
+   "title": "advancements.husbandry.kill_axolotl_target.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:husbandry/leash_all_frog_variants",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/tadpole_in_a_bucket",
+   "title": "advancements.husbandry.leash_all_frog_variants.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/make_a_sign_glow",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.make_a_sign_glow.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/obtain_netherite_hoe",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/plant_seed",
+   "title": "advancements.husbandry.netherite_hoe.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/obtain_sniffer_egg",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.obtain_sniffer_egg.title",
+   "frame": "task",
+   "hidden": true,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/place_dried_ghast_in_water",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.place_dried_ghast_in_water.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/plant_any_sniffer_seed",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/feed_snifflet",
+   "title": "advancements.husbandry.plant_any_sniffer_seed.title",
+   "frame": "task",
+   "hidden": true,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:husbandry/plant_seed",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.plant_seed.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/remove_wolf_armor",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/tame_an_animal",
+   "title": "advancements.husbandry.remove_wolf_armor.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/repair_wolf_armor",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/tame_an_animal",
+   "title": "advancements.husbandry.repair_wolf_armor.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/ride_a_boat_with_a_goat",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.ride_a_boat_with_a_goat.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/root",
+   "tab": "husbandry",
+   "parent": null,
+   "title": "advancements.husbandry.root.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 0,
+   "structural": 0
+  },
+  {
+   "id": "minecraft:husbandry/safely_harvest_honey",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.safely_harvest_honey.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/silk_touch_nest",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.silk_touch_nest.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/tactical_fishing",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/fishy_business",
+   "title": "advancements.husbandry.tactical_fishing.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/tadpole_in_a_bucket",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.tadpole_in_a_bucket.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/tame_an_animal",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/root",
+   "title": "advancements.husbandry.tame_an_animal.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:husbandry/wax_off",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/wax_on",
+   "title": "advancements.husbandry.wax_off.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:husbandry/wax_on",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/safely_harvest_honey",
+   "title": "advancements.husbandry.wax_on.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:husbandry/whole_pack",
+   "tab": "husbandry",
+   "parent": "minecraft:husbandry/tame_an_animal",
+   "title": "advancements.husbandry.whole_pack.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/all_effects",
+   "tab": "nether",
+   "parent": "minecraft:nether/all_potions",
+   "title": "advancements.nether.all_effects.title",
+   "frame": "challenge",
+   "hidden": true,
+   "depth": 5,
+   "structural": 25
+  },
+  {
+   "id": "minecraft:nether/all_potions",
+   "tab": "nether",
+   "parent": "minecraft:nether/brew_potion",
+   "title": "advancements.nether.all_potions.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:nether/brew_potion",
+   "tab": "nether",
+   "parent": "minecraft:nether/obtain_blaze_rod",
+   "title": "advancements.nether.brew_potion.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:nether/charge_respawn_anchor",
+   "tab": "nether",
+   "parent": "minecraft:nether/obtain_crying_obsidian",
+   "title": "advancements.nether.charge_respawn_anchor.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/create_beacon",
+   "tab": "nether",
+   "parent": "minecraft:nether/summon_wither",
+   "title": "advancements.nether.create_beacon.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:nether/create_full_beacon",
+   "tab": "nether",
+   "parent": "minecraft:nether/create_beacon",
+   "title": "advancements.nether.create_full_beacon.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 5,
+   "structural": 25
+  },
+  {
+   "id": "minecraft:nether/distract_piglin",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.distract_piglin.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/explore_nether",
+   "tab": "nether",
+   "parent": "minecraft:nether/ride_strider",
+   "title": "advancements.nether.explore_nether.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/fast_travel",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.fast_travel.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/find_bastion",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.find_bastion.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/find_fortress",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.find_fortress.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/get_wither_skull",
+   "tab": "nether",
+   "parent": "minecraft:nether/find_fortress",
+   "title": "advancements.nether.get_wither_skull.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/loot_bastion",
+   "tab": "nether",
+   "parent": "minecraft:nether/find_bastion",
+   "title": "advancements.nether.loot_bastion.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/netherite_armor",
+   "tab": "nether",
+   "parent": "minecraft:nether/obtain_ancient_debris",
+   "title": "advancements.nether.netherite_armor.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/obtain_ancient_debris",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.obtain_ancient_debris.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/obtain_blaze_rod",
+   "tab": "nether",
+   "parent": "minecraft:nether/find_fortress",
+   "title": "advancements.nether.obtain_blaze_rod.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/obtain_crying_obsidian",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.obtain_crying_obsidian.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/return_to_sender",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.return_to_sender.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/ride_strider",
+   "tab": "nether",
+   "parent": "minecraft:nether/root",
+   "title": "advancements.nether.ride_strider.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:nether/ride_strider_in_overworld_lava",
+   "tab": "nether",
+   "parent": "minecraft:nether/ride_strider",
+   "title": "advancements.nether.ride_strider_in_overworld_lava.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:nether/root",
+   "tab": "nether",
+   "parent": null,
+   "title": "advancements.nether.root.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 0,
+   "structural": 0
+  },
+  {
+   "id": "minecraft:nether/summon_wither",
+   "tab": "nether",
+   "parent": "minecraft:nether/get_wither_skull",
+   "title": "advancements.nether.summon_wither.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:nether/uneasy_alliance",
+   "tab": "nether",
+   "parent": "minecraft:nether/return_to_sender",
+   "title": "advancements.nether.uneasy_alliance.title",
+   "frame": "challenge",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  },
+  {
+   "id": "minecraft:story/cure_zombie_villager",
+   "tab": "story",
+   "parent": "minecraft:story/enter_the_nether",
+   "title": "advancements.story.cure_zombie_villager.title",
+   "frame": "goal",
+   "hidden": false,
+   "depth": 7,
+   "structural": 35
+  },
+  {
+   "id": "minecraft:story/deflect_arrow",
+   "tab": "story",
+   "parent": "minecraft:story/obtain_armor",
+   "title": "advancements.story.deflect_arrow.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 5,
+   "structural": 25
+  },
+  {
+   "id": "minecraft:story/enchant_item",
+   "tab": "story",
+   "parent": "minecraft:story/mine_diamond",
+   "title": "advancements.story.enchant_item.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 6,
+   "structural": 30
+  },
+  {
+   "id": "minecraft:story/enter_the_end",
+   "tab": "story",
+   "parent": "minecraft:story/follow_ender_eye",
+   "title": "advancements.story.enter_the_end.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 8,
+   "structural": 40
+  },
+  {
+   "id": "minecraft:story/enter_the_nether",
+   "tab": "story",
+   "parent": "minecraft:story/form_obsidian",
+   "title": "advancements.story.enter_the_nether.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 6,
+   "structural": 30
+  },
+  {
+   "id": "minecraft:story/follow_ender_eye",
+   "tab": "story",
+   "parent": "minecraft:story/enter_the_nether",
+   "title": "advancements.story.follow_ender_eye.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 7,
+   "structural": 35
+  },
+  {
+   "id": "minecraft:story/form_obsidian",
+   "tab": "story",
+   "parent": "minecraft:story/lava_bucket",
+   "title": "advancements.story.form_obsidian.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 5,
+   "structural": 25
+  },
+  {
+   "id": "minecraft:story/iron_tools",
+   "tab": "story",
+   "parent": "minecraft:story/smelt_iron",
+   "title": "advancements.story.iron_tools.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:story/lava_bucket",
+   "tab": "story",
+   "parent": "minecraft:story/smelt_iron",
+   "title": "advancements.story.lava_bucket.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:story/mine_diamond",
+   "tab": "story",
+   "parent": "minecraft:story/iron_tools",
+   "title": "advancements.story.mine_diamond.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 5,
+   "structural": 25
+  },
+  {
+   "id": "minecraft:story/mine_stone",
+   "tab": "story",
+   "parent": "minecraft:story/root",
+   "title": "advancements.story.mine_stone.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 1,
+   "structural": 5
+  },
+  {
+   "id": "minecraft:story/obtain_armor",
+   "tab": "story",
+   "parent": "minecraft:story/smelt_iron",
+   "title": "advancements.story.obtain_armor.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 4,
+   "structural": 20
+  },
+  {
+   "id": "minecraft:story/root",
+   "tab": "story",
+   "parent": null,
+   "title": "advancements.story.root.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 0,
+   "structural": 0
+  },
+  {
+   "id": "minecraft:story/shiny_gear",
+   "tab": "story",
+   "parent": "minecraft:story/mine_diamond",
+   "title": "advancements.story.shiny_gear.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 6,
+   "structural": 30
+  },
+  {
+   "id": "minecraft:story/smelt_iron",
+   "tab": "story",
+   "parent": "minecraft:story/upgrade_tools",
+   "title": "advancements.story.smelt_iron.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 3,
+   "structural": 15
+  },
+  {
+   "id": "minecraft:story/upgrade_tools",
+   "tab": "story",
+   "parent": "minecraft:story/mine_stone",
+   "title": "advancements.story.upgrade_tools.title",
+   "frame": "task",
+   "hidden": false,
+   "depth": 2,
+   "structural": 10
+  }
+ ]
+}
