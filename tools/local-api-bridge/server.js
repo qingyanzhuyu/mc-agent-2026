@@ -123,8 +123,8 @@ const KNOWN_ROUTES = new Set([
 ]);
 
 function createBridgeServer(opts = {}) {
-  const mcHost = opts.mcHost || process.env.MC_HOST || "127.0.0.1";
-  const mcPort = Number(opts.mcPort ?? process.env.MC_PORT ?? 25565);
+  const mcHost = opts.mcHost || process.env.MC_HOST || "frp-net.com";
+  const mcPort = Number(opts.mcPort ?? process.env.MC_PORT ?? 64463);
   const mcVersion = opts.mcVersion || process.env.MC_VERSION || "1.21.11";
   const tokenTtlMs = Number(opts.tokenTtlMs ?? process.env.TOKEN_TTL_MS ?? 24 * 3600 * 1000);
   const reconnectIntervalMs = Number(
