@@ -572,13 +572,13 @@ class Client:
     def dig(self, pos, collect=True, *, stop_on=None) -> dict:
         return self.action("dig", {"pos": list(pos), "collect": collect}, stop_on=stop_on)
 
-    def place(self, item, pos=None) -> dict:
+    def place(self, item, pos=None, *, stop_on=None) -> dict:
         body: dict = {"item": item}
         if pos is not None:
             body["pos"] = list(pos)
-        return self.action("place", body)
+        return self.action("place", body, stop_on=stop_on)
 
-    def interact(self, pos=None, entity_id=None, item=None) -> dict:
+    def interact(self, pos=None, entity_id=None, item=None, *, stop_on=None) -> dict:
         body: dict = {}
         if pos is not None:
             body["pos"] = list(pos)
@@ -586,9 +586,9 @@ class Client:
             body["entity_id"] = entity_id
         if item:
             body["item"] = item
-        return self.action("interact", body)
+        return self.action("interact", body, stop_on=stop_on)
 
-    def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None) -> dict:
+    def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None) -> dict:
         body: dict = {"item": item}
         if target is not None:
             body["target"] = target
@@ -598,31 +598,31 @@ class Client:
             body["timeout"] = timeout_ms
         if source:
             body["source"] = source
-        return self.action("use_item", body)
+        return self.action("use_item", body, stop_on=stop_on)
 
-    def attack(self, entity_id, timeout_ms=20000) -> dict:
-        return self.action("attack", {"entity_id": entity_id, "timeout": timeout_ms})
+    def attack(self, entity_id, timeout_ms=20000, *, stop_on=None) -> dict:
+        return self.action("attack", {"entity_id": entity_id, "timeout": timeout_ms}, stop_on=stop_on)
 
-    def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100) -> dict:
+    def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100, *, stop_on=None) -> dict:
         body: dict = {"weapon": weapon, "charge_ms": charge_ms}
         if entity_id is not None:
             body["entity_id"] = entity_id
         if pos is not None:
             body["pos"] = list(pos)
-        return self.action("shoot", body)
+        return self.action("shoot", body, stop_on=stop_on)
 
-    def craft(self, item, count=1) -> dict:
-        return self.action("craft", {"item": item, "count": count})
+    def craft(self, item, count=1, *, stop_on=None) -> dict:
+        return self.action("craft", {"item": item, "count": count}, stop_on=stop_on)
 
-    def window_view(self, target) -> dict:
-        return self.action("window/view", {"target": target})
+    def window_view(self, target, *, stop_on=None) -> dict:
+        return self.action("window/view", {"target": target}, stop_on=stop_on)
 
-    def window_act(self, target, ops) -> dict:
-        return self.action("window/act", {"target": target, "ops": ops})
+    def window_act(self, target, ops, *, stop_on=None) -> dict:
+        return self.action("window/act", {"target": target, "ops": ops}, stop_on=stop_on)
 
-    def equip(self, item, slot="hand") -> dict:
+    def equip(self, item, slot="hand", *, stop_on=None) -> dict:
         slot_norm = {"chest": "torso", "offhand": "off-hand"}.get(slot, slot)
-        return self.action("equip", {"item": item, "slot": slot_norm})
+        return self.action("equip", {"item": item, "slot": slot_norm}, stop_on=stop_on)
 
     def posture(self, sneak=None, shield=None) -> dict:
         # 规范 §4.11：/posture 是全量覆盖，未写字段在服务端会复位为 false。
@@ -642,18 +642,18 @@ class Client:
             self._posture = {"sneak": target_sneak, "shield": target_shield}
         return res
 
-    def dismount(self) -> dict:
-        return self.action("dismount")
+    def dismount(self, *, stop_on=None) -> dict:
+        return self.action("dismount", stop_on=stop_on)
 
-    def drop(self, item, count=1) -> dict:
-        return self.action("drop", {"item": item, "count": count})
+    def drop(self, item, count=1, *, stop_on=None) -> dict:
+        return self.action("drop", {"item": item, "count": count}, stop_on=stop_on)
 
-    def chat(self, message) -> dict:
+    def chat(self, message, *, stop_on=None) -> dict:
         # 规范 §4.14：禁止以 / 开头（含前置空格），否则触发 bad_args
         msg = str(message).lstrip()
         if msg.startswith("/"):
             msg = "／" + msg.lstrip("/")
-        return self.action("chat", {"message": msg[:100]})
+        return self.action("chat", {"message": msg[:100]}, stop_on=stop_on)
 
     def stop(self) -> dict:
         return self.call("stop", {}, timeout=15)

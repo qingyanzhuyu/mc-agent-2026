@@ -20,12 +20,21 @@ import time
 from typing import Callable
 
 from .client import ApiError, Client, Config
-from .runtime import Executor, State
+from .runtime import Executor, Fatal, Replan, State
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe")
+
+
+def _unwrap_api_error(e: BaseException) -> tuple[str, dict]:
+    if isinstance(e, ApiError):
+        return e.code, dict(e.extra)
+    cause = e.__cause__
+    if isinstance(cause, ApiError):
+        return cause.code, dict(cause.extra)
+    return type(e).__name__.lower(), {}
 
 
 def bench(fn: Callable[[], object], n: int = 10, warmup: int = 1) -> dict:
@@ -68,7 +77,7 @@ def main(argv: list[str]) -> int:
     c = Client(cfg)
     s = State()
     ex = Executor(c, s)
-    res: dict = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "base": cfg.base}
+    res: dict = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "base": cfg.base, "max_rps": cfg.max_rps}
 
     st = c.wait_ready(timeout=120)
     s.set_status(st)
@@ -129,14 +138,15 @@ def main(argv: list[str]) -> int:
             dt = time.time() - t0
             res["move_20"] = {"ms": round(dt * 1000), "ok": True, "moved_to": r.get("pos")}
             print(f"  耗时 {dt:.2f}s -> {r.get('pos')}  (≈{20 / max(dt, 0.01):.1f} 格/秒)")
-        except ApiError as e:
-            res["move_20"] = {"ok": False, "code": e.code, "ms": round((time.time() - t0) * 1000)}
+        except (ApiError, Replan, Fatal) as e:
+            code, _ = _unwrap_api_error(e)
+            res["move_20"] = {"ok": False, "code": code, "ms": round((time.time() - t0) * 1000)}
             print(f"  失败: {e}")
         time.sleep(1)
         try:
-            r = ex.move_to(s.pos[0] - 20, s.pos[2], rng=1) if False else ex.move_to(x, z, rng=1)
+            r = ex.move_to(x, z, rng=1)
             print(f"  回位 -> {r.get('pos')}")
-        except ApiError as e:
+        except (ApiError, Replan, Fatal) as e:
             print(f"  回位失败: {e}")
 
     # ---- 5. 动作类：挖一块
@@ -160,8 +170,9 @@ def main(argv: list[str]) -> int:
                 dt = time.time() - t0
                 res["dig"] = {"ms": round(dt * 1000), "ok": True, "dig_ms": r.get("dig_ms"), "gained": r.get("gained")}
                 print(f"  耗时 {dt:.2f}s  服务端 dig_ms={r.get('dig_ms')}  gained={r.get('gained')}")
-            except ApiError as e:
-                res["dig"] = {"ok": False, "code": e.code}
+            except (ApiError, Replan, Fatal) as e:
+                code, _ = _unwrap_api_error(e)
+                res["dig"] = {"ok": False, "code": code, "ms": round((time.time() - t0) * 1000)}
                 print(f"  失败: {e}")
         else:
             print("  附近没找到可挖的方块")
@@ -177,7 +188,7 @@ def main(argv: list[str]) -> int:
             ex.posture(sneak=False)
             s.set_status(c.status())
             cycles.append((time.time() - t0) * 1000)
-        except ApiError as e:
+        except (ApiError, Replan, Fatal) as e:
             print(f"  失败: {e}")
             break
         time.sleep(0.1)
@@ -188,13 +199,19 @@ def main(argv: list[str]) -> int:
     # ---- 7. 错误路径的延迟（缺材料合成）
     print("\n[7] 错误路径（craft 缺材料）")
     try:
-        t0 = time.time()
+        # 先在计时外刷新背包快照，避免把 Executor 的合成前 GET /inventory 混入错误路径耗时
+        s.refresh_inventory(c)
+    except ApiError:
+        pass
+    t0 = time.time()
+    try:
         ex.craft("diamond_pickaxe")
         print("  意外成功？")
-    except ApiError as e:
+    except (ApiError, Replan, Fatal) as e:
         dt = (time.time() - t0) * 1000
-        res["craft_missing"] = {"ms": round(dt), "code": e.code, "extra": e.extra}
-        print(f"  {e.code} ({dt:.0f}ms) extra={json.dumps(e.extra, ensure_ascii=False)[:200]}")
+        code, extra = _unwrap_api_error(e)
+        res["craft_missing"] = {"ms": round(dt), "code": code, "extra": extra}
+        print(f"  {code} ({dt:.0f}ms) extra={json.dumps(extra, ensure_ascii=False)[:200]}")
 
     # ---- 落盘
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -205,8 +222,10 @@ def main(argv: list[str]) -> int:
 
     print("\n===== 三个决策数 =====")
     st50 = (res.get("status") or {}).get("p50")
-    mv = (res.get("move_20") or {}).get("ms")
-    dg = (res.get("dig") or {}).get("ms")
+    mv_row = res.get("move_20") or {}
+    dg_row = res.get("dig") or {}
+    mv = mv_row.get("ms") if mv_row.get("ok") else None
+    dg = dg_row.get("ms") if dg_row.get("ok") else None
     print(f"T_status   = {st50} ms/次")
     print(f"T_move20   = {mv} ms")
     print(f"T_dig1     = {dg} ms")
@@ -216,7 +235,8 @@ def main(argv: list[str]) -> int:
     return 0
 
 # ---------------------------------------------------------------- 官方寻路能力探测（独立于旧基线输出结构）
-PATH_CASES = ("wall", "gap", "pillar", "climb_y", "water", "pearl", "move20", "dig1")
+# 先测无损的 move20 / dig1（采集 C1），再测障碍寻路与会产生摔伤的 pearl
+PATH_CASES = ("move20", "dig1", "wall", "gap", "pillar", "climb_y", "water", "pearl")
 
 
 def path_template() -> dict:
@@ -251,6 +271,9 @@ def validate_fixture(fixture: dict, selected: list[str]) -> None:
         case = fixture.get("cases", {}).get(name, {})
         if not all(pos_ok(case.get(k)) for k in ("start", "target")):
             raise ValueError(f"{name}: 先用官方 API 观察并填入 start/target [x,y,z]")
+        rng = case.get("range")
+        if rng is not None and (not isinstance(rng, (int, float)) or isinstance(rng, bool) or not math.isfinite(rng) or rng <= 0):
+            raise ValueError(f"{name}: range 必须为正有限数")
         witnesses = case.get("witness_blocks")
         if not isinstance(witnesses, list) or not all(pos_ok(v) for v in witnesses):
             raise ValueError(f"{name}: witness_blocks 必须为坐标数组")
@@ -271,15 +294,17 @@ def pathfinding_main(argv: list[str]) -> int:
     from datetime import datetime, timezone
     from pathlib import Path
     from .client import DEFAULT_BASE
-    from .runtime import Executor, Fatal, Replan, Safety, SafetyMonitor
+    from .runtime import Safety, SafetyMonitor
 
     parser = argparse.ArgumentParser(description="赛前官方寻路 probe；默认离线，不登录。")
     parser.add_argument("--pathfinding", action="store_true")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--case", choices=PATH_CASES, action="append", dest="cases")
     parser.add_argument("--dry", action="store_true")
+    parser.add_argument("--snapshot", action="store_true", help="只读采集当前坐标与周边方块并输出夹具草稿（不移动、不挖放）")
     parser.add_argument("--live", action="store_true", help="已获人类账号登录授权并在 docs/05 占位后使用")
     parser.add_argument("--local-target", action="store_true", help="仅允许联调，永不计入官方结论")
+    parser.add_argument("--void-guard", action="store_true", help="显式对 gap/pillar 开启虚空支撑护栏标定（默认关闭防误掐寻路）")
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--pearl-trials", type=int, default=3)
     parser.add_argument("--output", type=Path)
@@ -289,6 +314,47 @@ def pathfinding_main(argv: list[str]) -> int:
         parser.error("pearl-trials 必须为 1..20")
     if args.samples < 1 or args.samples > 100:
         parser.error("samples 必须为 1..100")
+
+    if args.snapshot:
+        if args.dry or not args.live:
+            parser.error("--snapshot 需要配合 --live（及非官方端点时的 --local-target）确认只读上线许可")
+        cfg = Config.load()
+        official = cfg.base == DEFAULT_BASE
+        if not official and not args.local_target:
+            parser.error("非官方端点：只可显式 --local-target 做联调")
+        c = Client(cfg)
+        try:
+            st = c.wait_ready()
+            inv = c.inventory()
+            nearby = c.find_blocks(radius=24, limit=30)
+            stones = c.find_blocks(types=["stone"], radius=16, limit=10)
+            waters = c.find_blocks(types=["water"], radius=24, limit=10)
+            tpl = path_template()
+            if st.get("pos"):
+                p = st["pos"]
+                tpl["cases"]["move20"]["start"] = list(p)
+                tpl["cases"]["move20"]["target"] = [round(p[0] + 20.0, 2), p[1], p[2]]
+            snap_out = {
+                "source": "official" if official and not args.local_target else "local-target",
+                "status": st,
+                "inventory": inv,
+                "nearby_summary": nearby,
+                "stones": stones,
+                "waters": waters,
+                "fixture_draft": tpl,
+            }
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(snap_out, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                print(json.dumps(snap_out, ensure_ascii=False, indent=2))
+            return 0
+        finally:
+            try:
+                c.disconnect()
+            except Exception:
+                pass
+
     if not args.fixture:
         print(json.dumps(path_template(), ensure_ascii=False, indent=2))
         if args.live:
@@ -308,10 +374,10 @@ def pathfinding_main(argv: list[str]) -> int:
     c, state = Client(cfg), State()
     ex = Executor(c, state)
     out = args.output or Path(OUT_DIR) / datetime.now(timezone.utc).strftime("pathfinding-%Y%m%dT%H%M%S-%fZ.json")
-    report = {"schema": "pathfinding-v1", "source": source, "base": cfg.base,
+    report = {"schema": "pathfinding-v1", "source": source, "base": cfg.base, "max_rps": cfg.max_rps,
               "started_at": datetime.now(timezone.utc).isoformat(), "fixture": fixture,
               "cases": [], "C1": {}, "complete": False,
-              "interpretation": "API 成功不等于能力已证实；需结合轨迹、方块前后变化与背包变化人工复核。"}
+              "interpretation": "API 成功/拒绝均保留原始证据；需结合轨迹、方块前后变化与背包变化复核真实物理行为。"}
     def save():
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(".tmp")
@@ -327,12 +393,13 @@ def pathfinding_main(argv: list[str]) -> int:
         def tick(self):
             hz = super().tick()
             timeline.append({"elapsed_s": round(time.monotonic()-started, 3),
-                             "status": state.snapshot(), "support": state.support, "hazard": hz})
+                             "status": state.snapshot(), "support": state.get_support(), "hazard": hz})
             return hz
     monitor = None
     connected = False
     timeline: list[dict] = []
     started = time.monotonic()
+    safety = Safety(state.config)
     try:
         # wait_ready 自动复用缓存 token；不强制 login 踢掉现有会话。
         state.set_status(c.wait_ready())
@@ -347,23 +414,32 @@ def pathfinding_main(argv: list[str]) -> int:
         runs = [(name, trial+1) for name in selected for trial in range(args.pearl_trials if name == "pearl" else 1)]
         for name, trial in runs:
             case = fixture["cases"][name]
-            row = {"case": name, "trial": trial, "status": "inconclusive", "setup": {}, "samples": []}
+            rng = float(case["range"]) if case.get("range") is not None else 1.0
+            tol_h = max(1.8, rng + 0.8)
+            row: dict = {"case": name, "trial": trial, "status": "inconclusive", "setup": {}, "samples": []}
             report["cases"].append(row)
             save()
             # 准备阶段也经 Executor；不把去起点的时间混入 case/C1。
             state.set_risk_context(near_water=name == "water", near_void=False, void_guard=False)
             timeline = []
             started = time.monotonic()
-            monitor = RecordingMonitor(c, state, ex)
+            monitor = RecordingMonitor(c, state, ex, safety=safety)
             monitor.start()
+            phase = "setup"
+            preempted = False
+            fatal_abort = False
             try:
-                row["setup"] = ex.act("move_to", lambda: c.move_to(pos=case["start"], rng=0.25), retries=0)
+                row["setup"] = ex.act("move_to", lambda st=case["start"], r=rng: c.move_to(pos=st, rng=r), retries=0)
                 before = observe()
                 row["before"] = before
-                if math.dist(before["status"].get("pos", [float("inf")]*3), case["start"]) > 0.5:
-                    raise ValueError("未到 fixture 起点，不能执行本 case")
-                if Safety().check(state):
-                    raise ValueError("起点存在安全风险，不能执行本 case")
+                before_pos = before["status"].get("pos") or [float("inf")] * 3
+                start_h_err = math.hypot(before_pos[0] - case["start"][0], before_pos[2] - case["start"][2])
+                start_y_err = abs(before_pos[1] - case["start"][1])
+                if start_h_err > tol_h or start_y_err > 1.5:
+                    raise ValueError(f"未到 fixture 起点 (horiz={start_h_err:.2f}, dy={start_y_err:.2f})")
+                urgent_start = [h for h in safety.hazards(state) if h["severity"] == "urgent"]
+                if urgent_start:
+                    raise ValueError(f"起点存在紧急安全风险 ({urgent_start[0]['kind']})，不能执行本 case")
                 witnesses = case["witness_blocks"]
                 row["blocks_before"] = blocks(witnesses)
                 names = [b["block"].get("name", "").removeprefix("minecraft:") for b in row["blocks_before"]]
@@ -381,22 +457,41 @@ def pathfinding_main(argv: list[str]) -> int:
                     if (math.floor(feet[0]) == math.floor(case["target"][0]) and
                             math.floor(feet[2]) == math.floor(case["target"][2]) and case["target"][1] < feet[1]):
                         raise ValueError("拒绝测量挖脚下承重块")
-                if name == "pearl" and state.count("ender_pearl") < 1:
-                    raise ValueError("缺少 ender_pearl，不能测落点")
-                # 坑/柱默认有安全底板；guard 保守拒绝悬空，若被截停只能记为干扰不能判能力不存在。
-                state.set_risk_context(void_guard=name in ("gap", "pillar"))
+                if name == "pearl":
+                    if float(before["status"].get("health", 20)) <= 6.0:
+                        raise ValueError("血量 <=6，停止投掷末影珍珠防摔落致死")
+                    if state.count("ender_pearl") < 1:
+                        raise ValueError("缺少 ender_pearl，不能测落点")
+
+                # 坑/柱已有安全底板，默认不开 void_guard 以免起跳/跨坑瞬间被护栏自掐；仅 --void-guard 显式标定时开启。
+                state.set_risk_context(
+                    near_water=name == "water",
+                    near_void=False,
+                    void_guard=bool(args.void_guard and name in ("gap", "pillar")),
+                )
                 action = "dig" if name == "dig1" else "use_item" if name == "pearl" else "move_to"
                 action_args = ({"pos": case["target"]} if name == "dig1" else
                                {"item": "ender_pearl", "target": {"pos": case["target"]}} if name == "pearl" else
-                               {"pos": case["target"], "rng": 0.25})
+                               {"pos": case["target"], "rng": rng})
                 row["action"] = {"name": action, "args": action_args}
+                phase = "action"
+                epoch_before = ex._preempt_epoch
                 t = time.monotonic()
                 try:
                     result = ex.act(action, lambda: getattr(c, action)(**action_args), retries=0)
                     row["result"] = result
                     row["api_ok"] = True
+                    row["outcome"] = "ok"
+                except (ApiError, Replan) as act_err:
+                    code, extra = _unwrap_api_error(act_err)
+                    row["api_ok"] = False
+                    row["outcome"] = f"rejected:{code}"
+                    row["error"] = {"type": type(act_err).__name__, "code": code, "phase": "action",
+                                    "extra": extra, "message": str(act_err)}
                 finally:
                     row["elapsed_ms"] = round((time.monotonic()-t)*1000, 2)
+                    preempted = ex._preempt_epoch != epoch_before
+
                 row["after"] = observe()
                 row["blocks_after"] = blocks(witnesses)
                 actual = row["after"]["status"].get("pos")
@@ -404,26 +499,57 @@ def pathfinding_main(argv: list[str]) -> int:
                     row["target_error_3d"] = math.dist(actual, case["target"])
                     row["target_error_horizontal"] = math.hypot(actual[0]-case["target"][0], actual[2]-case["target"][2])
                     row["target_error_y"] = actual[1]-case["target"][1]
+                    row["walked_horizontal"] = math.hypot(actual[0]-before_pos[0], actual[2]-before_pos[2])
+
                 if name == "pearl":
-                    row["teleported"] = row["result"].get("teleported")
-                    row["status"] = "observed" if row["teleported"] is True else "inconclusive"
+                    row["teleported"] = (row.get("result") or {}).get("teleported")
+                    row["status"] = "observed" if (row["api_ok"] and row["teleported"] is True) else "inconclusive"
+                elif name in ("move20", "dig1"):
+                    row["status"] = "observed" if row["api_ok"] else "inconclusive"
                 else:
-                    row["status"] = "observed"
-                if name in ("move20", "dig1"):
-                    valid = (name == "dig1" and row["result"].get("dug") in ("stone", "minecraft:stone")) or (
-                        name == "move20" and row.get("target_error_3d", 99) <= 0.5)
-                    if valid:
-                        report["C1"]["T_move20" if name == "move20" else "T_dig1"] = {"ms": row["elapsed_ms"], "case": name}
+                    # 障碍寻路能力测试：服务端正常返回 path_not_found/timeout 同样是明确的能力观测结论
+                    err_code = (row.get("error") or {}).get("code")
+                    if row["api_ok"] or err_code in ("path_not_found", "timeout", "out_of_reach"):
+                        row["status"] = "observed"
+                    else:
+                        row["status"] = "inconclusive"
+
+                if name in ("move20", "dig1") and row["api_ok"]:
+                    if name == "dig1":
+                        valid = (row.get("result") or {}).get("dug") in ("stone", "minecraft:stone")
+                        if valid:
+                            report["C1"]["T_dig1"] = {"ms": row["elapsed_ms"], "case": name}
+                    else:
+                        valid = (
+                            row.get("target_error_horizontal", 99) <= tol_h
+                            and abs(row.get("target_error_y", 99)) <= 1.5
+                            and row.get("walked_horizontal", 0) >= 18.0
+                        )
+                        if valid:
+                            report["C1"]["T_move20"] = {
+                                "ms": row["elapsed_ms"],
+                                "walked_horizontal": round(row.get("walked_horizontal", 0), 2),
+                                "case": name,
+                            }
             except (ApiError, Replan, Fatal, ValueError) as e:
-                row["error"] = {"type": type(e).__name__, "message": str(e)}
+                code, extra = _unwrap_api_error(e)
+                row["error"] = {"type": type(e).__name__, "code": code, "phase": phase,
+                                "extra": extra, "message": str(e)}
                 row["api_ok"] = False
+                row["status"] = "inconclusive"
+                if isinstance(e, Fatal):
+                    fatal_abort = True
             finally:
-                # 关 monitor 后取完整事件尾部；即使中断也落盘，不用成功代替缺失证据。
+                # 关 monitor 后取完整事件尾部；仅真实抢占或紧急危险标为干扰，软意图（如珍珠扣血 heal）不抹除有效样本。
                 ex.stop()
                 monitor.close(timeout=60)
                 monitor = None
+                state.set_risk_context(near_water=False, near_void=False, void_guard=False)
                 row["samples"] = timeline
-                if any(sample.get("hazard") for sample in timeline):
+                urgent_in_timeline = any(
+                    (sample.get("hazard") or {}).get("severity") == "urgent" for sample in timeline
+                )
+                if preempted or urgent_in_timeline:
                     row["safety_interference"] = True
                     row["status"] = "inconclusive"
                     report["C1"].pop("T_move20" if name == "move20" else "T_dig1" if name == "dig1" else "unused", None)
@@ -437,7 +563,9 @@ def pathfinding_main(argv: list[str]) -> int:
                 except Exception as e:
                     row["cleanup_observation_error"] = str(e)
                 save()
-            if row.get("error") or state.safety_intent:
+            snap_after = state.snapshot()
+            urgent_after = [h for h in safety.hazards(state) if h["severity"] == "urgent"]
+            if fatal_abort or not snap_after.get("alive", True) or urgent_after:
                 report["aborted_after"] = name
                 break
         errors = [r["target_error_3d"] for r in report["cases"]

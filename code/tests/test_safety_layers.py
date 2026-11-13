@@ -351,3 +351,267 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["status"], "inconclusive")
         self.assertIn("after", report["cases"][0])
         self.assertNotIn("T_move20", report["C1"])
+
+    def test_wall_rejection_gap_jump_pearl_soft_heal_and_block_center_tolerance(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from mcagent.client import DEFAULT_BASE
+
+        fixture = path_template()
+        fixture["cases"]["wall"].update(start=[0, 64, 0], target=[4, 64, 0], witness_blocks=[[2, 64, 0]])
+        fixture["cases"]["pillar"].update(start=[0, 64, 0], target=[0, 67, 0], witness_blocks=[[0, 65, 0]])
+        fixture["cases"]["pearl"].update(start=[0, 64, 0], target=[15, 64, 0], witness_blocks=[])
+        fixture["cases"]["move20"].update(start=[0, 64, 0], target=[20, 64, 0], witness_blocks=[])
+
+        client = FakeClient()
+        client.wait_ready = lambda: dict(client.st)
+        client.disconnect = Mock(return_value={})
+        client.inventory = lambda: {"items": [{"name": "ender_pearl", "count": 5, "slot": 0}]}
+        client.advancements = lambda **_: {"advancements": [], "ready": True}
+        client.find_blocks = lambda **_: {"blocks": {}}
+        client.get_entities = lambda **_: {"entities": []}
+
+        def get_block(pos):
+            if pos == [2, 64, 0]:
+                return {"name": "stone"}
+            return {"name": "air"}
+
+        client.get_block = get_block
+
+        def move_to(x=None, z=None, y=None, entity_id=None, rng=1, pos=None, stop_on=None):
+            target = list(pos) if pos is not None else [x, client.st["pos"][1] if y is None else y, z]
+            if target == [4, 64, 0]:
+                raise ApiError("path_not_found", "blocked by stone wall")
+            if target == [20, 64, 0]:
+                # 模拟真实寻路停在方块中心附近（距整数坐标约 0.72 > 0.5）
+                ended = [19.4, 64.0, 0.4]
+                client.st["pos"] = ended
+                return {"pos": ended}
+            if target == [0, 64, 0]:
+                ended = [0.5, 64.0, 0.5]
+                client.st["pos"] = ended
+                return {"pos": ended}
+            client.st["pos"] = target
+            return {"pos": target}
+
+        def use_item(item, target=None, **kw):
+            self.assertEqual(item, "ender_pearl")
+            # 连投 3 次扣血到 8（触发软 heal 意图但不发 /stop）
+            client.st["health"] = max(7, client.st["health"] - 4)
+            landed = [14.6, 64.0, 0.3]
+            client.st["pos"] = landed
+            return {"used": item, "thrown": True, "teleported": True, "pos": landed}
+
+        client.move_to = move_to
+        client.use_item = use_item
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "fixture.json", Path(tmp) / "report.json"
+            source.write_text(json.dumps(fixture))
+            with (
+                patch("mcagent.probe.Client", return_value=client),
+                patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "u", "p")),
+                patch("builtins.print"),
+            ):
+                rc = pathfinding_main([
+                    "--pathfinding", "--live", "--local-target",
+                    "--fixture", str(source),
+                    "--case", "wall", "--case", "pillar", "--case", "pearl", "--case", "move20",
+                    "--pearl-trials", "3", "--samples", "1", "--output", str(output),
+                ])
+            report = json.loads(output.read_text())
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["complete"])
+        by_case = {}
+        for r in report["cases"]:
+            by_case.setdefault(r["case"], []).append(r)
+        self.assertEqual(by_case["wall"][0]["status"], "observed")
+        self.assertEqual(by_case["wall"][0]["outcome"], "rejected:path_not_found")
+        self.assertEqual(by_case["pillar"][0]["status"], "observed")
+        self.assertFalse(by_case["pillar"][0].get("safety_interference", False))
+        self.assertEqual(report["pearl_error"]["n"], 3)
+        self.assertIn("T_move20", report["C1"])
+
+    def test_legacy_probe_catches_replan_and_writes_report(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from mcagent import probe as probe_mod
+
+        client = FakeClient()
+        client.wait_ready = lambda timeout=120: dict(client.st)
+        client.find_blocks = lambda **_: {"blocks": {}}
+        client.get_entities = lambda **_: {"entities": []}
+        client.advancements = lambda **_: {"advancements": [], "ready": True}
+        client.posture = lambda **_: {"sneaking": False, "blocking": False}
+
+        def craft(item, count=1, stop_on=None):
+            raise ApiError("missing_ingredients", "need diamonds", {"needed": 3})
+
+        client.craft = craft
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.object(probe_mod, "OUT_DIR", tmp),
+                patch.object(probe_mod, "Client", return_value=client),
+                patch.object(probe_mod.Config, "load", return_value=Config("https://mock", "u", "p")),
+                patch.object(probe_mod, "bench", side_effect=lambda fn, n=1, warmup=0: (fn(), {"n": 1, "err": 0, "p50": 1.0, "min": 1.0, "max": 1.0, "all": [1]})[1]),
+                patch.object(probe_mod.time, "sleep"),
+                patch("builtins.print"),
+            ):
+                rc = probe_mod.main(["--no-move", "--no-dig"])
+            files = list(Path(tmp).iterdir())
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(files), 1)
+            saved = json.loads(files[0].read_text(encoding="utf-8"))
+            self.assertEqual(saved["craft_missing"]["code"], "missing_ingredients")
+            self.assertEqual(saved["craft_missing"]["extra"], {"needed": 3})
+
+
+class AuditRegressionTests(unittest.TestCase):
+    def test_place_bridging_does_not_trigger_extra_inventory_reads(self):
+        c, s = FakeClient(), State()
+        ex = Executor(c, s, log=lambda *_: None)
+        for i in range(5):
+            ex.act("place", lambda i=i: {"placed": "cobblestone", "pos": [i, 63, 0]})
+        self.assertEqual(c.inventory_calls, 0)
+        self.assertTrue(s.inventory_dirty)
+        # craft 仍需在执行前拍一次快照以支持丢包判重
+        ex.act("craft", lambda: {"crafted": "stick", "gained": 4})
+        self.assertEqual(c.inventory_calls, 1)
+
+    def test_restart_multipage_events_catches_up_without_false_safe_mode(self):
+        s = State()
+        now_ms = 2_000_000_000
+        pages = [
+            {
+                "events": [{"seq": 1, "t": now_ms - 7_200_000, "type": "chat", "text": "old"}],
+                "last_seq": 1,
+                "has_more": True,
+            },
+            {
+                "events": [
+                    {"seq": 2, "t": now_ms - 7_000_000, "type": "death", "pos": [0, 64, 0]},
+                    {"seq": 3, "t": now_ms - 6_990_000, "type": "death", "pos": [0, 64, 0]},
+                    {"seq": 4, "t": now_ms, "type": "pickup", "item": "oak_log", "count": 1},
+                ],
+                "last_seq": 4,
+                "has_more": False,
+            },
+            {
+                "events": [{"seq": 5, "t": now_ms + 1000, "type": "chat", "text": "steady1"}],
+                "last_seq": 5,
+                "has_more": True,
+            },
+            {
+                "events": [{"seq": 6, "t": now_ms + 2000, "type": "chat", "text": "steady2"}],
+                "last_seq": 6,
+                "has_more": False,
+            },
+        ]
+        calls = 0
+
+        class PagedClient:
+            def events(self, since=0, limit=200):
+                nonlocal calls
+                idx = min(calls, len(pages) - 1)
+                calls += 1
+                return pages[idx]
+
+        pc = PagedClient()
+        evs = s.drain(pc)
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(evs), 4)
+        self.assertEqual(s.deaths_in(60), 0)
+        self.assertFalse(s.in_safe_mode)
+        # 进入稳态后每次只读一页，不挤占急停额度
+        evs2 = s.drain(pc)
+        self.assertEqual(calls, 3)
+        self.assertEqual(len(evs2), 1)
+
+    def test_sneak_bridge_step_down_and_safe_mode_hazard_ordering(self):
+        c = FakeClient()
+        s = State(replace(RuntimeConfig(), stop_cooldown_s=10))
+        ex = Executor(c, s, log=lambda *_: None)
+        mon = SafetyMonitor(c, s, ex)
+
+        # 1) 潜行搭桥探边（on_ground=True, sneaking=True）：脚下中心虽是空气，不得误发 /stop
+        s.set_risk_context(void_guard=True)
+        c.st.update(pos=[10.25, 64.0, 10.0], on_ground=True, sneaking=True)
+        s.status_at = float("-inf")
+        mon.tick()
+        self.assertEqual(c.stops, 0)
+        self.assertIsNone(s.safety_intent)
+
+        # 2) 高风险区起跳上升瞬间（64.0 -> 64.42）：不得误判坠落
+        c.st.update(pos=[10.25, 64.42, 10.0], on_ground=False, sneaking=False)
+        s.status_at = float("-inf")
+        mon.tick()
+        self.assertEqual(c.stops, 0)
+
+        # 3) 普通地形下 1~2 格台阶（脚下 1 格空气、第 2 格泥土）：不得误判虚空
+        s.set_risk_context(void_guard=False)
+        c.st.update(pos=[0, 65.0, 0], on_ground=True)
+        s.status_at = float("-inf")
+        mon.tick()
+        c.get_block = lambda pos: {"name": "air"} if pos[1] >= 64 else {"name": "dirt"}
+        c.st.update(pos=[1, 64.2, 0], on_ground=False)
+        s.status_at = float("-inf")
+        mon.tick()
+        self.assertEqual(c.stops, 0)
+
+        # 4) safe_mode 期间掉入岩浆：safety_intent 必须优先暴露 escape_lava 而非被 safe_mode 遮蔽
+        s.safe_mode_until = time.monotonic() + 60
+        c.st.update(in_lava=True, on_ground=True)
+        s.status_at = float("-inf")
+        mon.tick()
+        self.assertEqual(s.safety_intent["kind"], "escape_lava")
+
+    def test_stop_on_supported_for_use_item_and_scheduler_urgent_events(self):
+        from mcagent.planner.decision import validate
+        from mcagent.planner.llm import LLMClient
+
+        ok, errs = validate({
+            "goal": "heal:eat",
+            "action": "use_item",
+            "args": {"item": "cooked_beef", "stop_on": ["death"]},
+        })
+        self.assertTrue(ok, errs)
+        ok_posture, _ = validate({
+            "goal": "sneak",
+            "action": "posture",
+            "args": {"sneak": True, "stop_on": ["death"]},
+        })
+        self.assertFalse(ok_posture)
+
+        c = Client(Config("https://unused", "", ""))
+        c.call = Mock(return_value={})
+        c.use_item("cooked_beef", stop_on=["death"])
+        self.assertEqual(c.call.call_args.args[1]["stop_on"], ["death"])
+
+        # DecisionScheduler: routine 事件受 min_interval 节流，但 phase_changed/uncovered/连续失败立即放行
+        cfg = replace(RuntimeConfig(), model_min_interval_s=30.0)
+        sched = DecisionScheduler(lambda _: "plan_a", cfg)
+        self.assertTrue(sched.notify("skill_done", "s1", iron_complete=True))
+        sched._worker.join(1)
+        self.assertEqual(sched.poll(lambda: "fallback"), "plan_a")
+        self.assertFalse(sched.notify("skill_done", "s2", iron_complete=True))
+        self.assertTrue(sched.notify("phase_changed", "entered_nether", iron_complete=True))
+        sched._worker.join(1)
+        self.assertEqual(sched.poll(lambda: "fallback"), "plan_a")
+
+        # LLMClient.decide total_timeout 严格收敛单次调用超时预算
+        seen_timeouts = []
+
+        def slow_poster(url, headers, data, timeout, proxy):
+            seen_timeouts.append(timeout)
+            time.sleep(0.06)
+            return 200, '{"choices":[{"message":{"content":"bad"}}]}'
+
+        llm = LLMClient(key="k", poster=slow_poster, timeout=90)
+        d, errs, used = llm.decide("state", attempts=3, total_timeout=0.08)
+        self.assertIsNone(d)
+        self.assertLessEqual(used, 2)
+        self.assertTrue(all(t <= 0.09 for t in seen_timeouts))

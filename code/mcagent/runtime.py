@@ -43,7 +43,7 @@ class RuntimeConfig:
     hostile_flee_dist: float = 6.0
     night_start: float = 13000.0
     night_end: float = 23000.0
-    support_ttl_s: float = 2.0
+    support_ttl_s: float = 5.0
     void_fall_delta: float = 0.5
     safe_cooldown_s: float = 65.0
     model_timeout_s: float = 8.0
@@ -232,6 +232,18 @@ class State:
         self.risk_context.update(flags)
 
     @_locked
+    def get_risk_context(self) -> dict[str, bool]:
+        return dict(self.risk_context)
+
+    @_locked
+    def get_support(self) -> dict:
+        return copy.deepcopy(self.support)
+
+    @_locked
+    def set_support(self, evidence: dict) -> None:
+        self.support = copy.deepcopy(evidence)
+
+    @_locked
     def snapshot(self) -> dict:
         return copy.deepcopy(self.st)
 
@@ -240,13 +252,31 @@ class State:
         self.safety_intent = copy.deepcopy(hazard)
 
     def drain(self, client: Client, limit: int = 200) -> list[dict]:
-        """按 seq 增量读一页；积压留给下一拍，避免一次轮询挤占急停额度。"""
+        """首次启动先追平历史积压（防数小时前旧 death 误计为实时死亡），运行期每拍读一页防挤占急停额度。"""
         with self._event_fetch:
             return self._drain(client, limit)
 
     def _drain(self, client: Client, limit: int) -> list[dict]:
-        result = client.events(since=self.last_seq, limit=limit)
-        return self._consume_events(result)
+        with self._lock:
+            booting = not self._events_booted
+            last_seq = self.last_seq
+        if not booting:
+            result = client.events(since=last_seq, limit=limit)
+            return self._consume_events(result)
+
+        combined: list[dict] = []
+        still_more = False
+        for _ in range(20):
+            r = client.events(since=last_seq, limit=limit)
+            evs = r.get("events") or []
+            last_seq = r.get("last_seq", last_seq)
+            combined.extend(evs)
+            still_more = bool(r.get("has_more"))
+            if not still_more or not evs:
+                break
+        return self._consume_events(
+            {"events": combined, "last_seq": last_seq, "has_more": still_more}
+        )
 
     @_locked
     def _consume_events(self, result: dict) -> list[dict]:
@@ -254,7 +284,8 @@ class State:
         out = result.get("events") or []
         self.last_seq = result.get("last_seq", self.last_seq)
         self.events.extend(out)
-        self._events_booted = True
+        if not result.get("has_more"):
+            self._events_booted = True
         self.events_at = time.monotonic()
 
         if out:
@@ -366,24 +397,40 @@ class Safety:
         if not st.get("alive", True):
             return [{"kind": "wait_respawn", "severity": "soft"}]
         out = []
-        def add(kind, why, severity="urgent"):
-            out.append({"kind": kind, "why": why, "severity": severity})
-        if s.in_safe_mode:
-            add("safe_mode", "接近死亡循环，锁存避险")
+
+        def add(kind: str, why: str, severity: str = "urgent", **extra: Any) -> None:
+            out.append({"kind": kind, "why": why, "severity": severity, **extra})
+
+        # 致命物理险情（岩浆/缺氧/失重坠落）必须排在 safe_mode 之前，避免 65s 避险锁存遮蔽当前逃生意图
         if st.get("in_lava"):
             add("escape_lava", "在岩浆里")
         if st.get("submerged") and float(st.get("oxygen", 300)) < self.config.oxygen_warn:
             add("surface", f"氧气 {st.get('oxygen')}")
-        support = s.support
-        if (support.get("risk") and time.monotonic() - support.get("at", 0) <= self.config.support_ttl_s
-                and support.get("status_pos") == st.get("pos")):
+        support = s.get_support()
+        if (
+            support.get("risk")
+            and time.monotonic() - support.get("at", 0) <= self.config.support_ttl_s
+            and support.get("status_pos") == st.get("pos")
+        ):
             add("void_risk", support["risk"])
+        if s.in_safe_mode:
+            add(
+                "safe_mode",
+                f"接近死亡循环，锁存避险剩 {s.safe_mode_remaining:.0f}s",
+                remaining_s=round(s.safe_mode_remaining, 1),
+            )
         hp = float(st.get("health", 20))
         if hp <= self.config.hp_crit:
             add("heal", f"血量 {hp}", "soft")
         hostile = st.get("nearest_hostile") or {}
         if hostile and float(hostile.get("dist", 99)) < self.config.hostile_flee_dist:
-            add("flee", f"{hostile.get('name')} 距离 {hostile.get('dist')}", "soft")
+            add(
+                "flee",
+                f"{hostile.get('name')} 距离 {hostile.get('dist')}",
+                "soft",
+                hostile=hostile.get("name"),
+                dist=hostile.get("dist"),
+            )
         if st.get("on_fire") and not st.get("in_water"):
             add("douse", "着火", "soft")
         return out
@@ -396,6 +443,10 @@ class Safety:
 # 响应丢失时不可盲目重发的非幂等动作（可能再次消耗材料、弹药或耐久）
 NON_IDEMPOTENT_ACTIONS: frozenset[str] = frozenset({
     "craft", "window/act", "window_act", "use_item", "place", "interact", "drop", "shoot",
+})
+# 执行前需确保背包快照新鲜，以便断流后按产物/消耗做确定性判重的动作（避免搭桥 place 等每步多发一次 GET /inventory）
+SNAPSHOT_INVENTORY_ACTIONS: frozenset[str] = frozenset({
+    "craft", "window/act", "window_act", "use_item",
 })
 # 超时或网络中断后需主动发 /stop 清理服务端持续寻路/挖掘/追击的动作
 STOP_ON_TIMEOUT_ACTIONS: frozenset[str] = frozenset({
@@ -455,9 +506,12 @@ class Executor:
     def _snapshot_before_non_idempotent(self, name: str) -> Optional[dict[str, int]]:
         if name not in NON_IDEMPOTENT_ACTIONS:
             return None
-        try:
-            self.state.refresh_inventory(self.client)
-        except Exception:
+        if name in SNAPSHOT_INVENTORY_ACTIONS:
+            try:
+                self.state.refresh_inventory(self.client)
+            except Exception:
+                return None
+        elif self.state.inventory_dirty or not self.state.inventory:
             return None
         return _inv_fingerprint(self.state.inventory)
 
@@ -641,7 +695,7 @@ class Executor:
                         continue
                     raise Replan(str(e)) from e
         finally:
-            if name in NON_IDEMPOTENT_ACTIONS or name in ("dig", "attack", "equip", "window/view"):
+            if name in NON_IDEMPOTENT_ACTIONS or name in ("dig", "attack", "equip"):
                 self.state.invalidate_inventory()
             with self._cond:
                 self.active_action = None
@@ -659,42 +713,46 @@ class Executor:
     def dig(self, pos, collect: bool = True, *, stop_on=None) -> dict:
         return self.act("dig", lambda: self.client.dig(pos, collect=collect, stop_on=stop_on))
 
-    def place(self, item, pos=None) -> dict:
-        return self.act("place", lambda: self.client.place(item, pos))
+    def place(self, item, pos=None, *, stop_on=None) -> dict:
+        return self.act("place", lambda: self.client.place(item, pos, stop_on=stop_on))
 
-    def interact(self, pos=None, entity_id=None, item=None) -> dict:
-        return self.act("interact", lambda: self.client.interact(pos, entity_id, item))
+    def interact(self, pos=None, entity_id=None, item=None, *, stop_on=None) -> dict:
+        return self.act("interact", lambda: self.client.interact(pos, entity_id, item, stop_on=stop_on))
 
-    def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None) -> dict:
+    def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None) -> dict:
         return self.act(
             "use_item",
-            lambda: self.client.use_item(item, target=target, ms=ms, timeout_ms=timeout_ms, source=source),
+            lambda: self.client.use_item(
+                item, target=target, ms=ms, timeout_ms=timeout_ms, source=source, stop_on=stop_on
+            ),
         )
 
-    def craft(self, item, count=1) -> dict:
+    def craft(self, item, count=1, *, stop_on=None) -> dict:
         return self.act(
             "craft",
-            lambda: self.client.craft(item, count),
+            lambda: self.client.craft(item, count, stop_on=stop_on),
             verify_done=lambda before, after: after.get(item, 0) > before.get(item, 0),
         )
 
-    def attack(self, entity_id, timeout_ms=20000) -> dict:
-        return self.act("attack", lambda: self.client.attack(entity_id, timeout_ms))
+    def attack(self, entity_id, timeout_ms=20000, *, stop_on=None) -> dict:
+        return self.act("attack", lambda: self.client.attack(entity_id, timeout_ms, stop_on=stop_on))
 
-    def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100) -> dict:
+    def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100, *, stop_on=None) -> dict:
         return self.act(
             "shoot",
-            lambda: self.client.shoot(entity_id=entity_id, pos=pos, weapon=weapon, charge_ms=charge_ms),
+            lambda: self.client.shoot(
+                entity_id=entity_id, pos=pos, weapon=weapon, charge_ms=charge_ms, stop_on=stop_on
+            ),
         )
 
-    def window_view(self, target) -> dict:
-        return self.act("window/view", lambda: self.client.window_view(target))
+    def window_view(self, target, *, stop_on=None) -> dict:
+        return self.act("window/view", lambda: self.client.window_view(target, stop_on=stop_on))
 
-    def window_act(self, target, ops) -> dict:
-        return self.act("window/act", lambda: self.client.window_act(target, ops))
+    def window_act(self, target, ops, *, stop_on=None) -> dict:
+        return self.act("window/act", lambda: self.client.window_act(target, ops, stop_on=stop_on))
 
-    def equip(self, item, slot="hand") -> dict:
-        return self.act("equip", lambda: self.client.equip(item, slot))
+    def equip(self, item, slot="hand", *, stop_on=None) -> dict:
+        return self.act("equip", lambda: self.client.equip(item, slot, stop_on=stop_on))
 
     def posture(self, sneak=None, shield=None) -> dict:
         # 规范 §4.11：/posture 不占动作锁，可在动作阻塞中途调用
@@ -706,14 +764,14 @@ class Executor:
         })
         return res
 
-    def dismount(self) -> dict:
-        return self.act("dismount", lambda: self.client.dismount())
+    def dismount(self, *, stop_on=None) -> dict:
+        return self.act("dismount", lambda: self.client.dismount(stop_on=stop_on))
 
-    def drop(self, item, count=1) -> dict:
-        return self.act("drop", lambda: self.client.drop(item, count))
+    def drop(self, item, count=1, *, stop_on=None) -> dict:
+        return self.act("drop", lambda: self.client.drop(item, count, stop_on=stop_on))
 
-    def chat(self, message) -> dict:
-        return self.act("chat", lambda: self.client.chat(message))
+    def chat(self, message, *, stop_on=None) -> dict:
+        return self.act("chat", lambda: self.client.chat(message, stop_on=stop_on))
 
     def stop(self, *, raise_on_error: bool = False) -> None:
         try:
@@ -747,6 +805,7 @@ class SafetyMonitor:
         if self.interval_s is not None:
             return self.interval_s
         st, cfg = self.state.snapshot(), self.config
+        rc = self.state.get_risk_context()
         hostile = st.get("nearest_hostile") or {}
         tod = float(st.get("time_of_day", 0)) % 24000
         risk = (not st or cfg.night_start <= tod <= cfg.night_end
@@ -754,47 +813,83 @@ class SafetyMonitor:
                 or float(st.get("health", 20)) < cfg.hp_risk
                 or float(hostile.get("dist", 999)) <= cfg.hostile_risk_dist
                 or st.get("in_water") or st.get("in_lava") or st.get("on_fire")
-                or st.get("on_ground") is False or any(self.state.risk_context.values()))
+                or st.get("on_ground") is False or any(rc.values()))
         return cfg.poll_risk_s if risk else cfg.poll_safe_s
 
     def _check_support(self) -> None:
         st = self.state.snapshot()
         pos = st.get("pos")
-        guard = self.state.risk_context["void_guard"] or self.state.risk_context["near_void"]
-        self.state.support = {}
+        rc = self.state.get_risk_context()
+        guard = rc["void_guard"] or rc["near_void"]
         if not pos or st.get("in_water") or st.get("in_vehicle") or not st.get("alive", True):
             self._last_y = None
+            self.state.set_support({})
             return
         y = float(pos[1])
-        falling = self._last_y is not None and self._last_y - y >= self.config.void_fall_delta
+        prev_y = self._last_y
+        falling = prev_y is not None and prev_y - y >= self.config.void_fall_delta
+        ascending = prev_y is not None and y - prev_y > 0.05
         self._last_y = y
-        if not guard and st.get("on_ground") is not False:
+        on_ground = st.get("on_ground")
+        # 潜行且仍在地面上（如搭桥探边准备放下一块）受原版潜行防坠保护，不把待放空气格误判为坠落
+        if on_ground is True and st.get("sneaking") and not falling:
+            self.state.set_support({
+                "pos": [math.floor(pos[0]), math.floor(y - 0.01), math.floor(pos[2])],
+                "status_pos": pos,
+                "at": time.monotonic(),
+                "sneak_edge": True,
+            })
+            return
+        # 高风险区正常起跳上升瞬间（刚离地），不把起跳前的空气格误判为失重悬空
+        if guard and on_ground is False and ascending:
+            self.state.set_support({})
+            return
+        if not guard and on_ground is not False:
+            self.state.set_support({})
             return
         # y-epsilon 正确处理整格顶面与半砖；空气只表示这一格无支撑，非“证明无限虚空”。
         under = [math.floor(pos[0]), math.floor(y - 0.01), math.floor(pos[2])]
-        evidence = {"pos": under, "status_pos": pos, "at": time.monotonic()}
+        evidence: dict[str, Any] = {"pos": under, "status_pos": pos}
         try:
             block = self.client.get_block(under)
             evidence["block"] = block
             name = str(block.get("name", "")).removeprefix("minecraft:")
-            if name in ("air", "cave_air", "void_air") and (guard or falling):
-                evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
+            if name in ("air", "cave_air", "void_air"):
+                if guard:
+                    evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
+                elif falling:
+                    # 普通地形下落时再往下探 2 格，区分正常下 1~2 格台阶与真悬空/深坑
+                    has_near_ground = False
+                    below_checked = []
+                    for dy in (1, 2):
+                        bpos = [under[0], under[1] - dy, under[2]]
+                        b = self.client.get_block(bpos)
+                        bname = str(b.get("name", "")).removeprefix("minecraft:")
+                        below_checked.append({"pos": bpos, "name": bname})
+                        if bname and bname not in ("air", "cave_air", "void_air", "lava"):
+                            has_near_ground = True
+                            break
+                    evidence["below_checked"] = below_checked
+                    if not has_near_ground:
+                        evidence["risk"] = "脚下连续空气且正在下落：疑似坠落/深坑"
             elif not name and guard:
                 evidence["risk"] = "高风险路径脚下方块未知"
         except ApiError as e:
             evidence["error"] = e.code
             if guard:
                 evidence["risk"] = "高风险路径支撑查询失败，不能按安全处理"
-        self.state.support = evidence
+        # 在 get_block 返回后打时间戳，防官方慢 RTT 下刚返回即超过 support_ttl_s
+        evidence["at"] = time.monotonic()
+        self.state.set_support(evidence)
 
     def tick(self) -> Optional[dict]:
         self.state.refresh_status(self.client)
-        # 先处理致命状态，再读事件，避免事件积压/超时延误已观察到的岩浆抢占。
+        # 先处理致命状态，再查支撑与事件，避免慢请求延误已观察到的岩浆/缺氧抢占。
         hazard = self._dispatch(reconcile=False)
         self._check_support()
-        hazard = self._dispatch() or hazard
+        hazard = self._dispatch(reconcile=True) or hazard
         self.state.drain(self.client)
-        after_events = self._dispatch()
+        after_events = self._dispatch(reconcile=False)
         return after_events or hazard
 
     def _dispatch(self, reconcile: bool = True) -> Optional[dict]:

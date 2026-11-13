@@ -52,8 +52,15 @@ class DecisionScheduler:
             now = time.monotonic()
             if event == "review" and now - self._last_review < self.config.model_review_s:
                 return False
-            if (self._pending is not None or (self._worker and self._worker.is_alive())
-                    or now - self._last_request < self.config.model_min_interval_s):
+            if self._worker and self._worker.is_alive():
+                return False
+            if self._pending is not None and not self._pending["done"]:
+                return False
+            routine = event in ("skill_done", "review")
+            if routine and (
+                self._pending is not None
+                or now - self._last_request < self.config.model_min_interval_s
+            ):
                 return False
             self._last_request = self._last_review = now
             request = {"generation": self._generation, "deadline": now + self.config.model_timeout_s,

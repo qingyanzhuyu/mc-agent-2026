@@ -146,7 +146,8 @@ class LLMClient:
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
         request_timeout = timeout
         if request_timeout is None:
-            request_timeout = self.timeout if thinking else float(os.environ.get("MC_MODEL_TIMEOUT_S", "8"))
+            env_fast = float(os.environ.get("MC_MODEL_TIMEOUT_S", "8"))
+            request_timeout = self.timeout if thinking else min(self.timeout, env_fast)
         status, text = self._poster(url, headers, json.dumps(body), request_timeout, self.proxy_for(thinking))
         if status != 200:
             raise LLMError(f"HTTP {status}: {text[:200]}")
@@ -176,6 +177,7 @@ class LLMClient:
         extra: str = "",
         attempts: int = 2,
         thinking: bool = False,
+        total_timeout: Optional[float] = None,
     ) -> tuple[Optional[Decision], list[str], int]:
         """返回 (决策或 None, 最后一次的错误列表, 实际调用次数)。
 
@@ -185,7 +187,17 @@ class LLMClient:
         allowed = list(allowed or ALLOWED_ACTIONS)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         errors: list[str] = []
+        deadline = (time.monotonic() + total_timeout) if total_timeout is not None else None
+        used_attempts = 0
         for attempt in range(1, attempts + 1):
+            call_timeout: Optional[float] = None
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0.05:
+                    errors = errors or ["决策总耗时到达上限"]
+                    break
+                call_timeout = rem
+            used_attempts = attempt
             user = f"当前状态：\n{state_summary}\n\n可用动作：\n{', '.join(allowed)}\n"
             if extra:
                 user += f"\n补充：\n{extra}\n"
@@ -196,10 +208,14 @@ class LLMClient:
             messages.append({"role": "user", "content": user})
 
             try:
-                text = self.chat(messages, thinking=thinking)
+                text = self.chat(messages, thinking=thinking, timeout=call_timeout)
             except LLMError as e:
                 errors = [f"调用失败: {e}"]
-                time.sleep(min(2.0, 0.5 * attempt))
+                sleep_s = min(2.0, 0.5 * attempt)
+                if deadline is not None:
+                    sleep_s = min(sleep_s, max(0.0, deadline - time.monotonic() - 0.05))
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
                 continue
 
             obj = extract_json(text)
@@ -214,4 +230,4 @@ class LLMClient:
             errors = errs
             messages.append({"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)})
 
-        return None, errors, attempts
+        return None, errors, used_attempts
