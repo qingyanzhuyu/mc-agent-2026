@@ -89,7 +89,22 @@
 
 ---
 
-## 四、后续推进与人工合入说明
+## 四、双工位「边跑边修」热接力框架验收（`tools/soak-autofix/soak_ctl.py`）
+
+为支撑长程挂机期间 AI 并行修单且不污染主工作区、不越修越坏，新增 `tools/soak-autofix/soak_ctl.py` 与离线契约单测 `code/tests/test_soak_autofix.py`：
+
+1. **单一待审分支收敛**：硬护栏拒绝 `main`/`master`；所有通过验证的修复统一提交至独立待审分支（默认 `feat/soak-autofix`），挂机结束后在会话目录生成 `REVIEW_REPORT.md` 供人工审阅合并。
+2. **双 Git Worktree 零冲突热接力**：`worktrees/fixer` 检出待审分支负责修单提交，`worktrees/runner` 以 `--detach` 游离态指向待审分支尖端并在每轮起跑前原子热切换，且各自锁定独立 `PYTHONPATH` 防止 editable `.pth` 串包。
+3. **四道确定性机器闸门 + 自动回滚**：
+   - Gate 1：文件白名单（仅允许 `loop/*.py`、非冻结 `skills/*.py`、`tests/test_*.py`）+ 密钥正则扫描；
+   - Gate 2：`compileall` + 全量 `unittest`（122 项）+ `mcagent.loop --dry`；
+   - Gate 3：独立离线角色 `agy_soak_fixer` 跑 `--mode focus` 真机金丝雀小灶验收；
+   - Gate 4：入分支并在 Runner 下一轮 `campaign` 对比基线，若新增 `P0 bug` 自动 `git revert --no-edit` 回退；单指纹连续失败 2 次熔断转人工（`escalated_human`）。
+4. **实测结果**：`unittest` **122 项全绿**；本地 `1.21.11` 靶场实跑 `init -> runner-loop (agy_dual_s001) -> status -> teardown` 全链路退出码 `0`，结束后 `/healthz` 确认全部测试角色 `ready: false`。
+
+---
+
+## 五、后续推进与人工合入说明
 
 1. 当前所有代码与文档均已提交在分支 `feat/loop-soak-agy`，各 L3 技能按规范保持 `verified = "offline"`，等待人工审阅确认后再合入 `main`。
 2. 自建测试服若开启 RCON，可直接运行 `python3 tools/test-island/rcon_ctl.py carve-void` 与 `scenario --name night_combat` 等指令做虚空边界与 `keepInventory=true/false` 专项回归。
