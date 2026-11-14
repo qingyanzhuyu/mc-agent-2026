@@ -62,7 +62,8 @@ SECRET_SCAN_RE = re.compile(
 )
 
 FIXER_PRESETS: dict[str, str] = {
-    "codex": "codex exec -C {fixer_wt} -s workspace-write - < {prompt_file}",
+    "codex": 'codex exec -C {fixer_wt} -s workspace-write -m gpt-6.1-sol -c \'model_reasoning_effort="xhigh"\' - < {prompt_file}',
+    "agy": 'cd {fixer_wt} && agy --model gemini-4-hydrogen-high --effort high --mode accept-edits --sandbox --dangerously-skip-permissions --disable-slash-commands -p="$(cat {prompt_file})"',
     "claude": 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}',
 }
 
@@ -251,6 +252,10 @@ def _uv_env(wt_dir: Path) -> dict[str, str]:
     env.pop("UV_PROJECT_ENVIRONMENT", None)
     env.setdefault("UV_LINK_MODE", "copy")
     env["PYTHONPATH"] = str((wt_dir / "code").resolve())
+    local_bin = str((Path.home() / ".local" / "bin").resolve())
+    cur_path = env.get("PATH", "")
+    if local_bin not in cur_path.split(os.pathsep):
+        env["PATH"] = f"{local_bin}{os.pathsep}{cur_path}" if cur_path else local_bin
     return env
 
 
@@ -1071,7 +1076,7 @@ def run_fixer_once(
     session_dir: Path,
     *,
     fixer_cmd_template: str,
-    fixer_timeout_s: int = 300,
+    fixer_timeout_s: int = 600,
     live_canary: bool = True,
     fixer_bot_user: str = "agy_soak_fixer",
 ) -> Optional[dict[str, Any]]:
@@ -1448,7 +1453,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fix.add_argument("--once", action="store_true", help="只处理一单即退出")
     p_fix.add_argument("--skip-live-canary", action="store_true")
     p_fix.add_argument("--fixer-user", default="agy_soak_fixer")
-    p_fix.add_argument("--fixer-timeout", type=int, default=300)
+    p_fix.add_argument("--fixer-timeout", type=int, default=600)
 
     p_dual = sub.add_parser("run", help="一键并行启动 Runner + Fixer 双工位守护")
     p_dual.add_argument("--session-dir", required=True)
@@ -1469,8 +1474,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="使用 LLM API 操纵角色选技能（默认开启，接入 run_runner_loop(use_llm=...)；纯规则传 --no-llm）",
     )
-    p_dual.add_argument("--fixer-preset", choices=tuple(FIXER_PRESETS), default="codex")
+    p_dual.add_argument(
+        "--fixer-preset",
+        choices=tuple(FIXER_PRESETS),
+        default="codex",
+        help="工位 B 修单入口预设：codex（默认 gpt-6.1-sol xhigh）| agy（gemini-4-hydrogen-high）| claude",
+    )
     p_dual.add_argument("--fixer-cmd", default="")
+    p_dual.add_argument("--fixer-timeout", type=int, default=600, help="单次 AI 修单命令超时秒数（默认 600s）")
     p_dual.add_argument("--skip-live-canary", action="store_true")
 
     p_set = sub.add_parser(
@@ -1554,7 +1565,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "fixer-loop":
         tmpl = args.fixer_cmd or (FIXER_PRESETS[args.fixer_preset] if args.fixer_preset else "")
         if not tmpl:
-            print("错误: fixer-loop 需要传 --fixer-preset {codex,claude} 或 --fixer-cmd", file=sys.stderr)
+            print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
             return 2
         while not (session_dir / "STOP").exists():
             res = run_fixer_once(
@@ -1596,6 +1607,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             sys.executable, script, "fixer-loop",
             "--session-dir", str(session_dir),
             "--fixer-cmd", tmpl,
+            "--fixer-timeout", str(args.fixer_timeout),
         ]
         if args.skip_live_canary:
             fixer_cmd.append("--skip-live-canary")
