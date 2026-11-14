@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import fcntl
 import fnmatch
+import getpass
 import json
 import math
 import os
@@ -68,6 +69,31 @@ FIXER_PRESETS: dict[str, str] = {
 }
 
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
+
+# 工位 A 进服角色名：默认每轮同名（服务器上只有一个挂机角色，轮次号只体现在记录里）；
+# 同名意味着上一轮的背包、位置、进度会带进下一轮，要每轮空包冷启动就加 --rotate-user（<名字>001、002…）
+# 默认名按本机系统用户名派生（<用户名前 8 位>_soak），避免队友在同一个共享测试世界里同名互踢
+#（网关对同名重复登录会踢掉旧 token）
+BOT_USER_RE = re.compile(r"^[A-Za-z0-9_]{3,13}$")  # 轮换时末尾补 3 位轮次号，总长不超 MC 的 16 字符
+
+
+def default_bot_user() -> str:
+    try:
+        raw = getpass.getuser()
+    except Exception:
+        raw = ""
+    stem = re.sub(r"[^A-Za-z0-9_]", "", raw or "")[:8]
+    return f"{stem}_soak" if stem else "agy_soak_bot"
+
+
+DEFAULT_BOT_USER = default_bot_user()
+
+
+def validate_bot_user(name: str) -> str:
+    norm = (name or "").strip()
+    if not BOT_USER_RE.match(norm):
+        raise ValueError(f"角色名 {name!r} 非法：只能用字母、数字、下划线，长度 3–13")
+    return norm
 
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 CATEGORY_RANK = {"bug": 0, "strategy": 1}
@@ -1619,6 +1645,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="工位 B 修单入口预设：codex（默认 gpt-6.1-sol xhigh）| agy（gemini-4-hydrogen-high）| claude",
     )
+    p_dual.add_argument(
+        "--bot-user",
+        default=DEFAULT_BOT_USER,
+        help=f"工位 A 进服角色名（默认 {DEFAULT_BOT_USER}，每轮同名，轮次号只记在 ep-NNNN 记录里）",
+    )
+    p_dual.add_argument(
+        "--rotate-user",
+        action="store_true",
+        help="每轮换新角色 <bot-user>001、002…（空包冷启动；不加则每轮同名、继承上一轮背包与进度）",
+    )
     p_dual.add_argument("--fixer-cmd", default="")
     p_dual.add_argument("--fixer-timeout", type=int, default=600, help="单次 AI 修单命令超时秒数（默认 600s）")
     p_dual.add_argument("--skip-live-canary", action="store_true")
@@ -1742,6 +1778,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "run":
+        try:
+            bot_user = validate_bot_user(args.bot_user)
+        except ValueError as exc:
+            print(f"[run] {exc}", file=sys.stderr)
+            return 2
         repo_root = find_repo_root()
         init_session(
             repo_root,
@@ -1760,7 +1801,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--episodes", str(args.episodes),
             "--episode-seconds", str(args.episode_seconds),
             "--episode-steps", str(args.episode_steps),
+            "--user-prefix", bot_user,
         ]
+        if not args.rotate_user:
+            runner_cmd.append("--fixed-user")
         if (args.goal or "").strip():
             runner_cmd.extend(["--goal", args.goal.strip()])
         runner_cmd.append("--llm" if args.llm else "--no-llm")

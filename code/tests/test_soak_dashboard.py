@@ -178,6 +178,13 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index(flag) + 1], val)
         self.assertIn("--no-llm", cmd)
         self.assertIn("--skip-live-canary", cmd)
+        self.assertEqual(cmd[cmd.index("--bot-user") + 1], dash.soak_ctl.DEFAULT_BOT_USER)
+        self.assertNotIn("--rotate-user", cmd)
+        cmd_rot = self.console.build_run_cmd(self.console._validate_start({"bot_user": "team_bot", "rotate_user": True}))
+        self.assertEqual(cmd_rot[cmd_rot.index("--bot-user") + 1], "team_bot")
+        self.assertIn("--rotate-user", cmd_rot)
+        with self.assertRaises(ValueError):
+            self.console._validate_start({"bot_user": "bad name"})
 
         with patch.object(dash, "find_soak_processes", return_value=[{"pid": 1, "role": "run"}]):
             with self.assertRaises(ValueError):
