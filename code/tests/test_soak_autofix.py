@@ -1062,5 +1062,66 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         soak_ctl.teardown_session(self.session)
 
 
+    def test_run_keeps_same_bot_name_each_episode_unless_rotate(self):
+        class DummyProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        def runner_cmd_for(extra: list[str]) -> list[str]:
+            spawned: list[list[str]] = []
+            with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+                 patch.object(soak_ctl, "init_session", return_value={}), \
+                 patch.object(soak_ctl.subprocess, "Popen",
+                              side_effect=lambda cmd, **kw: (spawned.append(list(cmd)), DummyProc())[1]):
+                rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/fixed-bot",
+                                    "--episodes", "1", *extra])
+            self.assertEqual(rc, 0)
+            return next(c for c in spawned if "runner-loop" in c)
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/fixed-bot")
+        default_cmd = runner_cmd_for([])
+        self.assertEqual(default_cmd[default_cmd.index("--user-prefix") + 1], soak_ctl.DEFAULT_BOT_USER)
+        self.assertIn("--fixed-user", default_cmd)
+        rotate_cmd = runner_cmd_for(["--bot-user", "team_bot", "--rotate-user"])
+        self.assertEqual(rotate_cmd[rotate_cmd.index("--user-prefix") + 1], "team_bot")
+        self.assertNotIn("--fixed-user", rotate_cmd)
+        self.assertEqual(soak_ctl.main(["run", "--session-dir", str(self.session), "--bot-user", "bad name!"]), 2)
+        with self.assertRaises(ValueError):
+            soak_ctl.validate_bot_user("x" * 14)
+        with patch.object(soak_ctl.getpass, "getuser", return_value="Alice.Wang-PC"):
+            self.assertEqual(soak_ctl.default_bot_user(), "AliceWan_soak")
+        with patch.object(soak_ctl.getpass, "getuser", side_effect=OSError("no user")):
+            self.assertEqual(soak_ctl.default_bot_user(), "agy_soak_bot")
+        soak_ctl.validate_bot_user(soak_ctl.DEFAULT_BOT_USER)
+
+        # 同名挂机：每轮进服都是同一个角色名，轮次号只出现在 ep-NNNN 记录里
+        (self.session / "STOP").unlink(missing_ok=True)
+        users: list[str] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                users.append(cmd[cmd.index("--user") + 1])
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 5.0, "source": "local-target"}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(self.session, episodes=2, use_llm=False,
+                                     user_prefix="agy_soak_bot", rotate_user=False)
+        self.assertEqual(users, ["agy_soak_bot", "agy_soak_bot"])
+        st = soak_ctl.read_state(self.session)
+        self.assertEqual([e["ep_id"] for e in st["episodes"]], ["ep-0001", "ep-0002"])
+        self.assertEqual({e["bot_user"] for e in st["episodes"]}, {"agy_soak_bot"})
+        soak_ctl.teardown_session(self.session)
+
 if __name__ == "__main__":
     unittest.main()

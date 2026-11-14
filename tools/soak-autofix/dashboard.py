@@ -341,6 +341,8 @@ class Console:
             "player_model": soak_ctl.DEFAULT_PLAYER_MODEL,
             "fixer_preset": "codex",
             "skip_live_canary": False,
+            "bot_user": soak_ctl.DEFAULT_BOT_USER,
+            "rotate_user": False,
         }
         p = self.session_dir / LAST_START_NAME
         try:
@@ -536,6 +538,8 @@ class Console:
         p["player_model"] = str(p["player_model"] or "").strip()
         p["llm"] = bool(p["llm"])
         p["skip_live_canary"] = bool(p["skip_live_canary"])
+        p["bot_user"] = soak_ctl.validate_bot_user(str(p["bot_user"]))
+        p["rotate_user"] = bool(p["rotate_user"])
         return p
 
     def build_run_cmd(self, p: dict[str, Any]) -> list[str]:
@@ -549,8 +553,11 @@ class Console:
             "--max-goal-attempts", str(p["max_goal_attempts"]),
             "--player-model", p["player_model"],
             "--fixer-preset", p["fixer_preset"],
+            "--bot-user", p["bot_user"],
             "--llm" if p["llm"] else "--no-llm",
         ]
+        if p["rotate_user"]:
+            cmd.append("--rotate-user")
         if p["goal"]:
             cmd.extend(["--goal", p["goal"]])
         if p["skip_live_canary"]:

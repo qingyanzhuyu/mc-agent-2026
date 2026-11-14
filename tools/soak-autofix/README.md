@@ -36,9 +36,25 @@
 
 ### 方式零：网页控制台（实时改轮长、看每一轮、一键启停）
 
+**队友上手（每人在自己电脑上开，页面只认本机）：**
+
+1. 环境：Linux 或 Windows 的 **WSL2**（`soak_ctl.py` 用 `fcntl` 加锁、控制台扫 `/proc` 识别守护，原生 Windows / macOS 跑不了）；装好 `uv`、Node.js ≥ 18，`code/mcagent/.env` 配好 LLM key；修单用 `codex` / `agy` / `claude` 中的哪个，就要先装好并登录那个 CLI。
+2. 拉最新 `main` 后先起本地网关（另开一个终端，保持运行）：
+   ```bash
+   cd tools/local-api-bridge && npm ci && npm start     # 看到 listening on http://127.0.0.1:8787/api/v1 即可
+   ```
+3. 在仓库根目录起控制台：
+   ```bash
+   python3 tools/soak-autofix/dashboard.py
+   ```
+4. 浏览器打开 **http://127.0.0.1:8790/** → 左侧「启动参数」确认一下 → 点右上角 **一键启动**。
+   - 「进服角色名」默认是 `<你的系统用户名前 8 位>_soak`，**每轮同一个名字进服**，轮次号只记在 `ep-NNNN` 里。共享测试世界里同名会互踢，所以每人保持各自的名字，别改成同一个。
+   - 同名意味着上一轮的背包、位置、已拿到的进度会带进下一轮；要每轮空包从头跑（测聚焦目标的真实成功率时），勾「每轮换新角色」，角色名变成 `<名字>001`、`002`…
+   - 修单工位的金丝雀角色目前固定叫 `agy_soak_fixer`，两人同时挂机且都在修单时会互踢；不修单或只一人挂机时无影响。
+5. 想在别的机器上看：`ssh -L 8790:127.0.0.1:8790 <挂机那台机器>`，再在自己浏览器开 http://127.0.0.1:8790/ 。
+
 ```bash
-python3 tools/soak-autofix/dashboard.py            # 默认会话 code/mcagent/logs/soak-cont，打开 http://127.0.0.1:8790/
-python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/logs/soak-night
+python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/logs/soak-night   # 换端口 / 换会话目录
 ```
 
 - 只监听 `127.0.0.1`，零第三方依赖；校验 `Host` / `Origin` / `Content-Type`，别的网页无法跨站调用。
@@ -47,6 +63,8 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 - **实时参数**：秒数、步数、聚焦目标、玩家模型、单目标最大尝试直接写会话 `state.json`，Runner 下一轮开跑时读取。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
 - **当前轮**：解析正在跑的 `timeline.jsonl` / `progress_curve.jsonl`，2 秒刷新用时、步数、正在跑的技能、LLM 延迟、Token、血量和最近事件；**轮次历史**点一行看该轮 `summary.md`。
 - **热合入开发分支**：后台调用 `inject_and_set_goal`（同样跑编译 + 全量单测 + `--dry` 门禁），页面显示任务进度与结果。
+
+命令行等价写法：`soak_ctl.py run ... --bot-user <名字>`（默认同上），加 `--rotate-user` 每轮换新角色。
 
 ### 方式一：一键双进程全自动挂机（外接本机 `codex` / `agy` / `claude` CLI）
 

@@ -138,10 +138,13 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         <label class="f wide">聚焦目标<select id="sGoal"></select></label>
         <label class="f">玩家模型<input id="sModel"></label>
         <label class="f">单目标最大尝试<input type="number" id="sAttempts" min="1" max="20"></label>
+        <label class="f">进服角色名<input id="sBot" maxlength="13"></label>
+        <label class="f inline" title="不勾：每轮同一个角色进服，背包和进度带到下一轮；勾上：每轮换 名字001、002… 空包冷启动">
+          <input type="checkbox" id="sRotate">每轮换新角色</label>
         <label class="f inline"><input type="checkbox" id="sLlm">用 LLM 选技能</label>
         <label class="f inline"><input type="checkbox" id="sSkipCanary">跳过真机金丝雀</label>
       </div>
-      <p class="note">守护输出写到会话目录下的 <span class="mono">dashboard_run.log</span>；关掉本页面或控制台不会停掉守护。</p>
+      <p class="note">默认每轮用同一个角色名进服（轮次号只记在 ep-NNNN 里），上一轮的背包、位置、进度会带进下一轮；要每轮空包从头跑就勾「每轮换新角色」。<br>守护输出写到会话目录下的 <span class="mono">dashboard_run.log</span>；关掉本页面或控制台不会停掉守护。</p>
     </section>
 
     <section>
@@ -277,6 +280,7 @@ function fillForms(s) {
   goalOptions($("sGoal"), s.ledger, d.goal, false);
   $("sModel").value = d.player_model; $("sAttempts").value = d.max_goal_attempts;
   $("sLlm").checked = !!d.llm; $("sSkipCanary").checked = !!d.skip_live_canary;
+  $("sBot").value = d.bot_user; $("sRotate").checked = !!d.rotate_user;
 }
 
 function startParams() {
@@ -286,6 +290,7 @@ function startParams() {
     goal: $("sGoal").value, max_goal_attempts: Number($("sAttempts").value),
     llm: $("sLlm").checked, player_model: $("sModel").value.trim(),
     fixer_preset: $("sFixer").value, skip_live_canary: $("sSkipCanary").checked,
+    bot_user: $("sBot").value.trim(), rotate_user: $("sRotate").checked,
   };
 }
 
