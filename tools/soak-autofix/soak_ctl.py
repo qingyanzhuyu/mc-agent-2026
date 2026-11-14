@@ -25,6 +25,7 @@ import contextlib
 import fcntl
 import fnmatch
 import json
+import math
 import os
 import re
 import shlex
@@ -66,6 +67,53 @@ FIXER_PRESETS: dict[str, str] = {
 
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 CATEGORY_RANK = {"bug": 0, "strategy": 1}
+
+QUOTA_INPUT_TOKENS = 8_000_000
+QUOTA_OUTPUT_TOKENS = 1_500_000
+MATCH_DURATION_S = 8 * 3600
+
+
+def _nonneg_float(val: Any) -> float:
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return 0.0
+    return x if math.isfinite(x) and x > 0.0 else 0.0
+
+
+def format_episode_value(
+    prompt_tokens: int,
+    completion_tokens: int,
+    elapsed_s: float,
+    *,
+    price_in_per_m: Optional[float] = None,
+    price_out_per_m: Optional[float] = None,
+) -> str:
+    """按初赛公告额度占比（含 8h 外推）与可选单价（默认 0 不显示金额）格式化一轮 token 价值。"""
+    p_tok = max(0, int(prompt_tokens))
+    c_tok = max(0, int(completion_tokens))
+    if p_tok == 0 and c_tok == 0:
+        return "-"
+
+    in_pct = p_tok / QUOTA_INPUT_TOKENS * 100.0
+    out_pct = c_tok / QUOTA_OUTPUT_TOKENS * 100.0
+    parts = [f"额度 入{in_pct:.2f}%/出{out_pct:.2f}%"]
+    if elapsed_s > 0.0:
+        scale_8h = MATCH_DURATION_S / elapsed_s
+        proj_in_pct = (p_tok * scale_8h) / QUOTA_INPUT_TOKENS * 100.0
+        proj_out_pct = (c_tok * scale_8h) / QUOTA_OUTPUT_TOKENS * 100.0
+        parts[0] += f"（8h≈入{proj_in_pct:.1f}%/出{proj_out_pct:.1f}%）"
+
+    p_in = _nonneg_float(os.environ.get("LLM_PRICE_IN_PER_M", "0")) if price_in_per_m is None else max(0.0, price_in_per_m)
+    p_out = _nonneg_float(os.environ.get("LLM_PRICE_OUT_PER_M", "0")) if price_out_per_m is None else max(0.0, price_out_per_m)
+    if p_in > 0.0 or p_out > 0.0:
+        cost = (p_tok / 1_000_000.0) * p_in + (c_tok / 1_000_000.0) * p_out
+        cost_str = f"¥{cost:.4f}"
+        if elapsed_s > 0.0:
+            cost_str += f"（8h≈¥{cost * (MATCH_DURATION_S / elapsed_s):.2f}）"
+        parts.append(cost_str)
+
+    return " · ".join(parts)
 
 
 def _utc_now() -> str:
@@ -260,6 +308,9 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
 
     server_score = 0
     inferred_score = 0
+    curve_prompt = 0
+    curve_comp = 0
+    elapsed_s = 0.0
     curve_path = ep_dir / "progress_curve.jsonl"
     if curve_path.exists():
         for line in curve_path.read_text(encoding="utf-8").splitlines():
@@ -270,11 +321,17 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                 pt = json.loads(line)
                 server_score = max(server_score, int(pt.get("server_score_v2", 0)))
                 inferred_score = max(inferred_score, int(pt.get("inferred_score_v2", 0)))
+                curve_prompt = max(curve_prompt, int(pt.get("prompt_tokens", 0) or 0))
+                curve_comp = max(curve_comp, int(pt.get("completion_tokens", 0) or 0))
+                elapsed_s = max(elapsed_s, float(pt.get("elapsed_s", 0.0) or 0.0))
             except Exception:
                 pass
 
     skills_ok = 0
-    elapsed_s = 0.0
+    tl_sum_prompt = 0
+    tl_sum_comp = 0
+    tl_cum_prompt = 0
+    tl_cum_comp = 0
     tl_path = ep_dir / "timeline.jsonl"
     if tl_path.exists():
         for line in tl_path.read_text(encoding="utf-8").splitlines():
@@ -282,12 +339,24 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                 continue
             try:
                 ev = json.loads(line)
+                if "elapsed_s" in ev:
+                    elapsed_s = max(elapsed_s, float(ev.get("elapsed_s", 0.0) or 0.0))
                 if ev.get("event") == "skill_end" and ev.get("outcome") == "completed":
                     skills_ok += 1
+                if ev.get("event") == "llm_call":
+                    tl_sum_prompt += int(ev.get("prompt_tokens", 0) or 0)
+                    tl_sum_comp += int(ev.get("completion_tokens", 0) or 0)
+                    tl_cum_prompt = max(tl_cum_prompt, int(ev.get("cumulative_prompt_tokens", 0) or 0))
+                    tl_cum_comp = max(tl_cum_comp, int(ev.get("cumulative_completion_tokens", 0) or 0))
                 if ev.get("event") == "run_end":
-                    elapsed_s = float(ev.get("elapsed_s", elapsed_s))
+                    elapsed_s = max(elapsed_s, float(ev.get("elapsed_s", elapsed_s) or 0.0))
+                    tl_cum_prompt = max(tl_cum_prompt, int(ev.get("prompt_tokens", 0) or 0))
+                    tl_cum_comp = max(tl_cum_comp, int(ev.get("completion_tokens", 0) or 0))
             except Exception:
                 pass
+
+    prompt_tokens = max(curve_prompt, tl_cum_prompt, tl_sum_prompt)
+    completion_tokens = max(curve_comp, tl_cum_comp, tl_sum_comp)
 
     return {
         "bugs_count": bugs_count,
@@ -296,6 +365,9 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
         "inferred_score": inferred_score,
         "skills_completed": skills_ok,
         "elapsed_s": elapsed_s,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
         "parsed_incidents": parsed_incidents,
     }
 
@@ -619,7 +691,7 @@ def run_runner_loop(
     episode_steps: int = 40,
     user_prefix: str = "agy_soak_r",
     rotate_user: bool = True,
-    use_llm: bool = False,
+    use_llm: bool = True,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     idx = 0
@@ -669,7 +741,8 @@ def run_runner_loop(
         results.append(meta)
         print(
             f"[runner] 完成 {ep_id}: skills_ok={meta['skills_completed']} bugs={meta['bugs_count']} "
-            f"score={meta['server_score']}/{meta['inferred_score']} rolled_back={meta['rolled_back']}"
+            f"score={meta['server_score']}/{meta['inferred_score']} "
+            f"tokens={meta['prompt_tokens']}/{meta['completion_tokens']} rolled_back={meta['rolled_back']}"
         )
     return results
 
@@ -736,12 +809,17 @@ def write_review_report(session_dir: Path) -> Path:
     base_sha = st["base_commit"][:7]
     tip_sha = st["current_tip"][:7]
 
+    tot_in = sum(int(e.get("prompt_tokens", 0) or 0) for e in st["episodes"])
+    tot_out = sum(int(e.get("completion_tokens", 0) or 0) for e in st["episodes"])
+    tot_elapsed = sum(float(e.get("elapsed_s", 0.0) or 0.0) for e in st["episodes"])
+
     lines = [
         f"# 双工位挂机自愈待审报告（分支 `{branch}`）",
         "",
         f"- **会话目录**：`{session_dir}`",
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
+        f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
         "",
         "## 一、人工验收与合并命令（跑完后由人执行）",
         "",
@@ -784,14 +862,19 @@ def write_review_report(session_dir: Path) -> Path:
     if not st["episodes"]:
         lines.append("- 暂无已完成挂机轮次。")
     else:
-        lines.append("| 轮次 | 提交 | 测试角色 | 完成技能数 | Bug 单数 | 服务端分 / 代理分 | 回滚 |")
-        lines.append("|---|---|---|---:|---:|---|---|")
+        lines.append("| 轮次 | 提交 | 测试角色 | 完成技能数 | Bug 单数 | 服务端分 / 代理分 | 输入/输出 token | 价值 | 回滚 |")
+        lines.append("|---|---|---|---:|---:|---|---|---|---|")
         for e in st["episodes"]:
             rb = f"`{e['rolled_back'][:7]}`" if e.get("rolled_back") else "-"
+            p_tok = int(e.get("prompt_tokens", 0) or 0)
+            c_tok = int(e.get("completion_tokens", 0) or 0)
+            el_s = float(e.get("elapsed_s", 0.0) or 0.0)
+            tok_s = f"`{p_tok:,} / {c_tok:,}`"
+            val_s = format_episode_value(p_tok, c_tok, el_s)
             lines.append(
                 f"| `{e['ep_id']}` | `{e['commit'][:7]}` | `{e['bot_user']}` | "
                 f"{e['skills_completed']} | {e['bugs_count']} | "
-                f"{e['server_score']} / {e['inferred_score']} | {rb} |"
+                f"{e['server_score']} / {e['inferred_score']} | {tok_s} | {val_s} | {rb} |"
             )
 
     report_path = session_dir / "REVIEW_REPORT.md"
@@ -828,7 +911,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run_ep.add_argument("--episode-steps", type=int, default=40)
     p_run_ep.add_argument("--user-prefix", default="agy_soak_r")
     p_run_ep.add_argument("--fixed-user", action="store_true", help="不按轮次轮换角色名")
-    p_run_ep.add_argument("--llm", action="store_true")
+    p_run_ep.add_argument(
+        "--llm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="使用 LLM API 操纵角色选技能（默认开启；纯规则基线传 --no-llm）",
+    )
 
     p_claim = sub.add_parser("claim", help="工位 B 原子认领最高优先级异常单并生成 prompt.md")
     p_claim.add_argument("--session-dir", required=True)
@@ -855,6 +943,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument("--episodes", type=int, default=3)
     p_dual.add_argument("--episode-seconds", type=float, default=180.0)
     p_dual.add_argument("--episode-steps", type=int, default=40)
+    p_dual.add_argument(
+        "--llm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="使用 LLM API 操纵角色选技能（默认开启，接入 run_runner_loop(use_llm=...)；纯规则传 --no-llm）",
+    )
     p_dual.add_argument("--fixer-preset", choices=tuple(FIXER_PRESETS), default="codex")
     p_dual.add_argument("--fixer-cmd", default="")
     p_dual.add_argument("--skip-live-canary", action="store_true")
@@ -948,6 +1042,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--episode-seconds", str(args.episode_seconds),
             "--episode-steps", str(args.episode_steps),
         ]
+        runner_cmd.append("--llm" if args.llm else "--no-llm")
         fixer_cmd = [
             sys.executable, script, "fixer-loop",
             "--session-dir", str(session_dir),

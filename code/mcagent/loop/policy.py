@@ -39,6 +39,8 @@ class PlanDecision:
     llm_ms: Optional[float] = None
     llm_attempts: int = 0
     llm_errors: tuple[str, ...] = ()
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 def build_state_summary(state: State) -> str:
@@ -218,6 +220,8 @@ class CampaignPlanner:
 
         if not self.use_llm or self.llm is None or state.in_safe_mode:
             return self.rules.choose(state)
+        if not skill_choice.has_ready_skill(state, self.registry, self.min_verified):
+            return self.rules.choose(state)
 
         summary = build_state_summary(state)
         fail_str = "\n".join(f"- {x}" for x in recent_failures[-5:])
@@ -225,6 +229,7 @@ class CampaignPlanner:
         errors: list[str] = []
         used = 0
         chosen: Optional[Skill] = None
+        usage: dict[str, int] = {}
         try:
             chosen, errors, used = skill_choice.choose(
                 self.llm,
@@ -236,11 +241,18 @@ class CampaignPlanner:
                 attempts=2,
                 thinking=False,
                 total_timeout=state.config.model_timeout_s * 2,
+                usage_out=usage,
             )
         except LLMError as e:
             errors = [f"LLMError: {e}"]
             used = max(1, used)
         dt_ms = round((time.monotonic() - t0) * 1000.0, 1)
+        prompt_tok = int(usage.get("prompt_tokens", 0))
+        comp_tok = int(usage.get("completion_tokens", 0))
+        total_tok = int(usage.get("total_tokens", prompt_tok + comp_tok))
+        cum_prompt = int(usage.get("cumulative_prompt_tokens", self.llm.stats.get("prompt_tokens", 0)))
+        cum_comp = int(usage.get("cumulative_completion_tokens", self.llm.stats.get("completion_tokens", 0)))
+        cum_total = int(usage.get("cumulative_total_tokens", cum_prompt + cum_comp))
 
         if self.on_llm_telemetry is not None:
             self.on_llm_telemetry({
@@ -250,10 +262,19 @@ class CampaignPlanner:
                 "args": chosen.args if chosen else None,
                 "attempts": used,
                 "errors": list(errors),
+                "prompt_tokens": prompt_tok,
+                "completion_tokens": comp_tok,
+                "total_tokens": total_tok,
+                "cumulative_prompt_tokens": cum_prompt,
+                "cumulative_completion_tokens": cum_comp,
+                "cumulative_total_tokens": cum_total,
             })
 
         if chosen is not None:
-            return PlanDecision(chosen, "llm", f"LLM 选择 {chosen}", dt_ms, used, tuple(errors))
+            return PlanDecision(
+                chosen, "llm", f"LLM 选择 {chosen}",
+                dt_ms, used, tuple(errors), prompt_tok, comp_tok,
+            )
 
         fallback = self.rules.choose(state)
         return PlanDecision(
@@ -263,4 +284,6 @@ class CampaignPlanner:
             dt_ms,
             used,
             tuple(errors),
+            prompt_tok,
+            comp_tok,
         )

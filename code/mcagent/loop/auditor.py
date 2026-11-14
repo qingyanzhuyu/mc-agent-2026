@@ -68,6 +68,90 @@ _ITEM_MILESTONES: tuple[tuple[str, tuple[str, ...], int], ...] = (
 
 _SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
+# 初赛公告参考额度口径与满场时长（用于报告额度占比与 8h 满场外推）
+QUOTA_INPUT_TOKENS = 8_000_000
+QUOTA_OUTPUT_TOKENS = 1_500_000
+MATCH_DURATION_S = 8 * 3600
+
+
+def _nonneg_float(val: Any) -> float:
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return 0.0
+    return x if math.isfinite(x) and x > 0.0 else 0.0
+
+
+def _nonneg_int(val: Any) -> int:
+    if isinstance(val, bool):
+        return 0
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def compute_token_valuation(
+    prompt_tokens: int,
+    completion_tokens: int,
+    elapsed_s: float,
+    *,
+    price_in_per_m: Optional[float] = None,
+    price_out_per_m: Optional[float] = None,
+) -> dict[str, Any]:
+    """计算 token 花费的两种价值口径：初赛公告额度占比（含 8h 外推）与可选金额。"""
+    p_tok = max(0, int(prompt_tokens))
+    c_tok = max(0, int(completion_tokens))
+    p_in = _nonneg_float(os.environ.get("LLM_PRICE_IN_PER_M", "0")) if price_in_per_m is None else max(0.0, price_in_per_m)
+    p_out = _nonneg_float(os.environ.get("LLM_PRICE_OUT_PER_M", "0")) if price_out_per_m is None else max(0.0, price_out_per_m)
+
+    in_quota_pct = p_tok / QUOTA_INPUT_TOKENS * 100.0
+    out_quota_pct = c_tok / QUOTA_OUTPUT_TOKENS * 100.0
+
+    has_8h = elapsed_s > 0.0
+    scale_8h = (MATCH_DURATION_S / elapsed_s) if has_8h else 0.0
+    proj_8h_in = round(p_tok * scale_8h) if has_8h else 0
+    proj_8h_out = round(c_tok * scale_8h) if has_8h else 0
+    proj_8h_in_pct = proj_8h_in / QUOTA_INPUT_TOKENS * 100.0
+    proj_8h_out_pct = proj_8h_out / QUOTA_OUTPUT_TOKENS * 100.0
+
+    has_price = (p_in > 0.0) or (p_out > 0.0)
+    cost = (p_tok / 1_000_000.0) * p_in + (c_tok / 1_000_000.0) * p_out if has_price else 0.0
+    proj_8h_cost = cost * scale_8h if (has_price and has_8h) else 0.0
+
+    return {
+        "prompt_tokens": p_tok,
+        "completion_tokens": c_tok,
+        "total_tokens": p_tok + c_tok,
+        "in_quota_pct": in_quota_pct,
+        "out_quota_pct": out_quota_pct,
+        "has_8h": has_8h,
+        "proj_8h_in": proj_8h_in,
+        "proj_8h_out": proj_8h_out,
+        "proj_8h_in_pct": proj_8h_in_pct,
+        "proj_8h_out_pct": proj_8h_out_pct,
+        "has_price": has_price,
+        "price_in_per_m": p_in,
+        "price_out_per_m": p_out,
+        "cost": cost,
+        "proj_8h_cost": proj_8h_cost,
+    }
+
+
+def _format_source_breakdown(counts: dict[str, int], unit: str) -> str:
+    total = sum(counts.values())
+    if total <= 0:
+        return f"0 {unit}"
+    ordered_keys = ["llm", "llm_fallback_rule", "rule"] + [
+        k for k in sorted(counts) if k not in ("llm", "llm_fallback_rule", "rule") and counts[k] > 0
+    ]
+    parts = [
+        f"`{k}` `{counts.get(k, 0)}` {unit} (`{counts.get(k, 0) / total * 100.0:.1f}%`)"
+        for k in ordered_keys
+    ]
+    return f"共 `{total}` {unit}（" + " · ".join(parts) + "）"
+
 
 def git_provenance(cwd: Optional[str] = None) -> dict[str, Any]:
     work = cwd or os.path.dirname(os.path.abspath(__file__))
@@ -133,8 +217,12 @@ class SoakObserver:
 
         self.skill_stats: dict[str, dict[str, int]] = {}
         self.env_variance_counts: dict[str, int] = {}
+        self.decision_sources: dict[str, int] = {}
+        self.step_sources: dict[str, int] = {}
         self.llm_latencies_ms: list[float] = []
         self.llm_fallbacks = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
         self.deaths_count = 0
         self.respawn_ms_samples: list[float] = []
         self.keep_inventory_inferred: Optional[bool] = None
@@ -186,6 +274,7 @@ class SoakObserver:
         }
         stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "budget_stopped": 0, "bug": 0})
         stat["started"] += 1
+        self.decision_sources[plan_source] = self.decision_sources.get(plan_source, 0) + 1
         self._append_jsonl(self.timeline_path, {
             "event": "skill_start",
             "elapsed_s": self._elapsed_s(),
@@ -200,11 +289,14 @@ class SoakObserver:
     def on_step(self, skill, record: Optional[dict], state: State, client=None) -> None:
         if self._skill_ctx is not None:
             self._skill_ctx["steps"] += 1
+        plan_source = str((self._skill_ctx or {}).get("plan_source") or "rule")
+        self.step_sources[plan_source] = self.step_sources.get(plan_source, 0) + 1
         rec_copy = copy.deepcopy(record or {})
         step_row = {
             "event": "step",
             "elapsed_s": self._elapsed_s(),
             "skill": skill.name,
+            "source": plan_source,
             "op": rec_copy.get("op"),
             "pos": state.pos,
             "hp": state.hp,
@@ -470,6 +562,10 @@ class SoakObserver:
 
     def on_llm_call(self, telemetry: dict) -> None:
         ms = float(telemetry.get("ms", 0.0))
+        p_tok = _nonneg_int(telemetry.get("prompt_tokens"))
+        c_tok = _nonneg_int(telemetry.get("completion_tokens"))
+        self.prompt_tokens += p_tok
+        self.completion_tokens += c_tok
         self.llm_latencies_ms.append(ms)
         if not telemetry.get("ok"):
             self.llm_fallbacks += 1
@@ -486,6 +582,12 @@ class SoakObserver:
             "event": "llm_call",
             "elapsed_s": self._elapsed_s(),
             **telemetry,
+            "prompt_tokens": p_tok,
+            "completion_tokens": c_tok,
+            "total_tokens": p_tok + c_tok,
+            "cumulative_prompt_tokens": self.prompt_tokens,
+            "cumulative_completion_tokens": self.completion_tokens,
+            "cumulative_total_tokens": self.prompt_tokens + self.completion_tokens,
         })
 
     def on_progress_tick(self, state: State, client=None, *, force: bool = False) -> dict:
@@ -516,6 +618,9 @@ class SoakObserver:
             "server_score_v2": srv_score,
             "inferred_milestones": sorted(self.inferred_milestones),
             "inferred_score_v2": inf_score,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
         }
         self.curve_points.append(point)
         self._append_jsonl(self.curve_path, point)
@@ -523,6 +628,17 @@ class SoakObserver:
 
     def on_run_end(self, state: State, client=None) -> None:
         self.on_progress_tick(state, client=client, force=True)
+        self._append_jsonl(self.timeline_path, {
+            "event": "run_end",
+            "elapsed_s": self._elapsed_s(),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.prompt_tokens + self.completion_tokens,
+            "decision_sources": dict(self.decision_sources),
+            "step_sources": dict(self.step_sources),
+            "llm_calls": len(self.llm_latencies_ms),
+            "llm_fallbacks": self.llm_fallbacks,
+        })
         self.write_summary()
 
     # ---- 去重立档与汇总看板 --------------------------------------------
@@ -632,11 +748,55 @@ class SoakObserver:
             )
         if self.llm_latencies_ms:
             s_lat = sorted(self.llm_latencies_ms)
+            total_calls = len(s_lat)
+            ok_calls = total_calls - self.llm_fallbacks
+            ok_pct = ok_calls / total_calls * 100.0
             p95 = s_lat[min(len(s_lat) - 1, int(len(s_lat) * 0.95))]
             lines.append(
-                f"- **LLM 决策遥测**：调用 `{len(s_lat)}` 次，p50=`{statistics.median(s_lat):.0f}ms`，"
-                f"p95=`{p95:.0f}ms`，max=`{max(s_lat):.0f}ms`，回退规则次数=`{self.llm_fallbacks}`"
+                f"- **LLM 决策遥测**：调用 `{total_calls}` 次，成功率 `{ok_calls}/{total_calls}` (`{ok_pct:.1f}%`)，"
+                f"p50=`{statistics.median(s_lat):.0f}ms`，p95=`{p95:.0f}ms`，max=`{max(s_lat):.0f}ms`，"
+                f"回退规则次数=`{self.llm_fallbacks}`"
             )
+        if self.decision_sources or self.step_sources:
+            lines.append(
+                f"- **决策来源占比**：选技能 {_format_source_breakdown(self.decision_sources, '次')}；"
+                f"动作步 {_format_source_breakdown(self.step_sources, '步')}"
+            )
+
+        elapsed_now = self._elapsed_s()
+        val = compute_token_valuation(self.prompt_tokens, self.completion_tokens, elapsed_now)
+        budget_cfg = _nonneg_int(os.environ.get("LLM_TOKEN_BUDGET", "0"))
+        lines += [
+            "",
+            "## Token 花费",
+            f"- **累计用量**：输入 `{val['prompt_tokens']:,}` · 输出 `{val['completion_tokens']:,}` · "
+            f"合计 `{val['total_tokens']:,}` tokens（`llm_call` `{len(self.llm_latencies_ms)}` 次）",
+            f"- **初赛公告额度占比**（输入 ÷ 800 万 / 输出 ÷ 150 万）："
+            f"输入 `{val['in_quota_pct']:.3f}%` · 输出 `{val['out_quota_pct']:.3f}%`",
+        ]
+        if val["has_8h"] and val["total_tokens"] > 0:
+            lines.append(
+                f"- **8 小时满场推算**（按当前 `{elapsed_now:.1f}s` 外推 28,800s）："
+                f"预计输入 `{val['proj_8h_in']:,}`（占 800 万额度的 `{val['proj_8h_in_pct']:.1f}%`）· "
+                f"预计输出 `{val['proj_8h_out']:,}`（占 150 万额度的 `{val['proj_8h_out_pct']:.1f}%`）"
+            )
+        else:
+            lines.append("- **8 小时满场推算**：暂无非零速率样本（纯规则运行或时长为 0s）")
+        if budget_cfg > 0:
+            lines.append(
+                f"- **预算上限（`LLM_TOKEN_BUDGET`）**：`{val['total_tokens']:,} / {budget_cfg:,}` tokens "
+                f"(`{val['total_tokens'] / budget_cfg * 100.0:.1f}%`)"
+            )
+        else:
+            lines.append("- **预算上限（`LLM_TOKEN_BUDGET`）**：`0`（仅记账、不熔断）")
+        if val["has_price"]:
+            price_line = (
+                f"- **估算金额**（输入 `{val['price_in_per_m']:g}`/M · 输出 `{val['price_out_per_m']:g}`/M）："
+                f"本轮 `¥{val['cost']:.4f}`"
+            )
+            if val["has_8h"] and val["total_tokens"] > 0:
+                price_line += f" · 8 小时推算 `¥{val['proj_8h_cost']:.2f}`"
+            lines.append(price_line)
 
         lines += ["", "## 一、代码与安全缺陷榜（`category = bug`，优先修）"]
         if not bugs:

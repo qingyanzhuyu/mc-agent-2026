@@ -155,6 +155,16 @@ def _reset_semaphores() -> None:
         _SEMS.clear()
 
 
+def _nonneg_int(val: Any) -> int:
+    if isinstance(val, bool) or not isinstance(val, (int, float, str)):
+        return 0
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
 class LLMClient:
     def __init__(
         self,
@@ -168,6 +178,7 @@ class LLMClient:
         fallback_direct: Optional[bool] = None,
         breaker_fails: Optional[int] = None,
         breaker_cooldown_s: Optional[float] = None,
+        token_budget: Optional[int] = None,
         clock: Callable[[], float] = time.monotonic,
         log: Optional[Callable[[str], None]] = print,
         profile: Optional[str] = None,
@@ -203,12 +214,17 @@ class LLMClient:
         self._lock = threading.Lock()   # 预取线程与主线程可能同时调用
         self._proxy_breaker = Breaker(fails, cooldown, clock)
         self._endpoint_breaker = Breaker(fails, cooldown, clock)
+        if token_budget is not None:
+            self.token_budget = max(0, int(token_budget))
+        else:
+            self.token_budget = _nonneg_int(env("LLM_TOKEN_BUDGET", "0"))
         #: 最近一次成功调用走的线路："proxy" / "direct" / None
         self.last_route: Optional[str] = None
         self.stats: dict[str, int] = {
             "proxy_ok": 0, "direct_ok": 0, "fallback_direct": 0,
             "proxy_opened": 0, "endpoint_opened": 0, "short_circuited": 0,
-            "no_slot": 0, "thinking_field_dropped": 0,
+            "no_slot": 0, "thinking_field_dropped": 0, "budget_exceeded": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
         }
 
     # ---- 传输层（可注入，便于离线单测） ------------------------------
@@ -253,12 +269,22 @@ class LLMClient:
                 **self.stats,
                 "profile": self.profile,
                 "model": self.model,
+                "token_budget": self.token_budget,
                 "last_route": self.last_route,
                 "proxy_open_s": round(self._proxy_breaker.remaining(), 1),
                 "endpoint_open_s": round(self._endpoint_breaker.remaining(), 1),
             }
 
-    def _post_once(self, url: str, headers: dict, data: str, timeout: float, proxy: Optional[str]) -> str:
+    def _post_once(
+        self,
+        url: str,
+        headers: dict,
+        data: str,
+        timeout: float,
+        proxy: Optional[str],
+        *,
+        usage_out: Optional[dict[str, int]] = None,
+    ) -> str:
         """发一次请求并取出 content；任何失败都抛带 `kind` 的 LLMError。
 
         进 HTTP 之前先占一个并发槽：比赛期只有 2 路，超发会被网关排队/429，
@@ -293,24 +319,51 @@ class LLMClient:
 
         choice = (payload.get("choices") or [{}])[0]
         content = ((choice.get("message") or {}).get("content") or "").strip()
+        raw_usage = payload.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
         if content:
+            prompt_tok = _nonneg_int(usage.get("prompt_tokens"))
+            comp_tok = _nonneg_int(usage.get("completion_tokens"))
+            total_tok = prompt_tok + comp_tok
+            with self._lock:
+                self.stats["prompt_tokens"] += prompt_tok
+                self.stats["completion_tokens"] += comp_tok
+                self.stats["total_tokens"] += total_tok
+                cum_prompt = self.stats["prompt_tokens"]
+                cum_comp = self.stats["completion_tokens"]
+                cum_total = self.stats["total_tokens"]
+            if usage_out is not None:
+                usage_out["prompt_tokens"] = usage_out.get("prompt_tokens", 0) + prompt_tok
+                usage_out["completion_tokens"] = usage_out.get("completion_tokens", 0) + comp_tok
+                usage_out["total_tokens"] = usage_out.get("total_tokens", 0) + total_tok
+                usage_out["cumulative_prompt_tokens"] = cum_prompt
+                usage_out["cumulative_completion_tokens"] = cum_comp
+                usage_out["cumulative_total_tokens"] = cum_total
             return content
 
         # 空回复：多半是思考把 token 吃光了
-        usage = payload.get("usage") or {}
         raise LLMError(
             f"空 content（finish={choice.get('finish_reason')}, "
             f"completion={usage.get('completion_tokens')}）", kind="empty")
 
-    def _send(self, url: str, headers: dict, body: dict, budget: float, proxy: Optional[str],
-              deadline: float) -> str:
+    def _send(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        budget: float,
+        proxy: Optional[str],
+        deadline: float,
+        *,
+        usage_out: Optional[dict[str, int]] = None,
+    ) -> str:
         """在一条线路上发一次；custom 端点 400 拒收关思考字段时，去掉字段用剩余预算原线路重发一次。
 
         只对 custom 生效：官方端点认这个字段（实测 356ms），它回 400 一定是别的原因，
         自动去掉会让后续请求全部开思考、慢一个数量级。
         """
         try:
-            return self._post_once(url, headers, json.dumps(body), budget, proxy)
+            return self._post_once(url, headers, json.dumps(body), budget, proxy, usage_out=usage_out)
         except LLMError as e:
             if not (self.profile == CUSTOM_PROFILE and e.kind == "http" and e.status == 400
                     and "chat_template_kwargs" in body):
@@ -323,7 +376,7 @@ class LLMClient:
             self._log(f"  [llm] custom 端点拒收 chat_template_kwargs（{e}），本进程之后不再发送该字段")
             if remaining < MIN_FALLBACK_BUDGET_S:
                 raise
-        return self._post_once(url, headers, json.dumps(body), remaining, proxy)
+        return self._post_once(url, headers, json.dumps(body), remaining, proxy, usage_out=usage_out)
 
     # ---- 单次调用 ----------------------------------------------------
     def chat(
@@ -332,11 +385,19 @@ class LLMClient:
         thinking: bool = False,
         max_tokens: int = 900,
         timeout: Optional[float] = None,
+        *,
+        usage_out: Optional[dict[str, int]] = None,
     ) -> str:
         missing = [self._env_names[k] for k in ("base", "key", "model") if not getattr(self, k)]
         if missing:
             raise LLMError(f"LLM_PROFILE={self.profile} 缺少 {', '.join(missing)}（见 .env.example）", kind="config")
         with self._lock:
+            if self.token_budget > 0 and self.stats["total_tokens"] >= self.token_budget:
+                self.stats["budget_exceeded"] += 1
+                raise LLMError(
+                    f"已达 token 预算上限（{self.stats['total_tokens']}/{self.token_budget}）",
+                    kind="budget_exceeded",
+                )
             if not self._endpoint_breaker.allow():
                 self.stats["short_circuited"] += 1
                 raise LLMError(f"模型端点熔断中，还剩 {self._endpoint_breaker.remaining():.0f}s", kind="circuit_open")
@@ -366,7 +427,7 @@ class LLMClient:
             if i > 0 and budget < MIN_FALLBACK_BUDGET_S:
                 break
             try:
-                content = self._send(url, headers, body, budget, proxy, deadline)
+                content = self._send(url, headers, body, budget, proxy, deadline, usage_out=usage_out)
             except LLMError as e:
                 error, failed_via = e, proxy
                 if proxy and e.route_fault:
@@ -412,12 +473,25 @@ class LLMClient:
         attempts: int = 2,
         thinking: bool = False,
         total_timeout: Optional[float] = None,
+        *,
+        usage_out: Optional[dict[str, int]] = None,
     ) -> tuple[Optional[dict], list[str], int]:
         """问模型要一个 JSON 对象，用 `check` 校验；不合法就把错误原文回喂重问。
 
         返回 (通过校验的对象或 None, 最后一次的错误列表, 实际调用次数)。
         仍不合法就返回 None，由上层走规则兜底——**绝不让非法输出进入执行器**。
+        若传入 `usage_out`，会把本次决策（含多次重问）消耗的 token 累加写入其中。
         """
+        if usage_out is not None:
+            with self._lock:
+                usage_out.update({
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cumulative_prompt_tokens": self.stats["prompt_tokens"],
+                    "cumulative_completion_tokens": self.stats["completion_tokens"],
+                    "cumulative_total_tokens": self.stats["total_tokens"],
+                })
         messages = [{"role": "system", "content": system}]
         errors: list[str] = []
         deadline = (time.monotonic() + total_timeout) if total_timeout is not None else None
@@ -439,11 +513,11 @@ class LLMClient:
             messages.append({"role": "user", "content": content})
 
             try:
-                text = self.chat(messages, thinking=thinking, timeout=call_timeout)
+                text = self.chat(messages, thinking=thinking, timeout=call_timeout, usage_out=usage_out)
             except LLMError as e:
                 errors = [f"调用失败: {e}"]
-                if e.kind == "circuit_open":
-                    used_attempts = attempt - 1  # 熔断中没有发出请求：不重试、不睡眠，立刻交还给规则兜底
+                if e.kind in ("circuit_open", "budget_exceeded"):
+                    used_attempts = attempt - 1  # 熔断/预算耗尽未发出请求：不重试、不睡眠，立刻交还给规则兜底
                     break
                 if attempt == attempts:
                     break  # 后面没有重试了，不必再等
