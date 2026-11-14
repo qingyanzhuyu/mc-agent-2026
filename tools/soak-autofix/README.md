@@ -18,12 +18,19 @@
 │ 1. claim 认领最高优 INC-*.json         │◀───┼─ 产出异常包 + progress_curve.jsonl     │
 │ 2. AI 修复（Codex/Claude/AGY 子代理）  │    │  若新 commit 诱发新 P0 bug → 自动 revert│
 │ 3. 四道机器闸门独立核验：               │    └───────────────────────────────────────┘
-│    - Gate 1: 文件白名单 + 密钥正则扫描 │
+│    - Gate 1: 文件白名单 + 密钥正则扫描 │       (支持 --goal 聚焦单目标晋级 + 实测遥测回写)
+│      (GOAL_MISS 自动收窄至目标专属文件) │
 │    - Gate 2: compileall + 120+ 单测   │
-│    - Gate 3: 30s 真机 focus 金丝雀     │
-│    - Gate 4: 提交至待审分支            │
+│    - Gate 3: 真机 focus/goal 金丝雀    │
+│    - Gate 4: 提交至待审分支 + 防退化回滚│
 └───────────────────────────────────────┘
 ```
+
+## 单目标晋级纪律与遥测隔离（配合 `mcagent.loop.goals`）
+
+- **单目标聚焦与止损（`--goal <id> --max-goal-attempts 4`）**：在 `init`、`runner-loop` 或 `run` 中指定 `--goal <goal_id>`，Runner 自动透传 `--goal` 仅激活该目标及其传递前置链；若目标未达成并产出 `GOAL_MISS:<goal_id>` 异常单，最多允许自动修复 `--max-goal-attempts`（默认 `4`）轮，超限自动升级 `escalated_human` 并在持续挂机模式下写入 `STOP` 止损退出，防止单目标死磕耗尽时间与额度。
+- **`GOAL_MISS` 动态收窄白名单（Gate 1）**：针对 `GOAL_MISS` 异常单，Gate 1 在冻结文件保护之上进一步将允许修改范围收窄至该目标声明的 `editable_files` 及 `code/tests/test_*.py`（越界触碰 `policy.py` 或其他无关技能直接打回）；Gate 3 金丝雀验收自动使用 `--mode campaign --goal <goal_id>` 冷启动跑通前置；Gate 4 若检测到新提交导致原有已达成前置全部丢失且最高分倒退，自动触发 `git revert`（`prereq_score_regression`）。
+- **环境隔离实测成本落盘（`goal_telemetry.<source>.json`）**：每轮非回滚挂机结束后按运行环境 `source` 隔离聚合成就达成率（`hit_rate`）、中位耗时（`p50_elapsed_s`）、中位 Token（`p50_tokens`）与死亡次数，落盘至 `<session-dir>/goal_telemetry.local-target.json`（遵循 `AGENTS.md §4`，绝不混同本地靶场与官方赛服数据），并在后续轮次通过 `--goal-telemetry` 回喂给规划器更新性价比排序。
 
 ## 两种使用方式
 
@@ -38,6 +45,17 @@ python3 tools/soak-autofix/soak_ctl.py run \
   --branch feat/soak-autofix \
   --episodes 5 \
   --episode-seconds 180 \
+  --llm \
+  --fixer-preset codex
+
+# 单候选目标晋级聚焦模式（例如专项打通 smelt_iron，最多自动尝试 4 轮后止损）
+python3 tools/soak-autofix/soak_ctl.py run \
+  --session-dir code/mcagent/logs/soak-iron-01 \
+  --branch feat/soak-autofix \
+  --goal smelt_iron \
+  --max-goal-attempts 4 \
+  --episodes 5 \
+  --episode-seconds 240 \
   --llm \
   --fixer-preset codex
 
