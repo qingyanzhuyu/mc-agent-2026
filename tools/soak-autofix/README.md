@@ -81,6 +81,20 @@ python3 tools/soak-autofix/soak_ctl.py set-goal \
   --merge-ref feat/goal-staging \
   --goal obtain_armor
 
+# 技能文件名以 goals.py 的 skill / editable_files 为准（铁器线在 skills/iron.py + tests/test_iron.py，
+# 钻石 diamond.py、生存 survival.py、战斗 combat.py、黑曜石/下界门 nether.py），否则 Fixer 白名单改不到。
+
+# 热改每轮时长/步数（每轮都是新角色空包从头跑前置链，越往后的目标需要越长的轮；下一轮起生效）
+# 合法区间：60–3600 秒、10–600 步；越界直接拒绝。可与 --merge-ref / --goal 同时使用
+python3 tools/soak-autofix/soak_ctl.py set-goal \
+  --session-dir code/mcagent/logs/soak-cont \
+  --episode-seconds 420 --episode-steps 80
+
+# 清除热覆盖，回到 run 启动时的 --episode-seconds / --episode-steps
+python3 tools/soak-autofix/soak_ctl.py set-goal \
+  --session-dir code/mcagent/logs/soak-cont \
+  --clear-episode-budget
+
 # 或切回常规全量已毕业目标挂机（不聚焦单一目标）
 python3 tools/soak-autofix/soak_ctl.py set-goal \
   --session-dir code/mcagent/logs/soak-cont \

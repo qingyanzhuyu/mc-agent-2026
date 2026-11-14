@@ -76,6 +76,46 @@ QUOTA_INPUT_TOKENS = 8_000_000
 QUOTA_OUTPUT_TOKENS = 1_500_000
 MATCH_DURATION_S = 8 * 3600
 
+# set-goal 热改每轮时长/步数的合法区间（越界直接拒绝，不写入 state.json）
+EPISODE_SECONDS_BOUNDS: tuple[float, float] = (60.0, 3600.0)
+EPISODE_STEPS_BOUNDS: tuple[int, int] = (10, 600)
+
+
+def validate_episode_budget(seconds: Optional[float], steps: Optional[int]) -> str:
+    """校验热覆盖的每轮时长/步数；返回空串表示合法，否则返回中文原因。None 表示不改该项。"""
+    errs: list[str] = []
+    if seconds is not None:
+        lo, hi = EPISODE_SECONDS_BOUNDS
+        try:
+            s_val = float(seconds)
+        except (TypeError, ValueError):
+            s_val = float("nan")
+        if not (math.isfinite(s_val) and lo <= s_val <= hi):
+            errs.append(f"episode_seconds={seconds!r} 超出允许区间 [{lo:g}, {hi:g}]")
+    if steps is not None:
+        lo_n, hi_n = EPISODE_STEPS_BOUNDS
+        if isinstance(steps, bool) or not isinstance(steps, int) or not (lo_n <= steps <= hi_n):
+            errs.append(f"episode_steps={steps!r} 超出允许区间 [{lo_n}, {hi_n}]")
+    return "；".join(errs)
+
+
+def effective_episode_budget(
+    st: dict[str, Any], default_seconds: float, default_steps: int
+) -> tuple[float, int]:
+    """取本轮生效的时长/步数：state.json 里有合法热覆盖就用覆盖值，否则沿用启动参数。"""
+    o_sec = st.get("episode_seconds")
+    o_steps = st.get("episode_steps")
+    if validate_episode_budget(o_sec, o_steps):
+        print(
+            f"[runner] state.json 中的热覆盖轮长非法（episode_seconds={o_sec!r}, episode_steps={o_steps!r}），"
+            "本轮沿用启动参数。"
+        )
+        return float(default_seconds), int(default_steps)
+    return (
+        float(o_sec) if o_sec is not None else float(default_seconds),
+        int(o_steps) if o_steps is not None else int(default_steps),
+    )
+
 
 def _nonneg_float(val: Any) -> float:
     try:
@@ -1049,6 +1089,7 @@ def run_runner_loop(
         st = read_state(session_dir)
         active_goal = (st.get("target_goal") or "").strip()
         active_model = (st.get("player_model") or "").strip()
+        ep_seconds, ep_steps = effective_episode_budget(st, episode_seconds, episode_steps)
         if episodes <= 0 and active_goal:
             goal_inc = st.get("incidents", {}).get(f"GOAL_MISS:{active_goal}", {})
             if goal_inc.get("status") == "escalated_human":
@@ -1083,8 +1124,8 @@ def run_runner_loop(
             "--user", bot_user,
             "--world-snapshot", f"{ep_id}-{tip_sha[:7]}",
             "--run-dir", str(ep_dir),
-            "--max-steps", str(episode_steps),
-            "--max-seconds", str(episode_seconds),
+            "--max-steps", str(ep_steps),
+            "--max-seconds", str(ep_seconds),
             "--disconnect-on-exit",
         ]
         if active_goal:
@@ -1100,7 +1141,7 @@ def run_runner_loop(
         print(
             f"[runner] 启动 {ep_id} @ {tip_sha[:7]} "
             f"(bot={bot_user}, model={active_model if use_llm and active_model else ('env' if use_llm else 'rule')}, "
-            f"goal={active_goal or 'all'}, max={episode_seconds}s)..."
+            f"goal={active_goal or 'all'}, max={ep_seconds:g}s/{ep_steps} 步)..."
         )
         subprocess.run(
             cmd,
@@ -1189,9 +1230,25 @@ def inject_and_set_goal(
     target_goal: Optional[str] = None,
     max_goal_attempts: Optional[int] = None,
     player_model: Optional[str] = None,
+    episode_seconds: Optional[float] = None,
+    episode_steps: Optional[int] = None,
+    clear_episode_budget: bool = False,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
-    """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。"""
+    """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。
+
+    `episode_seconds` / `episode_steps` 写进 state.json，Runner 下一轮起生效；
+    `clear_episode_budget=True` 清掉热覆盖，回到 `run` 启动参数。越界时在合入前直接拒绝。
+    """
+    budget_err = validate_episode_budget(episode_seconds, episode_steps)
+    if budget_err:
+        return {"ok": False, "failed_step": "invalid_episode_budget", "detail": budget_err}
+    if clear_episode_budget and (episode_seconds is not None or episode_steps is not None):
+        return {
+            "ok": False,
+            "failed_step": "invalid_episode_budget",
+            "detail": "--clear-episode-budget 不能与 --episode-seconds / --episode-steps 同时使用",
+        }
     with locked_fixer_wt(session_dir):
         st_snap = read_state(session_dir)
         claimed_fps = [
@@ -1275,6 +1332,13 @@ def inject_and_set_goal(
                 st["max_goal_attempts"] = int(max_goal_attempts)
             if player_model is not None:
                 st["player_model"] = player_model.strip()
+            if clear_episode_budget:
+                st.pop("episode_seconds", None)
+                st.pop("episode_steps", None)
+            if episode_seconds is not None:
+                st["episode_seconds"] = float(episode_seconds)
+            if episode_steps is not None:
+                st["episode_steps"] = int(episode_steps)
             if merged_sha:
                 st["commits"].append({
                     "sha": merged_sha,
@@ -1290,12 +1354,17 @@ def inject_and_set_goal(
             (session_dir / "STOP").unlink(missing_ok=True)
             final_goal = st.get("target_goal", "")
             final_tip = st["current_tip"]
+            final_budget = {
+                "episode_seconds": st.get("episode_seconds"),
+                "episode_steps": st.get("episode_steps"),
+            }
 
         write_review_report(session_dir)
         return {
             "ok": True,
             "target_branch": branch,
             "target_goal": final_goal,
+            "episode_budget_override": final_budget,
             "previous_tip": prev_tip,
             "current_tip": final_tip,
             "merged_files": merged_files,
@@ -1325,6 +1394,15 @@ def write_review_report(session_dir: Path) -> Path:
         lines.append(
             f"- **本轮聚焦晋级目标**：`{st['target_goal']}`（最大自动尝试上限 `{st.get('max_goal_attempts', 4)}` 轮）"
         )
+    o_sec, o_steps = st.get("episode_seconds"), st.get("episode_steps")
+    if o_sec is not None or o_steps is not None:
+        bad = validate_episode_budget(o_sec, o_steps)
+        if bad:
+            lines.append(f"- **每轮时长/步数热覆盖**：⚠️ 非法（{bad}），Runner 沿用启动参数")
+        else:
+            sec_txt = f"{float(o_sec):g}s" if o_sec is not None else "沿用启动参数"
+            steps_txt = f"{int(o_steps)} 步" if o_steps is not None else "沿用启动参数"
+            lines.append(f"- **每轮时长/步数热覆盖**：`{sec_txt}` / `{steps_txt}`（下一轮起生效）")
 
     lines.extend([
         "",
@@ -1560,6 +1638,23 @@ def build_parser() -> argparse.ArgumentParser:
     g_grp.add_argument("--clear-goal", action="store_true", help="清空单目标聚焦，切回常规全量已毕业目标挂机")
     p_set.add_argument("--max-goal-attempts", type=int, default=None, help="可选更新单目标最大自动尝试轮数")
     p_set.add_argument("--player-model", default=None, help="可选热切换下一轮起工位 A 玩家模型名")
+    p_set.add_argument(
+        "--clear-episode-budget",
+        action="store_true",
+        help="清除每轮时长/步数热覆盖，回到 run 启动参数",
+    )
+    p_set.add_argument(
+        "--episode-seconds",
+        type=float,
+        default=None,
+        help=f"可选热改下一轮起每轮最长秒数（{EPISODE_SECONDS_BOUNDS[0]:g}–{EPISODE_SECONDS_BOUNDS[1]:g}）",
+    )
+    p_set.add_argument(
+        "--episode-steps",
+        type=int,
+        default=None,
+        help=f"可选热改下一轮起每轮最大步数（{EPISODE_STEPS_BOUNDS[0]}–{EPISODE_STEPS_BOUNDS[1]}）",
+    )
     p_set.add_argument("--skip-offline-gate", action="store_true", help="仅测试夹具用：跳过合入后的离线编译与单测")
 
     p_st = sub.add_parser("status", help="查看当前待修队列与待审分支进度")
@@ -1703,6 +1798,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_goal=tgt_goal,
             max_goal_attempts=args.max_goal_attempts,
             player_model=args.player_model,
+            episode_seconds=args.episode_seconds,
+            episode_steps=args.episode_steps,
+            clear_episode_budget=args.clear_episode_budget,
             skip_offline_gate=args.skip_offline_gate,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1715,6 +1813,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             "target_branch": st["target_branch"],
             "target_goal": st.get("target_goal", ""),
             "player_model": st.get("player_model", ""),
+            "episode_budget_override": {
+                "episode_seconds": st.get("episode_seconds"),
+                "episode_steps": st.get("episode_steps"),
+            },
             "base_commit": st["base_commit"][:7],
             "current_tip": st["current_tip"][:7],
             "episodes": len(st["episodes"]),
