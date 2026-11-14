@@ -184,7 +184,7 @@ class SoakObserver:
             "pre_blocking": bool(st.get("blocking", False)),
             "steps": 0,
         }
-        stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "bug": 0})
+        stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "budget_stopped": 0, "bug": 0})
         stat["started"] += 1
         self._append_jsonl(self.timeline_path, {
             "event": "skill_start",
@@ -305,7 +305,7 @@ class SoakObserver:
         tape_slice = self.tape.end_skill_slice() if self.tape is not None else []
         ctx = self._skill_ctx or {"skill": skill.name, "args": dict(skill.args), "before_counts": {}}
         ctx["outcome"] = outcome
-        stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "bug": 0})
+        stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "budget_stopped": 0, "bug": 0})
 
         post_err = ""
         if outcome == "completed":
@@ -329,6 +329,11 @@ class SoakObserver:
                 )
             else:
                 stat["ok"] += 1
+                # 经后置判据确认的成功打断该目标的连续失败，其他目标的历史保持不变。
+                self._goal_failures.pop(skill.goal, None)
+        elif outcome == "budget_stopped":
+            # 外层运行预算只说明未继续执行，不能判定技能失败；保留流水与姿态核对。
+            stat["budget_stopped"] += 1
         else:
             stat["replan"] += 1
             self._classify_skill_failure(skill, outcome, error_code, error_msg, state, ctx, tape_slice)
@@ -645,9 +650,9 @@ class SoakObserver:
         for s in strats:
             lines.append(f"- **[{s['severity']}] `{s['id']}` `{s['code']}`**（×{s['count']}）：{s['title']} → `{Path(s['path']).name}`")
 
-        lines += ["", "## 三、各技能执行统计", "", "| 技能 | 启动 | 完成 | Replan | Bug |", "|---|---:|---:|---:|---:|"]
+        lines += ["", "## 三、各技能执行统计", "", "| 技能 | 启动 | 完成 | Replan | 预算中止 | Bug |", "|---|---:|---:|---:|---:|---:|"]
         for sname, st in sorted(self.skill_stats.items()):
-            lines.append(f"| `{sname}` | {st['started']} | {st['ok']} | {st['replan']} | {st['bug']} |")
+            lines.append(f"| `{sname}` | {st['started']} | {st['ok']} | {st['replan']} | {st['budget_stopped']} | {st['bug']} |")
 
         if self.env_variance_counts:
             lines += ["", "## 四、已知环境波动计数（仅统计，不入缺陷榜）"]
