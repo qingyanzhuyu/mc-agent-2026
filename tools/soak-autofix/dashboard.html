@@ -50,6 +50,7 @@ label.f.inline { display: flex; align-items: center; gap: 6px; color: var(--text
 input, select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
   border-radius: 7px; padding: 6px 8px; width: 100%; min-width: 0; }
 input[type=checkbox] { width: auto; }
+input:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
 input[type=range] { padding: 0; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .grid2 .wide { grid-column: 1 / -1; }
@@ -132,6 +133,11 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
     <section>
       <h2>启动参数 <small>一键启动 / 重启时使用</small></h2>
       <div class="grid2">
+        <label class="f wide">工位 A 进哪个服务器<select id="sServer"></select></label>
+        <div class="wide hidden" id="officialBox">
+          <div class="banner warn" id="officialWarn" style="margin:0 0 6px"></div>
+          <label class="f inline"><input type="checkbox" id="sAck">已在 docs/05 账号表占位比赛账号（每次启动都要勾）</label>
+        </div>
         <label class="f wide">挂机分支<input id="sBranch"></label>
         <label class="f">轮数（0 = 一直跑）<input type="number" id="sEpisodes" min="0"></label>
         <label class="f">每轮秒数<input type="number" id="sSec" step="10"></label>
@@ -299,6 +305,20 @@ function fillForms(s) {
   $("sModel").value = d.player_model; $("sAttempts").value = d.max_goal_attempts;
   $("sLlm").checked = !!d.llm; $("sSkipCanary").checked = !!d.skip_live_canary;
   $("sBot").value = d.bot_user; $("sRotate").checked = !!d.rotate_user;
+  $("sServer").innerHTML = s.servers.map((x) => `<option value="${esc(x.key)}">${esc(x.label)}</option>`).join("");
+  $("sServer").value = d.server; $("sAck").checked = false;
+  syncServerForm();
+}
+
+function syncServerForm() {
+  const official = $("sServer").value === "official";
+  $("officialBox").classList.toggle("hidden", !official);
+  for (const id of ["sBot", "sRotate", "sModel"]) $(id).disabled = official;
+  if (!official || !snap) return;
+  const checks = $("sLlm").checked ? snap.official_checks.with_llm : snap.official_checks.rules_only;
+  const base = "比赛服只能用 .env 里的队伍正式账号（角色名、轮换不生效），模型固定官方模型（玩家模型不生效）；修单验证仍在自建测试服。";
+  $("officialWarn").textContent = checks.length ? `${base} 还不能启动：${checks.join("；")}` : base;
+  $("officialWarn").className = `banner ${checks.length ? "bad" : "warn"}`;
 }
 
 function startParams() {
@@ -309,6 +329,7 @@ function startParams() {
     llm: $("sLlm").checked, player_model: $("sModel").value.trim(),
     fixer_preset: $("sFixer").value, skip_live_canary: $("sSkipCanary").checked,
     bot_user: $("sBot").value.trim(), rotate_user: $("sRotate").checked,
+    server: $("sServer").value, account_reserved: $("sAck").checked,
   };
 }
 
@@ -319,8 +340,9 @@ function renderHeader(s) {
   pill.className = `pill ${cls}`; pill.textContent = txt;
   const st = s.state;
   const pids = s.processes.map((p) => `${p.role}:${p.pid}`).join(" ");
+  const srv = st.server_target === "official" ? "比赛服" : "自建测试服";
   $("headMeta").textContent = s.session_exists
-    ? `${st.target_branch} @ ${st.current_tip}（基线 ${st.base_commit}，自动修复 ${st.commits} 个）${pids ? " · " + pids : ""}`
+    ? `[${srv}] ${st.target_branch} @ ${st.current_tip}（基线 ${st.base_commit}，自动修复 ${st.commits} 个）${pids ? " · " + pids : ""}`
     : `会话 ${s.session_dir} 尚未初始化`;
   $("btnStart").disabled = s.daemon !== "stopped";
   $("btnStop").disabled = s.daemon !== "running";
@@ -346,7 +368,8 @@ function renderSettingsNote(s) {
     ? `热覆盖：${st.episode_seconds != null ? fmtS(st.episode_seconds) : "沿用启动参数"} / ${st.episode_steps != null ? st.episode_steps + " 步" : "沿用启动参数"}`
     : "未设热覆盖，沿用启动参数";
   const cur = live && !live.finished ? `；正在跑的 ${live.ep_id} 上限 ${fmtS(live.max_seconds)} / ${live.max_steps} 步` : "";
-  $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${st.player_model || "沿用 .env"}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${cur}`;
+  const pm = st.server_target === "official" ? "官方模型（比赛服固定）" : (st.player_model || "沿用 .env");
+  $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${cur}`;
 }
 
 function setBar(id, cur, max) {
@@ -365,7 +388,7 @@ function renderLive(s) {
     : !L.finished ? "守护已停，本轮未写完"
     : interrupted ? `已中断（${L.stop_reason}），未入账，下次启动会复用这个轮次号`
     : s.daemon === "stopped" ? `已结束（${L.stop_reason}），守护已停，未入账` : `已结束（${L.stop_reason}），等待入账`;
-  $("liveSub").textContent = `${L.ep_id} · ${L.bot_user || "-"} · ${L.model || "-"} · @${L.commit || "-"} · 目标 ${L.target_goal || "全部"} · ${state}`;
+  $("liveSub").textContent = `${L.ep_id} · ${!L.base ? "-" : /windywindie|nmo\.net\.cn/.test(L.base) ? "比赛服" : "自建测试服"} · ${L.bot_user || "-"} · ${L.model || "-"} · @${L.commit || "-"} · 目标 ${L.target_goal || "全部"} · ${state}`;
   $("tLabel").textContent = `${fmtS(L.elapsed_s)} / ${fmtS(L.max_seconds)}`;
   $("sLabel").textContent = `${L.steps} / ${L.max_steps ?? "-"}`;
   setBar("tBar", L.elapsed_s, L.max_seconds); setBar("sBar", L.steps, L.max_steps);
@@ -447,6 +470,8 @@ async function refreshLog() {
 }
 
 // ---- 交互 ----
+$("sServer").addEventListener("change", syncServerForm);
+$("sLlm").addEventListener("change", syncServerForm);
 $("secRange").addEventListener("input", (e) => { $("secIn").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
 $("secIn").addEventListener("input", (e) => { $("secRange").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
 
