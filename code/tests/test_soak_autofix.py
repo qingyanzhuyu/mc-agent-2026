@@ -963,6 +963,28 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertEqual(seen_models, ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Pro-0813"])
         report_txt = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
         self.assertIn("`DeepSeek-V4-Pro-0813`", report_txt)
+
+        # 验证主干新增提交后重新 init 同一会话，已有待审分支与双 worktree 自动同步最新主干，且回收孤儿 claimed 单
+        (self.repo / "code" / "mcagent" / "loop" / "hotfix.py").write_text("FIXED = True\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-m", "fix: main hotfix after session created")
+        new_main_sha = _git(self.repo, "rev-parse", "HEAD")
+
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["incidents"]["orphan_fp"] = {
+                "fingerprint": "orphan_fp",
+                "incident_id": "INC-ORPHAN",
+                "code": "LLM_INVALID_OR_TIMEOUT",
+                "severity": "P3",
+                "category": "strategy",
+                "status": "claimed",
+                "attempts": 0,
+            }
+
+        st_reinit = soak_ctl.init_session(self.repo, self.session, target_branch="feat/ds-player")
+        self.assertEqual(st_reinit["current_tip"], new_main_sha)
+        self.assertTrue((Path(st_reinit["runner_wt"]) / "code" / "mcagent" / "loop" / "hotfix.py").exists())
+        self.assertEqual(st_reinit["incidents"]["orphan_fp"]["status"], "pending")
         soak_ctl.teardown_session(self.session)
 
 

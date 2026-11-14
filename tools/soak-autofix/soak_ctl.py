@@ -314,6 +314,23 @@ def init_session(
         wt_root.mkdir(parents=True, exist_ok=True)
         _git(repo_root, "worktree", "add", "--detach", str(runner_wt), tip_sha)
 
+    # 若主干（base_ref）已有新提交未进入已有待审分支，自动在 fixer_wt 同步跟进并清理上次 Ctrl+C 遗留脏状态
+    with locked_fixer_wt(session_dir):
+        _clean_fixer_worktree(fixer_wt)
+        _git(fixer_wt, "checkout", branch)
+        if tip_sha != base_sha and _git(repo_root, "merge-base", "--is-ancestor", base_sha, tip_sha, check=False).returncode != 0:
+            mproc = _git(fixer_wt, "merge", "--no-edit", base_sha, check=False)
+            if mproc.returncode != 0:
+                _git(fixer_wt, "merge", "--abort", check=False)
+                _clean_fixer_worktree(fixer_wt)
+                print(
+                    f"[init] 警告: 待审分支 {branch} 自动同步 {base_sha[:7]} 存在冲突，保留原尖端 {tip_sha[:7]}",
+                    file=sys.stderr,
+                )
+            else:
+                tip_sha = _branch_tip(repo_root, branch)
+        _git(runner_wt, "checkout", "--detach", tip_sha)
+
     _wire_worktree_env(repo_root, fixer_wt)
     _wire_worktree_env(repo_root, runner_wt)
 
@@ -340,6 +357,10 @@ def init_session(
             })
         else:
             st["current_tip"] = tip_sha
+            # 回收上次进程 Ctrl+C 中断留下的孤儿 claimed 状态
+            for rec in st.get("incidents", {}).values():
+                if rec.get("status") == "claimed":
+                    rec["status"] = "pending"
             if norm_goal:
                 st["target_goal"] = norm_goal
             else:
