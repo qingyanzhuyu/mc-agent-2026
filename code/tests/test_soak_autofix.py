@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -881,6 +882,54 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertEqual(seen_goals, ["smelt_iron", "craft_shield", None])
 
         soak_ctl.teardown_session(self.session)
+
+    def test_fixer_presets_codex_61sol_xhigh_and_agy_hydrogen_high(self):
+        codex_tmpl = soak_ctl.FIXER_PRESETS["codex"]
+        self.assertIn("-m gpt-6.1-sol", codex_tmpl)
+        self.assertIn('model_reasoning_effort="xhigh"', codex_tmpl)
+
+        agy_tmpl = soak_ctl.FIXER_PRESETS["agy"]
+        self.assertIn("agy", agy_tmpl)
+        self.assertIn("--model gemini-4-hydrogen-high", agy_tmpl)
+        self.assertIn("--effort high", agy_tmpl)
+        self.assertIn('-p="$(cat {prompt_file})"', agy_tmpl)
+
+        # 验证 run --fixer-preset agy 正确透传预设与 --fixer-timeout，且 $(cat ...) 不被 bash 展开 $ 符号
+        spawned: list[list[str]] = []
+
+        class DummyProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        self.session.mkdir(parents=True, exist_ok=True)
+        with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+             patch.object(soak_ctl, "init_session", return_value={}), \
+             patch.object(soak_ctl, "write_review_report", return_value=self.session / "REVIEW_REPORT.md"), \
+             patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda c, **kw: (spawned.append(list(c)), DummyProc())[1]):
+            rc = soak_ctl.main([
+                "run",
+                "--session-dir", str(self.session),
+                "--branch", "feat/agy-preset",
+                "--fixer-preset", "agy",
+                "--fixer-timeout", "720",
+                "--episodes", "1",
+            ])
+        self.assertEqual(rc, 0)
+        fixer_argv = [c for c in spawned if "fixer-loop" in c][0]
+        self.assertIn("--fixer-cmd", fixer_argv)
+        self.assertEqual(fixer_argv[fixer_argv.index("--fixer-cmd") + 1], agy_tmpl)
+        self.assertIn("--fixer-timeout", fixer_argv)
+        self.assertEqual(fixer_argv[fixer_argv.index("--fixer-timeout") + 1], "720")
+
+        # 验证 $(cat {prompt_file}) 对含 $VAR 与反引号的工单文本零意外 shell 展开
+        prompt_p = self.root / "prompt_with_special.md"
+        prompt_p.write_text("line1 $HOME `uname`\nline2 /api/v1/act\n", encoding="utf-8")
+        rendered = 'printf "%s" "$(cat ' + shlex.quote(str(prompt_p)) + ')"'
+        out = subprocess.run(["bash", "-lc", rendered], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "line1 $HOME `uname`\nline2 /api/v1/act")
 
 
 if __name__ == "__main__":

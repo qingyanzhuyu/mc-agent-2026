@@ -34,12 +34,17 @@
 
 ## 两种使用方式
 
-### 方式一：一键双进程全自动挂机（外接本机 `codex` 或 `claude` CLI）
+### 方式一：一键双进程全自动挂机（外接本机 `codex` / `agy` / `claude` CLI）
+
+内置 `--fixer-preset` 修单入口：
+- `codex`（默认）：`gpt-6.1-sol` + `model_reasoning_effort="xhigh"`
+- `agy`：Antigravity CLI（`gemini-4-hydrogen-high` + `--effort high`）
+- `claude`：Claude Code CLI
 
 确保本地联调网关 `tools/local-api-bridge` 已启动后执行：
 
 ```bash
-# 启动 5 轮连续挂机（默认已启用 --llm 让模型操纵角色；若跑纯规则基线可传 --no-llm）+ Codex 自动修单
+# 启动 5 轮连续挂机 + Codex (gpt-6.1-sol xhigh) 自动修单（默认预设即 codex）
 python3 tools/soak-autofix/soak_ctl.py run \
   --session-dir code/mcagent/logs/soak-night-01 \
   --branch feat/soak-autofix \
@@ -47,6 +52,15 @@ python3 tools/soak-autofix/soak_ctl.py run \
   --episode-seconds 180 \
   --llm \
   --fixer-preset codex
+
+# 或切换为 Antigravity CLI (gemini-4-hydrogen-high) 自动修单入口
+python3 tools/soak-autofix/soak_ctl.py run \
+  --session-dir code/mcagent/logs/soak-night-agy \
+  --branch feat/soak-autofix \
+  --episodes 5 \
+  --episode-seconds 180 \
+  --llm \
+  --fixer-preset agy
 
 # 单候选目标晋级聚焦模式（--episodes 0 持续不间断挂机；可在挂机期间随时用 set-goal 热注入下一个目标）
 python3 tools/soak-autofix/soak_ctl.py run \
