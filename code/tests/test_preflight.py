@@ -78,6 +78,11 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(c.ok)
         self.assertEqual(c.level, pf.BLOCK)
 
+    def test_train_on_official_flag_blocks_match(self):
+        env = dict(MATCH, MCAGENT_TRAIN_ON_OFFICIAL="1")
+        self.assertIn("没开「比赛服训练」开关", failed_names(run(env)))
+        self.assertNotIn("没开「比赛服训练」开关", failed_names(run(dict(MATCH, MCAGENT_TRAIN_ON_OFFICIAL="0"))))
+
     def test_explicit_official_profile_passes(self):
         env = dict(MATCH, LLM_PROFILE="Official")
         self.assertNotIn("LLM_PROFILE 是 official", failed_names(run(env)))

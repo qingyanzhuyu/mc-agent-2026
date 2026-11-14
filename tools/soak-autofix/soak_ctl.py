@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import fcntl
 import fnmatch
+import getpass
 import json
 import math
 import os
@@ -61,13 +62,174 @@ SECRET_SCAN_RE = re.compile(
     r"(sk-[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._\-]{16,}|MC_PASS\s*=\s*\S+|LLM_API_KEY\s*=\s*\S+)"
 )
 
-FIXER_PRESETS: dict[str, str] = {
-    "codex": 'codex exec -C {fixer_wt} -s workspace-write -m gpt-6.1-sol -c \'model_reasoning_effort="xhigh"\' - < {prompt_file}',
-    "agy": 'cd {fixer_wt} && agy --model gemini-4-hydrogen-high --effort high --mode accept-edits --sandbox --dangerously-skip-permissions --disable-slash-commands -p="$(cat {prompt_file})"',
-    "claude": 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}',
+# 工位 B 修单模型目录（2026-11-14 本机实测：`agy models` 与 ~/.codex/models_cache.json）
+# - codex：gpt-6.1-sol / gpt-6-astra 都支持 low/medium/high/xhigh/max（另有 ultra 会自动派子代理，无人值守修单不收）
+# - agy：hydrogen 有 low/medium/high/xhigh 四档，carbon 有 low/medium/high 三档；档位写在模型名里，--effort 同步传
+_CODEX_FIXER_TMPL = (
+    "codex exec -C {{fixer_wt}} -s workspace-write -m {model} "
+    "-c 'model_reasoning_effort=\"{effort}\"' - < {{prompt_file}}"
+)
+_AGY_FIXER_TMPL = (
+    "cd {{fixer_wt}} && agy --model {model}-{effort} --effort {effort} --mode accept-edits --sandbox "
+    "--dangerously-skip-permissions --disable-slash-commands -p=\"$(cat {{prompt_file}})\""
+)
+CODEX_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "gpt-6.1-sol": ("GPT-6.1-Sol", "codex", ("low", "medium", "high", "xhigh", "max")),
+    "gpt-6-astra": ("GPT-6-Astra", "codex", ("low", "medium", "high", "xhigh", "max")),
+}
+AGY_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "gemini-4-hydrogen": ("Gemini 4 Hydrogen", "agy", ("low", "medium", "high", "xhigh")),
+    "gemini-4-carbon": ("Gemini 4 Carbon", "agy", ("low", "medium", "high")),
 }
 
+
+def _build_fixer_catalog() -> tuple[dict[str, str], dict[str, str]]:
+    presets: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    for model, (title, cli, efforts) in CODEX_FIXER_MODELS.items():
+        for eff in efforts:
+            key = f"codex:{model}:{eff}"
+            presets[key] = _CODEX_FIXER_TMPL.format(model=model, effort=eff)
+            labels[key] = f"Codex · {title} · {eff}"
+    for model, (title, cli, efforts) in AGY_FIXER_MODELS.items():
+        for eff in efforts:
+            key = f"agy:{model}-{eff}"
+            presets[key] = _AGY_FIXER_TMPL.format(model=model, effort=eff)
+            labels[key] = f"agy · {title} · {eff}"
+    # 兼容旧名字：codex = 6.1-sol xhigh，agy = hydrogen high
+    presets["codex"] = presets["codex:gpt-6.1-sol:xhigh"]
+    labels["codex"] = "codex（= Codex · GPT-6.1-Sol · xhigh）"
+    presets["agy"] = presets["agy:gemini-4-hydrogen-high"]
+    labels["agy"] = "agy（= agy · Gemini 4 Hydrogen · high）"
+    presets["claude"] = 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}'
+    labels["claude"] = "Claude Code（claude -p，本机默认模型）"
+    return presets, labels
+
+
+FIXER_PRESETS, FIXER_PRESET_LABELS = _build_fixer_catalog()
+
+
+def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: str) -> tuple[str, str]:
+    """每接一单前取工位 B 的修单命令：state.json 里有合法的热切换 fixer_preset 就用它，否则用启动参数。"""
+    try:
+        st = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        st = {}
+    name = str(st.get("fixer_preset") or "").strip()
+    if name and name in FIXER_PRESETS:
+        return name, FIXER_PRESETS[name]
+    return default_name, default_tmpl
+
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
+
+# 统一配置：一份 .env 同时装比赛服与自建测试服两套端点，每次启动选工位 A 进哪个（挂机中不切）。
+# - official（默认，日常训练）：比赛服官方端点 + .env 里的队伍正式账号 MC_USER/MC_PASS（不能改名、不能轮换，
+#   全队独占，启动前须在 docs/05 账号表占位，AGENTS.md §3）。模型来源二选一：
+#     custom   = 赛前训练用自备 key（LLM_CUSTOM_*，如并行云 DeepSeek-V4.1-Flash），子进程带
+#                MCAGENT_TRAIN_ON_OFFICIAL=1 才被 mcagent.loop 放行；比赛当天 preflight 会 BLOCK 这一套；
+#     official = AIA 官方代理（LLM_KEY），与比赛当天完全一致。
+# - local（备选）：本机联调网关 MC_LOCAL_API_BASE（默认 127.0.0.1:8787 → 队内测试服），角色名随意，模型用 custom。
+# 工位 B 的金丝雀验修始终在自建测试服跑，不占比赛账号。
+OFFICIAL_MC_BASE = "https://mc-api.windywindie.top/api/v1"
+DEFAULT_LOCAL_MC_BASE = "http://127.0.0.1:8787/api/v1"
+SERVER_TARGETS: dict[str, str] = {
+    "official": "比赛服（官方端点 mc-api.windywindie.top，用队伍正式账号）",
+    "local": "自建测试服（本机联调网关 → 队内测试服）",
+}
+OFFICIAL_LLM_SOURCES: dict[str, str] = {
+    "custom": "赛前训练：自备 key（LLM_CUSTOM_*，如并行云 DeepSeek-V4.1-Flash）",
+    "official": "比赛同款：AIA 官方代理（LLM_KEY）",
+}
+# 前端下拉用的已知玩家模型（并行云 custom 通道实测过；也可以手填别的名字）
+PLAYER_MODEL_CHOICES: dict[str, str] = {
+    "DeepSeek-V4.1-Flash": "默认；关思考后单拍约 1.5–2.5s",
+    "Qwen3.6-Flash": "Qwen 快速档",
+    "DeepSeek-V4-Pro-0813": "完整菜单下常超 12s 主循环超时，慎用",
+}
+
+# 工位 A 进服角色名：默认每轮同名（服务器上只有一个挂机角色，轮次号只体现在记录里）；
+# 同名意味着上一轮的背包、位置、进度会带进下一轮，要每轮空包冷启动就加 --rotate-user（<名字>001、002…）
+# 默认名按本机系统用户名派生（<用户名前 8 位>_soak），避免队友在同一个共享测试世界里同名互踢
+#（网关对同名重复登录会踢掉旧 token）
+BOT_USER_RE = re.compile(r"^[A-Za-z0-9_]{3,13}$")  # 轮换时末尾补 3 位轮次号，总长不超 MC 的 16 字符
+
+
+def _local_user_stem() -> str:
+    try:
+        raw = getpass.getuser()
+    except Exception:
+        raw = ""
+    return re.sub(r"[^A-Za-z0-9_]", "", raw or "")[:8]
+
+
+def default_bot_user() -> str:
+    stem = _local_user_stem()
+    return f"{stem}_soak" if stem else "agy_soak_bot"
+
+
+def default_fixer_user() -> str:
+    """工位 B 金丝雀验修角色：同样按本机用户名区分，避免两名队友同时修单时在共享测试世界互踢。"""
+    stem = _local_user_stem()
+    return f"{stem}_fixer" if stem else "agy_soak_fixer"
+
+
+DEFAULT_BOT_USER = default_bot_user()
+DEFAULT_FIXER_USER = default_fixer_user()
+
+
+def _read_dotenv_keys(repo_root: Path) -> dict[str, str]:
+    """只为判断「填没填」读取 code/mcagent/.env；进程环境变量优先（与 mcagent.client.Config.load 一致）。"""
+    vals: dict[str, str] = {}
+    env_path = repo_root / "code" / "mcagent" / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for k in ("MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE"):
+        if os.environ.get(k):
+            vals[k] = os.environ[k]
+    return vals
+
+
+def local_mc_base(repo_root: Path) -> str:
+    """自建测试服网关地址：MC_LOCAL_API_BASE，未设时用 127.0.0.1:8787。"""
+    return _read_dotenv_keys(repo_root).get("MC_LOCAL_API_BASE") or DEFAULT_LOCAL_MC_BASE
+
+
+def check_server_target(
+    repo_root: Path, server: str, *, use_llm: bool, account_reserved: bool, official_llm: str = "custom"
+) -> list[str]:
+    """启动前核对目标服务器的前置条件，返回中文问题清单（空表示可以启动）。不输出任何密钥值。"""
+    if server not in SERVER_TARGETS:
+        return [f"未知服务器 {server!r}（可选：{', '.join(SERVER_TARGETS)}）"]
+    env = _read_dotenv_keys(repo_root)
+    custom_ok = bool(env.get("LLM_CUSTOM_BASE") and env.get("LLM_CUSTOM_KEY"))
+    if server == "local":
+        return []
+    if official_llm not in OFFICIAL_LLM_SOURCES:
+        return [f"未知模型来源 {official_llm!r}（可选：{', '.join(OFFICIAL_LLM_SOURCES)}）"]
+    errs: list[str] = []
+    if not (env.get("MC_USER") and env.get("MC_PASS")):
+        errs.append("code/mcagent/.env 缺队伍正式账号 MC_USER / MC_PASS")
+    if use_llm and official_llm == "official" and not env.get("LLM_KEY"):
+        errs.append("选了 AIA 官方代理，但 .env 没填 LLM_KEY；改用自备 key 训练，或关掉 LLM 用纯规则跑")
+    if use_llm and official_llm == "custom" and not custom_ok:
+        errs.append("选了自备 key 训练，但 .env 缺 LLM_CUSTOM_BASE / LLM_CUSTOM_KEY")
+    if not account_reserved:
+        errs.append("比赛账号是全队独占资源：先在 docs/05 账号表占位，再确认「已占位」（AGENTS.md §3）")
+    return errs
+
+
+def validate_bot_user(name: str) -> str:
+    norm = (name or "").strip()
+    if not BOT_USER_RE.match(norm):
+        raise ValueError(f"角色名 {name!r} 非法：只能用字母、数字、下划线，长度 3–13")
+    return norm
 
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 CATEGORY_RANK = {"bug": 0, "strategy": 1}
@@ -902,7 +1064,7 @@ def verify_and_promote(
     fingerprint: str,
     *,
     live_canary: bool = True,
-    fixer_bot_user: str = "agy_soak_fixer",
+    fixer_bot_user: str = DEFAULT_FIXER_USER,
     canary_max_steps: int = 10,
     canary_max_seconds: float = 45.0,
 ) -> dict[str, Any]:
@@ -1012,6 +1174,8 @@ def verify_and_promote(
                 "--disconnect-on-exit",
             ]
         canary_env = _uv_env(fixer_wt, player_model=(st_snap.get("player_model") or "").strip())
+        canary_env["MC_API_BASE"] = local_mc_base(Path(st_snap["repo_root"]))  # 金丝雀永远在自建测试服，不占比赛账号
+        canary_env.pop("MCAGENT_TRAIN_ON_OFFICIAL", None)
         proc = subprocess.run(cmd, cwd=str(code_dir), env=canary_env, capture_output=True, text=True, timeout=int(canary_max_seconds + 45))
         (attempt_dir / "gate3_live_canary.log").write_text(
             (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
@@ -1072,7 +1236,13 @@ def run_runner_loop(
     use_llm: bool = True,
     target_goal: str = "",
     player_model: Optional[str] = None,
+    server: str = "local",
+    official_llm: str = "custom",
 ) -> list[dict[str, Any]]:
+    if server not in SERVER_TARGETS:
+        raise ValueError(f"未知服务器 {server!r}")
+    if official_llm not in OFFICIAL_LLM_SOURCES:
+        raise ValueError(f"未知模型来源 {official_llm!r}")
     results: list[dict[str, Any]] = []
     if (target_goal or "").strip() or player_model is not None:
         with locked_state(session_dir) as st_init:
@@ -1110,7 +1280,10 @@ def run_runner_loop(
         tip_sha = _branch_tip(repo_root, branch)
         _git(runner_wt, "checkout", "--detach", tip_sha)
 
-        bot_user = f"{user_prefix}{ep_num:03d}" if rotate_user else user_prefix
+        if server == "official":
+            bot_user = "official-account"  # 比赛服只能用 .env 里的正式账号，不传 --user
+        else:
+            bot_user = f"{user_prefix}{ep_num:03d}" if rotate_user else user_prefix
         prev_good = next(
             (e for e in reversed(st["episodes"]) if e.get("p0_bugs", 0) == 0 and not e.get("rolled_back")),
             st["episodes"][-1] if st["episodes"] else None,
@@ -1120,8 +1293,7 @@ def run_runner_loop(
             "uv", "run", "python", "-m", "mcagent.loop",
             "--mode", "campaign",
             "--soak",
-            "--local-target", "--live",
-            "--user", bot_user,
+            *(["--live"] if server == "official" else ["--local-target", "--live", "--user", bot_user]),
             "--world-snapshot", f"{ep_id}-{tip_sha[:7]}",
             "--run-dir", str(ep_dir),
             "--max-steps", str(ep_steps),
@@ -1140,13 +1312,29 @@ def run_runner_loop(
 
         print(
             f"[runner] 启动 {ep_id} @ {tip_sha[:7]} "
-            f"(bot={bot_user}, model={active_model if use_llm and active_model else ('env' if use_llm else 'rule')}, "
+            f"(server={server}, bot={bot_user}, "
+            f"model={('AIA官方代理' if (server == 'official' and official_llm == 'official') else (active_model or 'env')) if use_llm else 'rule'}, "
             f"goal={active_goal or 'all'}, max={ep_seconds:g}s/{ep_steps} 步)..."
         )
+        use_custom = use_llm and not (server == "official" and official_llm == "official")
+        run_env = _uv_env(runner_wt, player_model=active_model if use_custom else "")
+        run_env.pop("MCAGENT_TRAIN_ON_OFFICIAL", None)
+        if server == "official":
+            run_env["MC_API_BASE"] = OFFICIAL_MC_BASE
+            if use_llm and official_llm == "official":
+                run_env["LLM_PROFILE"] = "official"
+                run_env.pop("LLM_CUSTOM_MODEL", None)
+            elif use_llm:
+                run_env["LLM_PROFILE"] = "custom"
+                run_env["MCAGENT_TRAIN_ON_OFFICIAL"] = "1"
+        else:
+            run_env["MC_API_BASE"] = local_mc_base(Path(st["repo_root"]))
+            if use_llm:
+                run_env["LLM_PROFILE"] = "custom"
         subprocess.run(
             cmd,
             cwd=str(runner_wt / "code"),
-            env=_uv_env(runner_wt, player_model=active_model if use_llm else ""),
+            env=run_env,
             check=False,
         )
         meta = ingest_episode_and_check_rollback(session_dir, ep_id, ep_dir, tip_sha, bot_user)
@@ -1165,12 +1353,18 @@ def run_fixer_once(
     fixer_cmd_template: str,
     fixer_timeout_s: int = 600,
     live_canary: bool = True,
-    fixer_bot_user: str = "agy_soak_fixer",
+    fixer_bot_user: str = DEFAULT_FIXER_USER,
+    fixer_preset_name: str = "",
 ) -> Optional[dict[str, Any]]:
     with locked_fixer_wt(session_dir):
         claimed = claim_next_incident(session_dir)
         if claimed is None:
             return None
+        if fixer_preset_name:
+            with locked_state(session_dir) as st_rec:
+                rec = st_rec.get("incidents", {}).get(claimed["fingerprint"])
+                if rec is not None:
+                    rec["last_fixer_preset"] = fixer_preset_name
         st = read_state(session_dir)
         fixer_wt = Path(st["fixer_wt"])
         branch = st["target_branch"]
@@ -1186,7 +1380,10 @@ def run_fixer_once(
             skill=shlex.quote(str(claimed.get("skill", ""))),
         )
         attempt_dir = Path(claimed["active_attempt_dir"])
-        print(f"[fixer] 认领 {claimed['incident_id']} ({claimed['fingerprint']}) -> 执行修复器...")
+        print(
+            f"[fixer] 认领 {claimed['incident_id']} ({claimed['fingerprint']}) -> 执行修复器"
+            f"{' ' + fixer_preset_name if fixer_preset_name else ''}..."
+        )
         try:
             proc = subprocess.run(
                 ["bash", "-lc", cmd_str],
@@ -1233,6 +1430,7 @@ def inject_and_set_goal(
     episode_seconds: Optional[float] = None,
     episode_steps: Optional[int] = None,
     clear_episode_budget: bool = False,
+    fixer_preset: Optional[str] = None,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
     """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。
@@ -1240,6 +1438,8 @@ def inject_and_set_goal(
     `episode_seconds` / `episode_steps` 写进 state.json，Runner 下一轮起生效；
     `clear_episode_budget=True` 清掉热覆盖，回到 `run` 启动参数。越界时在合入前直接拒绝。
     """
+    if fixer_preset is not None and fixer_preset not in FIXER_PRESETS:
+        return {"ok": False, "failed_step": "invalid_fixer_preset", "detail": f"未知修单预设 {fixer_preset!r}"}
     budget_err = validate_episode_budget(episode_seconds, episode_steps)
     if budget_err:
         return {"ok": False, "failed_step": "invalid_episode_budget", "detail": budget_err}
@@ -1339,6 +1539,8 @@ def inject_and_set_goal(
                 st["episode_seconds"] = float(episode_seconds)
             if episode_steps is not None:
                 st["episode_steps"] = int(episode_steps)
+            if fixer_preset is not None:
+                st["fixer_preset"] = fixer_preset
             if merged_sha:
                 st["commits"].append({
                     "sha": merged_sha,
@@ -1358,6 +1560,7 @@ def inject_and_set_goal(
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
             }
+            final_fixer = st.get("fixer_preset", "")
 
         write_review_report(session_dir)
         return {
@@ -1365,6 +1568,7 @@ def inject_and_set_goal(
             "target_branch": branch,
             "target_goal": final_goal,
             "episode_budget_override": final_budget,
+            "fixer_preset": final_fixer,
             "previous_tip": prev_tip,
             "current_tip": final_tip,
             "merged_files": merged_files,
@@ -1387,7 +1591,10 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **会话目录**：`{session_dir}`",
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
-        f"- **玩家操控模型（工位 A）**：`{st.get('player_model') or '沿用 .env'}`",
+        f"- **工位 A 服务器**：`{SERVER_TARGETS.get(st.get('server_target') or 'local', st.get('server_target'))}`",
+        f"- **玩家操控模型（工位 A）**：`{'AIA 官方代理（LLM_PROFILE=official）' if (st.get('server_target') == 'official' and st.get('official_llm') == 'official') else (st.get('player_model') or '沿用 .env')}`"
+        + ("（比赛服赛前训练，自备 key）" if (st.get("server_target") == "official" and st.get("official_llm", "custom") == "custom") else ""),
+        f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
     if st.get("target_goal"):
@@ -1561,6 +1768,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run_ep.add_argument("--episode-steps", type=int, default=40)
     p_run_ep.add_argument("--user-prefix", default="agy_soak_r")
     p_run_ep.add_argument("--fixed-user", action="store_true", help="不按轮次轮换角色名")
+    p_run_ep.add_argument("--server", choices=tuple(SERVER_TARGETS), default="local",
+                          help="工位 A 进哪个服务器：local 自建测试服 | official 比赛服")
+    p_run_ep.add_argument("--official-llm", choices=tuple(OFFICIAL_LLM_SOURCES), default="custom",
+                          help="比赛服上的模型来源：custom 自备 key 训练 | official AIA 官方代理")
     p_run_ep.add_argument("--goal", default="", help="覆盖会话级聚焦目标 goal_id")
     p_run_ep.add_argument("--player-model", default=None, help="覆盖会话级工位 A 玩家模型名")
     p_run_ep.add_argument(
@@ -1577,7 +1788,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--session-dir", required=True)
     p_ver.add_argument("--fingerprint", required=True)
     p_ver.add_argument("--skip-live-canary", action="store_true")
-    p_ver.add_argument("--fixer-user", default="agy_soak_fixer")
+    p_ver.add_argument("--fixer-user", default=DEFAULT_FIXER_USER)
 
     p_fix = sub.add_parser("fixer-loop", help="启动工位 B（轮询待修队列并调用 CLI Agent 自动修单）")
     p_fix.add_argument("--session-dir", required=True)
@@ -1586,7 +1797,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fix.add_argument("--poll-s", type=float, default=5.0)
     p_fix.add_argument("--once", action="store_true", help="只处理一单即退出")
     p_fix.add_argument("--skip-live-canary", action="store_true")
-    p_fix.add_argument("--fixer-user", default="agy_soak_fixer")
+    p_fix.add_argument("--fixer-user", default=DEFAULT_FIXER_USER)
     p_fix.add_argument("--fixer-timeout", type=int, default=600)
 
     p_dual = sub.add_parser("run", help="一键并行启动 Runner + Fixer 双工位守护")
@@ -1619,6 +1830,33 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="工位 B 修单入口预设：codex（默认 gpt-6.1-sol xhigh）| agy（gemini-4-hydrogen-high）| claude",
     )
+    p_dual.add_argument(
+        "--server",
+        choices=tuple(SERVER_TARGETS),
+        default="official",
+        help="工位 A 进哪个服务器：official 比赛服（默认，队伍正式账号，须先在 docs/05 占位并加 --account-reserved）| local 自建测试服",
+    )
+    p_dual.add_argument(
+        "--official-llm",
+        choices=tuple(OFFICIAL_LLM_SOURCES),
+        default="custom",
+        help="比赛服上的模型来源：custom 自备 key 赛前训练（默认）| official AIA 官方代理（比赛同款，需 LLM_KEY）",
+    )
+    p_dual.add_argument(
+        "--account-reserved",
+        action="store_true",
+        help="--server official 时必加：确认已在 docs/05 账号表占位比赛账号",
+    )
+    p_dual.add_argument(
+        "--bot-user",
+        default=DEFAULT_BOT_USER,
+        help=f"工位 A 进服角色名（默认 {DEFAULT_BOT_USER}，每轮同名，轮次号只记在 ep-NNNN 记录里）",
+    )
+    p_dual.add_argument(
+        "--rotate-user",
+        action="store_true",
+        help="每轮换新角色 <bot-user>001、002…（空包冷启动；不加则每轮同名、继承上一轮背包与进度）",
+    )
     p_dual.add_argument("--fixer-cmd", default="")
     p_dual.add_argument("--fixer-timeout", type=int, default=600, help="单次 AI 修单命令超时秒数（默认 600s）")
     p_dual.add_argument("--skip-live-canary", action="store_true")
@@ -1638,6 +1876,12 @@ def build_parser() -> argparse.ArgumentParser:
     g_grp.add_argument("--clear-goal", action="store_true", help="清空单目标聚焦，切回常规全量已毕业目标挂机")
     p_set.add_argument("--max-goal-attempts", type=int, default=None, help="可选更新单目标最大自动尝试轮数")
     p_set.add_argument("--player-model", default=None, help="可选热切换下一轮起工位 A 玩家模型名")
+    p_set.add_argument(
+        "--fixer-preset",
+        choices=tuple(FIXER_PRESETS),
+        default=None,
+        help="可选热切换工位 B 修单模型（下一单起生效），如 codex:gpt-6-astra:high、agy:gemini-4-carbon-medium",
+    )
     p_set.add_argument(
         "--clear-episode-budget",
         action="store_true",
@@ -1704,6 +1948,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             use_llm=args.llm,
             target_goal=args.goal,
             player_model=args.player_model,
+            server=args.server,
+            official_llm=args.official_llm,
         )
         return 0
 
@@ -1727,13 +1973,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not tmpl:
             print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
             return 2
+        default_name = "custom" if args.fixer_cmd else args.fixer_preset
         while not (session_dir / "STOP").exists():
+            cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
             res = run_fixer_once(
                 session_dir,
-                fixer_cmd_template=tmpl,
+                fixer_cmd_template=cur_tmpl,
                 fixer_timeout_s=args.fixer_timeout,
                 live_canary=not args.skip_live_canary,
                 fixer_bot_user=args.fixer_user,
+                fixer_preset_name=cur_name,
             )
             if args.once:
                 return 0 if (res is None or res.get("ok")) else 1
@@ -1742,7 +1991,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "run":
+        try:
+            bot_user = validate_bot_user(args.bot_user)
+        except ValueError as exc:
+            print(f"[run] {exc}", file=sys.stderr)
+            return 2
         repo_root = find_repo_root()
+        server_errs = check_server_target(
+            repo_root, args.server, use_llm=args.llm, account_reserved=args.account_reserved,
+            official_llm=args.official_llm,
+        )
+        if server_errs:
+            for msg in server_errs:
+                print(f"[run] 不能启动：{msg}", file=sys.stderr)
+            return 2
         init_session(
             repo_root,
             session_dir,
@@ -1752,6 +2014,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             player_model=args.player_model,
         )
         (session_dir / "STOP").unlink(missing_ok=True)
+        with locked_state(session_dir) as st_fx:
+            st_fx["server_target"] = args.server
+            st_fx["official_llm"] = args.official_llm
+            if args.fixer_cmd:
+                st_fx.pop("fixer_preset", None)
+            else:
+                st_fx["fixer_preset"] = args.fixer_preset
         tmpl = args.fixer_cmd or FIXER_PRESETS[args.fixer_preset]
         script = str(Path(__file__).resolve())
         runner_cmd = [
@@ -1760,7 +2029,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--episodes", str(args.episodes),
             "--episode-seconds", str(args.episode_seconds),
             "--episode-steps", str(args.episode_steps),
+            "--user-prefix", bot_user,
+            "--server", args.server,
+            "--official-llm", args.official_llm,
         ]
+        if not args.rotate_user:
+            runner_cmd.append("--fixed-user")
         if (args.goal or "").strip():
             runner_cmd.extend(["--goal", args.goal.strip()])
         runner_cmd.append("--llm" if args.llm else "--no-llm")
@@ -1801,6 +2075,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             episode_seconds=args.episode_seconds,
             episode_steps=args.episode_steps,
             clear_episode_budget=args.clear_episode_budget,
+            fixer_preset=args.fixer_preset,
             skip_offline_gate=args.skip_offline_gate,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1813,6 +2088,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             "target_branch": st["target_branch"],
             "target_goal": st.get("target_goal", ""),
             "player_model": st.get("player_model", ""),
+            "fixer_preset": st.get("fixer_preset", ""),
+            "server_target": st.get("server_target", "local"),
+            "official_llm": st.get("official_llm", "custom"),
             "episode_budget_override": {
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),

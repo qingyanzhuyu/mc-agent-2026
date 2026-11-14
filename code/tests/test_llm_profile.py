@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -220,6 +221,32 @@ class LoopGuardTests(unittest.TestCase):
         code, err = self.run_main(env, ["--llm", "--live"])
         self.assertEqual(code, 2)
         self.assertIn("LLM_PROFILE=official", err)
+
+    def test_train_on_official_needs_flag_and_soak(self):
+        base = dict(CUSTOM_ENV, MC_API_BASE="https://mc-api.windywindie.top/api/v1", MC_USER="bot", MC_PASS="p")
+        # 只设开关、不加 --soak：仍拒绝
+        code, err = self.run_main(dict(base, MCAGENT_TRAIN_ON_OFFICIAL="1"), ["--llm", "--live"])
+        self.assertEqual(code, 2)
+        # 加 --soak 但没设开关：仍拒绝
+        code, err = self.run_main(base, ["--llm", "--live", "--soak"])
+        self.assertEqual(code, 2)
+        self.assertIn("MCAGENT_TRAIN_ON_OFFICIAL", err)
+
+        # 开关 + --soak：放行过模型闸门（在真正登录前截停，不发任何请求）
+        from mcagent.loop import __main__ as loop_main
+
+        class Stop(Exception):
+            pass
+
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, \
+                patch.dict(os.environ, dict(base, MCAGENT_TRAIN_ON_OFFICIAL="1"), clear=True), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err), \
+                patch.object(loop_main.Config, "load", classmethod(lambda cls, env_file=None: _cfg_from_env())), \
+                patch.object(loop_main, "TapeClient", side_effect=Stop), patch.object(loop_main, "Client", side_effect=Stop):
+            with self.assertRaises(Stop):
+                loop_main.main(["--llm", "--live", "--soak", "--run-dir", td])
+        self.assertIn("比赛服训练模式", err.getvalue())
 
     def test_campus_mc_with_custom_llm_refused(self):
         env = dict(CUSTOM_ENV, MC_API_BASE="https://apiin.nmo.net.cn/api/v1", MC_USER="bot", MC_PASS="p")

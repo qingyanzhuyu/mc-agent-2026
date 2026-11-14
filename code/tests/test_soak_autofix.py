@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import tempfile
@@ -254,7 +255,8 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
              patch.object(soak_ctl, "init_session", return_value={}), \
              patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda cmd, **kw: (spawned_cmds.append(list(cmd)), DummyProc())[1]):
-            rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/soak-llm", "--episodes", "1", "--llm"])
+            rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/soak-llm", "--episodes", "1", "--llm",
+                                "--server", "local"])
         self.assertEqual(rc, 0)
         runner_invocations = [c for c in spawned_cmds if "runner-loop" in c]
         self.assertEqual(len(runner_invocations), 1)
@@ -767,6 +769,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
              patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda c, **kw: (spawned_dual.append(list(c)), DummyProc())[1]):
             rc_dual = soak_ctl.main([
                 "run",
+                "--server", "local",
                 "--session-dir", str(self.session),
                 "--branch", "feat/goal-telemetry",
                 "--goal", "smelt_iron",
@@ -911,6 +914,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
              patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda c, **kw: (spawned.append(list(c)), DummyProc())[1]):
             rc = soak_ctl.main([
                 "run",
+                "--server", "local",
                 "--session-dir", str(self.session),
                 "--branch", "feat/agy-preset",
                 "--fixer-preset", "agy",
@@ -1061,6 +1065,237 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertEqual((kw["episode_seconds"], kw["episode_steps"], kw["clear_episode_budget"]), (420.0, 80, False))
         soak_ctl.teardown_session(self.session)
 
+
+    def test_run_keeps_same_bot_name_each_episode_unless_rotate(self):
+        class DummyProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        def runner_cmd_for(extra: list[str]) -> list[str]:
+            spawned: list[list[str]] = []
+            with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+                 patch.object(soak_ctl, "init_session", return_value={}), \
+                 patch.object(soak_ctl.subprocess, "Popen",
+                              side_effect=lambda cmd, **kw: (spawned.append(list(cmd)), DummyProc())[1]):
+                rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/fixed-bot",
+                                    "--episodes", "1", "--server", "local", *extra])
+            self.assertEqual(rc, 0)
+            return next(c for c in spawned if "runner-loop" in c)
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/fixed-bot")
+        default_cmd = runner_cmd_for([])
+        self.assertEqual(default_cmd[default_cmd.index("--user-prefix") + 1], soak_ctl.DEFAULT_BOT_USER)
+        self.assertIn("--fixed-user", default_cmd)
+        rotate_cmd = runner_cmd_for(["--bot-user", "team_bot", "--rotate-user"])
+        self.assertEqual(rotate_cmd[rotate_cmd.index("--user-prefix") + 1], "team_bot")
+        self.assertNotIn("--fixed-user", rotate_cmd)
+        self.assertEqual(soak_ctl.main(["run", "--session-dir", str(self.session), "--bot-user", "bad name!"]), 2)
+        with self.assertRaises(ValueError):
+            soak_ctl.validate_bot_user("x" * 14)
+        with patch.object(soak_ctl.getpass, "getuser", return_value="Alice.Wang-PC"):
+            self.assertEqual(soak_ctl.default_bot_user(), "AliceWan_soak")
+        with patch.object(soak_ctl.getpass, "getuser", side_effect=OSError("no user")):
+            self.assertEqual(soak_ctl.default_bot_user(), "agy_soak_bot")
+        soak_ctl.validate_bot_user(soak_ctl.DEFAULT_BOT_USER)
+
+        # 同名挂机：每轮进服都是同一个角色名，轮次号只出现在 ep-NNNN 记录里
+        (self.session / "STOP").unlink(missing_ok=True)
+        users: list[str] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                users.append(cmd[cmd.index("--user") + 1])
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 5.0, "source": "local-target"}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(self.session, episodes=2, use_llm=False,
+                                     user_prefix="agy_soak_bot", rotate_user=False)
+        self.assertEqual(users, ["agy_soak_bot", "agy_soak_bot"])
+        st = soak_ctl.read_state(self.session)
+        self.assertEqual([e["ep_id"] for e in st["episodes"]], ["ep-0001", "ep-0002"])
+        self.assertEqual({e["bot_user"] for e in st["episodes"]}, {"agy_soak_bot"})
+        soak_ctl.teardown_session(self.session)
+
+    def test_fixer_model_catalog_hot_switch_and_per_machine_fixer_user(self):
+        cat = soak_ctl.FIXER_PRESETS
+        for eff in ("low", "medium", "high", "xhigh", "max"):
+            for model in ("gpt-6.1-sol", "gpt-6-astra"):
+                tmpl = cat[f"codex:{model}:{eff}"]
+                self.assertIn(f"-m {model} ", tmpl)
+                self.assertIn(f'model_reasoning_effort="{eff}"', tmpl)
+        for eff in ("low", "medium", "high", "xhigh"):
+            self.assertIn(f"--model gemini-4-hydrogen-{eff} --effort {eff} ", cat[f"agy:gemini-4-hydrogen-{eff}"])
+        for eff in ("low", "medium", "high"):
+            self.assertIn(f"--model gemini-4-carbon-{eff} --effort {eff} ", cat[f"agy:gemini-4-carbon-{eff}"])
+        self.assertNotIn("agy:gemini-4-carbon-xhigh", cat)
+        self.assertEqual(cat["codex"], cat["codex:gpt-6.1-sol:xhigh"])
+        self.assertEqual(cat["agy"], cat["agy:gemini-4-hydrogen-high"])
+        self.assertEqual(set(cat), set(soak_ctl.FIXER_PRESET_LABELS))
+        for tmpl in cat.values():  # 模板只留 {fixer_wt} {prompt_file} 两个占位
+            tmpl.format(fixer_wt="W", prompt_file="P", incident_file="I", skill="S")
+
+        with patch.object(soak_ctl.getpass, "getuser", return_value="Alice.Wang-PC"):
+            self.assertEqual(soak_ctl.default_fixer_user(), "AliceWan_fixer")
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/fixer-hot")
+        # 没有热切换时沿用启动参数
+        self.assertEqual(soak_ctl.resolve_fixer_template(self.session, "codex", "T0"), ("codex", "T0"))
+        bad = soak_ctl.inject_and_set_goal(self.session, fixer_preset="codex:gpt-9:max")
+        self.assertEqual((bad["ok"], bad["failed_step"]), (False, "invalid_fixer_preset"))
+        ok = soak_ctl.inject_and_set_goal(self.session, fixer_preset="agy:gemini-4-carbon-medium")
+        self.assertTrue(ok["ok"])
+        self.assertEqual(ok["fixer_preset"], "agy:gemini-4-carbon-medium")
+        name, tmpl = soak_ctl.resolve_fixer_template(self.session, "codex", "T0")
+        self.assertEqual(name, "agy:gemini-4-carbon-medium")
+        self.assertIn("gemini-4-carbon-medium", tmpl)
+        report = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("Gemini 4 Carbon · medium", report)
+        # 手改出的未知名字不生效，回落启动参数
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["fixer_preset"] = "nope"
+        self.assertEqual(soak_ctl.resolve_fixer_template(self.session, "codex", "T0"), ("codex", "T0"))
+
+        # fixer-loop 每接一单前重新解析，并把用到的模型记到异常单上
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["fixer_preset"] = "codex:gpt-6-astra:high"
+            st_mut["incidents"]["fp1"] = {
+                "fingerprint": "fp1", "incident_id": "INC-001", "code": "X", "severity": "P1",
+                "category": "bug", "status": "pending", "attempts": 0,
+            }
+        seen: list[str] = []
+
+        def fake_once(session_dir, **kw):
+            seen.append(kw["fixer_cmd_template"])
+            self.assertEqual(kw["fixer_preset_name"], "codex:gpt-6-astra:high")
+            return None
+
+        with patch.object(soak_ctl, "run_fixer_once", side_effect=fake_once):
+            rc = soak_ctl.main(["fixer-loop", "--session-dir", str(self.session), "--fixer-preset", "codex", "--once"])
+        self.assertEqual(rc, 0)
+        self.assertIn("-m gpt-6-astra", seen[0])
+
+        claimed = {"fingerprint": "fp1", "incident_id": "INC-001", "prompt_file": "/p", "incident_path": "/i",
+                   "active_attempt_dir": str(self.root / "att")}
+        (self.root / "att").mkdir()
+        with patch.object(soak_ctl, "claim_next_incident", return_value=claimed), \
+             patch.object(soak_ctl, "_clean_fixer_worktree"), patch.object(soak_ctl, "_git"), \
+             patch.object(soak_ctl.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")), \
+             patch.object(soak_ctl, "verify_and_promote", return_value={"ok": True}):
+            soak_ctl.run_fixer_once(self.session, fixer_cmd_template="echo {prompt_file}",
+                                    fixer_preset_name="codex:gpt-6-astra:high")
+        self.assertEqual(soak_ctl.read_state(self.session)["incidents"]["fp1"]["last_fixer_preset"],
+                         "codex:gpt-6-astra:high")
+        soak_ctl.teardown_session(self.session)
+
+    def test_server_target_local_vs_official_preflight_and_runner_env(self):
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("MC_USER", "MC_PASS", "LLM_KEY")}
+        env_file = self.repo / "code" / "mcagent" / ".env"
+        with patch.dict(os.environ, clean_env, clear=True):
+            self.assertEqual(soak_ctl.check_server_target(self.repo, "local", use_llm=True, account_reserved=False), [])
+            self.assertTrue(soak_ctl.check_server_target(self.repo, "moon", use_llm=False, account_reserved=True))
+            errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=False)
+            self.assertEqual(len(errs), 3)  # 缺账号、缺 LLM_KEY、未占位
+            env_file.write_text("MC_USER=team\nMC_PASS=secret\nLLM_KEY=\n", encoding="utf-8")
+            errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True)
+            self.assertEqual(len(errs), 1)  # 默认自备 key 训练，缺 LLM_CUSTOM_*
+            self.assertIn("LLM_CUSTOM_KEY", errs[0])
+            errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True,
+                                                official_llm="official")
+            self.assertIn("LLM_KEY", errs[0])
+            self.assertNotIn("secret", " ".join(errs))
+            self.assertEqual(soak_ctl.check_server_target(self.repo, "official", use_llm=False, account_reserved=True), [])
+            env_file.write_text("MC_USER=team\nMC_PASS=secret\nLLM_CUSTOM_BASE=https://x/v1\nLLM_CUSTOM_KEY=k\n"
+                                "MC_LOCAL_API_BASE=http://10.0.0.5:8787/api/v1\n", encoding="utf-8")
+            self.assertEqual(soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True), [])
+            self.assertEqual(soak_ctl.local_mc_base(self.repo), "http://10.0.0.5:8787/api/v1")
+
+            soak_ctl.init_session(self.repo, self.session, target_branch="feat/server")
+            with patch.object(soak_ctl, "find_repo_root", return_value=self.repo):
+                rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--server", "official", "--llm"])
+            self.assertEqual(rc, 2)
+
+            class DummyProc:
+                def wait(self, timeout=None):
+                    return 0
+
+                def poll(self):
+                    return 0
+
+            spawned: list[list[str]] = []
+            with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+                 patch.object(soak_ctl, "init_session", return_value={}), \
+                 patch.object(soak_ctl.subprocess, "Popen",
+                              side_effect=lambda cmd, **kw: (spawned.append(list(cmd)), DummyProc())[1]):
+                rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/server",
+                                    "--episodes", "1", "--server", "official", "--no-llm", "--account-reserved"])
+            self.assertEqual(rc, 0)
+            r_cmd = next(c for c in spawned if "runner-loop" in c)
+            self.assertEqual(r_cmd[r_cmd.index("--server") + 1], "official")
+            self.assertEqual(soak_ctl.read_state(self.session)["server_target"], "official")
+
+        # runner：比赛服不传 --user / --local-target，强制官方端点与官方模型；自建服保持原样
+        (self.session / "STOP").unlink(missing_ok=True)
+        seen: list[tuple[list[str], dict]] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                seen.append((list(cmd), dict(kwargs.get("env") or {})))
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 5.0, "source": "official"}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner), \
+             patch.dict(os.environ, {"MCAGENT_TRAIN_ON_OFFICIAL": "1"}):
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="official",
+                                     official_llm="official", player_model="DeepSeek-V4.1-Flash")
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="official",
+                                     player_model="DeepSeek-V4.1-Flash")
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="local",
+                                     user_prefix="me_soak", rotate_user=False, player_model="DeepSeek-V4.1-Flash")
+        (aia_cmd, aia_env), (trn_cmd, trn_env), (loc_cmd, loc_env) = seen
+        for cmd in (aia_cmd, trn_cmd):
+            self.assertNotIn("--user", cmd)
+            self.assertNotIn("--local-target", cmd)
+            self.assertIn("--live", cmd)
+            self.assertIn("--soak", cmd)
+        # 比赛服 + AIA 官方代理：与比赛当天一致，训练开关被剥掉
+        self.assertEqual(aia_env["MC_API_BASE"], soak_ctl.OFFICIAL_MC_BASE)
+        self.assertEqual(aia_env["LLM_PROFILE"], "official")
+        self.assertNotIn("LLM_CUSTOM_MODEL", aia_env)
+        self.assertNotIn("MCAGENT_TRAIN_ON_OFFICIAL", aia_env)
+        # 比赛服 + 自备 key 训练（默认）：custom 模型 + 训练开关
+        self.assertEqual(trn_env["MC_API_BASE"], soak_ctl.OFFICIAL_MC_BASE)
+        self.assertEqual((trn_env["LLM_PROFILE"], trn_env["LLM_CUSTOM_MODEL"]), ("custom", "DeepSeek-V4.1-Flash"))
+        self.assertEqual(trn_env["MCAGENT_TRAIN_ON_OFFICIAL"], "1")
+        # 自建测试服：显式指向本地网关，不带训练开关
+        self.assertIn("--local-target", loc_cmd)
+        self.assertEqual(loc_cmd[loc_cmd.index("--user") + 1], "me_soak")
+        self.assertEqual(loc_env["MC_API_BASE"], soak_ctl.local_mc_base(self.repo))
+        self.assertEqual(loc_env.get("LLM_CUSTOM_MODEL"), "DeepSeek-V4.1-Flash")
+        self.assertNotIn("MCAGENT_TRAIN_ON_OFFICIAL", loc_env)
+        with self.assertRaises(ValueError):
+            soak_ctl.run_runner_loop(self.session, episodes=1, server="official", official_llm="moon")
+        with self.assertRaises(ValueError):
+            soak_ctl.run_runner_loop(self.session, episodes=1, server="moon")
+        soak_ctl.teardown_session(self.session)
 
 if __name__ == "__main__":
     unittest.main()

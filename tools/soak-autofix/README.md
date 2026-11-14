@@ -13,7 +13,7 @@
                         │                              ▼
 ┌───────────────────────────────────────┐    ┌───────────────────────────────────────┐
 │ 工位 B：worktrees/fixer (检出分支)     │    │ 工位 A：worktrees/runner (游离 HEAD)   │
-│ Bot: agy_soak_fixer (--mode focus)    │    │ Bot: agy_soak_r001... (--mode campaign)│
+│ Bot: <用户名>_fixer (--mode focus)    │    │ Bot: <用户名>_soak (--mode campaign)   │
 │                                       │    │                                       │
 │ 1. claim 认领最高优 INC-*.json         │◀───┼─ 产出异常包 + progress_curve.jsonl     │
 │ 2. AI 修复（Codex/Claude/AGY 子代理）  │    │  若新 commit 诱发新 P0 bug → 自动 revert│
@@ -33,6 +33,66 @@
 - **环境隔离实测成本落盘（`goal_telemetry.<source>.json`）**：每轮非回滚挂机结束后按运行环境 `source` 隔离聚合成就达成率（`hit_rate`）、中位耗时（`p50_elapsed_s`）、中位 Token（`p50_tokens`）与死亡次数，落盘至 `<session-dir>/goal_telemetry.local-target.json`（遵循 `AGENTS.md §4`，绝不混同本地靶场与官方赛服数据），并在后续轮次通过 `--goal-telemetry` 回喂给规划器更新性价比排序。
 
 ## 两种使用方式
+
+### 方式零：网页控制台（实时改轮长、看每一轮、一键启停）
+
+**队友上手（每人在自己电脑上开，页面只认本机）：**
+
+1. 环境：Linux 或 Windows 的 **WSL2**（`soak_ctl.py` 用 `fcntl` 加锁、控制台扫 `/proc` 识别守护，原生 Windows / macOS 跑不了）；装好 `uv`、Node.js ≥ 18，`code/mcagent/.env` 配好 LLM key；修单用 `codex` / `agy` / `claude` 中的哪个，就要先装好并登录那个 CLI。
+2. 拉最新 `main` 后先起本地网关（另开一个终端，保持运行）：
+   ```bash
+   cd tools/local-api-bridge && npm ci && npm start     # 看到 listening on http://127.0.0.1:8787/api/v1 即可
+   ```
+3. 在仓库根目录起控制台：
+   ```bash
+   python3 tools/soak-autofix/dashboard.py
+   ```
+4. 浏览器打开 **http://127.0.0.1:8790/** → 左侧「启动参数」确认一下 → 点右上角 **一键启动**。
+   - 「进服角色名」默认是 `<你的系统用户名前 8 位>_soak`，**每轮同一个名字进服**，轮次号只记在 `ep-NNNN` 里。共享测试世界里同名会互踢，所以每人保持各自的名字，别改成同一个。
+   - 同名意味着上一轮的背包、位置、已拿到的进度会带进下一轮；要每轮空包从头跑（测聚焦目标的真实成功率时），勾「每轮换新角色」，角色名变成 `<名字>001`、`002`…
+   - 修单工位的金丝雀验修角色同样按本机区分，默认 `<系统用户名前 8 位>_fixer`。
+5. 想在别的机器上看：`ssh -L 8790:127.0.0.1:8790 <挂机那台机器>`，再在自己浏览器开 http://127.0.0.1:8790/ 。
+
+```bash
+python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/logs/soak-night   # 换端口 / 换会话目录
+```
+
+- 只监听 `127.0.0.1`，零第三方依赖；校验 `Host` / `Origin` / `Content-Type`，别的网页无法跨站调用。
+- **一键启动 / 重启**：按页面「启动参数」拼 `soak_ctl.py run`，以独立进程组后台运行，输出写到会话目录 `dashboard_run.log`；关掉控制台或网页不会停掉守护。同一会话已有守护（包括终端里手动起的）时拒绝重复启动。
+- **优雅停止** = 写 `STOP`；**立即中断** = 给 `run` 进程发 SIGINT（等同 Ctrl+C，当前轮不入账）；**重启并应用新代码** = 写 `STOP` → 等两个工位都退出 → 用启动参数重新起。
+- **实时参数**：秒数、步数、聚焦目标、工位 A 玩家模型、工位 B 修单模型、单目标最大尝试直接写会话 `state.json`；Runner 下一轮开跑时读取，Fixer 每接一单前读取（正在修的那一单不受影响）。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
+- **当前轮**：解析正在跑的 `timeline.jsonl` / `progress_curve.jsonl`，2 秒刷新用时、步数、正在跑的技能、LLM 延迟、Token、血量和最近事件；**轮次历史**点一行看该轮 `summary.md`。
+- **热合入开发分支**：后台调用 `inject_and_set_goal`（同样跑编译 + 全量单测 + `--dry` 门禁），页面显示任务进度与结果。
+
+命令行等价写法：`soak_ctl.py run ... --bot-user <名字>`（默认同上），加 `--rotate-user` 每轮换新角色。
+
+**统一配置：工位 A 进哪个服务器**（一份 `code/mcagent/.env` 同时装两套端点，每次启动时选，挂机中不切）：
+
+| 选项 | 连哪里 | 角色名 | 模型 | 启动前要求 |
+|---|---|---|---|---|
+| `--server official --official-llm custom`（**默认**，日常训练） | 比赛服官方端点 `mc-api.windywindie.top` | 只能用 `.env` 里的队伍正式账号 `MC_USER`/`MC_PASS`，不能改名、不能轮换 | 自备 key（`LLM_CUSTOM_*`，如并行云 DeepSeek-V4.1-Flash），玩家模型可热切换 | `.env` 有账号与 `LLM_CUSTOM_BASE/KEY`；先在 `docs/05` 账号表占位，再加 `--account-reserved` |
+| `--server official --official-llm official`（比赛彩排） | 同上 | 同上 | AIA 官方代理（`LLM_KEY`），与比赛当天完全一致 | `.env` 有 `LLM_KEY`；同样要占位 |
+| `--server local`（备选） | `MC_LOCAL_API_BASE`（默认 `127.0.0.1:8787` 本机网关 → 队内测试服） | `--bot-user` 随意起 | 自备 key | 网关已启动 |
+
+- 比赛服 + 自备 key 是**赛前训练专用**：脚本给子进程设 `MCAGENT_TRAIN_ON_OFFICIAL=1`，`mcagent.loop` 只在 `--soak` 且有这个开关时放行；比赛当天 `preflight` 对 `LLM_PROFILE=custom` 与这个开关都会 BLOCK，必须切回官方代理（AGENTS.md §2B.3，公告：比赛统一用 AIA 代理上的 DeepSeek V4.1 Flash）。
+- 比赛服的轮次数据标 `official`，不进 `goal_telemetry.local-target.json`；工位 B 的金丝雀验修始终走 `MC_LOCAL_API_BASE`，不占比赛账号。比赛账号同一时刻只能一个 bot 在线（§3），挂机期间别人不能用这个账号。
+- 命令行里不写 `--server` 就是比赛服；只想在自建测试服跑，显式加 `--server local`。
+
+**工位 B 修单模型**（`--fixer-preset`，`run` 启动时指定，挂机中用页面或 `set-goal --fixer-preset` 热切换）：
+
+| 写法 | 含义 |
+|---|---|
+| `codex:gpt-6.1-sol:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6.1-sol -c model_reasoning_effort=...` |
+| `codex:gpt-6-astra:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6-astra ...` |
+| `agy:gemini-4-hydrogen-{low,medium,high,xhigh}` | `agy --model gemini-4-hydrogen-<档> --effort <档>` |
+| `agy:gemini-4-carbon-{low,medium,high}` | `agy --model gemini-4-carbon-<档> --effort <档>`（carbon 没有 xhigh） |
+| `codex` / `agy` / `claude` | 旧简写：6.1-sol xhigh / hydrogen high / `claude -p` |
+
+模型 id 与档位来自 2026-11-14 本机 `agy models` 与 `~/.codex/models_cache.json`；codex 的 `ultra` 档会自动派子代理，无人值守修单不收。
+
+```bash
+python3 tools/soak-autofix/soak_ctl.py set-goal --session-dir code/mcagent/logs/soak-cont --fixer-preset codex:gpt-6-astra:high
+```
 
 ### 方式一：一键双进程全自动挂机（外接本机 `codex` / `agy` / `claude` CLI）
 
