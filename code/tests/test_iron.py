@@ -64,6 +64,20 @@ class IronWorld(GridWorld):
         return {}
 
 
+class ProspectingWorld(IronWorld):
+    """显式安排揭开表层后的暴露矿；不模拟矿物生成、重力或寻路。"""
+
+    def __init__(self, *args, exposed_after=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.exposed_after = exposed_after or {}
+
+    def find_blocks(self, *args, **kwargs):
+        result = super().find_blocks(*args, **kwargs)
+        result["blocks"] = [b for b in result["blocks"]
+                            if self.exposed_after.get(tuple(b["pos"])) not in self.blocks]
+        return result
+
+
 class SmeltIronTests(unittest.TestCase):
     def setUp(self):
         patcher = patch("mcagent.skills.iron.time.sleep")
@@ -92,8 +106,113 @@ class SmeltIronTests(unittest.TestCase):
         self.assertEqual(self.sleep.call_count, 1)
 
     def test_no_exposed_ore_replans(self):
-        with self.assertRaisesRegex(Replan, "半径 32 内无暴露铁矿.*环境缺铁矿"):
-            self.run_skill(IronWorld())
+        world = IronWorld()
+        with self.assertRaisesRegex(Replan, "半径 32/64.*需换区域探索") as caught:
+            self.run_skill(world)
+        self.assertNotIn("环境缺铁矿", str(caught.exception))
+        self.assertEqual([args["radius"] for op, args in world.calls if op == "find_blocks"],
+                         [32, 64])
+        self.assertFalse(any(op in ("dig", "move_to", "place") for op, _ in world.calls))
+
+    def test_expands_exposed_ore_search_before_digging_stairs(self):
+        world = IronWorld(blocks={(40, 64, 0): "iron_ore", (41, 64, 0): "furnace",
+                                  (40, 63, 0): "stone", (41, 63, 0): "stone"},
+                          views=[view(), view(output=1), view()])
+        _, _, state = self.run_skill(world)
+        scans = [args["radius"] for op, args in world.calls if op == "find_blocks"]
+        self.assertEqual(scans[:2], [32, 64])
+        self.assertEqual([args["pos"] for op, args in world.calls if op == "dig"], [[40, 64, 0]])
+        self.assertEqual(state.count("iron_ingot"), 1)
+
+    def test_empty_scan_prospects_then_smelts_newly_exposed_iron(self):
+        # INC-003 的空扫描前缀；以下可安全揭露的矿是合成回归夹具，不是原磁带证据。
+        world = ProspectingWorld(blocks={(1, 62, 0): "stone", (2, 63, 0): "iron_ore",
+                                         (2, 62, 0): "stone", (2, 64, 0): "stone"},
+                                 exposed_after={(2, 63, 0): (1, 63, 0)},
+                                 views=[view(), view(output=1), view()])
+        steps, _, state = self.run_skill(world)
+        digs = [args["pos"] for op, args in world.calls if op == "dig"]
+        self.assertEqual(digs, [[1, 63, 0], [2, 63, 0]])
+        self.assertEqual(world.blocks[(1, 62, 0)], "stone")
+        self.assertEqual(state.count("iron_ingot"), 1)
+        self.assertEqual(SmeltIron().verify_done(state, {}), "")
+        self.assertTrue(any(step["op"] == "window_act" for step in steps))
+
+    def test_prospecting_has_total_descent_budget_and_keeps_support(self):
+        blocks = {(x, y, 0): "stone" for x in range(1, 8)
+                  for y in range(63 - x, 64)}
+        world = IronWorld(blocks=blocks)
+        with self.assertRaisesRegex(Replan, "安全阶梯探矿仍未发现"):
+            self.run_skill(world)
+        moves = [args["pos"] for op, args in world.calls if op == "move_to"]
+        self.assertEqual(len(moves), 6)
+        self.assertLessEqual(sum(op == "dig" for op, _ in world.calls), 18)
+        for x in range(1, 8):
+            self.assertEqual(world.blocks[(x, 63 - x, 0)], "stone")
+        self.assertEqual(world.blocks[(7, 57, 0)], "stone")
+        self.assertEqual(world.items.get("raw_iron", 0), 0)
+
+    def test_prospecting_rejects_unsafe_floor_clearance_and_roof(self):
+        hazards = [(62, name) for name in ("air", "water", "lava", "sand", "gravel", "unknown")]
+        hazards += [(64, name) for name in ("water", "lava", "sand", "gravel", "furnace", "unknown")]
+        hazards += [(66, name) for name in ("water", "lava", "sand", "red_sand", "gravel", "unknown")]
+        for y, name in hazards:
+            with self.subTest(y=y, name=name):
+                world = IronWorld(blocks={(1, 62, 0): "stone", (1, y, 0): name})
+                with self.assertRaises(Replan):
+                    self.run_skill(world)
+                self.assertFalse(any(op in ("dig", "move_to") for op, _ in world.calls))
+
+    def test_prospecting_rechecks_support_position_and_tool_after_each_yield(self):
+        for change in ("support", "position", "tool"):
+            with self.subTest(change=change):
+                world = IronWorld(blocks={(1, y, 0): "stone" for y in range(62, 66)})
+                ex, state = world.session()
+                skill = SmeltIron()
+                while not skill.step(ex, state):
+                    if skill.last["op"] == "dig":
+                        break
+                self.assertEqual(skill.last["pos"], [1, 65, 0])
+                if change == "support":
+                    world.blocks.pop((1, 62, 0))
+                elif change == "position":
+                    world.st["pos"] = [1.5, 65, 0.5]
+                else:
+                    world.items.pop("stone_pickaxe")
+                with self.assertRaisesRegex(Replan, "保留支撑|探矿工具"):
+                    drive(skill, ex, state)
+                self.assertEqual(world.blocks[(1, 64, 0)], "stone")
+                self.assertEqual(sum(op == "dig" for op, _ in world.calls), 1)
+                self.assertFalse(any(op == "move_to" for op, _ in world.calls))
+
+    def test_prospecting_requires_observed_arrival_before_further_descent(self):
+        world = IronWorld(blocks={(1, 62, 0): "stone", (2, 61, 0): "stone"})
+        move = world.move_to
+        def stays_put(*args, **kwargs):
+            old = list(world.st["pos"])
+            result = move(*args, **kwargs)
+            world.st["pos"] = old
+            return result
+        world.move_to = stays_put
+        with self.assertRaisesRegex(Replan, "未确认到达落脚点"):
+            self.run_skill(world)
+        self.assertEqual(sum(op == "move_to" for op, _ in world.calls), 1)
+        self.assertEqual(world.blocks[(2, 63, 0)], "stone")
+
+    def test_abort_during_prospecting_stops_all_further_actions(self):
+        for stop_at in range(1, 8):
+            with self.subTest(stop_at=stop_at):
+                world = IronWorld(blocks={(x, y, 0): "stone" for x in range(1, 4)
+                                          for y in range(63 - x, 64)})
+                ex, state = world.session()
+                skill = SmeltIron()
+                for _ in range(stop_at):
+                    self.assertFalse(skill.step(ex, state))
+                before = list(ex.acts)
+                skill.abort()
+                self.assertIsNone(skill._flow)
+                self.assertEqual(ex.acts, before)
+                self.assertFalse(world.st["sneaking"])
 
     def test_missing_pickaxe_and_gold_cannot_mine(self):
         for pick in ("wooden_pickaxe", "golden_pickaxe"):

@@ -23,6 +23,7 @@ WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "ma
 FUELS = (("coal", 16),) + tuple((f"{w}_{suffix}", 3)
                                 for suffix in ("planks", "log") for w in WOODS)
 RADIUS = 32
+PROSPECT_STEPS = 6
 POLL_SECONDS = 2.0
 SOLID_SUPPORT = frozenset(("stone", "cobblestone", "deepslate", "cobbled_deepslate",
                            "dirt", "grass_block", "andesite", "diorite", "granite"))
@@ -45,7 +46,7 @@ def _amount(view: dict, section: str, item: str) -> int:
 @register
 class SmeltIron(Skill):
     name = "smelt_iron"
-    description = "采集暴露铁矿，安全放置或复用熔炉并有界等待取出铁锭"
+    description = "采集暴露铁矿，缺矿时有界阶梯探矿，再安全熔炼取出铁锭"
     params = {"count": Param(int, "期望新增铁锭数（粗铁用完即止）", default=3, min=1, max=16)}
     goal = "acq:iron_ingot"
     verified = "offline"
@@ -58,6 +59,18 @@ class SmeltIron(Skill):
             return "背包缺煤、木板或原木燃料，且无可采煤的镐"
         return ""
 
+    def _prepare_pick(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        inv = state.refresh_inventory(ex.client)
+        pick = best_pickaxe(state)
+        if pick not in PICKS:
+            raise Replan("挖掘前检查背包缺石镐或更好的镐")
+        if bare((inv.get("held", state.st.get("held")) or {}).get("name")) != pick:
+            yield rec("equip", ex.equip(pick, "hand"), item=pick)
+            inv = state.refresh_inventory(ex.client)
+            if best_pickaxe(state) not in PICKS or ("held" in inv and
+                    bare((inv.get("held") or {}).get("name")) != pick):
+                raise Replan(f"挖掘前装备 {pick} 后手持未确认")
+
     def _mine(self, ex: "Executor", state: "State", pos, ores, drop: str) -> Iterator[dict]:
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
         if math.dist(cur, pos) > 4:
@@ -67,16 +80,7 @@ class SmeltIron(Skill):
             raise Replan(f"观察到 {drop} 矿 {pos} 已在脚下，停止挖掘以保留支撑")
         if bare(ex.client.get_block(pos).get("name")) not in ores:
             raise Replan(f"到达 {pos} 后 get_block 未确认目标矿 {ores}")
-        inv = state.refresh_inventory(ex.client)
-        pick = best_pickaxe(state)
-        if pick not in PICKS:
-            raise Replan(f"在矿 {pos} 前检查背包缺石镐或更好的镐")
-        if bare((inv.get("held", state.st.get("held")) or {}).get("name")) != pick:
-            yield rec("equip", ex.equip(pick, "hand"), item=pick)
-            inv = state.refresh_inventory(ex.client)
-            if best_pickaxe(state) not in PICKS or ("held" in inv and
-                    bare((inv.get("held") or {}).get("name")) != pick):
-                raise Replan(f"在矿 {pos} 前装备 {pick} 后手持未确认")
+        yield from self._prepare_pick(ex, state)
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
         if _under_feet(cur, pos):
             raise Replan(f"装备后重新观察 {pos} 已在脚下，停止挖掘以保留支撑")
@@ -87,18 +91,80 @@ class SmeltIron(Skill):
         if result.get("warning") or state.count(drop) <= before:
             raise Replan(f"挖掘 {pos} 后背包 {drop} 未确认增加或工具告警：{result.get('warning', '')}")
 
+    def _ore_candidates(self, ex: "Executor", state: "State", radius=RADIUS) -> list:
+        blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=radius, limit=16).get("blocks") or []
+        cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+        return [b["pos"] for b in blocks if isinstance(b.get("pos"), list)
+                and len(b["pos"]) == 3 and not _under_feet(cur, b["pos"])]
+
+    def _safe_column(self, ex: "Executor", pos) -> bool:
+        x, y, z = pos
+        # 只开凿已观察到的普通地层；未知方块、液体、落沙和设施一律不动。
+        allowed = SOLID_SUPPORT | set(IRON_ORES)
+        return (bare(ex.client.get_block([x, y - 1, z]).get("name")) in SOLID_SUPPORT
+                and bare(ex.client.get_block([x, y + 3, z]).get("name")) in AIR | SOLID_SUPPORT
+                and all(bare(ex.client.get_block([x, y + dy, z]).get("name")) in AIR | allowed
+                        for dy in (2, 1, 0)))
+
+    def _prospect(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        # API §3.3 允许 radius <= 64，但仍只返回暴露矿，不能据空扫描断言环境无矿。
+        candidates = self._ore_candidates(ex, state, radius=64)
+        if candidates:
+            return candidates
+        visited = set()
+        for _ in range(PROSPECT_STEPS):
+            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            x, y, z = map(math.floor, cur)
+            visited.add((x, z))
+            pos = next(([x + dx, y - 1, z + dz] for dx, dz in
+                        ((1, 0), (-1, 0), (0, 1), (0, -1))
+                        if (x + dx, z + dz) not in visited
+                        and self._safe_column(ex, [x + dx, y - 1, z + dz])), None)
+            if pos is None:
+                break
+            visited.add((pos[0], pos[2]))
+            # 从上往下清出三格；每个动作让出 Safety 边界，并重新观察承重/工具/站位。
+            for dy in (2, 1, 0):
+                target = [pos[0], pos[1] + dy, pos[2]]
+                if bare(ex.client.get_block(target).get("name")) in AIR:
+                    continue
+                yield from self._prepare_pick(ex, state)
+                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                if _under_feet(cur, target) or not self._safe_column(ex, pos):
+                    raise Replan("探矿阶梯站位或承重/净空变化，停止挖掘以保留支撑")
+                result = ex.dig(target, collect=True)
+                yield rec("dig", result, pos=target)
+                state.refresh_inventory(ex.client)
+                if result.get("warning") or best_pickaxe(state) not in PICKS:
+                    raise Replan("探矿工具告警或已无石镐，停止开凿")
+                candidates = self._ore_candidates(ex, state)
+                if candidates or state.count("raw_iron"):
+                    return candidates
+            if not self._safe_column(ex, pos) or any(
+                    bare(ex.client.get_block([pos[0], pos[1] + dy, pos[2]]).get("name")) not in AIR
+                    for dy in (2, 1, 0)):
+                raise Replan("探矿阶梯承重/净空变化，停止下行")
+            dest = [pos[0] + 0.5, pos[1], pos[2] + 0.5]
+            yield rec("move_to", ex.move_to(pos=dest, rng=1), pos=dest)
+            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            if tuple(map(math.floor, cur)) != tuple(pos):
+                raise Replan("探矿阶梯未确认到达落脚点，停止下行")
+            candidates = self._ore_candidates(ex, state)
+            if candidates:
+                return candidates
+        raise Replan(f"半径 32/64 内未找到可采的暴露铁矿，最多 {PROSPECT_STEPS} 步安全阶梯探矿仍未发现；需换区域探索")
+
     def _collect(self, ex: "Executor", state: "State") -> Iterator[dict]:
         if state.count("raw_iron"):
             return
         for _ in range(self.args["count"]):
-            blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=RADIUS, limit=16).get("blocks") or []
-            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-            candidates = [b["pos"] for b in blocks if isinstance(b.get("pos"), list)
-                          and len(b["pos"]) == 3 and not _under_feet(cur, b["pos"])]
+            candidates = self._ore_candidates(ex, state)
             if not candidates:
                 if state.count("raw_iron"):
                     return
-                raise Replan(f"半径 {RADIUS} 内无暴露铁矿；find_blocks 已搜索 iron_ore/deepslate_iron_ore，环境缺铁矿")
+                candidates = yield from self._prospect(ex, state)
+                if state.count("raw_iron"):
+                    return
             yield from self._mine(ex, state, candidates[0], IRON_ORES, "raw_iron")
             if state.count("raw_iron") >= self.args["count"]:
                 return
