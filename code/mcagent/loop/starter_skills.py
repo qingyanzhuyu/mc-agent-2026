@@ -352,6 +352,9 @@ class GatherWood(Skill):
                 preferred_species = bare(cands[0].get("name", "")) or None
             cands.sort(
                 key=lambda b: (
+                    # 先试当前高度附近的树干，避免近处树冠耗尽尝试预算。
+                    # 沿用上面的 4 格高差，只作排序；山坡上的高树仍可后备尝试。
+                    float(b["pos"][1]) > cur[1] + 4.0,
                     0 if (preferred_species and bare(b.get("name", "")) == preferred_species and float(b.get("dist", 99)) <= 18.0) else 1,
                     float(b.get("dist", math.dist(cur, b["pos"]))),
                 )
@@ -369,6 +372,7 @@ class GatherWood(Skill):
                             for dy in range(0, 5):
                                 bad_positions.add((t_key[0], t_key[1] + dy, t_key[2]))
                         last_nav_err = e
+                        yield rec("move_to", pos=target, error_code=code)
                         continue
                     raise
             try:
@@ -381,6 +385,7 @@ class GatherWood(Skill):
                 if code in ("unreachable", "dig_timeout", "path_not_found"):
                     bad_positions.add(t_key)
                     last_nav_err = e
+                    yield rec("dig", pos=target, error_code=code)
                     continue
                 raise
             state.refresh_inventory(ex.client)
