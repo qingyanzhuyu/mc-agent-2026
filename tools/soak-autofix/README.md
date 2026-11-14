@@ -36,10 +36,12 @@
 
 ### 方式一：一键双进程全自动挂机（外接本机 `codex` / `agy` / `claude` CLI）
 
-内置 `--fixer-preset` 修单入口：
-- `codex`（默认）：`gpt-6.1-sol` + `model_reasoning_effort="xhigh"`
-- `agy`：Antigravity CLI（`gemini-4-hydrogen-high` + `--effort high`）
-- `claude`：Claude Code CLI
+内置模型分工（默认）：
+- **工位 A（进游戏玩的玩家 `--player-model`）**：默认 `DeepSeek-V4.1-Flash`（自动注入子进程 `LLM_CUSTOM_MODEL`，无需改 `.env`；也可传 `--player-model DeepSeek-V4-Pro-0813` 或 `Qwen3.6-Flash`）
+- **工位 B（改代码的修单入口 `--fixer-preset`）**：
+  - `codex`（默认）：`gpt-6.1-sol` + `model_reasoning_effort="xhigh"`
+  - `agy`：Antigravity CLI（`gemini-4-hydrogen-high` + `--effort high`）
+  - `claude`：Claude Code CLI
 
 确保本地联调网关 `tools/local-api-bridge` 已启动后执行：
 
