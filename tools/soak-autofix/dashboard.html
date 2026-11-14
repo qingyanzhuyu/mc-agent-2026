@@ -110,6 +110,7 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
     <section>
       <h2>实时参数 <small>下一轮起生效，不用停机</small></h2>
       <div id="budgetBanner" class="banner warn hidden"></div>
+      <div id="fixerBanner" class="banner warn hidden"></div>
       <div class="grid2">
         <label class="f wide">每轮最长秒数：<b id="secOut" class="mono"></b>
           <input type="range" id="secRange" step="30">
@@ -117,8 +118,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         <label class="f">秒数<input type="number" id="secIn" step="10"></label>
         <label class="f">步数<input type="number" id="stepsIn" step="5"></label>
         <label class="f wide">聚焦目标<select id="goalSel"></select></label>
-        <label class="f">玩家模型<input id="modelIn" placeholder="空 = 沿用 .env"></label>
+        <label class="f">工位 A 玩家模型<input id="modelIn" list="playerModels" placeholder="空 = 沿用 .env"></label>
         <label class="f">单目标最大尝试<input type="number" id="attemptsIn" min="1" max="20"></label>
+        <label class="f wide">工位 B 修单模型（下一单起生效）<select id="fixerSel"></select></label>
       </div>
       <div class="row" style="margin-top:10px">
         <button class="primary" id="btnApply">应用到下一轮</button>
@@ -132,11 +134,11 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
       <div class="grid2">
         <label class="f wide">挂机分支<input id="sBranch"></label>
         <label class="f">轮数（0 = 一直跑）<input type="number" id="sEpisodes" min="0"></label>
-        <label class="f">修单入口<select id="sFixer"></select></label>
         <label class="f">每轮秒数<input type="number" id="sSec" step="10"></label>
         <label class="f">每轮步数<input type="number" id="sSteps" step="5"></label>
         <label class="f wide">聚焦目标<select id="sGoal"></select></label>
-        <label class="f">玩家模型<input id="sModel"></label>
+        <label class="f wide">工位 B 修单模型<select id="sFixer"></select></label>
+        <label class="f">工位 A 玩家模型<input id="sModel" list="playerModels"></label>
         <label class="f">单目标最大尝试<input type="number" id="sAttempts" min="1" max="20"></label>
         <label class="f">进服角色名<input id="sBot" maxlength="13"></label>
         <label class="f inline" title="不勾：每轮同一个角色进服，背包和进度带到下一轮；勾上：每轮换 名字001、002… 空包冷启动">
@@ -203,7 +205,7 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
       <div class="tablewrap">
         <table>
           <thead><tr><th>单号</th><th>级别</th><th>代码</th><th>技能/目标</th><th>状态</th>
-            <th class="num">尝试</th><th>最近一轮</th><th>修复提交</th></tr></thead>
+            <th class="num">尝试</th><th>最近一轮</th><th>最近修单模型</th><th>修复提交</th></tr></thead>
           <tbody id="incBody"></tbody>
         </table>
       </div>
@@ -216,6 +218,7 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
   </div>
 </main>
 
+<datalist id="playerModels"></datalist>
 <dialog id="epDialog">
   <header><h1 id="dlgTitle"></h1><span class="spacer"></span><button id="dlgClose">关闭</button></header>
   <div class="body"><pre class="log" id="dlgBody" style="max-height:none"></pre></div>
@@ -260,6 +263,20 @@ function goalOptions(sel, goals, current, allowKeep) {
   sel.value = current;
 }
 
+function fixerLabel(s, key) {
+  if (!key) return "";
+  const hit = s.fixer_catalog.find((c) => c.key === key);
+  return hit ? hit.label : key;
+}
+
+function fixerOptions(sel, catalog, current) {
+  const groups = new Map();
+  catalog.forEach((c) => { if (!groups.has(c.group)) groups.set(c.group, []); groups.get(c.group).push(c); });
+  sel.innerHTML = [...groups].map(([g, items]) =>
+    `<optgroup label="${esc(g)}">` + items.map((c) => `<option value="${esc(c.key)}">${esc(c.label)}</option>`).join("") + `</optgroup>`).join("");
+  sel.value = current;
+}
+
 function fillForms(s) {
   const b = s.bounds, st = s.state, d = s.start_defaults;
   for (const el of [$("secRange"), $("secIn"), $("sSec")]) { el.min = b.seconds[0]; el.max = b.seconds[1]; }
@@ -271,11 +288,12 @@ function fillForms(s) {
   $("modelIn").value = s.session_exists ? (st.player_model ?? "") : d.player_model;
   $("attemptsIn").value = st.max_goal_attempts ?? d.max_goal_attempts;
   goalOptions($("goalSel"), s.ledger, s.session_exists ? (st.target_goal || "") : d.goal, false);
+  fixerOptions($("fixerSel"), s.fixer_catalog, st.fixer_preset || d.fixer_preset);
+  $("playerModels").innerHTML = s.player_models.map((m) => `<option value="${esc(m.name)}">${esc(m.note)}</option>`).join("");
   goalOptions($("iGoal"), s.ledger, "__keep__", true);
 
   $("sBranch").value = d.branch; $("sEpisodes").value = d.episodes;
-  $("sFixer").innerHTML = s.fixer_presets.map((p) => `<option>${esc(p)}</option>`).join("");
-  $("sFixer").value = d.fixer_preset;
+  fixerOptions($("sFixer"), s.fixer_catalog, d.fixer_preset);
   $("sSec").value = d.episode_seconds; $("sSteps").value = d.episode_steps;
   goalOptions($("sGoal"), s.ledger, d.goal, false);
   $("sModel").value = d.player_model; $("sAttempts").value = d.max_goal_attempts;
@@ -319,11 +337,16 @@ function renderSettingsNote(s) {
     bn.textContent = "当前守护是在「热改轮长」功能之前启动的，改秒数/步数不会生效（目标、模型照常生效）。点右上角「重启并应用新代码」。";
     bn.classList.remove("hidden");
   } else bn.classList.add("hidden");
+  const fb = $("fixerBanner");
+  if (s.hot_fixer_supported === false) {
+    fb.textContent = "当前工位 B 是在「热切换修单模型」功能之前启动的，改修单模型不会生效。点右上角「重启并应用新代码」。";
+    fb.classList.remove("hidden");
+  } else fb.classList.add("hidden");
   const ov = (st.episode_seconds != null || st.episode_steps != null)
     ? `热覆盖：${st.episode_seconds != null ? fmtS(st.episode_seconds) : "沿用启动参数"} / ${st.episode_steps != null ? st.episode_steps + " 步" : "沿用启动参数"}`
     : "未设热覆盖，沿用启动参数";
   const cur = live && !live.finished ? `；正在跑的 ${live.ep_id} 上限 ${fmtS(live.max_seconds)} / ${live.max_steps} 步` : "";
-  $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${st.player_model || "沿用 .env"}${cur}`;
+  $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${st.player_model || "沿用 .env"}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${cur}`;
 }
 
 function setBar(id, cur, max) {
@@ -385,8 +408,9 @@ function renderTables(s) {
   $("incBody").innerHTML = s.incidents.map((r) =>
     `<tr><td class="mono">${esc(r.incident_id)}</td><td class="${sevCls[r.severity] || ""}">${esc(r.severity)}/${esc(r.category)}</td>
       <td class="mono">${esc(r.code)}</td><td>${esc(r.skill || "-")}${r.goal_id ? " / " + esc(r.goal_id) : ""}</td><td>${esc(r.status)}</td>
-      <td class="num">${r.attempts ?? 0}</td><td class="mono">${esc(r.last_seen_ep || "-")}</td><td class="mono">${esc((r.fix_commit || "-").slice(0, 7))}</td></tr>`
-  ).join("") || `<tr><td colspan="8" class="dim">没有异常单</td></tr>`;
+      <td class="num">${r.attempts ?? 0}</td><td class="mono">${esc(r.last_seen_ep || "-")}</td>
+      <td>${esc(fixerLabel(s, r.last_fixer_preset) || "-")}</td><td class="mono">${esc((r.fix_commit || "-").slice(0, 7))}</td></tr>`
+  ).join("") || `<tr><td colspan="9" class="dim">没有异常单</td></tr>`;
 }
 
 function renderJob(s) {
@@ -430,6 +454,7 @@ $("btnApply").onclick = async () => {
   const body = {
     episode_seconds: $("secIn").value, episode_steps: $("stepsIn").value,
     target_goal: $("goalSel").value, player_model: $("modelIn").value, max_goal_attempts: $("attemptsIn").value,
+    fixer_preset: $("fixerSel").value,
   };
   try { await api("/api/settings", body); toast("已写入，下一轮开跑时生效"); refresh(); }
   catch (e) { toast(e.message, "bad"); }

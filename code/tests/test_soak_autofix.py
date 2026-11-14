@@ -1123,5 +1123,77 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertEqual({e["bot_user"] for e in st["episodes"]}, {"agy_soak_bot"})
         soak_ctl.teardown_session(self.session)
 
+    def test_fixer_model_catalog_hot_switch_and_per_machine_fixer_user(self):
+        cat = soak_ctl.FIXER_PRESETS
+        for eff in ("low", "medium", "high", "xhigh", "max"):
+            for model in ("gpt-6.1-sol", "gpt-6-astra"):
+                tmpl = cat[f"codex:{model}:{eff}"]
+                self.assertIn(f"-m {model} ", tmpl)
+                self.assertIn(f'model_reasoning_effort="{eff}"', tmpl)
+        for eff in ("low", "medium", "high", "xhigh"):
+            self.assertIn(f"--model gemini-4-hydrogen-{eff} --effort {eff} ", cat[f"agy:gemini-4-hydrogen-{eff}"])
+        for eff in ("low", "medium", "high"):
+            self.assertIn(f"--model gemini-4-carbon-{eff} --effort {eff} ", cat[f"agy:gemini-4-carbon-{eff}"])
+        self.assertNotIn("agy:gemini-4-carbon-xhigh", cat)
+        self.assertEqual(cat["codex"], cat["codex:gpt-6.1-sol:xhigh"])
+        self.assertEqual(cat["agy"], cat["agy:gemini-4-hydrogen-high"])
+        self.assertEqual(set(cat), set(soak_ctl.FIXER_PRESET_LABELS))
+        for tmpl in cat.values():  # 模板只留 {fixer_wt} {prompt_file} 两个占位
+            tmpl.format(fixer_wt="W", prompt_file="P", incident_file="I", skill="S")
+
+        with patch.object(soak_ctl.getpass, "getuser", return_value="Alice.Wang-PC"):
+            self.assertEqual(soak_ctl.default_fixer_user(), "AliceWan_fixer")
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/fixer-hot")
+        # 没有热切换时沿用启动参数
+        self.assertEqual(soak_ctl.resolve_fixer_template(self.session, "codex", "T0"), ("codex", "T0"))
+        bad = soak_ctl.inject_and_set_goal(self.session, fixer_preset="codex:gpt-9:max")
+        self.assertEqual((bad["ok"], bad["failed_step"]), (False, "invalid_fixer_preset"))
+        ok = soak_ctl.inject_and_set_goal(self.session, fixer_preset="agy:gemini-4-carbon-medium")
+        self.assertTrue(ok["ok"])
+        self.assertEqual(ok["fixer_preset"], "agy:gemini-4-carbon-medium")
+        name, tmpl = soak_ctl.resolve_fixer_template(self.session, "codex", "T0")
+        self.assertEqual(name, "agy:gemini-4-carbon-medium")
+        self.assertIn("gemini-4-carbon-medium", tmpl)
+        report = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("Gemini 4 Carbon · medium", report)
+        # 手改出的未知名字不生效，回落启动参数
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["fixer_preset"] = "nope"
+        self.assertEqual(soak_ctl.resolve_fixer_template(self.session, "codex", "T0"), ("codex", "T0"))
+
+        # fixer-loop 每接一单前重新解析，并把用到的模型记到异常单上
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["fixer_preset"] = "codex:gpt-6-astra:high"
+            st_mut["incidents"]["fp1"] = {
+                "fingerprint": "fp1", "incident_id": "INC-001", "code": "X", "severity": "P1",
+                "category": "bug", "status": "pending", "attempts": 0,
+            }
+        seen: list[str] = []
+
+        def fake_once(session_dir, **kw):
+            seen.append(kw["fixer_cmd_template"])
+            self.assertEqual(kw["fixer_preset_name"], "codex:gpt-6-astra:high")
+            return None
+
+        with patch.object(soak_ctl, "run_fixer_once", side_effect=fake_once):
+            rc = soak_ctl.main(["fixer-loop", "--session-dir", str(self.session), "--fixer-preset", "codex", "--once"])
+        self.assertEqual(rc, 0)
+        self.assertIn("-m gpt-6-astra", seen[0])
+
+        claimed = {"fingerprint": "fp1", "incident_id": "INC-001", "prompt_file": "/p", "incident_path": "/i",
+                   "active_attempt_dir": str(self.root / "att")}
+        (self.root / "att").mkdir()
+        with patch.object(soak_ctl, "claim_next_incident", return_value=claimed), \
+             patch.object(soak_ctl, "_clean_fixer_worktree"), patch.object(soak_ctl, "_git"), \
+             patch.object(soak_ctl.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")), \
+             patch.object(soak_ctl, "verify_and_promote", return_value={"ok": True}):
+            soak_ctl.run_fixer_once(self.session, fixer_cmd_template="echo {prompt_file}",
+                                    fixer_preset_name="codex:gpt-6-astra:high")
+        self.assertEqual(soak_ctl.read_state(self.session)["incidents"]["fp1"]["last_fixer_preset"],
+                         "codex:gpt-6-astra:high")
+        soak_ctl.teardown_session(self.session)
+
 if __name__ == "__main__":
     unittest.main()

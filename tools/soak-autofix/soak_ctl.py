@@ -62,13 +62,71 @@ SECRET_SCAN_RE = re.compile(
     r"(sk-[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._\-]{16,}|MC_PASS\s*=\s*\S+|LLM_API_KEY\s*=\s*\S+)"
 )
 
-FIXER_PRESETS: dict[str, str] = {
-    "codex": 'codex exec -C {fixer_wt} -s workspace-write -m gpt-6.1-sol -c \'model_reasoning_effort="xhigh"\' - < {prompt_file}',
-    "agy": 'cd {fixer_wt} && agy --model gemini-4-hydrogen-high --effort high --mode accept-edits --sandbox --dangerously-skip-permissions --disable-slash-commands -p="$(cat {prompt_file})"',
-    "claude": 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}',
+# 工位 B 修单模型目录（2026-11-14 本机实测：`agy models` 与 ~/.codex/models_cache.json）
+# - codex：gpt-6.1-sol / gpt-6-astra 都支持 low/medium/high/xhigh/max（另有 ultra 会自动派子代理，无人值守修单不收）
+# - agy：hydrogen 有 low/medium/high/xhigh 四档，carbon 有 low/medium/high 三档；档位写在模型名里，--effort 同步传
+_CODEX_FIXER_TMPL = (
+    "codex exec -C {{fixer_wt}} -s workspace-write -m {model} "
+    "-c 'model_reasoning_effort=\"{effort}\"' - < {{prompt_file}}"
+)
+_AGY_FIXER_TMPL = (
+    "cd {{fixer_wt}} && agy --model {model}-{effort} --effort {effort} --mode accept-edits --sandbox "
+    "--dangerously-skip-permissions --disable-slash-commands -p=\"$(cat {{prompt_file}})\""
+)
+CODEX_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "gpt-6.1-sol": ("GPT-6.1-Sol", "codex", ("low", "medium", "high", "xhigh", "max")),
+    "gpt-6-astra": ("GPT-6-Astra", "codex", ("low", "medium", "high", "xhigh", "max")),
+}
+AGY_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "gemini-4-hydrogen": ("Gemini 4 Hydrogen", "agy", ("low", "medium", "high", "xhigh")),
+    "gemini-4-carbon": ("Gemini 4 Carbon", "agy", ("low", "medium", "high")),
 }
 
+
+def _build_fixer_catalog() -> tuple[dict[str, str], dict[str, str]]:
+    presets: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    for model, (title, cli, efforts) in CODEX_FIXER_MODELS.items():
+        for eff in efforts:
+            key = f"codex:{model}:{eff}"
+            presets[key] = _CODEX_FIXER_TMPL.format(model=model, effort=eff)
+            labels[key] = f"Codex · {title} · {eff}"
+    for model, (title, cli, efforts) in AGY_FIXER_MODELS.items():
+        for eff in efforts:
+            key = f"agy:{model}-{eff}"
+            presets[key] = _AGY_FIXER_TMPL.format(model=model, effort=eff)
+            labels[key] = f"agy · {title} · {eff}"
+    # 兼容旧名字：codex = 6.1-sol xhigh，agy = hydrogen high
+    presets["codex"] = presets["codex:gpt-6.1-sol:xhigh"]
+    labels["codex"] = "codex（= Codex · GPT-6.1-Sol · xhigh）"
+    presets["agy"] = presets["agy:gemini-4-hydrogen-high"]
+    labels["agy"] = "agy（= agy · Gemini 4 Hydrogen · high）"
+    presets["claude"] = 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}'
+    labels["claude"] = "Claude Code（claude -p，本机默认模型）"
+    return presets, labels
+
+
+FIXER_PRESETS, FIXER_PRESET_LABELS = _build_fixer_catalog()
+
+
+def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: str) -> tuple[str, str]:
+    """每接一单前取工位 B 的修单命令：state.json 里有合法的热切换 fixer_preset 就用它，否则用启动参数。"""
+    try:
+        st = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        st = {}
+    name = str(st.get("fixer_preset") or "").strip()
+    if name and name in FIXER_PRESETS:
+        return name, FIXER_PRESETS[name]
+    return default_name, default_tmpl
+
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
+# 前端下拉用的已知玩家模型（并行云 custom 通道实测过；也可以手填别的名字）
+PLAYER_MODEL_CHOICES: dict[str, str] = {
+    "DeepSeek-V4.1-Flash": "默认；关思考后单拍约 1.5–2.5s",
+    "Qwen3.6-Flash": "Qwen 快速档",
+    "DeepSeek-V4-Pro-0813": "完整菜单下常超 12s 主循环超时，慎用",
+}
 
 # 工位 A 进服角色名：默认每轮同名（服务器上只有一个挂机角色，轮次号只体现在记录里）；
 # 同名意味着上一轮的背包、位置、进度会带进下一轮，要每轮空包冷启动就加 --rotate-user（<名字>001、002…）
@@ -77,16 +135,27 @@ DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
 BOT_USER_RE = re.compile(r"^[A-Za-z0-9_]{3,13}$")  # 轮换时末尾补 3 位轮次号，总长不超 MC 的 16 字符
 
 
-def default_bot_user() -> str:
+def _local_user_stem() -> str:
     try:
         raw = getpass.getuser()
     except Exception:
         raw = ""
-    stem = re.sub(r"[^A-Za-z0-9_]", "", raw or "")[:8]
+    return re.sub(r"[^A-Za-z0-9_]", "", raw or "")[:8]
+
+
+def default_bot_user() -> str:
+    stem = _local_user_stem()
     return f"{stem}_soak" if stem else "agy_soak_bot"
 
 
+def default_fixer_user() -> str:
+    """工位 B 金丝雀验修角色：同样按本机用户名区分，避免两名队友同时修单时在共享测试世界互踢。"""
+    stem = _local_user_stem()
+    return f"{stem}_fixer" if stem else "agy_soak_fixer"
+
+
 DEFAULT_BOT_USER = default_bot_user()
+DEFAULT_FIXER_USER = default_fixer_user()
 
 
 def validate_bot_user(name: str) -> str:
@@ -928,7 +997,7 @@ def verify_and_promote(
     fingerprint: str,
     *,
     live_canary: bool = True,
-    fixer_bot_user: str = "agy_soak_fixer",
+    fixer_bot_user: str = DEFAULT_FIXER_USER,
     canary_max_steps: int = 10,
     canary_max_seconds: float = 45.0,
 ) -> dict[str, Any]:
@@ -1191,12 +1260,18 @@ def run_fixer_once(
     fixer_cmd_template: str,
     fixer_timeout_s: int = 600,
     live_canary: bool = True,
-    fixer_bot_user: str = "agy_soak_fixer",
+    fixer_bot_user: str = DEFAULT_FIXER_USER,
+    fixer_preset_name: str = "",
 ) -> Optional[dict[str, Any]]:
     with locked_fixer_wt(session_dir):
         claimed = claim_next_incident(session_dir)
         if claimed is None:
             return None
+        if fixer_preset_name:
+            with locked_state(session_dir) as st_rec:
+                rec = st_rec.get("incidents", {}).get(claimed["fingerprint"])
+                if rec is not None:
+                    rec["last_fixer_preset"] = fixer_preset_name
         st = read_state(session_dir)
         fixer_wt = Path(st["fixer_wt"])
         branch = st["target_branch"]
@@ -1212,7 +1287,10 @@ def run_fixer_once(
             skill=shlex.quote(str(claimed.get("skill", ""))),
         )
         attempt_dir = Path(claimed["active_attempt_dir"])
-        print(f"[fixer] 认领 {claimed['incident_id']} ({claimed['fingerprint']}) -> 执行修复器...")
+        print(
+            f"[fixer] 认领 {claimed['incident_id']} ({claimed['fingerprint']}) -> 执行修复器"
+            f"{' ' + fixer_preset_name if fixer_preset_name else ''}..."
+        )
         try:
             proc = subprocess.run(
                 ["bash", "-lc", cmd_str],
@@ -1259,6 +1337,7 @@ def inject_and_set_goal(
     episode_seconds: Optional[float] = None,
     episode_steps: Optional[int] = None,
     clear_episode_budget: bool = False,
+    fixer_preset: Optional[str] = None,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
     """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。
@@ -1266,6 +1345,8 @@ def inject_and_set_goal(
     `episode_seconds` / `episode_steps` 写进 state.json，Runner 下一轮起生效；
     `clear_episode_budget=True` 清掉热覆盖，回到 `run` 启动参数。越界时在合入前直接拒绝。
     """
+    if fixer_preset is not None and fixer_preset not in FIXER_PRESETS:
+        return {"ok": False, "failed_step": "invalid_fixer_preset", "detail": f"未知修单预设 {fixer_preset!r}"}
     budget_err = validate_episode_budget(episode_seconds, episode_steps)
     if budget_err:
         return {"ok": False, "failed_step": "invalid_episode_budget", "detail": budget_err}
@@ -1365,6 +1446,8 @@ def inject_and_set_goal(
                 st["episode_seconds"] = float(episode_seconds)
             if episode_steps is not None:
                 st["episode_steps"] = int(episode_steps)
+            if fixer_preset is not None:
+                st["fixer_preset"] = fixer_preset
             if merged_sha:
                 st["commits"].append({
                     "sha": merged_sha,
@@ -1384,6 +1467,7 @@ def inject_and_set_goal(
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
             }
+            final_fixer = st.get("fixer_preset", "")
 
         write_review_report(session_dir)
         return {
@@ -1391,6 +1475,7 @@ def inject_and_set_goal(
             "target_branch": branch,
             "target_goal": final_goal,
             "episode_budget_override": final_budget,
+            "fixer_preset": final_fixer,
             "previous_tip": prev_tip,
             "current_tip": final_tip,
             "merged_files": merged_files,
@@ -1414,6 +1499,7 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
         f"- **玩家操控模型（工位 A）**：`{st.get('player_model') or '沿用 .env'}`",
+        f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
     if st.get("target_goal"):
@@ -1603,7 +1689,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--session-dir", required=True)
     p_ver.add_argument("--fingerprint", required=True)
     p_ver.add_argument("--skip-live-canary", action="store_true")
-    p_ver.add_argument("--fixer-user", default="agy_soak_fixer")
+    p_ver.add_argument("--fixer-user", default=DEFAULT_FIXER_USER)
 
     p_fix = sub.add_parser("fixer-loop", help="启动工位 B（轮询待修队列并调用 CLI Agent 自动修单）")
     p_fix.add_argument("--session-dir", required=True)
@@ -1612,7 +1698,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fix.add_argument("--poll-s", type=float, default=5.0)
     p_fix.add_argument("--once", action="store_true", help="只处理一单即退出")
     p_fix.add_argument("--skip-live-canary", action="store_true")
-    p_fix.add_argument("--fixer-user", default="agy_soak_fixer")
+    p_fix.add_argument("--fixer-user", default=DEFAULT_FIXER_USER)
     p_fix.add_argument("--fixer-timeout", type=int, default=600)
 
     p_dual = sub.add_parser("run", help="一键并行启动 Runner + Fixer 双工位守护")
@@ -1674,6 +1760,12 @@ def build_parser() -> argparse.ArgumentParser:
     g_grp.add_argument("--clear-goal", action="store_true", help="清空单目标聚焦，切回常规全量已毕业目标挂机")
     p_set.add_argument("--max-goal-attempts", type=int, default=None, help="可选更新单目标最大自动尝试轮数")
     p_set.add_argument("--player-model", default=None, help="可选热切换下一轮起工位 A 玩家模型名")
+    p_set.add_argument(
+        "--fixer-preset",
+        choices=tuple(FIXER_PRESETS),
+        default=None,
+        help="可选热切换工位 B 修单模型（下一单起生效），如 codex:gpt-6-astra:high、agy:gemini-4-carbon-medium",
+    )
     p_set.add_argument(
         "--clear-episode-budget",
         action="store_true",
@@ -1763,13 +1855,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not tmpl:
             print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
             return 2
+        default_name = "custom" if args.fixer_cmd else args.fixer_preset
         while not (session_dir / "STOP").exists():
+            cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
             res = run_fixer_once(
                 session_dir,
-                fixer_cmd_template=tmpl,
+                fixer_cmd_template=cur_tmpl,
                 fixer_timeout_s=args.fixer_timeout,
                 live_canary=not args.skip_live_canary,
                 fixer_bot_user=args.fixer_user,
+                fixer_preset_name=cur_name,
             )
             if args.once:
                 return 0 if (res is None or res.get("ok")) else 1
@@ -1793,6 +1888,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             player_model=args.player_model,
         )
         (session_dir / "STOP").unlink(missing_ok=True)
+        with locked_state(session_dir) as st_fx:
+            if args.fixer_cmd:
+                st_fx.pop("fixer_preset", None)
+            else:
+                st_fx["fixer_preset"] = args.fixer_preset
         tmpl = args.fixer_cmd or FIXER_PRESETS[args.fixer_preset]
         script = str(Path(__file__).resolve())
         runner_cmd = [
@@ -1845,6 +1945,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             episode_seconds=args.episode_seconds,
             episode_steps=args.episode_steps,
             clear_episode_budget=args.clear_episode_budget,
+            fixer_preset=args.fixer_preset,
             skip_offline_gate=args.skip_offline_gate,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1857,6 +1958,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "target_branch": st["target_branch"],
             "target_goal": st.get("target_goal", ""),
             "player_model": st.get("player_model", ""),
+            "fixer_preset": st.get("fixer_preset", ""),
             "episode_budget_override": {
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),

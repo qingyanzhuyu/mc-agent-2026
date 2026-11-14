@@ -152,6 +152,29 @@ class DashboardTests(unittest.TestCase):
         self.assertIsNone(res2["episode_seconds"])
         self.assertEqual(res2["target_goal"], "smelt_iron")
 
+    def test_apply_settings_hot_switches_fixer_model_and_snapshot_lists_catalog(self):
+        self._init_state(fixer_preset="codex")
+        with self.assertRaises(ValueError):
+            self.console.apply_settings({"fixer_preset": "codex:gpt-9:max"})
+        res = self.console.apply_settings({"fixer_preset": "agy:gemini-4-hydrogen-xhigh"})
+        self.assertEqual(res["fixer_preset"], "agy:gemini-4-hydrogen-xhigh")
+        st = json.loads((self.session / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["fixer_preset"], "agy:gemini-4-hydrogen-xhigh")
+        # 空串表示不改
+        self.assertEqual(self.console.apply_settings({"fixer_preset": ""})["fixer_preset"], "agy:gemini-4-hydrogen-xhigh")
+
+        snap = self.console.snapshot()
+        self.assertEqual(snap["state"]["fixer_preset"], "agy:gemini-4-hydrogen-xhigh")
+        groups = {c["group"] for c in snap["fixer_catalog"]}
+        self.assertTrue({"Codex · GPT-6.1-Sol", "Codex · GPT-6-Astra", "agy · Gemini 4 Hydrogen",
+                         "agy · Gemini 4 Carbon"} <= groups)
+        carbon = [c["key"] for c in snap["fixer_catalog"] if c["group"] == "agy · Gemini 4 Carbon"]
+        self.assertEqual(carbon, ["agy:gemini-4-carbon-low", "agy:gemini-4-carbon-medium", "agy:gemini-4-carbon-high"])
+        self.assertIn("DeepSeek-V4.1-Flash", [m["name"] for m in snap["player_models"]])
+        p = self.console._validate_start({"fixer_preset": "codex:gpt-6-astra:max"})
+        cmd = self.console.build_run_cmd(p)
+        self.assertEqual(cmd[cmd.index("--fixer-preset") + 1], "codex:gpt-6-astra:max")
+
     def test_apply_settings_rejects_unknown_goal_when_ledger_known(self):
         self._init_state()
         with patch.object(self.console, "ledger", return_value=[{"id": "smelt_iron", "stage": "draft"}]):
