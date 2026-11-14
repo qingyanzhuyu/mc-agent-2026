@@ -93,6 +93,8 @@ def extract_json(text: str) -> Optional[dict]:
 _SEM_LOCK = threading.Lock()
 _SEMS: dict[int, threading.BoundedSemaphore] = {}
 DEFAULT_MAX_CONCURRENCY = 2
+#: 等到槽后剩余预算不足这么多就不发了（发出去也只会超时，白占一路并发）
+MIN_SLOT_BUDGET_S = 0.05
 
 
 def _semaphore(capacity: int) -> threading.BoundedSemaphore:
@@ -158,6 +160,7 @@ class LLMClient:
         self.stats: dict[str, int] = {
             "proxy_ok": 0, "direct_ok": 0, "fallback_direct": 0,
             "proxy_opened": 0, "endpoint_opened": 0, "short_circuited": 0,
+            "no_slot": 0,
         }
 
     # ---- 传输层（可注入，便于离线单测） ------------------------------
@@ -210,11 +213,23 @@ class LLMClient:
 
         进 HTTP 之前先占一个并发槽：比赛期只有 2 路，超发会被网关排队/429，
         排队时间比"等槽"更长，所以宁可在本地排队。
+
+        等槽的时间从 `timeout` 里扣：调用方给的是这一次请求的总预算，
+        不能等满一份再给 HTTP 一份（否则最坏要等 2 倍）。
+        等槽超时是本地排队，不是端点故障：`no_slot` 不计入端点熔断（见 llm_fault）。
         """
-        if not self._sem.acquire(timeout=timeout):
-            raise LLMError(f"等并发槽超时（上限 {self.max_concurrency} 路，已等 {timeout:.0f}s）", kind="no_slot")
+        t0 = time.monotonic()
+        if not self._sem.acquire(timeout=max(0.0, timeout)):
+            with self._lock:
+                self.stats["no_slot"] += 1
+            raise LLMError(f"等并发槽超时（上限 {self.max_concurrency} 路，已等 {timeout:.1f}s）", kind="no_slot")
         try:
-            status, text = self._poster(url, headers, data, timeout, proxy)
+            remaining = timeout - (time.monotonic() - t0)
+            if remaining <= MIN_SLOT_BUDGET_S:
+                with self._lock:
+                    self.stats["no_slot"] += 1
+                raise LLMError(f"等到并发槽时预算已用完（剩 {max(0.0, remaining):.2f}s）", kind="no_slot")
+            status, text = self._poster(url, headers, data, remaining, proxy)
         finally:
             self._sem.release()
         if status != 200:

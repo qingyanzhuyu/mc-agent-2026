@@ -138,5 +138,53 @@ class GateTests(Base):
         t.join(5)
 
 
+class SlotFaultTests(Base):
+    """等槽超时是本地排队，不能被当成端点故障；等槽时间也要算进这一次的预算。"""
+
+    def test_no_slot_is_not_endpoint_or_route_fault(self):
+        e = L.LLMError("x", kind="no_slot")
+        self.assertFalse(e.endpoint_fault)
+        self.assertFalse(e.route_fault)
+
+    def test_slot_timeouts_do_not_open_endpoint_breaker(self):
+        """回归：容量 1、槽被占，连续等槽超时曾让端点熔断 60s，槽空出来后健康端点仍被拦。"""
+        import os
+        os.environ["LLM_MAX_CONCURRENCY"] = "1"
+        c = self.client(lambda *a: (200, ok_body()), breaker_fails=1)
+        self.assertTrue(c._sem.acquire(timeout=1))      # 模拟另一路请求正占着唯一的槽
+        try:
+            for _ in range(3):
+                with self.assertRaises(L.LLMError) as cm:
+                    c.chat([{"role": "user", "content": "x"}], timeout=0.1)
+                self.assertEqual(cm.exception.kind, "no_slot")
+        finally:
+            c._sem.release()
+        self.assertEqual(c.stats["endpoint_opened"], 0)
+        self.assertEqual(c.stats["no_slot"], 3)
+        self.assertEqual(c.chat([{"role": "user", "content": "y"}], timeout=1), "ok")
+
+    def test_slot_wait_is_deducted_from_http_timeout(self):
+        import os
+        os.environ["LLM_MAX_CONCURRENCY"] = "1"
+        seen = []
+
+        def poster(url, headers, data, timeout, proxy):
+            seen.append(timeout)
+            return 200, ok_body()
+
+        c = self.client(poster)
+        self.assertTrue(c._sem.acquire(timeout=1))
+        releaser = threading.Timer(0.4, c._sem.release)
+        releaser.start()
+        try:
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}], timeout=2.0), "ok")
+        finally:
+            releaser.join(2)
+        self.assertEqual(len(seen), 1)
+        # 等了约 0.4s，HTTP 只该拿到剩下的约 1.6s；留足粗时钟（15.6ms）与调度余量
+        self.assertLess(seen[0], 1.8)
+        self.assertGreater(seen[0], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
