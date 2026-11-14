@@ -31,12 +31,13 @@ import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 
 PROTECTED_BRANCHES = frozenset({"main", "master", "HEAD"})
 
@@ -145,7 +146,11 @@ def validate_target_branch(branch: str) -> str:
     return b
 
 
-def is_allowed_edit_path(rel_path: str) -> tuple[bool, str]:
+def is_allowed_edit_path(
+    rel_path: str,
+    *,
+    narrow_files: Optional[Sequence[str]] = None,
+) -> tuple[bool, str]:
     norm = rel_path.strip().lstrip("./").replace("\\", "/")
     if not norm:
         return False, "空路径"
@@ -154,9 +159,28 @@ def is_allowed_edit_path(rel_path: str) -> tuple[bool, str]:
     base = Path(norm).name
     if base.startswith(".env") or base.startswith(".token") or "__pycache__" in norm:
         return False, f"禁止提交敏感配置或缓存文件 {norm}"
-    if any(fnmatch.fnmatch(norm, pat) for pat in ALLOWED_EDIT_PATTERNS):
-        return True, ""
-    return False, f"不在自动修复允许白名单内: {norm}"
+    if not any(fnmatch.fnmatch(norm, pat) for pat in ALLOWED_EDIT_PATTERNS):
+        return False, f"不在自动修复允许白名单内: {norm}"
+    if narrow_files:
+        allowed_narrow = {
+            p.strip().lstrip("./").replace("\\", "/")
+            for p in narrow_files
+            if p and p.strip()
+        }
+        if allowed_narrow and not (
+            norm in allowed_narrow or fnmatch.fnmatch(norm, "code/tests/test_*.py")
+        ):
+            return (
+                False,
+                f"超出目标单收窄白名单（仅限 {sorted(allowed_narrow)} 及 code/tests/test_*.py）: {norm}",
+            )
+    return True, ""
+
+
+def _max_attempts_for(st: dict[str, Any], inc_rec: dict[str, Any]) -> int:
+    if inc_rec.get("code") == "GOAL_MISS":
+        return int(st.get("max_goal_attempts", 4))
+    return int(st.get("max_attempts", 2))
 
 
 def scan_diff_for_secrets(diff_text: str) -> list[str]:
@@ -242,6 +266,8 @@ def init_session(
     target_branch: str,
     base_ref: str = "HEAD",
     max_attempts: int = 2,
+    target_goal: str = "",
+    max_goal_attempts: int = 4,
 ) -> dict[str, Any]:
     branch = validate_target_branch(target_branch)
     session_dir = session_dir.resolve()
@@ -267,6 +293,7 @@ def init_session(
     _wire_worktree_env(repo_root, fixer_wt)
     _wire_worktree_env(repo_root, runner_wt)
 
+    norm_goal = (target_goal or "").strip()
     with locked_state(session_dir) as st:
         if not st:
             st.update({
@@ -279,12 +306,20 @@ def init_session(
                 "runner_wt": str(runner_wt),
                 "fixer_wt": str(fixer_wt),
                 "max_attempts": int(max_attempts),
+                "target_goal": norm_goal,
+                "max_goal_attempts": int(max_goal_attempts),
                 "episodes": [],
                 "incidents": {},
                 "commits": [],
             })
         else:
             st["current_tip"] = tip_sha
+            if norm_goal:
+                st["target_goal"] = norm_goal
+            else:
+                st.setdefault("target_goal", "")
+            if "max_goal_attempts" not in st or int(max_goal_attempts) != 4:
+                st["max_goal_attempts"] = int(max_goal_attempts)
     write_review_report(session_dir)
     return read_state(session_dir)
 
@@ -310,6 +345,7 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
     inferred_score = 0
     curve_prompt = 0
     curve_comp = 0
+    curve_total = 0
     elapsed_s = 0.0
     curve_path = ep_dir / "progress_curve.jsonl"
     if curve_path.exists():
@@ -323,6 +359,7 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                 inferred_score = max(inferred_score, int(pt.get("inferred_score_v2", 0)))
                 curve_prompt = max(curve_prompt, int(pt.get("prompt_tokens", 0) or 0))
                 curve_comp = max(curve_comp, int(pt.get("completion_tokens", 0) or 0))
+                curve_total = max(curve_total, int(pt.get("total_tokens", 0) or 0))
                 elapsed_s = max(elapsed_s, float(pt.get("elapsed_s", 0.0) or 0.0))
             except Exception:
                 pass
@@ -332,6 +369,15 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
     tl_sum_comp = 0
     tl_cum_prompt = 0
     tl_cum_comp = 0
+    tl_run_end_total = 0
+    source = "local-target"
+    deaths_recovered_count = 0
+    run_end_deaths: Optional[int] = None
+    stop_reason = ""
+    target_goal = ""
+    target_goal_reached = False
+    target_goal_elapsed_s: Optional[float] = None
+    goals_reached: dict[str, float] = {}
     tl_path = ep_dir / "timeline.jsonl"
     if tl_path.exists():
         for line in tl_path.read_text(encoding="utf-8").splitlines():
@@ -341,22 +387,58 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                 ev = json.loads(line)
                 if "elapsed_s" in ev:
                     elapsed_s = max(elapsed_s, float(ev.get("elapsed_s", 0.0) or 0.0))
-                if ev.get("event") == "skill_end" and ev.get("outcome") == "completed":
+                ev_type = ev.get("event")
+                if ev_type == "run_start":
+                    if ev.get("source"):
+                        source = str(ev["source"])
+                    if ev.get("target_goal"):
+                        target_goal = str(ev["target_goal"])
+                elif ev_type == "death_recovered":
+                    deaths_recovered_count += 1
+                elif ev_type == "goal_reached" and ev.get("goal_id"):
+                    goals_reached.setdefault(str(ev["goal_id"]), float(ev.get("elapsed_s", 0.0) or 0.0))
+                elif ev_type == "skill_end" and ev.get("outcome") == "completed":
                     skills_ok += 1
-                if ev.get("event") == "llm_call":
+                elif ev_type == "llm_call":
                     tl_sum_prompt += int(ev.get("prompt_tokens", 0) or 0)
                     tl_sum_comp += int(ev.get("completion_tokens", 0) or 0)
                     tl_cum_prompt = max(tl_cum_prompt, int(ev.get("cumulative_prompt_tokens", 0) or 0))
                     tl_cum_comp = max(tl_cum_comp, int(ev.get("cumulative_completion_tokens", 0) or 0))
-                if ev.get("event") == "run_end":
+                elif ev_type == "run_end":
                     elapsed_s = max(elapsed_s, float(ev.get("elapsed_s", elapsed_s) or 0.0))
                     tl_cum_prompt = max(tl_cum_prompt, int(ev.get("prompt_tokens", 0) or 0))
                     tl_cum_comp = max(tl_cum_comp, int(ev.get("completion_tokens", 0) or 0))
+                    tl_run_end_total = max(tl_run_end_total, int(ev.get("total_tokens", 0) or 0))
+                    if ev.get("source"):
+                        source = str(ev["source"])
+                    if ev.get("deaths") is not None:
+                        run_end_deaths = int(ev.get("deaths") or 0)
+                    if ev.get("stop_reason"):
+                        stop_reason = str(ev["stop_reason"])
+                    if ev.get("target_goal"):
+                        target_goal = str(ev["target_goal"])
+                    if "target_goal_reached" in ev:
+                        target_goal_reached = bool(ev.get("target_goal_reached"))
+                    if ev.get("target_goal_elapsed_s") is not None:
+                        target_goal_elapsed_s = float(ev["target_goal_elapsed_s"])
+                    if isinstance(ev.get("goals_reached"), dict):
+                        for k, v in ev["goals_reached"].items():
+                            try:
+                                goals_reached[str(k)] = float(v)
+                            except (TypeError, ValueError):
+                                pass
             except Exception:
                 pass
 
+    if target_goal and target_goal in goals_reached:
+        target_goal_reached = True
+        if target_goal_elapsed_s is None:
+            target_goal_elapsed_s = goals_reached[target_goal]
+
+    deaths = run_end_deaths if run_end_deaths is not None else deaths_recovered_count
     prompt_tokens = max(curve_prompt, tl_cum_prompt, tl_sum_prompt)
     completion_tokens = max(curve_comp, tl_cum_comp, tl_sum_comp)
+    total_tokens = max(prompt_tokens + completion_tokens, curve_total, tl_run_end_total)
 
     return {
         "bugs_count": bugs_count,
@@ -367,9 +449,92 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
         "elapsed_s": elapsed_s,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "total_tokens": total_tokens,
+        "source": source,
+        "deaths": deaths,
+        "stop_reason": stop_reason,
+        "target_goal": target_goal,
+        "target_goal_reached": target_goal_reached,
+        "target_goal_elapsed_s": target_goal_elapsed_s,
+        "goals_reached": goals_reached,
         "parsed_incidents": parsed_incidents,
     }
+
+
+def update_session_goal_telemetry(session_dir: Path, episodes: list[dict[str, Any]]) -> dict[str, Path]:
+    """按运行环境 source 物理隔离聚合非回滚轮次的目标实测成本（严守 AGENTS.md §4）。"""
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for ep in episodes:
+        if ep.get("rolled_back"):
+            continue
+        src = str(ep.get("source") or "local-target").strip() or "local-target"
+        by_source.setdefault(src, []).append(ep)
+
+    written: dict[str, Path] = {}
+    for src, source_eps in by_source.items():
+        goal_ids: list[str] = []
+        seen_gids: set[str] = set()
+        for ep in source_eps:
+            for gid in (ep.get("goals_reached") or {}):
+                gid_s = str(gid).strip()
+                if gid_s and gid_s not in seen_gids:
+                    seen_gids.add(gid_s)
+                    goal_ids.append(gid_s)
+            tg = str(ep.get("target_goal") or "").strip()
+            if tg and tg not in seen_gids:
+                seen_gids.add(tg)
+                goal_ids.append(tg)
+
+        goals_stats: dict[str, dict[str, Any]] = {}
+        for gid in goal_ids:
+            ep_pool = [
+                ep for ep in source_eps
+                if not ep.get("target_goal")
+                or ep.get("target_goal") == gid
+                or gid in (ep.get("goals_reached") or {})
+            ]
+            if not ep_pool:
+                ep_pool = list(source_eps)
+            hit_times = sorted(
+                float(ep["goals_reached"][gid])
+                for ep in source_eps
+                if gid in (ep.get("goals_reached") or {})
+            )
+            hit_tokens = sorted(
+                int(ep.get("total_tokens", 0) or 0)
+                for ep in source_eps
+                if gid in (ep.get("goals_reached") or {})
+            )
+            hits = len(hit_times)
+            n_eps = max(1, len(ep_pool))
+            hit_rate = round(hits / n_eps, 3)
+            p50_elapsed_s = round(statistics.median(hit_times), 1) if hit_times else None
+            p50_tokens = int(statistics.median(hit_tokens)) if hit_tokens else 0
+            total_deaths = sum(int(ep.get("deaths", 0) or 0) for ep in ep_pool)
+            goals_stats[gid] = {
+                "episodes": len(ep_pool),
+                "hits": hits,
+                "hit_rate": hit_rate,
+                "p50_elapsed_s": p50_elapsed_s,
+                "p50_tokens": p50_tokens,
+                "total_deaths": total_deaths,
+            }
+
+        safe_src = re.sub(r"[^A-Za-z0-9._\-]", "_", src)
+        out_path = session_dir / f"goal_telemetry.{safe_src}.json"
+        payload = {
+            "source": src,
+            "updated_at": _utc_now(),
+            "note": (
+                f"AGENTS.md §4 环境与测试隔离落盘：本文件仅聚合 source={src!r} 的挂机实测成本，"
+                "本地靶场数据严禁混同为官方赛服结论。"
+            ),
+            "episodes_total": len(source_eps),
+            "goals": goals_stats,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        written[src] = out_path
+    return written
 
 
 def ingest_episode_and_check_rollback(
@@ -382,6 +547,7 @@ def ingest_episode_and_check_rollback(
     summary = _summarize_episode_dir(ep_dir)
     parsed_incidents = summary.pop("parsed_incidents")
     rolled_back_sha: Optional[str] = None
+    revert_reason: Optional[str] = None
 
     with locked_state(session_dir) as st:
         repo_root = Path(st["repo_root"])
@@ -390,7 +556,7 @@ def ingest_episode_and_check_rollback(
 
         # 检查是否存在尚未经过整轮 campaign 验证的新自动修复提交
         prev_good = next(
-            (e for e in reversed(st["episodes"]) if e.get("p0_bugs", 0) == 0),
+            (e for e in reversed(st["episodes"]) if e.get("p0_bugs", 0) == 0 and not e.get("rolled_back")),
             st["episodes"][-1] if st["episodes"] else None,
         )
         unverified_commit = next(
@@ -400,8 +566,30 @@ def ingest_episode_and_check_rollback(
 
         if unverified_commit is not None:
             prev_p0 = int(prev_good.get("p0_bugs", 0)) if prev_good else 0
+            commit_code = str(
+                unverified_commit.get("code")
+                or st["incidents"].get(unverified_commit.get("fingerprint", ""), {}).get("code", "")
+            )
             if summary["p0_bugs"] > prev_p0:
-                # 发现自动修复引入了新 P0 bug：当场在待审分支自动 revert 回退（仅当 fixer 工位干净时执行）
+                revert_reason = "p0_bug_regression"
+            elif prev_good and (prev_good.get("goals_reached") or {}):
+                prev_best_score = max(
+                    int(prev_good.get("server_score", 0) or 0),
+                    int(prev_good.get("inferred_score", 0) or 0),
+                )
+                if prev_best_score > 0 and commit_code == "GOAL_MISS":
+                    tgt_set = {summary["target_goal"]} if summary.get("target_goal") else set()
+                    prev_prereqs = set((prev_good.get("goals_reached") or {}).keys()) - tgt_set
+                    cur_reached = set((summary.get("goals_reached") or {}).keys())
+                    cur_best_score = max(
+                        int(summary.get("server_score", 0) or 0),
+                        int(summary.get("inferred_score", 0) or 0),
+                    )
+                    if prev_prereqs and not (prev_prereqs & cur_reached) and cur_best_score < prev_best_score:
+                        revert_reason = "prereq_score_regression"
+
+            if revert_reason is not None:
+                # 发现自动修复引入了新 P0 bug 或破坏了前置目标得分：当场在待审分支自动 revert 回退（仅当 fixer 工位干净时执行）
                 dirty = _git(fixer_wt, "status", "--porcelain", check=False).stdout.strip()
                 if not dirty and _branch_tip(repo_root, branch) == commit_sha:
                     rev = _git(fixer_wt, "revert", "--no-edit", commit_sha, check=False)
@@ -409,12 +597,15 @@ def ingest_episode_and_check_rollback(
                         rolled_back_sha = commit_sha
                         unverified_commit["status"] = "reverted"
                         unverified_commit["reverted_by_ep"] = ep_id
+                        unverified_commit["revert_reason"] = revert_reason
                         fp = unverified_commit.get("fingerprint", "")
                         if fp in st["incidents"]:
                             st["incidents"][fp]["status"] = "rolled_back"
+                            st["incidents"][fp]["revert_reason"] = revert_reason
                         st["current_tip"] = _branch_tip(repo_root, branch)
                 if rolled_back_sha is None:
                     unverified_commit["status"] = "flagged_regression"
+                    unverified_commit["revert_reason"] = revert_reason
             else:
                 unverified_commit["status"] = "active"
                 unverified_commit["validated_by_ep"] = ep_id
@@ -424,16 +615,26 @@ def ingest_episode_and_check_rollback(
             cat = str(inc_obj.get("category", ""))
             if cat not in ("bug", "strategy"):
                 continue
-            fp = str(inc_obj.get("fingerprint") or f"{inc_obj.get('code')}:{inc_obj.get('skill')}")
+            skill_val = str(inc_obj.get("skill") or (inc_obj.get("skill_context") or {}).get("skill") or "")
+            inc_id_val = str(inc_obj.get("incident_id") or inc_obj.get("id") or inc_path.stem)
+            goal_id_val = str(inc_obj.get("goal_id") or (inc_obj.get("detail") or {}).get("goal_id") or "")
+            editable_files_val = [
+                str(x)
+                for x in (inc_obj.get("editable_files") or (inc_obj.get("detail") or {}).get("editable_files") or [])
+                if x
+            ]
+            fp = str(inc_obj.get("fingerprint") or f"{inc_obj.get('code')}:{skill_val}")
             rec = st["incidents"].get(fp)
             if rec is None:
                 st["incidents"][fp] = {
                     "fingerprint": fp,
-                    "incident_id": inc_obj.get("incident_id", inc_path.stem),
+                    "incident_id": inc_id_val,
                     "code": inc_obj.get("code", ""),
                     "severity": inc_obj.get("severity", "P2"),
                     "category": cat,
-                    "skill": inc_obj.get("skill", ""),
+                    "skill": skill_val,
+                    "goal_id": goal_id_val,
+                    "editable_files": editable_files_val,
                     "status": "pending",
                     "attempts": 0,
                     "first_seen_ep": ep_id,
@@ -446,17 +647,36 @@ def ingest_episode_and_check_rollback(
             else:
                 rec["last_seen_ep"] = ep_id
                 rec["incident_path"] = str(inc_path.resolve())
+                if skill_val and not rec.get("skill"):
+                    rec["skill"] = skill_val
+                if goal_id_val:
+                    rec["goal_id"] = goal_id_val
+                if editable_files_val:
+                    rec["editable_files"] = editable_files_val
                 if commit_sha not in rec.get("seen_commits", []):
                     rec.setdefault("seen_commits", []).append(commit_sha)
-                # 若之前标为 fixed 但在修复提交之后的轮次再次复发，说明未根治，若未超阈值则重新打开
-                if rec["status"] == "fixed" and rec.get("fix_commit") and rec["fix_commit"] != commit_sha:
-                    # 确认当前 commit_sha 包含 fix_commit 祖先却仍复发
+                # 若之前标为 fixed 但在包含 fix_commit 的轮次（含 commit_sha == fix_commit 当轮）仍复发，说明未根治
+                if rec["status"] == "fixed" and rec.get("fix_commit"):
                     anc = _git(repo_root, "merge-base", "--is-ancestor", rec["fix_commit"], commit_sha, check=False)
                     if anc.returncode == 0:
-                        if int(rec.get("attempts", 0)) < int(st.get("max_attempts", 2)):
+                        rec["last_failed_fix_commit"] = rec["fix_commit"]
+                        rec["fix_commit"] = None
+                        if int(rec.get("attempts", 0)) < _max_attempts_for(st, rec):
                             rec["status"] = "pending"
                         else:
                             rec["status"] = "escalated_human"
+                elif rec["status"] == "resolved_by_run":
+                    if int(rec.get("attempts", 0)) < _max_attempts_for(st, rec):
+                        rec["status"] = "pending"
+
+        # 若本轮成功达成聚焦目标，同步标记对应 GOAL_MISS 已由实跑达成，避免 Fixer 空转认领
+        gid = str(summary.get("target_goal") or "").strip()
+        if gid and summary.get("target_goal_reached"):
+            miss_rec = st["incidents"].get(f"GOAL_MISS:{gid}")
+            if miss_rec is not None and miss_rec.get("status") in ("pending", "fixed"):
+                miss_rec["goal_achieved_ep"] = ep_id
+                if miss_rec.get("status") == "pending":
+                    miss_rec["status"] = "resolved_by_run"
 
         ep_meta = {
             "ep_id": ep_id,
@@ -465,11 +685,14 @@ def ingest_episode_and_check_rollback(
             "bot_user": bot_user,
             "run_dir": str(ep_dir.resolve()),
             "rolled_back": rolled_back_sha,
+            "revert_reason": revert_reason if rolled_back_sha else None,
             **summary,
         }
         st["episodes"].append(ep_meta)
         st["current_tip"] = _branch_tip(repo_root, branch)
+        episodes_snap = list(st["episodes"])
 
+    update_session_goal_telemetry(session_dir, episodes_snap)
     write_review_report(session_dir)
     return ep_meta
 
@@ -477,6 +700,50 @@ def ingest_episode_and_check_rollback(
 def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixer_wt: Path) -> str:
     tape_preview = json.dumps((inc_json.get("http_tape") or [])[-10:], ensure_ascii=False, indent=2)
     inc_path = inc_rec["incident_path"]
+    skill_ctx = inc_json.get("skill_context") or {}
+    detail = inc_json.get("detail") or {}
+    skill_args = inc_json.get("skill_args") if inc_json.get("skill_args") is not None else skill_ctx.get("args", {})
+    outcome = inc_json.get("outcome") if inc_json.get("outcome") is not None else skill_ctx.get("outcome")
+    error_code = inc_json.get("error_code") if inc_json.get("error_code") is not None else skill_ctx.get("error_code")
+    error_msg = (
+        inc_json.get("error_msg")
+        if inc_json.get("error_msg") is not None
+        else (skill_ctx.get("error_msg") or detail.get("summary"))
+    )
+
+    is_goal_miss = inc_rec.get("code") == "GOAL_MISS"
+    goal_id = str(inc_rec.get("goal_id") or inc_json.get("goal_id") or detail.get("goal_id") or "")
+    narrow_files = [
+        str(p)
+        for p in (inc_rec.get("editable_files") or inc_json.get("editable_files") or detail.get("editable_files") or [])
+        if p
+    ]
+
+    goal_section = ""
+    if is_goal_miss:
+        goal_section = f"""
+## 1B. 目标未达成诊断（GOAL_MISS）
+- **目标 (`goal_id`)**：`{goal_id}` — {detail.get('goal_title', '')}（层级 `{detail.get('tier', '')}`，分值 `{detail.get('score', 0)}`）
+- **卡点摘要**：{detail.get('summary', '')}
+- **耗时 / 预算 / 结束原因**：`{detail.get('elapsed_s')}`s / `{detail.get('budget_s')}`s / `{detail.get('stop_reason')}`
+- **瓶颈目标 / 瓶颈技能**：`{detail.get('bottleneck_goal_id', '')}` / `{detail.get('bottleneck_skill', '')}`（目标主技能是否已启动：`{detail.get('target_skill_started')}`）
+- **已完成前置 (`completed_prereqs`)**：`{json.dumps(detail.get('completed_prereqs', []), ensure_ascii=False)}`
+- **未满足前置 (`missing_prereqs`)**：`{json.dumps(detail.get('missing_prereqs', []), ensure_ascii=False)}`
+- **物资/判据缺口 (`missing_items`)**：`{json.dumps(detail.get('missing_items', []), ensure_ascii=False)}`
+- **最近一次 Replan (`last_replan`)**：`{json.dumps(detail.get('last_replan'), ensure_ascii=False)}`
+- **技能执行统计 (`skill_stats`)**：`{json.dumps(detail.get('skill_stats', {}), ensure_ascii=False)}`\n"""
+
+    if is_goal_miss and narrow_files:
+        narrow_list_str = "、".join(f"`{f}`" for f in narrow_files)
+        whitelist_block = f"""2. **目标单收窄文件白名单（Gate 1 动态收窄强校验，越界直接拒绝并丢弃改动）**：
+   - **本单只允许修改/新增**：{narrow_list_str} 以及 `code/tests/test_*.py`。
+   - **严禁越界触碰其他模块**：修改 `code/mcagent/loop/policy.py`、其他无关 `skills/*.py` 或 `loop/*.py` 将被 Gate 1 直接拒绝！
+   - **严禁触碰冻结底座**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{{base,registry,testing}}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
+    else:
+        whitelist_block = """2. **文件白名单（严禁越界）**：
+   - **只允许修改/新增**：`code/mcagent/loop/*.py`、`code/mcagent/skills/*.py`（不含冻结文件）、`code/tests/test_*.py`。
+   - **严禁触碰**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{base,registry,testing}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
+
     return f"""# 自动修单任务：{inc_rec['incident_id']} (`{inc_rec['code']}`)
 
 你正在独立的修复工作树 `{fixer_wt}` 中修复挂机压测捕获的真实异常单。
@@ -484,12 +751,12 @@ def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixe
 ## 1. 异常摘要
 - **指纹 (`fingerprint`)**：`{inc_rec['fingerprint']}`
 - **级别 / 类别**：`{inc_rec['severity']}` / `{inc_rec['category']}`
-- **触发技能**：`{inc_rec['skill']}` · 参数：`{json.dumps(inc_json.get('skill_args', {}), ensure_ascii=False)}`
-- **结果 / 报错码**：`{inc_json.get('outcome')}` / `{inc_json.get('error_code')}`
-- **错误信息**：`{inc_json.get('error_msg')}`
+- **触发技能**：`{inc_rec['skill']}` · 参数：`{json.dumps(skill_args, ensure_ascii=False)}`
+- **结果 / 报错码**：`{outcome}` / `{error_code}`
+- **错误信息**：`{error_msg}`
 - **后置断言信息**：`{inc_json.get('postcondition_error')}`
 - **异常包完整路径**：`{inc_path}`
-
+{goal_section}
 ## 2. 最近 HTTP 交互磁带切片（末尾 10 条）
 ```json
 {tape_preview}
@@ -497,9 +764,7 @@ def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixe
 
 ## 3. 修复步骤与硬性红线（机器门禁将逐项核查，违规直接丢弃改动）
 1. **复现与定位**：可在 `{fixer_wt}/code` 下运行 `uv run python -m mcagent.loop --replay {shlex.quote(inc_path)}` 查看确定性回放，并阅读相关技能与规划代码。
-2. **文件白名单（严禁越界）**：
-   - **只允许修改/新增**：`code/mcagent/loop/*.py`、`code/mcagent/skills/*.py`（不含冻结文件）、`code/tests/test_*.py`。
-   - **严禁触碰**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{{base,registry,testing}}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。
+{whitelist_block}
 3. **补充离线回归单测**：在 `code/tests/` 中针对该根因补充至少 1 条确定性单测，确保 `cd {fixer_wt}/code && uv run python -m unittest discover -s tests` 全部通过。
 4. **不要自己执行 `git commit`**：保留工作区修改即可，外层 `soak_ctl.py verify-and-promote` 会独立运行四道门禁并统一提交到待审分支。
 """
@@ -507,13 +772,13 @@ def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixe
 
 def claim_next_incident(session_dir: Path) -> Optional[dict[str, Any]]:
     with locked_state(session_dir) as st:
-        max_attempts = int(st.get("max_attempts", 2))
         fixer_wt = Path(st["fixer_wt"])
         candidates = []
         for fp, rec in st.get("incidents", {}).items():
             if rec.get("status") != "pending":
                 continue
-            if int(rec.get("attempts", 0)) >= max_attempts:
+            max_att = _max_attempts_for(st, rec)
+            if int(rec.get("attempts", 0)) >= max_att:
                 rec["status"] = "escalated_human"
                 continue
             rank = (
@@ -570,7 +835,7 @@ def verify_and_promote(
         with locked_state(session_dir) as st:
             rec = st["incidents"][fingerprint]
             rec["attempts"] = int(rec.get("attempts", 0)) + 1
-            max_att = int(st.get("max_attempts", 2))
+            max_att = _max_attempts_for(st, rec)
             rec["status"] = "escalated_human" if rec["attempts"] >= max_att else "pending"
             entry = {"at": _utc_now(), "ok": False, "failed_gate": gate, "detail": detail[:1000]}
             rec.setdefault("gate_history", []).append(entry)
@@ -591,8 +856,13 @@ def verify_and_promote(
     if not changed_files:
         return _fail("gate1_whitelist", "fixer 工位没有任何文件改动")
 
+    narrow_files = (
+        inc_rec.get("editable_files")
+        if inc_rec.get("code") == "GOAL_MISS" and inc_rec.get("editable_files")
+        else None
+    )
     for rel in changed_files:
-        ok, why = is_allowed_edit_path(rel)
+        ok, why = is_allowed_edit_path(rel, narrow_files=narrow_files)
         if not ok:
             return _fail("gate1_whitelist", why)
 
@@ -620,22 +890,38 @@ def verify_and_promote(
             tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-600:]
             return _fail(f"gate2_{step_name}", tail)
 
-    # ---------------- Gate 3: 独立测试号真机 focus 金丝雀小灶验收 ----------------
+    # ---------------- Gate 3: 独立测试号真机 focus / goal 金丝雀小灶验收 ----------------
     skill_name = str(inc_rec.get("skill") or "").strip()
-    if live_canary and skill_name:
+    goal_id = str(inc_rec.get("goal_id") or "").strip()
+    is_goal_canary = inc_rec.get("code") == "GOAL_MISS" and bool(goal_id)
+    if live_canary and (is_goal_canary or skill_name):
         canary_dir = attempt_dir / "live_canary"
-        cmd = [
-            "uv", "run", "python", "-m", "mcagent.loop",
-            "--mode", "focus",
-            "--skill", skill_name,
-            "--soak",
-            "--local-target", "--live",
-            "--user", fixer_bot_user,
-            "--run-dir", str(canary_dir),
-            "--max-steps", str(canary_max_steps),
-            "--max-seconds", str(canary_max_seconds),
-            "--disconnect-on-exit",
-        ]
+        if is_goal_canary:
+            cmd = [
+                "uv", "run", "python", "-m", "mcagent.loop",
+                "--mode", "campaign",
+                "--goal", goal_id,
+                "--soak",
+                "--local-target", "--live",
+                "--user", fixer_bot_user,
+                "--run-dir", str(canary_dir),
+                "--max-steps", str(canary_max_steps),
+                "--max-seconds", str(canary_max_seconds),
+                "--disconnect-on-exit",
+            ]
+        else:
+            cmd = [
+                "uv", "run", "python", "-m", "mcagent.loop",
+                "--mode", "focus",
+                "--skill", skill_name,
+                "--soak",
+                "--local-target", "--live",
+                "--user", fixer_bot_user,
+                "--run-dir", str(canary_dir),
+                "--max-steps", str(canary_max_steps),
+                "--max-seconds", str(canary_max_seconds),
+                "--disconnect-on-exit",
+            ]
         proc = subprocess.run(cmd, cwd=str(code_dir), env=uv_env, capture_output=True, text=True, timeout=int(canary_max_seconds + 45))
         (attempt_dir / "gate3_live_canary.log").write_text(
             (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
@@ -645,12 +931,12 @@ def verify_and_promote(
             return _fail("gate3_live_canary_exit", tail)
         canary_summary = _summarize_episode_dir(canary_dir)
         if canary_summary["bugs_count"] > 0:
-            return _fail("gate3_live_canary_bugs", f"focus 金丝雀仍触发 {canary_summary['bugs_count']} 个 bug 异常单")
+            return _fail("gate3_live_canary_bugs", f"金丝雀验收仍触发 {canary_summary['bugs_count']} 个 bug 异常单")
 
     # ---------------- Gate 4: 提交到单一待审分支并通知 Runner 下一轮热切换 ----------------
     _git(fixer_wt, "add", *changed_files)
     commit_msg = (
-        f"fix(soak-autofix): {skill_name or 'loop'} resolve {inc_rec.get('incident_id')} "
+        f"fix(soak-autofix): {skill_name or goal_id or 'loop'} resolve {inc_rec.get('incident_id')} "
         f"[{inc_rec.get('code')}]"
     )
     _git(fixer_wt, "commit", "-m", commit_msg)
@@ -666,13 +952,15 @@ def verify_and_promote(
             "ok": True,
             "commit": new_sha,
             "changed_files": changed_files,
-            "live_canary": bool(live_canary and skill_name),
+            "live_canary": bool(live_canary and (is_goal_canary or skill_name)),
         })
         st["commits"].append({
             "sha": new_sha,
             "at": _utc_now(),
             "fingerprint": fingerprint,
             "incident_id": inc_rec.get("incident_id"),
+            "code": inc_rec.get("code", ""),
+            "goal_id": goal_id,
             "skill": skill_name,
             "files": changed_files,
             "status": "pending_canary_ep",
@@ -692,6 +980,7 @@ def run_runner_loop(
     user_prefix: str = "agy_soak_r",
     rotate_user: bool = True,
     use_llm: bool = True,
+    target_goal: str = "",
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     idx = 0
@@ -699,8 +988,17 @@ def run_runner_loop(
         if (session_dir / "STOP").exists():
             print("[runner] 检测到 STOP 标志文件，安全退出挂机循环。")
             break
-        idx += 1
         st = read_state(session_dir)
+        active_goal = (target_goal or st.get("target_goal") or "").strip()
+        if episodes <= 0 and active_goal:
+            goal_inc = st.get("incidents", {}).get(f"GOAL_MISS:{active_goal}", {})
+            if goal_inc.get("status") == "escalated_human":
+                print(
+                    f"[runner] 聚焦目标 {active_goal} 已超最大自动尝试轮数并升级人工（escalated_human），自动止损退出。"
+                )
+                (session_dir / "STOP").write_text(_utc_now(), encoding="utf-8")
+                break
+        idx += 1
         repo_root = Path(st["repo_root"])
         runner_wt = Path(st["runner_wt"])
         branch = st["target_branch"]
@@ -714,7 +1012,7 @@ def run_runner_loop(
 
         bot_user = f"{user_prefix}{ep_num:03d}" if rotate_user else user_prefix
         prev_good = next(
-            (e for e in reversed(st["episodes"]) if e.get("p0_bugs", 0) == 0),
+            (e for e in reversed(st["episodes"]) if e.get("p0_bugs", 0) == 0 and not e.get("rolled_back")),
             st["episodes"][-1] if st["episodes"] else None,
         )
 
@@ -730,12 +1028,17 @@ def run_runner_loop(
             "--max-seconds", str(episode_seconds),
             "--disconnect-on-exit",
         ]
+        if active_goal:
+            cmd.extend(["--goal", active_goal])
+        telemetry_path = session_dir / "goal_telemetry.local-target.json"
+        if telemetry_path.exists():
+            cmd.extend(["--goal-telemetry", str(telemetry_path)])
         if use_llm:
             cmd.append("--llm")
         if prev_good and Path(prev_good["run_dir"]).exists():
             cmd.extend(["--baseline", prev_good["run_dir"]])
 
-        print(f"[runner] 启动 {ep_id} @ {tip_sha[:7]} (bot={bot_user}, max={episode_seconds}s)...")
+        print(f"[runner] 启动 {ep_id} @ {tip_sha[:7]} (bot={bot_user}, goal={active_goal or 'all'}, max={episode_seconds}s)...")
         subprocess.run(cmd, cwd=str(runner_wt / "code"), env=_uv_env(runner_wt), check=False)
         meta = ingest_episode_and_check_rollback(session_dir, ep_id, ep_dir, tip_sha, bot_user)
         results.append(meta)
@@ -820,6 +1123,13 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
+    ]
+    if st.get("target_goal"):
+        lines.append(
+            f"- **本轮聚焦晋级目标**：`{st['target_goal']}`（最大自动尝试上限 `{st.get('max_goal_attempts', 4)}` 轮）"
+        )
+
+    lines.extend([
         "",
         "## 一、人工验收与合并命令（跑完后由人执行）",
         "",
@@ -834,7 +1144,7 @@ def write_review_report(session_dir: Path) -> Path:
         "",
         "## 二、自动修复提交清单",
         "",
-    ]
+    ])
     if not st["commits"]:
         lines.append("- 暂无自动修复提交。")
     else:
@@ -842,8 +1152,11 @@ def write_review_report(session_dir: Path) -> Path:
         lines.append("|---|---|---|---|---|")
         for c in st["commits"]:
             files_s = ", ".join(f"`{x}`" for x in c.get("files", []))
+            st_s = f"`{c.get('status')}`"
+            if c.get("revert_reason"):
+                st_s += f" ({c['revert_reason']})"
             lines.append(
-                f"| `{c['sha'][:7]}` | `{c.get('status')}` | `{c.get('incident_id')}` | `{c.get('skill')}` | {files_s} |"
+                f"| `{c['sha'][:7]}` | {st_s} | `{c.get('incident_id')}` | `{c.get('skill') or c.get('goal_id')}` | {files_s} |"
             )
 
     lines.extend(["", "## 三、异常单状态总览", ""])
@@ -862,10 +1175,28 @@ def write_review_report(session_dir: Path) -> Path:
     if not st["episodes"]:
         lines.append("- 暂无已完成挂机轮次。")
     else:
-        lines.append("| 轮次 | 提交 | 测试角色 | 完成技能数 | Bug 单数 | 服务端分 / 代理分 | 输入/输出 token | 价值 | 回滚 |")
-        lines.append("|---|---|---|---:|---:|---|---|---|---|")
+        lines.append("| 轮次 | 提交 | 测试角色 | 完成技能数 | Bug 单数 | 服务端分 / 代理分 | 目标达成 | 输入/输出 token | 价值 | 回滚 |")
+        lines.append("|---|---|---|---:|---:|---|---|---|---|---|")
         for e in st["episodes"]:
-            rb = f"`{e['rolled_back'][:7]}`" if e.get("rolled_back") else "-"
+            if e.get("rolled_back"):
+                rb = f"`{e['rolled_back'][:7]}`"
+                if e.get("revert_reason"):
+                    rb += f" ({e['revert_reason']})"
+            else:
+                rb = "-"
+            if e.get("target_goal"):
+                if e.get("target_goal_reached"):
+                    t_el = e.get("target_goal_elapsed_s")
+                    goal_s = (
+                        f"✅ `{e['target_goal']}` ({float(t_el):.1f}s)"
+                        if t_el is not None
+                        else f"✅ `{e['target_goal']}`"
+                    )
+                else:
+                    goal_s = f"❌ `{e['target_goal']}`"
+            else:
+                gr = e.get("goals_reached") or {}
+                goal_s = f"{len(gr)} 项" if gr else "-"
             p_tok = int(e.get("prompt_tokens", 0) or 0)
             c_tok = int(e.get("completion_tokens", 0) or 0)
             el_s = float(e.get("elapsed_s", 0.0) or 0.0)
@@ -874,7 +1205,39 @@ def write_review_report(session_dir: Path) -> Path:
             lines.append(
                 f"| `{e['ep_id']}` | `{e['commit'][:7]}` | `{e['bot_user']}` | "
                 f"{e['skills_completed']} | {e['bugs_count']} | "
-                f"{e['server_score']} / {e['inferred_score']} | {tok_s} | {val_s} | {rb} |"
+                f"{e['server_score']} / {e['inferred_score']} | {goal_s} | {tok_s} | {val_s} | {rb} |"
+            )
+
+    telemetry_rows: list[tuple[str, str, dict[str, Any]]] = []
+    for tf in sorted(session_dir.glob("goal_telemetry.*.json")):
+        try:
+            tdata = json.loads(tf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        src = str(tdata.get("source") or tf.stem.removeprefix("goal_telemetry."))
+        for gid, gstat in (tdata.get("goals") or {}).items():
+            if isinstance(gstat, dict):
+                telemetry_rows.append((str(gid), src, gstat))
+
+    if telemetry_rows:
+        lines.extend([
+            "",
+            "## 五、目标台账实测成本汇总",
+            "",
+            "| 目标 ID | 数据来源 | 达成/轮数 (达成率) | P50 用时 | 中位 Token | 累计死亡 |",
+            "|---|---|---|---:|---:|---:|",
+        ])
+        for gid, src, gstat in telemetry_rows:
+            hits = int(gstat.get("hits", 0) or 0)
+            eps = int(gstat.get("episodes", 0) or 0)
+            hr_pct = float(gstat.get("hit_rate", 0.0) or 0.0) * 100.0
+            p50_s = gstat.get("p50_elapsed_s")
+            p50_s_str = f"{float(p50_s):.1f}s" if p50_s is not None else "-"
+            p50_tok = int(gstat.get("p50_tokens", 0) or 0)
+            p50_tok_str = f"`{p50_tok:,}`" if p50_tok > 0 else "-"
+            deaths = int(gstat.get("total_deaths", 0) or 0)
+            lines.append(
+                f"| `{gid}` | `{src}` | {hits}/{eps} ({hr_pct:.1f}%) | {p50_s_str} | {p50_tok_str} | {deaths} |"
             )
 
     report_path = session_dir / "REVIEW_REPORT.md"
@@ -903,6 +1266,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--branch", default="feat/soak-autofix", help="自动修复汇入的待审分支（严禁 main）")
     p_init.add_argument("--base-ref", default="HEAD")
     p_init.add_argument("--max-attempts", type=int, default=2)
+    p_init.add_argument("--goal", default="", help="会话级聚焦晋级目标 goal_id（空表示常规全目标挂机）")
+    p_init.add_argument(
+        "--max-goal-attempts",
+        type=int,
+        default=4,
+        help="单目标 GOAL_MISS 自动修复最大尝试轮数上限（超限自动转交人工，防单目标死磕耗尽时间）",
+    )
 
     p_run_ep = sub.add_parser("runner-loop", help="启动工位 A（挂机压测循环，轮间自动热切换新 commit）")
     p_run_ep.add_argument("--session-dir", required=True)
@@ -911,6 +1281,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run_ep.add_argument("--episode-steps", type=int, default=40)
     p_run_ep.add_argument("--user-prefix", default="agy_soak_r")
     p_run_ep.add_argument("--fixed-user", action="store_true", help="不按轮次轮换角色名")
+    p_run_ep.add_argument("--goal", default="", help="覆盖会话级聚焦目标 goal_id")
     p_run_ep.add_argument(
         "--llm",
         action=argparse.BooleanOptionalAction,
@@ -943,6 +1314,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument("--episodes", type=int, default=3)
     p_dual.add_argument("--episode-seconds", type=float, default=180.0)
     p_dual.add_argument("--episode-steps", type=int, default=40)
+    p_dual.add_argument("--goal", default="", help="本轮聚焦晋级目标 goal_id")
+    p_dual.add_argument(
+        "--max-goal-attempts",
+        type=int,
+        default=4,
+        help="单目标 GOAL_MISS 自动修复最大尝试轮数上限（超限自动转交人工，防单目标死磕耗尽时间）",
+    )
     p_dual.add_argument(
         "--llm",
         action=argparse.BooleanOptionalAction,
@@ -974,10 +1352,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_branch=args.branch,
             base_ref=args.base_ref,
             max_attempts=args.max_attempts,
+            target_goal=args.goal,
+            max_goal_attempts=args.max_goal_attempts,
         )
         print(json.dumps({
             "ok": True,
             "target_branch": st["target_branch"],
+            "target_goal": st.get("target_goal", ""),
             "runner_wt": st["runner_wt"],
             "fixer_wt": st["fixer_wt"],
             "review_report": str(session_dir / "REVIEW_REPORT.md"),
@@ -993,6 +1374,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             user_prefix=args.user_prefix,
             rotate_user=not args.fixed_user,
             use_llm=args.llm,
+            target_goal=args.goal,
         )
         return 0
 
@@ -1032,7 +1414,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "run":
         repo_root = find_repo_root()
-        init_session(repo_root, session_dir, target_branch=args.branch)
+        init_session(
+            repo_root,
+            session_dir,
+            target_branch=args.branch,
+            target_goal=args.goal,
+            max_goal_attempts=args.max_goal_attempts,
+        )
         tmpl = args.fixer_cmd or FIXER_PRESETS[args.fixer_preset]
         script = str(Path(__file__).resolve())
         runner_cmd = [
@@ -1042,6 +1430,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--episode-seconds", str(args.episode_seconds),
             "--episode-steps", str(args.episode_steps),
         ]
+        if (args.goal or "").strip():
+            runner_cmd.extend(["--goal", args.goal.strip()])
         runner_cmd.append("--llm" if args.llm else "--no-llm")
         fixer_cmd = [
             sys.executable, script, "fixer-loop",
@@ -1073,13 +1463,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         report = write_review_report(session_dir)
         print(json.dumps({
             "target_branch": st["target_branch"],
+            "target_goal": st.get("target_goal", ""),
             "base_commit": st["base_commit"][:7],
             "current_tip": st["current_tip"][:7],
             "episodes": len(st["episodes"]),
             "commits": len(st["commits"]),
             "incidents_by_status": {
                 k: sum(1 for r in st["incidents"].values() if r["status"] == k)
-                for k in ("pending", "claimed", "fixed", "rolled_back", "escalated_human")
+                for k in ("pending", "claimed", "fixed", "resolved_by_run", "rolled_back", "escalated_human")
             },
             "review_report": str(report),
         }, ensure_ascii=False, indent=2))

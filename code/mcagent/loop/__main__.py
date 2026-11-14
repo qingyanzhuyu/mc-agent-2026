@@ -21,6 +21,8 @@ from ..preflight import OFFICIAL_HOSTS
 from ..runtime import Executor, State
 from ..skills import REGISTRY, contract_errors
 from . import (
+    GOAL_MAP,
+    GOALS,
     CampaignPlanner,
     LoopConfig,
     MainLoop,
@@ -28,7 +30,9 @@ from . import (
     SoakObserver,
     TapeClient,
     TapeRecorder,
+    load_goal_telemetry,
     replay_incident,
+    validate_ledger,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -43,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=("campaign", "focus"), default="campaign", help="campaign=比赛跑法, focus=单技能定向验收")
     p.add_argument("--skill", default=None, help="focus 模式下要运行的技能名")
     p.add_argument("--skill-args", default="{}", help="focus 模式下的 JSON 参数对象")
+    p.add_argument("--goal", default=None, help="聚焦推进并验收目标台账中的指定 goal_id")
+    p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
+    p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
     p.add_argument("--llm", action="store_true", help="开启 LLM 菜单选择（默认关闭，走纯规则队列；失败自动回退规则）")
     p.add_argument("--soak", action="store_true", help="挂载 SoakObserver（落盘 timeline/http_tape/progress_curve/异常包）")
     p.add_argument("--run-dir", type=Path, default=None, help="指定运行日志目录（默认 mcagent/logs/soak-YYYYmmdd-HHMMSS）")
@@ -70,6 +77,12 @@ def _run_dry(cfg: Config) -> int:
         if errs:
             print(f"[dry] 契约不合格 {name}: {errs}")
             return 1
+    ledger_errs = validate_ledger(GOALS)
+    if ledger_errs:
+        print(f"[dry] 目标台账契约不合格: {ledger_errs}")
+        return 1
+    active_cnt = sum(1 for g in GOALS if g.stage != "draft")
+    print(f"[dry] 目标台账核验通过: 共 {len(GOALS)} 项（已激活 {active_cnt} 项）")
     st = State()
     st.set_status({"ready": True, "alive": True, "health": 20, "food": 20, "pos": [0.5, 64.0, 0.5]})
     st.set_inventory({"items": []})
@@ -95,6 +108,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--skill-args 必须是 JSON 对象")
     except Exception as e:
         print(f"参数错误: {e}", file=sys.stderr)
+        return 2
+
+    if args.goal is not None and args.goal not in GOAL_MAP:
+        print(f"参数错误: 未知 --goal {args.goal!r}（可选: {', '.join(GOAL_MAP)}）", file=sys.stderr)
         return 2
 
     cfg = Config.load()
@@ -136,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     source_tag = "official" if (official and not args.local_target) else "local-target"
     min_ver = args.min_verified or ("live" if source_tag == "official" else "offline")
     enable_obs = args.soak or args.run_dir is not None
+    stop_on_goal = bool(args.goal and not args.no_stop_on_goal)
+    telemetry = load_goal_telemetry(args.goal_telemetry)
 
     run_dir = args.run_dir or (DEFAULT_LOG_ROOT / time.strftime("soak-%Y%m%d-%H%M%S"))
     tape = TapeRecorder(tape_path=str(run_dir / "http_tape.jsonl")) if enable_obs else None
@@ -155,9 +174,12 @@ def main(argv: list[str] | None = None) -> int:
             sample_verify_rate=args.sample_verify,
             stuck_steps=args.stuck_steps,
             baseline_dir=args.baseline,
+            target_goal=args.goal,
             run_meta={
                 "mode": args.mode,
                 "skill": args.skill,
+                "target_goal": args.goal,
+                "stop_on_goal": stop_on_goal,
                 "use_llm": args.llm,
                 **llm_meta,
                 "min_verified": min_ver,
@@ -175,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         use_llm=args.llm,
         min_verified=min_ver,
         on_llm_telemetry=observer.on_llm_call if observer else None,
+        target_goal=args.goal,
+        telemetry=telemetry,
     )
     loop_cfg = LoopConfig(
         mode=args.mode,
@@ -182,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         max_seconds=args.max_seconds,
         max_deaths=args.max_deaths,
         disconnect_on_exit=args.disconnect_on_exit,
+        target_goal=args.goal,
+        stop_on_goal=stop_on_goal,
     )
     loop = MainLoop(client, state, executor, planner, config=loop_cfg, observer=observer)
     result = loop.run()

@@ -17,6 +17,7 @@ from ..client import ApiError, Client
 from ..runtime import Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
 from ..skills.base import Skill, failure
 from .auditor import SoakObserver
+from .goals import GOAL_MAP, GoalSpec, is_goal_achieved
 from .policy import CampaignPlanner
 
 
@@ -31,6 +32,8 @@ class LoopConfig:
     respawn_timeout_s: float = 90.0
     enable_monitor: bool = True
     disconnect_on_exit: bool = False
+    target_goal: Optional[str] = None
+    stop_on_goal: bool = False
 
 
 @dataclass
@@ -68,6 +71,35 @@ class MainLoop:
         self.log = log
         self.recent_failures: deque[str] = deque(maxlen=12)
         self._seen_deaths_len = 0
+        self._server_advancements: set[str] = set()
+
+    def _resolve_target_goal_spec(self) -> Optional[GoalSpec]:
+        gid = self.config.target_goal
+        if not gid:
+            return None
+        if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "ledger_map"):
+            g = self.planner.rules.ledger_map.get(gid)
+            if g is not None:
+                return g
+        if self.observer is not None and hasattr(self.observer, "_ledger_map"):
+            g = self.observer._ledger_map.get(gid)
+            if g is not None:
+                return g
+        return GOAL_MAP.get(gid)
+
+    def _sync_and_check_target_goal(self) -> bool:
+        completed_advs = set(self._server_advancements)
+        if self.observer is not None:
+            completed_advs.update(self.observer.server_advancements)
+            self._server_advancements.update(completed_advs)
+        if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "completed_advancements"):
+            self.planner.rules.completed_advancements.update(completed_advs)
+        if self.observer is not None:
+            self.observer.update_goals_reached(self.state)
+        if self.config.target_goal:
+            g = self._resolve_target_goal_spec()
+            return bool(g is not None and is_goal_achieved(g, self.state, completed_advs))
+        return False
 
     def _budget_exceeded(self, started_mono: float, steps: int, deaths: int) -> Optional[str]:
         if self.config.max_steps > 0 and steps >= self.config.max_steps:
@@ -210,8 +242,13 @@ class MainLoop:
                 monitor.start()
             if self.observer is not None:
                 self.observer.on_run_start(self.state)
+                if self.config.target_goal:
+                    self.observer.on_progress_tick(self.state, client=self.client, force=True)
 
-            while True:
+            if self._sync_and_check_target_goal() and self.config.stop_on_goal:
+                stop_reason = "goal_reached"
+
+            while stop_reason != "goal_reached":
                 budget = self._budget_exceeded(started_mono, steps, deaths_recovered)
                 if budget:
                     stop_reason = budget
@@ -232,6 +269,10 @@ class MainLoop:
                     deaths_recovered += 1
                     continue
 
+                if self._sync_and_check_target_goal() and self.config.stop_on_goal:
+                    stop_reason = "goal_reached"
+                    break
+
                 decision = self.planner.select(self.state, list(self.recent_failures))
                 if decision.skill is None:
                     if self.config.idle_sleep_s > 0:
@@ -250,10 +291,14 @@ class MainLoop:
                     self.observer.on_skill_start(active_skill, decision.source, decision.reason, self.state)
 
                 died_during_skill = False
+                skill_t0 = time.monotonic()
+                goal_reached_now = False
                 try:
                     while True:
                         budget = self._budget_exceeded(started_mono, steps, deaths_recovered)
                         if budget:
+                            if self.observer is not None and self.observer.tape is not None:
+                                self.observer.tape.end_skill_slice()
                             active_skill.abort()
                             if self.observer is not None:
                                 self.observer.on_skill_end(
@@ -272,20 +317,58 @@ class MainLoop:
 
                         done = active_skill.step(self.executor, self.state)
                         if done:
+                            skill_dt = max(0.0, time.monotonic() - skill_t0)
+                            finished_name = active_skill.name
+                            if self.observer is not None and self.observer.tape is not None:
+                                self.observer.tape.end_skill_slice()
                             self._refresh_world_state()
                             skills_ok += 1
+                            tgt_spec = self._resolve_target_goal_spec()
+                            force_tick = bool(
+                                tgt_spec is not None
+                                and tgt_spec.skill == finished_name
+                                and tgt_spec.done_advancements
+                            )
                             if self.observer is not None:
                                 self.observer.on_skill_end(
                                     active_skill, "completed", self.state, died_or_disconnected=False
                                 )
-                                self.observer.on_progress_tick(self.state, client=self.client)
+                                self.observer.on_progress_tick(
+                                    self.state, client=self.client, force=force_tick
+                                )
+                            elif force_tick:
+                                try:
+                                    adv = self.client.advancements(status="completed", include_recipes=False)
+                                    for item in (adv.get("advancements") or []):
+                                        aid = item.get("id") if isinstance(item, dict) else None
+                                        if aid:
+                                            self._server_advancements.add(aid)
+                                except Exception:
+                                    pass
+                            completed_advs = set(self._server_advancements)
+                            if self.observer is not None:
+                                completed_advs.update(self.observer.server_advancements)
+                            if hasattr(self.planner, "record_skill_outcome"):
+                                self.planner.record_skill_outcome(
+                                    finished_name,
+                                    ok=True,
+                                    elapsed_s=skill_dt,
+                                    completed_advs=completed_advs,
+                                )
                             active_skill = None
+                            if self._sync_and_check_target_goal() and self.config.stop_on_goal:
+                                stop_reason = "goal_reached"
+                                goal_reached_now = True
                             break
                         steps += 1
                         if self.observer is not None:
                             self.observer.on_step(active_skill, active_skill.last, self.state, client=self.client)
                 except (Replan, ApiError) as e:
                     if active_skill is not None:
+                        skill_dt = max(0.0, time.monotonic() - skill_t0)
+                        failed_name = active_skill.name
+                        if self.observer is not None and self.observer.tape is not None:
+                            self.observer.tape.end_skill_slice()
                         active_skill.abort()
                         code, extra = failure(e)
                         is_death_err = (
@@ -312,6 +395,17 @@ class MainLoop:
                                 error_msg=str(e),
                                 died_or_disconnected=is_death_err,
                             )
+                        if hasattr(self.planner, "record_skill_outcome"):
+                            self.planner.record_skill_outcome(
+                                failed_name,
+                                ok=False,
+                                elapsed_s=skill_dt,
+                                completed_advs=(
+                                    set(self.observer.server_advancements)
+                                    if self.observer is not None
+                                    else set(self._server_advancements)
+                                ),
+                            )
                         active_skill = None
                         if is_death_err:
                             init_api_err = e if isinstance(e, ApiError) else None
@@ -319,6 +413,8 @@ class MainLoop:
                             deaths_recovered += 1
                 except Fatal as e:
                     if active_skill is not None:
+                        if self.observer is not None and self.observer.tape is not None:
+                            self.observer.tape.end_skill_slice()
                         active_skill.abort()
                         code, _ = failure(e)
                         if self.observer is not None:
@@ -331,13 +427,16 @@ class MainLoop:
                     stop_reason = "keyboard_interrupt"
                     break
 
+                if goal_reached_now:
+                    break
+
         finally:
             if active_skill is not None:
                 active_skill.abort()
             if monitor is not None:
                 monitor.close()
             if self.observer is not None:
-                self.observer.on_run_end(self.state, client=self.client)
+                self.observer.on_run_end(self.state, client=self.client, stop_reason=stop_reason)
             if self.config.disconnect_on_exit:
                 try:
                     self.client.disconnect()

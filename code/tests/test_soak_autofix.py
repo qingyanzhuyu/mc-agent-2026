@@ -304,6 +304,483 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
 
         soak_ctl.teardown_session(self.session)
 
+    def test_narrow_file_whitelist_enforces_editable_files_without_weakening_frozen_guard(self):
+        narrow = ["code/mcagent/skills/iron.py", "code/tests/test_iron.py"]
+
+        for allowed in (
+            "code/mcagent/skills/iron.py",
+            "./code/mcagent/skills/iron.py",
+            "code/tests/test_iron.py",
+            "code/tests/test_iron_extra.py",
+        ):
+            ok, why = soak_ctl.is_allowed_edit_path(allowed, narrow_files=narrow)
+            self.assertTrue(ok, f"{allowed}: {why}")
+
+        for out_of_scope in (
+            "code/mcagent/loop/policy.py",
+            "code/mcagent/loop/starter_skills.py",
+            "code/mcagent/skills/wood.py",
+        ):
+            ok, why = soak_ctl.is_allowed_edit_path(out_of_scope, narrow_files=narrow)
+            self.assertFalse(ok, out_of_scope)
+            self.assertIn("超出目标单收窄白名单", why)
+
+        # 即使恶意/错误把冻结底座或工程外脚本塞入 narrow_files，也绝不能绕过底层硬防线
+        malicious_narrow = [
+            "code/mcagent/client.py",
+            "code/mcagent/runtime.py",
+            "code/mcagent/skills/base.py",
+            "tools/test-island/rcon_ctl.py",
+            "code/mcagent/skills/iron.py",
+        ]
+        for frozen in (
+            "code/mcagent/client.py",
+            "code/mcagent/runtime.py",
+            "code/mcagent/skills/base.py",
+        ):
+            ok, why = soak_ctl.is_allowed_edit_path(frozen, narrow_files=malicious_narrow)
+            self.assertFalse(ok, frozen)
+            self.assertIn("命中冻结保护文件", why)
+
+        ok_ext, why_ext = soak_ctl.is_allowed_edit_path("tools/test-island/rcon_ctl.py", narrow_files=malicious_narrow)
+        self.assertFalse(ok_ext)
+        self.assertIn("不在自动修复允许白名单内", why_ext)
+
+    def test_goal_miss_lifecycle_narrow_gate1_campaign_canary_and_same_sha_recurrence(self):
+        # 准备铁器技能初始文件
+        (self.repo / "code" / "mcagent" / "skills" / "iron.py").write_text("IRON_SCAN = 16\n", encoding="utf-8")
+        (self.repo / "code" / "tests" / "test_iron.py").write_text("assert True\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-m", "add iron skill stub")
+
+        # 常规 bug max_attempts=1，但 GOAL_MISS 使用独立的 max_goal_attempts=3（验证两者解耦 + reopen + escalate）
+        st = soak_ctl.init_session(
+            self.repo,
+            self.session,
+            target_branch="feat/goal-smelt-iron",
+            max_attempts=1,
+            target_goal="smelt_iron",
+            max_goal_attempts=3,
+        )
+        self.assertEqual(st["target_goal"], "smelt_iron")
+        self.assertEqual(st["max_goal_attempts"], 3)
+        fixer_wt = Path(st["fixer_wt"])
+
+        def _make_goal_miss_inc(ep_dir: Path, summary_txt: str = "缺少铁矿暴露面") -> None:
+            (ep_dir / "incidents").mkdir(parents=True, exist_ok=True)
+            (ep_dir / "timeline.jsonl").write_text(
+                json.dumps({"event": "run_start", "source": "local-target"}) + "\n"
+                + json.dumps({
+                    "event": "run_end",
+                    "elapsed_s": 120.0,
+                    "stop_reason": "max_seconds",
+                    "source": "local-target",
+                    "deaths": 0,
+                    "target_goal": "smelt_iron",
+                    "target_goal_reached": False,
+                    "goals_reached": {"prep_wood": 9.0, "upgrade_tools": 40.0},
+                    "total_tokens": 2200,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            inc_payload = {
+                "id": "INC-001",
+                "fingerprint": "GOAL_MISS:smelt_iron",
+                "severity": "P1",
+                "category": "strategy",
+                "code": "GOAL_MISS",
+                "skill_context": {"skill": "smelt_iron", "args": {"count": 3}, "outcome": "replan"},
+                "detail": {
+                    "goal_id": "smelt_iron",
+                    "goal_title": "来硬的（冶炼出铁锭）",
+                    "tier": "T1",
+                    "score": 5,
+                    "budget_s": 210.0,
+                    "elapsed_s": 120.0,
+                    "stop_reason": "max_seconds",
+                    "completed_prereqs": ["prep_wood", "upgrade_tools", "prep_furnace"],
+                    "missing_prereqs": [],
+                    "bottleneck_goal_id": "smelt_iron",
+                    "bottleneck_skill": "smelt_iron",
+                    "missing_items": ["iron_ingot (0/1)"],
+                    "summary": summary_txt,
+                    "target_skill_started": True,
+                    "last_replan": {"skill": "smelt_iron", "reason": "no_iron_ore_visible"},
+                    "skill_stats": {"smelt_iron": {"runs": 2, "replans": 2}},
+                    "editable_files": ["code/mcagent/skills/iron.py", "code/tests/test_iron.py"],
+                },
+            }
+            (ep_dir / "incidents" / "INC-001-P1-goal_miss-smelt_iron.json").write_text(
+                json.dumps(inc_payload, ensure_ascii=False), encoding="utf-8"
+            )
+
+        # 1) ep-0001 产出 GOAL_MISS:smelt_iron（验证 fallback 提取 id / skill_context.skill / detail.goal_id & editable_files）
+        ep1 = self.session / "episodes" / "ep-0001"
+        _make_goal_miss_inc(ep1)
+        soak_ctl.ingest_episode_and_check_rollback(
+            self.session, "ep-0001", ep1, st["current_tip"], "agy_soak_r001"
+        )
+
+        # 2) claim 生成 prompt.md，必须包含 1B 缺口诊断与收窄白名单警告
+        claimed = soak_ctl.claim_next_incident(self.session)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["fingerprint"], "GOAL_MISS:smelt_iron")
+        self.assertEqual(claimed["goal_id"], "smelt_iron")
+        self.assertEqual(claimed["skill"], "smelt_iron")
+        prompt_text = Path(claimed["prompt_file"]).read_text(encoding="utf-8")
+        self.assertIn("目标未达成诊断（GOAL_MISS）", prompt_text)
+        self.assertIn("iron_ingot (0/1)", prompt_text)
+        self.assertIn("no_iron_ore_visible", prompt_text)
+        self.assertIn("code/mcagent/skills/iron.py", prompt_text)
+        self.assertIn("policy.py", prompt_text)
+
+        # 3) 第 1 次尝试：Fixer 越界修改 starter_skills.py（不在 editable_files 中）-> Gate 1 拒绝！
+        # 且因 max_goal_attempts=3 (> max_attempts=1)，attempts=1 后状态仍为 pending 而非误熔断
+        (fixer_wt / "code" / "mcagent" / "loop" / "starter_skills.py").write_text("LIMIT = 999\n", encoding="utf-8")
+        bad_res = soak_ctl.verify_and_promote(self.session, "GOAL_MISS:smelt_iron", live_canary=False)
+        self.assertFalse(bad_res["ok"])
+        self.assertEqual(bad_res["failed_gate"], "gate1_whitelist")
+        self.assertIn("超出目标单收窄白名单", bad_res["detail"])
+        self.assertEqual(_git(fixer_wt, "status", "--porcelain"), "")
+        st_after_1 = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after_1["incidents"]["GOAL_MISS:smelt_iron"]["status"], "pending")
+        self.assertEqual(st_after_1["incidents"]["GOAL_MISS:smelt_iron"]["attempts"], 1)
+
+        # 4) 第 2 次尝试：重领并在收窄白名单内修改 iron.py + test_iron.py，且开启 live_canary 验证 Gate 3 走 --mode campaign --goal smelt_iron
+        reclaimed = soak_ctl.claim_next_incident(self.session)
+        self.assertIsNotNone(reclaimed)
+        (fixer_wt / "code" / "mcagent" / "skills" / "iron.py").write_text("IRON_SCAN = 32\n", encoding="utf-8")
+        (fixer_wt / "code" / "tests" / "test_iron.py").write_text("assert 32 > 16\n", encoding="utf-8")
+
+        real_run = subprocess.run
+        uv_cmds: list[list[str]] = []
+
+        def mock_uv_and_canary(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                uv_cmds.append(list(cmd))
+                if "--run-dir" in cmd:
+                    c_dir = Path(cmd[cmd.index("--run-dir") + 1])
+                    (c_dir / "incidents").mkdir(parents=True, exist_ok=True)
+                    (c_dir / "timeline.jsonl").write_text(
+                        json.dumps({"event": "run_end", "elapsed_s": 30.0}) + "\n", encoding="utf-8"
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_and_canary):
+            good_res = soak_ctl.verify_and_promote(
+                self.session, "GOAL_MISS:smelt_iron", live_canary=True
+            )
+        self.assertTrue(good_res["ok"], good_res)
+        sha_1 = good_res["commit"]
+        canary_invocations = [c for c in uv_cmds if "--live" in c]
+        self.assertEqual(len(canary_invocations), 1)
+        self.assertIn("campaign", canary_invocations[0])
+        self.assertIn("--goal", canary_invocations[0])
+        self.assertEqual(canary_invocations[0][canary_invocations[0].index("--goal") + 1], "smelt_iron")
+        self.assertNotIn("focus", canary_invocations[0])
+
+        # 5) ep-0002 正好跑在 commit_sha == sha_1 上，但仍复发 GOAL_MISS:smelt_iron！
+        # 验证修复后的 merge-base --is-ancestor 检查能准确识别同 SHA 复发并重新打开（attempts=2 < 3 -> pending）
+        ep2 = self.session / "episodes" / "ep-0002"
+        _make_goal_miss_inc(ep2, summary_txt="32 格仍未搜到铁矿")
+        soak_ctl.ingest_episode_and_check_rollback(
+            self.session, "ep-0002", ep2, sha_1, "agy_soak_r002"
+        )
+        st_after_ep2 = soak_ctl.read_state(self.session)
+        inc_after_ep2 = st_after_ep2["incidents"]["GOAL_MISS:smelt_iron"]
+        self.assertEqual(inc_after_ep2["status"], "pending")
+        self.assertEqual(inc_after_ep2["last_failed_fix_commit"], sha_1)
+        self.assertIsNone(inc_after_ep2["fix_commit"])
+
+        # 6) 第 3 次尝试提交 sha_2（attempts=3），随后 ep-0003 在 sha_2 上再次复发 -> 达到上限 3 自动升级 escalated_human！
+        reclaimed_3 = soak_ctl.claim_next_incident(self.session)
+        self.assertIsNotNone(reclaimed_3)
+        (fixer_wt / "code" / "mcagent" / "skills" / "iron.py").write_text("IRON_SCAN = 48\n", encoding="utf-8")
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_and_canary):
+            good_res_2 = soak_ctl.verify_and_promote(
+                self.session, "GOAL_MISS:smelt_iron", live_canary=False
+            )
+        self.assertTrue(good_res_2["ok"], good_res_2)
+        sha_2 = good_res_2["commit"]
+
+        ep3 = self.session / "episodes" / "ep-0003"
+        _make_goal_miss_inc(ep3, summary_txt="48 格仍失败")
+        soak_ctl.ingest_episode_and_check_rollback(
+            self.session, "ep-0003", ep3, sha_2, "agy_soak_r003"
+        )
+        st_after_ep3 = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after_ep3["incidents"]["GOAL_MISS:smelt_iron"]["status"], "escalated_human")
+
+        # 7) 持续模式（episodes=0）下 Runner 检测到聚焦目标已 escalated_human，自动写入 STOP 止损退出，不空耗下一轮
+        loop_res = soak_ctl.run_runner_loop(self.session, episodes=0)
+        self.assertEqual(loop_res, [])
+        self.assertTrue((self.session / "STOP").exists())
+
+        soak_ctl.teardown_session(self.session)
+
+    def test_prereq_score_regression_revert_goal_telemetry_isolation_and_cli_forwarding(self):
+        (self.repo / "code" / "mcagent" / "skills" / "iron.py").write_text("MODE = 'safe'\n", encoding="utf-8")
+        (self.repo / "code" / "tests" / "test_iron.py").write_text("x = 1\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-m", "init iron")
+
+        st = soak_ctl.init_session(
+            self.repo,
+            self.session,
+            target_branch="feat/goal-telemetry",
+            target_goal="smelt_iron",
+            max_goal_attempts=2,
+        )
+        fixer_wt = Path(st["fixer_wt"])
+        base_sha = st["current_tip"]
+
+        # 1) ep-0001 (local-target)：前置木石链达成（得分 10），但目标 smelt_iron 未达成
+        ep1 = self.session / "episodes" / "ep-0001"
+        (ep1 / "incidents").mkdir(parents=True)
+        (ep1 / "progress_curve.jsonl").write_text(
+            json.dumps({"server_score_v2": 10, "inferred_score_v2": 10}) + "\n", encoding="utf-8"
+        )
+        (ep1 / "timeline.jsonl").write_text(
+            json.dumps({"event": "run_start", "source": "local-target"}) + "\n"
+            + json.dumps({
+                "event": "run_end",
+                "elapsed_s": 95.0,
+                "stop_reason": "max_seconds",
+                "source": "local-target",
+                "deaths": 1,
+                "target_goal": "smelt_iron",
+                "target_goal_reached": False,
+                "goals_reached": {"prep_wood": 12.0, "mine_stone": 35.0, "upgrade_tools": 50.0},
+                "prompt_tokens": 2000,
+                "completion_tokens": 400,
+                "total_tokens": 2400,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        (ep1 / "incidents" / "INC-001-goal_miss.json").write_text(
+            json.dumps({
+                "incident_id": "INC-001",
+                "fingerprint": "GOAL_MISS:smelt_iron",
+                "severity": "P1",
+                "category": "strategy",
+                "code": "GOAL_MISS",
+                "skill": "smelt_iron",
+                "goal_id": "smelt_iron",
+                "editable_files": ["code/mcagent/skills/iron.py", "code/tests/test_iron.py"],
+            }),
+            encoding="utf-8",
+        )
+        soak_ctl.ingest_episode_and_check_rollback(self.session, "ep-0001", ep1, base_sha, "agy_soak_r001")
+
+        # 2) Fixer 提交一次修复 bad_sha
+        soak_ctl.claim_next_incident(self.session)
+        (fixer_wt / "code" / "mcagent" / "skills" / "iron.py").write_text("MODE = 'broken_prereqs'\n", encoding="utf-8")
+        real_run = subprocess.run
+
+        def mock_uv_ok(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_ok):
+            prom = soak_ctl.verify_and_promote(self.session, "GOAL_MISS:smelt_iron", live_canary=False)
+        self.assertTrue(prom["ok"], prom)
+        bad_sha = prom["commit"]
+
+        # 3) ep-0002 跑在 bad_sha 上：虽无 P0 bug，但原有前置目标全丢（goals_reached={}）且最高分退化为 0 (< 10)
+        # 必须触发 prereq_score_regression 自动 git revert！
+        ep2 = self.session / "episodes" / "ep-0002"
+        (ep2 / "incidents").mkdir(parents=True)
+        (ep2 / "progress_curve.jsonl").write_text(
+            json.dumps({"server_score_v2": 0, "inferred_score_v2": 0}) + "\n", encoding="utf-8"
+        )
+        (ep2 / "timeline.jsonl").write_text(
+            json.dumps({"event": "run_start", "source": "local-target"}) + "\n"
+            + json.dumps({
+                "event": "run_end",
+                "elapsed_s": 60.0,
+                "stop_reason": "max_seconds",
+                "source": "local-target",
+                "deaths": 0,
+                "target_goal": "smelt_iron",
+                "target_goal_reached": False,
+                "goals_reached": {},
+                "total_tokens": 900,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        ep2_meta = soak_ctl.ingest_episode_and_check_rollback(self.session, "ep-0002", ep2, bad_sha, "agy_soak_r002")
+        self.assertEqual(ep2_meta["rolled_back"], bad_sha)
+        self.assertEqual(ep2_meta["revert_reason"], "prereq_score_regression")
+        st_after_rev = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after_rev["commits"][-1]["status"], "reverted")
+        self.assertEqual(st_after_rev["commits"][-1]["revert_reason"], "prereq_score_regression")
+        self.assertEqual(st_after_rev["incidents"]["GOAL_MISS:smelt_iron"]["status"], "rolled_back")
+
+        # 4) ep-0003 (local-target) 成功达成 smelt_iron，且同时验证 pending GOAL_MISS 被实跑达成时转为 resolved_by_run
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["incidents"]["GOAL_MISS:iron_tools"] = {
+                "fingerprint": "GOAL_MISS:iron_tools",
+                "incident_id": "INC-009",
+                "code": "GOAL_MISS",
+                "severity": "P1",
+                "category": "strategy",
+                "skill": "craft_iron_gear",
+                "goal_id": "iron_tools",
+                "editable_files": ["code/mcagent/skills/iron.py"],
+                "status": "pending",
+                "attempts": 0,
+                "incident_path": str(ep1 / "incidents" / "INC-001-goal_miss.json"),
+                "gate_history": [],
+            }
+        cur_tip = soak_ctl.read_state(self.session)["current_tip"]
+        ep3 = self.session / "episodes" / "ep-0003"
+        (ep3 / "incidents").mkdir(parents=True)
+        (ep3 / "progress_curve.jsonl").write_text(
+            json.dumps({"server_score_v2": 20, "inferred_score_v2": 20}) + "\n", encoding="utf-8"
+        )
+        (ep3 / "timeline.jsonl").write_text(
+            json.dumps({"event": "run_start", "source": "local-target"}) + "\n"
+            + json.dumps({
+                "event": "run_end",
+                "elapsed_s": 110.0,
+                "stop_reason": "goal_reached",
+                "source": "local-target",
+                "deaths": 0,
+                "target_goal": "iron_tools",
+                "target_goal_reached": True,
+                "target_goal_elapsed_s": 102.5,
+                "goals_reached": {
+                    "prep_wood": 10.0,
+                    "mine_stone": 29.0,
+                    "upgrade_tools": 44.0,
+                    "smelt_iron": 88.4,
+                    "iron_tools": 102.5,
+                },
+                "prompt_tokens": 2600,
+                "completion_tokens": 400,
+                "total_tokens": 3000,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        soak_ctl.ingest_episode_and_check_rollback(self.session, "ep-0003", ep3, cur_tip, "agy_soak_r003")
+        st_after_ep3 = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after_ep3["incidents"]["GOAL_MISS:iron_tools"]["status"], "resolved_by_run")
+        self.assertEqual(st_after_ep3["incidents"]["GOAL_MISS:iron_tools"]["goal_achieved_ep"], "ep-0003")
+
+        # 5) ep-0004 (official) 独立落盘到 goal_telemetry.official.json，严禁污染 local-target 统计
+        ep4 = self.session / "episodes" / "ep-0004"
+        (ep4 / "incidents").mkdir(parents=True)
+        (ep4 / "timeline.jsonl").write_text(
+            json.dumps({"event": "run_start", "source": "official"}) + "\n"
+            + json.dumps({
+                "event": "run_end",
+                "elapsed_s": 50.0,
+                "source": "official",
+                "deaths": 2,
+                "goals_reached": {"prep_wood": 15.0},
+                "total_tokens": 1200,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        soak_ctl.ingest_episode_and_check_rollback(self.session, "ep-0004", ep4, cur_tip, "official_bot")
+
+        local_tel_path = self.session / "goal_telemetry.local-target.json"
+        official_tel_path = self.session / "goal_telemetry.official.json"
+        self.assertTrue(local_tel_path.exists())
+        self.assertTrue(official_tel_path.exists())
+
+        local_tel = json.loads(local_tel_path.read_text(encoding="utf-8"))
+        self.assertEqual(local_tel["source"], "local-target")
+        # ep-0002 已回滚排除，非回滚 local-target 轮次仅 ep-0001 与 ep-0003 共 2 轮
+        self.assertEqual(local_tel["episodes_total"], 2)
+        self.assertIn("AGENTS.md §4", local_tel["note"])
+        upg = local_tel["goals"]["upgrade_tools"]
+        self.assertEqual(upg["episodes"], 2)
+        self.assertEqual(upg["hits"], 2)
+        self.assertEqual(upg["hit_rate"], 1.0)
+        self.assertEqual(upg["p50_elapsed_s"], 47.0)   # median([50.0, 44.0])
+        self.assertEqual(upg["p50_tokens"], 2700)      # median([2400, 3000])
+        self.assertEqual(upg["total_deaths"], 1)
+
+        smelt = local_tel["goals"]["smelt_iron"]
+        self.assertEqual(smelt["episodes"], 2)
+        self.assertEqual(smelt["hits"], 1)
+        self.assertEqual(smelt["hit_rate"], 0.5)
+        self.assertEqual(smelt["p50_elapsed_s"], 88.4)
+        self.assertEqual(smelt["p50_tokens"], 3000)
+
+        # 6) 验证 REVIEW_REPORT.md 渲染聚焦目标、退化原因、达成耗时与第五节实测成本表
+        report_txt = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("本轮聚焦晋级目标", report_txt)
+        self.assertIn("`smelt_iron`", report_txt)
+        self.assertIn("prereq_score_regression", report_txt)
+        self.assertIn("✅ `iron_tools` (102.5s)", report_txt)
+        self.assertIn("目标台账实测成本汇总", report_txt)
+        self.assertIn("输入/输出 token", report_txt)
+        self.assertIn("价值", report_txt)
+
+        # 7) 验证 run / runner-loop CLI --goal 透传及 --goal-telemetry 自动挂载
+        loop_invocations: list[list[str]] = []
+
+        def mock_runner_subproc(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                loop_invocations.append(list(cmd))
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 10.0, "source": "local-target"}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner_subproc):
+            rc_rl = soak_ctl.main([
+                "runner-loop",
+                "--session-dir", str(self.session),
+                "--episodes", "1",
+                "--goal", "iron_tools",
+                "--no-llm",
+            ])
+        self.assertEqual(rc_rl, 0)
+        self.assertEqual(len(loop_invocations), 1)
+        inv = loop_invocations[0]
+        self.assertIn("--goal", inv)
+        self.assertEqual(inv[inv.index("--goal") + 1], "iron_tools")
+        self.assertIn("--goal-telemetry", inv)
+        self.assertEqual(inv[inv.index("--goal-telemetry") + 1], str(local_tel_path))
+
+        spawned_dual: list[list[str]] = []
+
+        class DummyProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+             patch.object(soak_ctl, "init_session", return_value={}) as mock_init, \
+             patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda c, **kw: (spawned_dual.append(list(c)), DummyProc())[1]):
+            rc_dual = soak_ctl.main([
+                "run",
+                "--session-dir", str(self.session),
+                "--branch", "feat/goal-telemetry",
+                "--goal", "smelt_iron",
+                "--max-goal-attempts", "5",
+                "--episodes", "1",
+            ])
+        self.assertEqual(rc_dual, 0)
+        self.assertEqual(mock_init.call_args.kwargs["target_goal"], "smelt_iron")
+        self.assertEqual(mock_init.call_args.kwargs["max_goal_attempts"], 5)
+        dual_runner = [c for c in spawned_dual if "runner-loop" in c][0]
+        self.assertIn("--goal", dual_runner)
+        self.assertEqual(dual_runner[dual_runner.index("--goal") + 1], "smelt_iron")
+
+        soak_ctl.teardown_session(self.session)
+
 
 if __name__ == "__main__":
     unittest.main()
