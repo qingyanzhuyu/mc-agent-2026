@@ -87,7 +87,7 @@ class MiningAccountingTests(unittest.TestCase):
                              (1, 0, "max_steps_reached"))
             self.assertEqual(ex.acts, ["dig"])
             self.assertEqual(world.items["sand"], 1)
-            incidents = [json.loads(p.read_text()) for p in Path(tmp, "incidents").glob("*.json")]
+            incidents = [json.loads(p.read_text(encoding="utf-8")) for p in Path(tmp, "incidents").glob("*.json")]
             self.assertEqual(len(incidents), 1)
             self.assertEqual((incidents[0]["fingerprint"], incidents[0]["detail"]["recent_failures"],
                               incidents[0]["count"], incidents[0]["skill_context"]["outcome"]),
@@ -96,7 +96,7 @@ class MiningAccountingTests(unittest.TestCase):
                              {"started": 4, "ok": 0, "replan": 3, "budget_stopped": 1, "bug": 0})
             self.assertEqual(obs.skill_stats["scout_island"]["ok"], 10)
             self.assertEqual(obs.env_variance_counts, {"mine_stone:replan": 3})
-            timeline = [json.loads(line) for line in Path(tmp, "timeline.jsonl").read_text().splitlines()]
+            timeline = [json.loads(line) for line in Path(tmp, "timeline.jsonl").read_text(encoding="utf-8").splitlines()]
             mining_ends = [r["outcome"] for r in timeline
                            if r["event"] == "skill_end" and r["skill"] == "mine_stone"]
             self.assertEqual(mining_ends, ["replan", "replan", "replan", "budget_stopped"])

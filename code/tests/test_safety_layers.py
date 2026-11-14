@@ -401,7 +401,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         client.move_to = move_to
         with tempfile.TemporaryDirectory() as tmp:
             source, output = Path(tmp)/"fixture.json", Path(tmp)/"report.json"
-            source.write_text(json.dumps(fixture))
+            source.write_text(json.dumps(fixture), encoding="utf-8")
             with patch("mcagent.probe_path.Client", return_value=client), patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "", "")), patch("mcagent.runtime.SafetyMonitor.start"), patch("builtins.print"):
                 rc = pathfinding_main(["--pathfinding", "--live", "--local-target", "--fixture", str(source),
                                        "--case", "move20", "--samples", "1", "--output", str(output)])
@@ -481,7 +481,7 @@ class ProbeIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             source, output = Path(tmp) / "fixture.json", Path(tmp) / "report.json"
-            source.write_text(json.dumps(fixture))
+            source.write_text(json.dumps(fixture), encoding="utf-8")
             with (
                 patch("mcagent.probe_path.Client", return_value=client),
                 patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "u", "p")),
@@ -768,7 +768,7 @@ class AuditRegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             source, output = Path(tmp) / "fixture.json", Path(tmp) / "report.json"
-            source.write_text(json.dumps(fixture))
+            source.write_text(json.dumps(fixture), encoding="utf-8")
             with (
                 patch("mcagent.probe_path.Client", return_value=client),
                 patch("mcagent.probe.Config.load", return_value=Config(DEFAULT_BASE, "u", "p")),
