@@ -60,7 +60,7 @@ class DashboardTests(unittest.TestCase):
         text = (REPO_ROOT / "code" / "mcagent" / "loop" / "goals.py").read_text(encoding="utf-8")
         goals = {g["id"]: g for g in dash.parse_ledger(text)}
         self.assertEqual(goals["prep_wood"]["stage"], "graduated")
-        self.assertEqual(goals["smelt_iron"]["stage"], "draft")
+        self.assertEqual(goals["smelt_iron"]["stage"], "candidate")
         self.assertEqual(goals["shiny_gear"]["score"], 60)
         self.assertEqual(goals["smelt_iron"]["skill"], "smelt_iron")
         self.assertIn("prep_diamond_pickaxe", goals)
@@ -180,7 +180,9 @@ class DashboardTests(unittest.TestCase):
     def test_start_official_server_needs_account_ack_and_never_remembers_it(self):
         env_file = self.root / "code" / "mcagent" / ".env"
         env_file.parent.mkdir(parents=True)
-        clean = {k: v for k, v in os.environ.items() if k not in ("MC_USER", "MC_PASS", "LLM_KEY")}
+        clean = {k: v for k, v in os.environ.items() if k not in (
+            "MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE"
+        )}
         with patch.dict(os.environ, clean, clear=True), patch.object(self.console, "ledger", return_value=[]):
             with self.assertRaises(ValueError):  # 缺账号
                 self.console._validate_start({"server": "official", "llm": False, "account_reserved": True})
@@ -222,6 +224,46 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(any("LLM_KEY" in m for m in snap_checks["official"]))
             env_file.write_text("MC_USER=team\nMC_PASS=pw\nLLM_CUSTOM_BASE=https://x/v1\nLLM_CUSTOM_KEY=k\n", encoding="utf-8")
             self.assertEqual(self.console.snapshot()["official_checks"]["custom"], [])
+
+    def test_multi_goal_focus_settings_start_and_inject(self):
+        self._init_state()
+        ledger = [{"id": g, "stage": "draft"} for g in ("smelt_iron", "kill_a_mob", "plant_seed")]
+        with patch.object(self.console, "ledger", return_value=ledger):
+            res = self.console.apply_settings({"target_goal": ["smelt_iron", "kill_a_mob", "smelt_iron"],
+                                               "focus_mode": "rotate"})
+            self.assertEqual((res["target_goal"], res["focus_mode"]), ("smelt_iron,kill_a_mob", "rotate"))
+            st = json.loads((self.session / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual((st["target_goal"], st["focus_mode"]), ("smelt_iron,kill_a_mob", "rotate"))
+            with self.assertRaises(ValueError):
+                self.console.apply_settings({"target_goal": ["smelt_iron", "no_such"]})
+            with self.assertRaises(ValueError):
+                self.console.apply_settings({"focus_mode": "sideways"})
+            self.assertEqual(self.console.apply_settings({"target_goal": []})["target_goal"], "")
+
+            p = self.console._validate_start({"goal": ["kill_a_mob", "plant_seed"], "focus_mode": "together"})
+            cmd = self.console.build_run_cmd(p)
+            self.assertEqual(cmd[cmd.index("--goal") + 1], "kill_a_mob,plant_seed")
+            self.assertEqual(cmd[cmd.index("--focus-mode") + 1], "together")
+            with self.assertRaises(ValueError):
+                self.console._validate_start({"focus_mode": "sideways"})
+
+            captured = {}
+
+            def fake_job(kind, fn):
+                captured["kind"] = kind
+                captured["fn"] = fn
+                return {"kind": kind, "status": "running"}
+
+            with patch.object(self.console, "_run_job", side_effect=fake_job), \
+                 patch.object(dash.soak_ctl, "inject_and_set_goal", return_value={"ok": True}) as mock_inj:
+                self.console.inject("feat/goal-staging", ["plant_seed", "kill_a_mob"])
+                captured["fn"]()
+                self.assertEqual(mock_inj.call_args.kwargs["target_goal"], "plant_seed,kill_a_mob")
+                self.console.inject("feat/goal-staging", None)
+                captured["fn"]()
+                self.assertIsNone(mock_inj.call_args.kwargs["target_goal"])
+            with self.assertRaises(ValueError):
+                self.console.inject("feat/goal-staging", ["nope"])
 
     def test_apply_settings_rejects_unknown_goal_when_ledger_known(self):
         self._init_state()

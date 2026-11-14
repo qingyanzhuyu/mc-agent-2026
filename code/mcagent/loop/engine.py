@@ -17,7 +17,7 @@ from ..client import ApiError, Client
 from ..runtime import Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
 from ..skills.base import Skill, failure
 from .auditor import SoakObserver
-from .goals import GOAL_MAP, GoalSpec, is_goal_achieved
+from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
 from .policy import CampaignPlanner
 
 
@@ -73,10 +73,7 @@ class MainLoop:
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
 
-    def _resolve_target_goal_spec(self) -> Optional[GoalSpec]:
-        gid = self.config.target_goal
-        if not gid:
-            return None
+    def _resolve_goal_spec(self, gid: str) -> Optional[GoalSpec]:
         if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "ledger_map"):
             g = self.planner.rules.ledger_map.get(gid)
             if g is not None:
@@ -86,6 +83,11 @@ class MainLoop:
             if g is not None:
                 return g
         return GOAL_MAP.get(gid)
+
+    def _resolve_target_goal_specs(self) -> list[GoalSpec]:
+        """本轮聚焦的全部目标（一个或多个，config.target_goal 可写成 "a,b"）。"""
+        specs = [self._resolve_goal_spec(gid) for gid in normalize_goal_ids(self.config.target_goal)]
+        return [g for g in specs if g is not None]
 
     def _sync_and_check_target_goal(self) -> bool:
         completed_advs = set(self._server_advancements)
@@ -97,8 +99,8 @@ class MainLoop:
         if self.observer is not None:
             self.observer.update_goals_reached(self.state)
         if self.config.target_goal:
-            g = self._resolve_target_goal_spec()
-            return bool(g is not None and is_goal_achieved(g, self.state, completed_advs))
+            specs = self._resolve_target_goal_specs()
+            return bool(specs) and all(is_goal_achieved(g, self.state, completed_advs) for g in specs)
         return False
 
     def _budget_exceeded(self, started_mono: float, steps: int, deaths: int) -> Optional[str]:
@@ -323,11 +325,9 @@ class MainLoop:
                                 self.observer.tape.end_skill_slice()
                             self._refresh_world_state()
                             skills_ok += 1
-                            tgt_spec = self._resolve_target_goal_spec()
-                            force_tick = bool(
-                                tgt_spec is not None
-                                and tgt_spec.skill == finished_name
-                                and tgt_spec.done_advancements
+                            force_tick = any(
+                                g.skill == finished_name and g.done_advancements
+                                for g in self._resolve_target_goal_specs()
                             )
                             if self.observer is not None:
                                 self.observer.on_skill_end(

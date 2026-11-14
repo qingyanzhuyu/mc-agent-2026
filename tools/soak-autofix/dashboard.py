@@ -348,6 +348,7 @@ class Console:
             "episode_seconds": 240.0,
             "episode_steps": 45,
             "goal": "",
+            "focus_mode": "together",
             "max_goal_attempts": 4,
             "llm": True,
             "player_model": soak_ctl.DEFAULT_PLAYER_MODEL,
@@ -426,6 +427,7 @@ class Console:
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
+                "focus_mode": st.get("focus_mode", "together"),
                 "server_target": st.get("server_target", "local"),
                 "official_llm": st.get("official_llm", "custom"),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
@@ -439,6 +441,7 @@ class Console:
                     "ep_id", "at", "commit", "bot_user", "elapsed_s", "stop_reason", "skills_completed",
                     "bugs_count", "p0_bugs", "server_score", "inferred_score", "deaths", "target_goal",
                     "target_goal_reached", "target_goal_elapsed_s", "goals_reached", "prompt_tokens",
+                    "target_goals_reached",
                     "completion_tokens", "rolled_back",
                 )}
                 for e in reversed(episodes[-60:])
@@ -461,6 +464,7 @@ class Console:
             "player_models": [{"name": k, "note": v} for k, v in soak_ctl.PLAYER_MODEL_CHOICES.items()],
             "servers": [{"key": k, "label": v} for k, v in soak_ctl.SERVER_TARGETS.items()],
             "official_llm_sources": [{"key": k, "label": v} for k, v in soak_ctl.OFFICIAL_LLM_SOURCES.items()],
+            "focus_modes": [{"key": k, "label": v} for k, v in soak_ctl.FOCUS_MODES.items()],
             # 比赛服前置检查（占位确认另算），页面据此提前提示；只给「缺什么」，不含任何值
             "official_checks": {
                 "custom": soak_ctl.check_server_target(self.repo_root, "official", use_llm=True,
@@ -517,12 +521,15 @@ class Console:
         if err:
             raise ValueError(err)
         if "target_goal" in payload:
-            goal = str(payload.get("target_goal") or "").strip()
             st_now = read_state_nolock(self.session_dir)
-            known = {g["id"] for g in self.ledger(st_now.get("target_branch") or "")}
-            if goal and known and goal not in known:
-                raise ValueError(f"台账里没有目标 {goal!r}")
-            changes["target_goal"] = goal
+            changes["target_goal"] = self._validate_goals(
+                payload.get("target_goal"), st_now.get("target_branch") or ""
+            )
+        if payload.get("focus_mode") not in (None, ""):
+            mode = str(payload["focus_mode"])
+            if mode not in soak_ctl.FOCUS_MODES:
+                raise ValueError(f"未知聚焦模式 {mode!r}")
+            changes["focus_mode"] = mode
         if "player_model" in payload and payload["player_model"] is not None:
             changes["player_model"] = str(payload["player_model"]).strip()
         if payload.get("fixer_preset") not in (None, ""):
@@ -550,6 +557,7 @@ class Console:
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
+                "focus_mode": st.get("focus_mode", "together"),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
             }
         try:
@@ -557,6 +565,15 @@ class Console:
         except Exception:  # 报告只是展示，失败不影响设置生效
             pass
         return result
+
+    def _validate_goals(self, goals: Any, branch: str) -> str:
+        """聚焦目标：接受列表或逗号串，逐个核对台账，返回规整后的逗号串（空串 = 不聚焦）。"""
+        ids = soak_ctl.split_goal_ids(goals)
+        known = {g["id"] for g in self.ledger(branch)}
+        unknown = [gid for gid in ids if known and gid not in known]
+        if unknown:
+            raise ValueError(f"台账里没有目标 {', '.join(unknown)}")
+        return ",".join(ids)
 
     # ---- 写：启停 ----
     def _validate_start(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -576,10 +593,10 @@ class Console:
             raise ValueError("最大尝试轮数需在 1–20")
         if p["fixer_preset"] not in soak_ctl.FIXER_PRESETS:
             raise ValueError(f"未知修单预设 {p['fixer_preset']!r}")
-        p["goal"] = str(p["goal"] or "").strip()
-        known = {g["id"] for g in self.ledger(p["branch"])}
-        if p["goal"] and known and p["goal"] not in known:
-            raise ValueError(f"台账里没有目标 {p['goal']!r}")
+        p["goal"] = self._validate_goals(p["goal"], p["branch"])
+        p["focus_mode"] = str(p["focus_mode"] or "together")
+        if p["focus_mode"] not in soak_ctl.FOCUS_MODES:
+            raise ValueError(f"未知聚焦模式 {p['focus_mode']!r}")
         p["player_model"] = str(p["player_model"] or "").strip()
         p["llm"] = bool(p["llm"])
         p["skip_live_canary"] = bool(p["skip_live_canary"])
@@ -617,6 +634,7 @@ class Console:
             cmd.append("--account-reserved")
         if p["goal"]:
             cmd.extend(["--goal", p["goal"]])
+        cmd.extend(["--focus-mode", p["focus_mode"]])
         if p["skip_live_canary"]:
             cmd.append("--skip-live-canary")
         return cmd
@@ -705,13 +723,14 @@ class Console:
 
         return self._run_job("restart", _job)
 
-    def inject(self, merge_ref: str, goal: Optional[str]) -> dict[str, Any]:
+    def inject(self, merge_ref: str, goal: Any) -> dict[str, Any]:
         ref = (merge_ref or "").strip()
         if not ref or not re.match(r"^[A-Za-z0-9._/\-]+$", ref):
             raise ValueError("请填写合法的分支名或 commit")
         if not (self.session_dir / "state.json").exists():
             raise ValueError("会话还没初始化：先一键启动一次双工位")
-        tgt = None if goal is None else str(goal).strip()
+        st_now = read_state_nolock(self.session_dir)
+        tgt = None if goal is None else self._validate_goals(goal, st_now.get("target_branch") or "")
         return self._run_job(
             f"inject {ref}",
             lambda: soak_ctl.inject_and_set_goal(self.session_dir, merge_ref=ref, target_goal=tgt),

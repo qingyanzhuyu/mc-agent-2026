@@ -68,6 +68,11 @@ input[type=range] { padding: 0; }
 .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 99px; transition: width .4s; }
 .bar.hot > i { background: var(--warn); }
 .barlabel { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+.goalpick { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); max-height: 190px; overflow: auto; padding: 4px 8px; }
+.goalpick .gp-group { font-size: 11px; color: var(--muted); margin: 6px 0 2px; font-weight: 600; }
+.goalpick label { display: flex; gap: 6px; align-items: baseline; font-size: 12.5px; color: var(--text); padding: 2px 0; cursor: pointer; }
+.goalpick label .dim { font-size: 11.5px; }
+.gpnote { font-size: 12px; color: var(--muted); }
 .events { list-style: none; margin: 10px 0 0; padding: 0; max-height: 260px; overflow: auto; font-size: 12.5px; }
 .events li { display: grid; grid-template-columns: 52px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
 .events li span:first-child { color: var(--muted); font-family: var(--mono); text-align: right; }
@@ -118,7 +123,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         </label>
         <label class="f">秒数<input type="number" id="secIn" step="10"></label>
         <label class="f">步数<input type="number" id="stepsIn" step="5"></label>
-        <label class="f wide">聚焦目标<select id="goalSel"></select></label>
+        <div class="f wide">聚焦目标（可多选）<div class="goalpick" id="goalSel" data-mode="modeSel"></div>
+          <span class="gpnote" id="goalSelNote"></span></div>
+        <label class="f wide">多个目标时<select id="modeSel"></select></label>
         <label class="f">工位 A 玩家模型<input id="modelIn" list="playerModels" placeholder="空 = 沿用 .env"></label>
         <label class="f">单目标最大尝试<input type="number" id="attemptsIn" min="1" max="20"></label>
         <label class="f wide">工位 B 修单模型（下一单起生效）<select id="fixerSel"></select></label>
@@ -143,7 +150,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         <label class="f">轮数（0 = 一直跑）<input type="number" id="sEpisodes" min="0"></label>
         <label class="f">每轮秒数<input type="number" id="sSec" step="10"></label>
         <label class="f">每轮步数<input type="number" id="sSteps" step="5"></label>
-        <label class="f wide">聚焦目标<select id="sGoal"></select></label>
+        <div class="f wide">聚焦目标（可多选）<div class="goalpick" id="sGoal" data-mode="sMode"></div>
+          <span class="gpnote" id="sGoalNote"></span></div>
+        <label class="f wide">多个目标时<select id="sMode"></select></label>
         <label class="f wide">工位 B 修单模型<select id="sFixer"></select></label>
         <label class="f">工位 A 玩家模型<input id="sModel" list="playerModels"></label>
         <label class="f">单目标最大尝试<input type="number" id="sAttempts" min="1" max="20"></label>
@@ -160,7 +169,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
       <h2>热合入开发分支 <small>带编译 + 单测 + dry 门禁</small></h2>
       <div class="grid2">
         <label class="f wide">分支或 commit<input id="iRef" placeholder="feat/goal-staging"></label>
-        <label class="f wide">同时切换聚焦目标<select id="iGoal"></select></label>
+        <label class="f inline wide"><input type="checkbox" id="iGoalOn">同时切换聚焦目标（不勾 = 保持现在的）</label>
+        <div class="f wide hidden" id="iGoalBox"><div class="goalpick" id="iGoal"></div>
+          <span class="gpnote" id="iGoalNote"></span></div>
       </div>
       <div class="row" style="margin-top:10px"><button id="btnInject">合入并切换</button></div>
       <div id="jobBox" class="banner hidden" style="margin-top:10px"></div>
@@ -256,18 +267,34 @@ async function api(path, body) {
   return j;
 }
 
-function goalOptions(sel, goals, current, allowKeep) {
+function goalPicker(el, goals, selected) {
+  const chosen = new Set(Array.isArray(selected) ? selected : String(selected || "").split(",").filter(Boolean));
   const groups = { candidate: [], graduated: [], live: [], draft: [] };
   goals.forEach((g) => (groups[g.stage] || groups.draft).push(g));
-  let html = allowKeep ? `<option value="__keep__">（不改）</option>` : "";
-  html += `<option value="">全部已毕业目标（不聚焦）</option>`;
+  let html = "";
   for (const st of ["candidate", "graduated", "live", "draft"]) {
     if (!groups[st].length) continue;
-    html += `<optgroup label="${STAGE_CN[st]}">` + groups[st].map((g) =>
-      `<option value="${esc(g.id)}">${esc(g.id)} · ${esc(g.title || "")}${g.score ? ` · ${g.score}分` : ""}</option>`).join("") + `</optgroup>`;
+    html += `<div class="gp-group">${STAGE_CN[st]}</div>` + groups[st].map((g) =>
+      `<label><input type="checkbox" value="${esc(g.id)}"${chosen.has(g.id) ? " checked" : ""}>` +
+      `<span class="mono">${esc(g.id)}</span><span class="dim">${esc(g.title || "")}${g.score ? ` · ${g.score}分` : ""}</span></label>`).join("");
   }
-  sel.innerHTML = html;
-  sel.value = current;
+  el.innerHTML = html;
+  el.onchange = () => pickerNote(el);
+  pickerNote(el);
+}
+
+function pickedGoals(el) { return [...el.querySelectorAll("input:checked")].map((i) => i.value); }
+
+function pickerNote(el) {
+  const ids = pickedGoals(el);
+  const note = $(el.id + "Note");
+  if (note) note.textContent = ids.length ? `已选 ${ids.length} 个：${ids.join("、")}` : "一个都不选 = 跑全部已毕业目标（不聚焦）";
+  if (el.dataset.mode) $(el.dataset.mode).disabled = ids.length < 2;
+}
+
+function modeOptions(sel, modes, current) {
+  sel.innerHTML = modes.map((m) => `<option value="${esc(m.key)}">${esc(m.label)}</option>`).join("");
+  sel.value = current || "together";
 }
 
 function fixerLabel(s, key) {
@@ -294,15 +321,17 @@ function fillForms(s) {
   $("stepsIn").value = steps;
   $("modelIn").value = s.session_exists ? (st.player_model ?? "") : d.player_model;
   $("attemptsIn").value = st.max_goal_attempts ?? d.max_goal_attempts;
-  goalOptions($("goalSel"), s.ledger, s.session_exists ? (st.target_goal || "") : d.goal, false);
+  modeOptions($("modeSel"), s.focus_modes, s.session_exists ? st.focus_mode : d.focus_mode);
+  modeOptions($("sMode"), s.focus_modes, d.focus_mode);
+  goalPicker($("goalSel"), s.ledger, s.session_exists ? (st.target_goal || "") : d.goal);
   fixerOptions($("fixerSel"), s.fixer_catalog, st.fixer_preset || d.fixer_preset);
   $("playerModels").innerHTML = s.player_models.map((m) => `<option value="${esc(m.name)}">${esc(m.note)}</option>`).join("");
-  goalOptions($("iGoal"), s.ledger, "__keep__", true);
+  goalPicker($("iGoal"), s.ledger, st.target_goal || "");
 
   $("sBranch").value = d.branch; $("sEpisodes").value = d.episodes;
   fixerOptions($("sFixer"), s.fixer_catalog, d.fixer_preset);
   $("sSec").value = d.episode_seconds; $("sSteps").value = d.episode_steps;
-  goalOptions($("sGoal"), s.ledger, d.goal, false);
+  goalPicker($("sGoal"), s.ledger, d.goal);
   $("sModel").value = d.player_model; $("sAttempts").value = d.max_goal_attempts;
   $("sLlm").checked = !!d.llm; $("sSkipCanary").checked = !!d.skip_live_canary;
   $("sBot").value = d.bot_user; $("sRotate").checked = !!d.rotate_user;
@@ -332,7 +361,7 @@ function startParams() {
   return {
     branch: $("sBranch").value.trim(), episodes: Number($("sEpisodes").value),
     episode_seconds: Number($("sSec").value), episode_steps: Number($("sSteps").value),
-    goal: $("sGoal").value, max_goal_attempts: Number($("sAttempts").value),
+    goal: pickedGoals($("sGoal")), focus_mode: $("sMode").value, max_goal_attempts: Number($("sAttempts").value),
     llm: $("sLlm").checked, player_model: $("sModel").value.trim(),
     fixer_preset: $("sFixer").value, skip_live_canary: $("sSkipCanary").checked,
     bot_user: $("sBot").value.trim(), rotate_user: $("sRotate").checked,
@@ -376,7 +405,10 @@ function renderSettingsNote(s) {
     : "未设热覆盖，沿用启动参数";
   const cur = live && !live.finished ? `；正在跑的 ${live.ep_id} 上限 ${fmtS(live.max_seconds)} / ${live.max_steps} 步` : "";
   const pm = (st.server_target === "official" && st.official_llm === "official") ? "AIA 官方代理（比赛同款）" : (st.player_model || "沿用 .env");
-  $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${cur}`;
+  const nGoals = (st.target_goal || "").split(",").filter(Boolean).length;
+  const focusTxt = !nGoals ? "全部" : nGoals === 1 ? st.target_goal
+    : `${st.target_goal.split(",").join("、")}（${st.focus_mode === "rotate" ? "每轮轮换一个" : "同轮一起跑"}）`;
+  $("effNote").textContent = `${ov}；聚焦目标：${focusTxt}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${cur}`;
 }
 
 function setBar(id, cur, max) {
@@ -395,7 +427,7 @@ function renderLive(s) {
     : !L.finished ? "守护已停，本轮未写完"
     : interrupted ? `已中断（${L.stop_reason}），未入账，下次启动会复用这个轮次号`
     : s.daemon === "stopped" ? `已结束（${L.stop_reason}），守护已停，未入账` : `已结束（${L.stop_reason}），等待入账`;
-  $("liveSub").textContent = `${L.ep_id} · ${!L.base ? "-" : /windywindie|nmo\.net\.cn/.test(L.base) ? "比赛服" : "自建测试服"} · ${L.bot_user || "-"} · ${L.model || "-"} · @${L.commit || "-"} · 目标 ${L.target_goal || "全部"} · ${state}`;
+  $("liveSub").textContent = `${L.ep_id} · ${!L.base ? "-" : /windywindie|nmo\.net\.cn/.test(L.base) ? "比赛服" : "自建测试服"} · ${L.bot_user || "-"} · ${L.model || "-"} · @${L.commit || "-"} · 目标 ${L.target_goal ? L.target_goal.split(",").join("、") : "全部"} · ${state}`;
   $("tLabel").textContent = `${fmtS(L.elapsed_s)} / ${fmtS(L.max_seconds)}`;
   $("sLabel").textContent = `${L.steps} / ${L.max_steps ?? "-"}`;
   setBar("tBar", L.elapsed_s, L.max_seconds); setBar("sBar", L.steps, L.max_steps);
@@ -417,7 +449,12 @@ function renderLive(s) {
 
 function renderTables(s) {
   $("epBody").innerHTML = s.episodes.map((e) => {
-    const goal = e.target_goal ? `${e.target_goal_reached ? '<span class="yes">✓</span>' : '<span class="no">✗</span>'} ${esc(e.target_goal)}` : '<span class="dim">全部</span>';
+    const tg = (e.target_goal || "").split(",").filter(Boolean);
+    const rmap = e.target_goals_reached || {};
+    const goal = tg.length ? tg.map((g) => {
+      const ok = g in rmap ? rmap[g] : g in (e.goals_reached || {});
+      return `${ok ? '<span class="yes">✓</span>' : '<span class="no">✗</span>'} ${esc(g)}`;
+    }).join("<br>") : '<span class="dim">全部</span>';
     const reached = Object.entries(e.goals_reached || {}).map(([g, t]) => `${esc(g)} <span class="dim">${fmtS(t)}</span>`).join("，") || '<span class="dim">无</span>';
     const at = e.at ? new Date(e.at).toLocaleTimeString() : "-";
     return `<tr class="click" data-ep="${esc(e.ep_id)}"><td class="mono">${esc(e.ep_id)}</td><td>${at}</td><td class="mono">${esc((e.commit || "").slice(0, 7))}</td>
@@ -478,6 +515,7 @@ async function refreshLog() {
 
 // ---- 交互 ----
 $("sServer").addEventListener("change", syncServerForm);
+$("iGoalOn").addEventListener("change", () => $("iGoalBox").classList.toggle("hidden", !$("iGoalOn").checked));
 $("sLlm").addEventListener("change", syncServerForm);
 $("sOfficialLlm").addEventListener("change", syncServerForm);
 $("secRange").addEventListener("input", (e) => { $("secIn").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
@@ -486,7 +524,8 @@ $("secIn").addEventListener("input", (e) => { $("secRange").value = e.target.val
 $("btnApply").onclick = async () => {
   const body = {
     episode_seconds: $("secIn").value, episode_steps: $("stepsIn").value,
-    target_goal: $("goalSel").value, player_model: $("modelIn").value, max_goal_attempts: $("attemptsIn").value,
+    target_goal: pickedGoals($("goalSel")), focus_mode: $("modeSel").value,
+    player_model: $("modelIn").value, max_goal_attempts: $("attemptsIn").value,
     fixer_preset: $("fixerSel").value,
   };
   try { await api("/api/settings", body); toast("已写入，下一轮开跑时生效"); refresh(); }
@@ -515,8 +554,8 @@ $("btnRestart").onclick = async () => {
   catch (e) { toast(e.message, "bad"); }
 };
 $("btnInject").onclick = async () => {
-  const g = $("iGoal").value;
-  try { await api("/api/inject", { merge_ref: $("iRef").value.trim(), goal: g === "__keep__" ? null : g }); toast("已开始合入，门禁要跑几分钟"); refresh(); }
+  const goal = $("iGoalOn").checked ? pickedGoals($("iGoal")) : null;
+  try { await api("/api/inject", { merge_ref: $("iRef").value.trim(), goal }); toast("已开始合入，门禁要跑几分钟"); refresh(); }
   catch (e) { toast(e.message, "bad"); }
 };
 $("epBody").addEventListener("click", async (e) => {

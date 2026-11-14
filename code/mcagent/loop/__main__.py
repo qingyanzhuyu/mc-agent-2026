@@ -20,6 +20,7 @@ from ..planner.llm import OFFICIAL_PROFILE, resolve_profile
 from ..preflight import OFFICIAL_HOSTS
 from ..runtime import Executor, State
 from ..skills import REGISTRY, contract_errors
+from .goals import normalize_goal_ids
 from . import (
     GOAL_MAP,
     GOALS,
@@ -47,7 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=("campaign", "focus"), default="campaign", help="campaign=比赛跑法, focus=单技能定向验收")
     p.add_argument("--skill", default=None, help="focus 模式下要运行的技能名")
     p.add_argument("--skill-args", default="{}", help="focus 模式下的 JSON 参数对象")
-    p.add_argument("--goal", default=None, help="聚焦推进并验收目标台账中的指定 goal_id")
+    p.add_argument("--goal", default=None,
+                   help="聚焦推进并验收目标台账中的 goal_id；多个用逗号分隔表示同一轮一起追（如 smelt_iron,kill_a_mob）")
     p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
     p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
     p.add_argument("--llm", action="store_true", help="开启 LLM 菜单选择（默认关闭，走纯规则队列；失败自动回退规则）")
@@ -110,9 +112,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"参数错误: {e}", file=sys.stderr)
         return 2
 
-    if args.goal is not None and args.goal not in GOAL_MAP:
-        print(f"参数错误: 未知 --goal {args.goal!r}（可选: {', '.join(GOAL_MAP)}）", file=sys.stderr)
-        return 2
+    if args.goal is not None:
+        goal_ids = normalize_goal_ids(args.goal)
+        unknown = [gid for gid in goal_ids if gid not in GOAL_MAP]
+        if not goal_ids or unknown:
+            print(f"参数错误: 未知 --goal {', '.join(unknown) or args.goal!r}（可选: {', '.join(GOAL_MAP)}）",
+                  file=sys.stderr)
+            return 2
+        args.goal = ",".join(goal_ids)
 
     cfg = Config.load()
     if args.user:

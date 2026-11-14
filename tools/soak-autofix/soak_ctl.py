@@ -38,7 +38,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Collection, Iterator, Optional, Sequence
 
 PROTECTED_BRANCHES = frozenset({"main", "master", "HEAD"})
 
@@ -223,6 +223,44 @@ def check_server_target(
     if not account_reserved:
         errs.append("比赛账号是全队独占资源：先在 docs/05 账号表占位，再确认「已占位」（AGENTS.md §3）")
     return errs
+
+
+# 聚焦多个目标时怎么跑：together = 同一轮一起追（抓互相抢材料/共享状态的问题，默认）；
+# rotate = 每轮只追其中一个，按顺序轮换（单独测各自成功率）。单目标时两者等价。
+FOCUS_MODES: dict[str, str] = {
+    "together": "同轮一起跑",
+    "rotate": "每轮轮换一个",
+}
+
+
+def split_goal_ids(target: Any) -> list[str]:
+    """与 mcagent.loop.goals.normalize_goal_ids 同规则（本脚本不导入 mcagent）：逗号分隔、去重保序。"""
+    if not target:
+        return []
+    parts = target.split(",") if isinstance(target, str) else list(target)
+    out: list[str] = []
+    for part in parts:
+        gid = str(part).strip()
+        if gid and gid not in out:
+            out.append(gid)
+    return out
+
+
+def pick_round_goals(
+    focus: Any, mode: str, round_index: int, escalated: Collection[str] = ()
+) -> tuple[str, list[str]]:
+    """决定这一轮交给 mcagent.loop 的 --goal：返回 (逗号串, 已升级人工而跳过的目标)。
+
+    已升级人工（escalated_human）的目标不再追；全被跳过时返回空串，由调用方决定是否止损。
+    """
+    ids = split_goal_ids(focus)
+    skipped = [g for g in ids if g in set(escalated)]
+    live = [g for g in ids if g not in set(escalated)]
+    if not live:
+        return "", skipped
+    if mode == "rotate" and len(live) > 1:
+        return live[round_index % len(live)], skipped
+    return ",".join(live), skipped
 
 
 def validate_bot_user(name: str) -> str:
@@ -536,7 +574,7 @@ def init_session(
     _wire_worktree_env(repo_root, fixer_wt)
     _wire_worktree_env(repo_root, runner_wt)
 
-    norm_goal = (target_goal or "").strip()
+    norm_goal = ",".join(split_goal_ids(target_goal))
     norm_player_model = (player_model if player_model is not None else DEFAULT_PLAYER_MODEL).strip()
     with locked_state(session_dir) as st:
         if not st:
@@ -681,10 +719,12 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
             except Exception:
                 pass
 
-    if target_goal and target_goal in goals_reached:
+    target_goals = split_goal_ids(target_goal)
+    target_goals_reached = {gid: gid in goals_reached for gid in target_goals}
+    if target_goals and all(target_goals_reached.values()):
         target_goal_reached = True
         if target_goal_elapsed_s is None:
-            target_goal_elapsed_s = goals_reached[target_goal]
+            target_goal_elapsed_s = max(goals_reached[g] for g in target_goals)
 
     deaths = run_end_deaths if run_end_deaths is not None else deaths_recovered_count
     prompt_tokens = max(curve_prompt, tl_cum_prompt, tl_sum_prompt)
@@ -705,6 +745,8 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
         "deaths": deaths,
         "stop_reason": stop_reason,
         "target_goal": target_goal,
+        "target_goals": target_goals,
+        "target_goals_reached": target_goals_reached,
         "target_goal_reached": target_goal_reached,
         "target_goal_elapsed_s": target_goal_elapsed_s,
         "goals_reached": goals_reached,
@@ -731,17 +773,17 @@ def update_session_goal_telemetry(session_dir: Path, episodes: list[dict[str, An
                 if gid_s and gid_s not in seen_gids:
                     seen_gids.add(gid_s)
                     goal_ids.append(gid_s)
-            tg = str(ep.get("target_goal") or "").strip()
-            if tg and tg not in seen_gids:
-                seen_gids.add(tg)
-                goal_ids.append(tg)
+            for tg in split_goal_ids(ep.get("target_goal")):
+                if tg not in seen_gids:
+                    seen_gids.add(tg)
+                    goal_ids.append(tg)
 
         goals_stats: dict[str, dict[str, Any]] = {}
         for gid in goal_ids:
             ep_pool = [
                 ep for ep in source_eps
                 if not ep.get("target_goal")
-                or ep.get("target_goal") == gid
+                or gid in split_goal_ids(ep.get("target_goal"))
                 or gid in (ep.get("goals_reached") or {})
             ]
             if not ep_pool:
@@ -829,7 +871,7 @@ def ingest_episode_and_check_rollback(
                     int(prev_good.get("inferred_score", 0) or 0),
                 )
                 if prev_best_score > 0 and commit_code == "GOAL_MISS":
-                    tgt_set = {summary["target_goal"]} if summary.get("target_goal") else set()
+                    tgt_set = set(split_goal_ids(summary.get("target_goal")))
                     prev_prereqs = set((prev_good.get("goals_reached") or {}).keys()) - tgt_set
                     cur_reached = set((summary.get("goals_reached") or {}).keys())
                     cur_best_score = max(
@@ -921,8 +963,9 @@ def ingest_episode_and_check_rollback(
                         rec["status"] = "pending"
 
         # 若本轮成功达成聚焦目标，同步标记对应 GOAL_MISS 已由实跑达成，避免 Fixer 空转认领
-        gid = str(summary.get("target_goal") or "").strip()
-        if gid and summary.get("target_goal_reached"):
+        for gid in split_goal_ids(summary.get("target_goal")):
+            if gid not in (summary.get("goals_reached") or {}):
+                continue
             miss_rec = st["incidents"].get(f"GOAL_MISS:{gid}")
             if miss_rec is not None and miss_rec.get("status") in ("pending", "fixed"):
                 miss_rec["goal_achieved_ep"] = ep_id
@@ -1257,17 +1300,25 @@ def run_runner_loop(
             print("[runner] 检测到 STOP 标志文件，安全退出挂机循环。")
             break
         st = read_state(session_dir)
-        active_goal = (st.get("target_goal") or "").strip()
+        focus = (st.get("target_goal") or "").strip()
+        focus_mode = st.get("focus_mode") if st.get("focus_mode") in FOCUS_MODES else "together"
         active_model = (st.get("player_model") or "").strip()
         ep_seconds, ep_steps = effective_episode_budget(st, episode_seconds, episode_steps)
-        if episodes <= 0 and active_goal:
-            goal_inc = st.get("incidents", {}).get(f"GOAL_MISS:{active_goal}", {})
-            if goal_inc.get("status") == "escalated_human":
+        escalated = {
+            gid for gid in split_goal_ids(focus)
+            if st.get("incidents", {}).get(f"GOAL_MISS:{gid}", {}).get("status") == "escalated_human"
+        }
+        active_goal, skipped = pick_round_goals(focus, focus_mode, len(st["episodes"]), escalated)
+        if focus and not active_goal:
+            if episodes <= 0:
                 print(
-                    f"[runner] 聚焦目标 {active_goal} 已超最大自动尝试轮数并升级人工（escalated_human），自动止损退出。"
+                    f"[runner] 聚焦目标 {focus} 已全部超最大自动尝试轮数并升级人工（escalated_human），自动止损退出。"
                 )
                 (session_dir / "STOP").write_text(_utc_now(), encoding="utf-8")
                 break
+            active_goal = focus  # 跑固定轮数时照常跑完
+        elif skipped:
+            print(f"[runner] 跳过已升级人工的目标 {', '.join(skipped)}，本轮只追 {active_goal}")
         idx += 1
         repo_root = Path(st["repo_root"])
         runner_wt = Path(st["runner_wt"])
@@ -1431,6 +1482,7 @@ def inject_and_set_goal(
     episode_steps: Optional[int] = None,
     clear_episode_budget: bool = False,
     fixer_preset: Optional[str] = None,
+    focus_mode: Optional[str] = None,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
     """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。
@@ -1438,6 +1490,8 @@ def inject_and_set_goal(
     `episode_seconds` / `episode_steps` 写进 state.json，Runner 下一轮起生效；
     `clear_episode_budget=True` 清掉热覆盖，回到 `run` 启动参数。越界时在合入前直接拒绝。
     """
+    if focus_mode is not None and focus_mode not in FOCUS_MODES:
+        return {"ok": False, "failed_step": "invalid_focus_mode", "detail": f"未知聚焦模式 {focus_mode!r}"}
     if fixer_preset is not None and fixer_preset not in FIXER_PRESETS:
         return {"ok": False, "failed_step": "invalid_fixer_preset", "detail": f"未知修单预设 {fixer_preset!r}"}
     budget_err = validate_episode_budget(episode_seconds, episode_steps)
@@ -1527,7 +1581,9 @@ def inject_and_set_goal(
         with locked_state(session_dir) as st:
             st["current_tip"] = _branch_tip(repo_root, branch)
             if target_goal is not None:
-                st["target_goal"] = target_goal.strip()
+                st["target_goal"] = ",".join(split_goal_ids(target_goal))
+            if focus_mode is not None:
+                st["focus_mode"] = focus_mode
             if max_goal_attempts is not None:
                 st["max_goal_attempts"] = int(max_goal_attempts)
             if player_model is not None:
@@ -1561,6 +1617,7 @@ def inject_and_set_goal(
                 "episode_steps": st.get("episode_steps"),
             }
             final_fixer = st.get("fixer_preset", "")
+            final_mode = st.get("focus_mode", "together")
 
         write_review_report(session_dir)
         return {
@@ -1569,6 +1626,7 @@ def inject_and_set_goal(
             "target_goal": final_goal,
             "episode_budget_override": final_budget,
             "fixer_preset": final_fixer,
+            "focus_mode": final_mode,
             "previous_tip": prev_tip,
             "current_tip": final_tip,
             "merged_files": merged_files,
@@ -1598,8 +1656,11 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
     if st.get("target_goal"):
+        n_focus = len(split_goal_ids(st["target_goal"]))
+        mode_txt = f"，{FOCUS_MODES.get(st.get('focus_mode') or 'together', '同轮一起跑')}" if n_focus > 1 else ""
         lines.append(
-            f"- **本轮聚焦晋级目标**：`{st['target_goal']}`（最大自动尝试上限 `{st.get('max_goal_attempts', 4)}` 轮）"
+            f"- **本轮聚焦晋级目标**：`{st['target_goal']}`（{n_focus} 个{mode_txt}；"
+            f"每个目标最大自动尝试上限 `{st.get('max_goal_attempts', 4)}` 轮）"
         )
     o_sec, o_steps = st.get("episode_seconds"), st.get("episode_steps")
     if o_sec is not None or o_steps is not None:
@@ -1667,7 +1728,13 @@ def write_review_report(session_dir: Path) -> Path:
             else:
                 rb = "-"
             if e.get("target_goal"):
-                if e.get("target_goal_reached"):
+                reached_map = e.get("target_goals_reached") or {}
+                ids = split_goal_ids(e["target_goal"])
+                if len(ids) > 1:
+                    goal_s = " ".join(
+                        f"{'✅' if reached_map.get(g, g in (e.get('goals_reached') or {})) else '❌'} `{g}`" for g in ids
+                    )
+                elif e.get("target_goal_reached"):
                     t_el = e.get("target_goal_elapsed_s")
                     goal_s = (
                         f"✅ `{e['target_goal']}` ({float(t_el):.1f}s)"
@@ -1806,7 +1873,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument("--episodes", type=int, default=3)
     p_dual.add_argument("--episode-seconds", type=float, default=180.0)
     p_dual.add_argument("--episode-steps", type=int, default=40)
-    p_dual.add_argument("--goal", default="", help="本轮聚焦晋级目标 goal_id")
+    p_dual.add_argument("--goal", default="", help="聚焦目标 goal_id；多个用逗号分隔（如 smelt_iron,kill_a_mob）")
+    p_dual.add_argument("--focus-mode", choices=tuple(FOCUS_MODES), default="together",
+                        help="多个聚焦目标时：together 同轮一起跑（默认）| rotate 每轮轮换一个")
     p_dual.add_argument(
         "--max-goal-attempts",
         type=int,
@@ -1872,7 +1941,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="可选：将指定分支或 commit（如 feat/goal-staging）经离线门禁核验后合入待审分支",
     )
     g_grp = p_set.add_mutually_exclusive_group()
-    g_grp.add_argument("--goal", default=None, help="切换下一轮起跑的聚焦目标 goal_id")
+    g_grp.add_argument("--goal", default=None,
+                       help="切换下一轮起跑的聚焦目标 goal_id；多个用逗号分隔（如 smelt_iron,kill_a_mob）")
+    p_set.add_argument("--focus-mode", choices=tuple(FOCUS_MODES), default=None,
+                       help="多个聚焦目标时：together 同轮一起跑 | rotate 每轮轮换一个")
     g_grp.add_argument("--clear-goal", action="store_true", help="清空单目标聚焦，切回常规全量已毕业目标挂机")
     p_set.add_argument("--max-goal-attempts", type=int, default=None, help="可选更新单目标最大自动尝试轮数")
     p_set.add_argument("--player-model", default=None, help="可选热切换下一轮起工位 A 玩家模型名")
@@ -2016,6 +2088,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         (session_dir / "STOP").unlink(missing_ok=True)
         with locked_state(session_dir) as st_fx:
             st_fx["server_target"] = args.server
+            st_fx["focus_mode"] = args.focus_mode
             st_fx["official_llm"] = args.official_llm
             if args.fixer_cmd:
                 st_fx.pop("fixer_preset", None)
@@ -2076,6 +2149,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             episode_steps=args.episode_steps,
             clear_episode_budget=args.clear_episode_budget,
             fixer_preset=args.fixer_preset,
+            focus_mode=args.focus_mode,
             skip_offline_gate=args.skip_offline_gate,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -2089,6 +2163,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "target_goal": st.get("target_goal", ""),
             "player_model": st.get("player_model", ""),
             "fixer_preset": st.get("fixer_preset", ""),
+            "focus_mode": st.get("focus_mode", "together"),
             "server_target": st.get("server_target", "local"),
             "official_llm": st.get("official_llm", "custom"),
             "episode_budget_override": {
