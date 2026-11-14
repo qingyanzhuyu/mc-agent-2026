@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 
 from ..client import DEFAULT_BASE, Client, Config
+from ..planner.llm import OFFICIAL_PROFILE, resolve_profile
+from ..preflight import OFFICIAL_HOSTS
 from ..runtime import Executor, State
 from ..skills import REGISTRY, contract_errors
 from . import (
@@ -115,6 +117,22 @@ def main(argv: list[str] | None = None) -> int:
         print("缺少 MC_USER / MC_PASS（见 mcagent/.env.example 或传 --user）", file=sys.stderr)
         return 2
 
+    llm_meta: dict = {}
+    if args.llm:
+        try:
+            prof = resolve_profile()
+        except ValueError as e:
+            print(f"参数错误: {e}", file=sys.stderr)
+            return 2
+        # 校园网入口也是官方端点，但不等于 DEFAULT_BASE，所以按域名再判一次
+        mc_official = official or any(h in cfg.base for h in OFFICIAL_HOSTS)
+        if mc_official and prof["profile"] != OFFICIAL_PROFILE:
+            print(f"拒绝运行：MC 指向官方端点时模型只能用 LLM_PROFILE=official（当前 {prof['profile']}，见 AGENTS.md §2B.3）",
+                  file=sys.stderr)
+            return 2
+        llm_meta = {"llm_profile": prof["profile"], "llm_model": prof["model"]}
+        print(f"[loop] LLM 配置: {prof['profile']} (model={prof['model'] or '(未设置)'})")
+
     source_tag = "official" if (official and not args.local_target) else "local-target"
     min_ver = args.min_verified or ("live" if source_tag == "official" else "offline")
     enable_obs = args.soak or args.run_dir is not None
@@ -141,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
                 "mode": args.mode,
                 "skill": args.skill,
                 "use_llm": args.llm,
+                **llm_meta,
                 "min_verified": min_ver,
                 "max_steps": args.max_steps,
                 "max_seconds": args.max_seconds,

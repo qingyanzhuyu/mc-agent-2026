@@ -98,6 +98,13 @@ def check_static(env: dict[str, str], gateway_open: bool | None = None,
         "LLM_MODEL 是 default", model == "default",
         f"LLM_MODEL={model or '(空)'}" + ("" if model == "default" else "  ← 写模型名会被 403")))
 
+    # custom 是赛前自备 key 的测试配置；比赛只许官方 AIA 代理（AGENTS §2B.3）
+    profile = (env.get("LLM_PROFILE", "") or "official").strip().lower()
+    out.append(Check(
+        "LLM_PROFILE 是 official", profile == "official",
+        f"LLM_PROFILE={env.get('LLM_PROFILE') or '(未设置=official)'}" +
+        ("" if profile == "official" else "  ← 自备模型只能赛前测试，比赛必须走官方代理")))
+
     conc_raw = env.get("LLM_MAX_CONCURRENCY", "")
     try:
         conc = int(conc_raw)

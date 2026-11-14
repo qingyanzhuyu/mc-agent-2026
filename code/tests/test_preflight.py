@@ -72,6 +72,16 @@ class GuardTests(unittest.TestCase):
         env = dict(MATCH, LLM_MODEL="qwen3.6-35b-a3b")
         self.assertIn("LLM_MODEL 是 default", failed_names(run(env)))
 
+    def test_custom_llm_profile_blocks(self):
+        env = dict(MATCH, LLM_PROFILE="custom")
+        c = next(x for x in run(env) if x.name == "LLM_PROFILE 是 official")
+        self.assertFalse(c.ok)
+        self.assertEqual(c.level, pf.BLOCK)
+
+    def test_explicit_official_profile_passes(self):
+        env = dict(MATCH, LLM_PROFILE="Official")
+        self.assertNotIn("LLM_PROFILE 是 official", failed_names(run(env)))
+
     def test_unknown_host_is_warn_not_block(self):
         env = dict(MATCH, MC_API_BASE="https://example.com/api/v1")
         checks = run(env)

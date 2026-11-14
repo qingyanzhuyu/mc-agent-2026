@@ -15,9 +15,16 @@
 
 5. **代理坏了就直连**：快路径经本机代理连不上/被网关拒（502/503/504）时，同一次调用里用剩余时间
    改直连重试；代理连续坏 `LLM_BREAKER_FAILS` 次后熔断 `LLM_BREAKER_COOLDOWN_S` 秒，期间直接走直连。
-   "直连"仍是同一个官方端点、同一把 key，只是不经本机代理——**没有也不允许有第二个模型端点**（AGENTS §2B.3）。
+   "直连"仍是同一个官方端点、同一把 key，只是不经本机代理——降级**不会**换到第二个模型端点（AGENTS §2B.3）。
 6. **端点坏了就别等**：所有线路都失败连续达到同一阈值后整体熔断，期间 `chat()` 立刻抛
    `LLMError(kind="circuit_open")`，`ask_json()` 不重试不睡眠直接返回 None，调用方走规则兜底（J8）。
+
+两套配置（2026-11-14 补，见 `resolve_profile()`）：
+
+7. `LLM_PROFILE=official`（默认）读 `LLM_BASE/LLM_KEY/LLM_MODEL/LLM_PROXY_FAST`，是比赛唯一合法配置；
+   `LLM_PROFILE=custom` 读 `LLM_CUSTOM_*`，**只给赛前用自备 key 测试**，`preflight` 会把它当 BLOCK 拦下。
+   一次进程只用一套，不会在两套之间自动切换（降级直连也只在本套内部发生）。
+   custom 端点若因不认识 `chat_template_kwargs` 回 400，去掉该字段原线路重发一次，之后本进程不再带它。
 """
 from __future__ import annotations
 
@@ -39,6 +46,42 @@ DEFAULT_FAST_PROXY = "http://127.0.0.1:7897"
 
 #: poster(url, headers, data, timeout, proxy) -> (status_code, body_text)
 Poster = Callable[[str, dict, str, float, Optional[str]], "tuple[int, str]"]
+
+#: 比赛唯一合法配置；custom 只给赛前测试（AGENTS §2B.3）
+OFFICIAL_PROFILE = "official"
+CUSTOM_PROFILE = "custom"
+PROFILES = (OFFICIAL_PROFILE, CUSTOM_PROFILE)
+
+
+def resolve_profile(profile: Optional[str] = None, env: Optional[dict] = None) -> dict:
+    """按 `LLM_PROFILE` 取出一套模型配置：`{profile, base, key, model, proxy, names}`。
+
+    - official：缺省值与改动前完全一致（官方端点、`default`、快路径走 7897 代理）。
+    - custom：**没有缺省值**，base/key/model 三项都要自己填；代理缺省为空（直连）。
+    `names` 是每一项对应的环境变量名，缺项报错时用。拼错 profile 直接 ValueError（启动即报，不静默回落）。
+    """
+    env = os.environ if env is None else env
+    name = (profile if profile is not None else env.get("LLM_PROFILE", "")).strip().lower() or OFFICIAL_PROFILE
+    if name not in PROFILES:
+        raise ValueError(f"LLM_PROFILE 只能是 {' / '.join(PROFILES)}；收到 {name!r}")
+    if name == OFFICIAL_PROFILE:
+        proxy = env.get("LLM_PROXY_FAST")
+        return {
+            "profile": name,
+            "base": env.get("LLM_BASE") or DEFAULT_BASE,
+            "key": env.get("LLM_KEY") or "",
+            "model": env.get("LLM_MODEL") or DEFAULT_MODEL,
+            "proxy": DEFAULT_FAST_PROXY if proxy is None else proxy,
+            "names": {"base": "LLM_BASE", "key": "LLM_KEY", "model": "LLM_MODEL"},
+        }
+    return {
+        "profile": name,
+        "base": env.get("LLM_CUSTOM_BASE") or "",
+        "key": env.get("LLM_CUSTOM_KEY") or "",
+        "model": env.get("LLM_CUSTOM_MODEL") or "",
+        "proxy": env.get("LLM_CUSTOM_PROXY") or "",
+        "names": {"base": "LLM_CUSTOM_BASE", "key": "LLM_CUSTOM_KEY", "model": "LLM_CUSTOM_MODEL"},
+    }
 
 
 SYSTEM_PROMPT = """你是 Minecraft 生存 Agent 的决策器。每次只输出一个 JSON 对象，不要输出任何其他文字、不要用 Markdown 代码块。
@@ -127,14 +170,19 @@ class LLMClient:
         breaker_cooldown_s: Optional[float] = None,
         clock: Callable[[], float] = time.monotonic,
         log: Optional[Callable[[str], None]] = print,
+        profile: Optional[str] = None,
     ):
-        self.base = (base or os.environ.get("LLM_BASE") or DEFAULT_BASE).rstrip("/")
-        self.key = key or os.environ.get("LLM_KEY") or ""
-        self.model = model or os.environ.get("LLM_MODEL") or DEFAULT_MODEL
+        # 显式参数优先，其余从 LLM_PROFILE 选中的那一套里取（见 resolve_profile）
+        cfg = resolve_profile(profile)
+        self.profile: str = cfg["profile"]
+        self._env_names: dict[str, str] = cfg["names"]
+        self.base = (base or cfg["base"]).rstrip("/")
+        self.key = key or cfg["key"]
+        self.model = model or cfg["model"]
         # 快路径的代理；慢路径强制直连（长请求走代理会被掐）
-        env_proxy = os.environ.get("LLM_PROXY_FAST")
-        self.fast_proxy = fast_proxy if fast_proxy is not None else (
-            env_proxy if env_proxy is not None else DEFAULT_FAST_PROXY)
+        self.fast_proxy = fast_proxy if fast_proxy is not None else cfg["proxy"]
+        #: custom 端点回 400 拒收 `chat_template_kwargs` 后置真，本进程之后不再带这个字段
+        self.drop_thinking_field = False
         self.timeout = timeout
         conc_raw = os.environ.get("LLM_MAX_CONCURRENCY", "")
         try:
@@ -160,7 +208,7 @@ class LLMClient:
         self.stats: dict[str, int] = {
             "proxy_ok": 0, "direct_ok": 0, "fallback_direct": 0,
             "proxy_opened": 0, "endpoint_opened": 0, "short_circuited": 0,
-            "no_slot": 0,
+            "no_slot": 0, "thinking_field_dropped": 0,
         }
 
     # ---- 传输层（可注入，便于离线单测） ------------------------------
@@ -203,6 +251,8 @@ class LLMClient:
         with self._lock:
             return {
                 **self.stats,
+                "profile": self.profile,
+                "model": self.model,
                 "last_route": self.last_route,
                 "proxy_open_s": round(self._proxy_breaker.remaining(), 1),
                 "endpoint_open_s": round(self._endpoint_breaker.remaining(), 1),
@@ -252,6 +302,29 @@ class LLMClient:
             f"空 content（finish={choice.get('finish_reason')}, "
             f"completion={usage.get('completion_tokens')}）", kind="empty")
 
+    def _send(self, url: str, headers: dict, body: dict, budget: float, proxy: Optional[str],
+              deadline: float) -> str:
+        """在一条线路上发一次；custom 端点 400 拒收关思考字段时，去掉字段用剩余预算原线路重发一次。
+
+        只对 custom 生效：官方端点认这个字段（实测 356ms），它回 400 一定是别的原因，
+        自动去掉会让后续请求全部开思考、慢一个数量级。
+        """
+        try:
+            return self._post_once(url, headers, json.dumps(body), budget, proxy)
+        except LLMError as e:
+            if not (self.profile == CUSTOM_PROFILE and e.kind == "http" and e.status == 400
+                    and "chat_template_kwargs" in body):
+                raise
+            remaining = deadline - self._clock()
+            body.pop("chat_template_kwargs")
+            with self._lock:
+                self.drop_thinking_field = True
+                self.stats["thinking_field_dropped"] += 1
+            self._log(f"  [llm] custom 端点拒收 chat_template_kwargs（{e}），本进程之后不再发送该字段")
+            if remaining < MIN_FALLBACK_BUDGET_S:
+                raise
+        return self._post_once(url, headers, json.dumps(body), remaining, proxy)
+
     # ---- 单次调用 ----------------------------------------------------
     def chat(
         self,
@@ -260,8 +333,9 @@ class LLMClient:
         max_tokens: int = 900,
         timeout: Optional[float] = None,
     ) -> str:
-        if not self.key:
-            raise LLMError("没有 LLM_KEY（见 .env.example）", kind="config")
+        missing = [self._env_names[k] for k in ("base", "key", "model") if not getattr(self, k)]
+        if missing:
+            raise LLMError(f"LLM_PROFILE={self.profile} 缺少 {', '.join(missing)}（见 .env.example）", kind="config")
         with self._lock:
             if not self._endpoint_breaker.allow():
                 self.stats["short_circuited"] += 1
@@ -272,7 +346,7 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
-        if not thinking:
+        if not thinking and not self.drop_thinking_field:
             body["chat_template_kwargs"] = {"enable_thinking": False}
 
         url = f"{self.base}/chat/completions"
@@ -281,7 +355,6 @@ class LLMClient:
         if request_timeout is None:
             env_fast = float(os.environ.get("MC_MODEL_TIMEOUT_S", "8"))
             request_timeout = self.timeout if thinking else min(self.timeout, env_fast)
-        data = json.dumps(body)
 
         # 两条线路共用这一次调用的时间预算：降级直连只用剩下的时间，不让调用方多等
         deadline = self._clock() + request_timeout
@@ -293,7 +366,7 @@ class LLMClient:
             if i > 0 and budget < MIN_FALLBACK_BUDGET_S:
                 break
             try:
-                content = self._post_once(url, headers, data, budget, proxy)
+                content = self._send(url, headers, body, budget, proxy, deadline)
             except LLMError as e:
                 error, failed_via = e, proxy
                 if proxy and e.route_fault:
