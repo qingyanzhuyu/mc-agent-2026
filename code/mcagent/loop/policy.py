@@ -10,25 +10,33 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Collection, Mapping, Optional
 
 from ..planner import skill_choice
 from ..planner.llm import LLMClient, LLMError
 from ..runtime import State
 from ..skills import REGISTRY, Skill, make
 from ..skills.items import best_pickaxe
+from .goals import (
+    DEFAULT_CAMPAIGN_STAGES,
+    GOALS,
+    OFFICIAL_CAMPAIGN_STAGES,
+    STONE_OR_BETTER_PICKS,
+    GoalSpec,
+    check_item_expr,
+    diagnose_goal_gap,
+    is_goal_achieved,
+    is_goal_stopped_out,
+    rank_actionable_goals,
+    resolve_active_goals,
+)
 from .starter_skills import (
     PROTECTED_ZONES,
     can_afford_gear,
-    has_known_table,
     total_cobble,
     total_logs,
     total_planks,
 )
-
-STONE_OR_BETTER_PICKS = frozenset({
-    "stone_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
-})
 
 
 @dataclass
@@ -43,7 +51,7 @@ class PlanDecision:
     completion_tokens: int = 0
 
 
-def build_state_summary(state: State) -> str:
+def build_state_summary(state: State, *, goal_hint: str = "") -> str:
     """给模型的一屏状态摘要（不暴露实体 id 与可编造坐标列表，遵守 J17）。"""
     st = state.snapshot()
     pick = best_pickaxe(state) or "无"
@@ -56,14 +64,37 @@ def build_state_summary(state: State) -> str:
     ]
     if PROTECTED_ZONES:
         lines.append(f"已发现保护区点位数={len(PROTECTED_ZONES)}（需远离）")
+    if goal_hint:
+        lines.append(f"当前目标指引：{goal_hint}")
     return "\n".join(lines)
 
 
 class RulePlanner:
-    """无状态科技树派生器：只看当拍 `State` 决定下一步做什么。"""
+    """基于目标台账（`goals.py`）与当拍真实 `State` 的科技树性价比派生器。"""
 
-    def __init__(self, registry: Optional[dict[str, type[Skill]]] = None):
+    def __init__(
+        self,
+        registry: Optional[dict[str, type[Skill]]] = None,
+        ledger: tuple[GoalSpec, ...] = GOALS,
+        include_stages: Collection[str] = DEFAULT_CAMPAIGN_STAGES,
+        target_goal: Optional[str] = None,
+        telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ):
         self.registry = REGISTRY if registry is None else registry
+        self.ledger: tuple[GoalSpec, ...] = tuple(ledger)
+        self.ledger_map: dict[str, GoalSpec] = {g.id: g for g in self.ledger}
+        self.include_stages: tuple[str, ...] = tuple(include_stages)
+        self.target_goal: Optional[str] = target_goal
+        self.telemetry: dict[str, Any] = dict(telemetry) if telemetry else {}
+        self.active_goals: tuple[GoalSpec, ...] = resolve_active_goals(
+            self.ledger,
+            include_stages=self.include_stages,
+            target_goal=self.target_goal,
+        )
+        self.completed_advancements: set[str] = set()
+        self.ep_goal_fails: dict[str, int] = {}
+        self.ep_goal_elapsed: dict[str, float] = {}
+        self._last_selected_goal_id: Optional[str] = None
 
     def _try_make(self, name: str, args: Optional[dict], state: State) -> Optional[Skill]:
         cls = self.registry.get(name)
@@ -74,7 +105,77 @@ class RulePlanner:
             return None
         return inst
 
+    def _rank(self, state: State):
+        return rank_actionable_goals(
+            state,
+            self.active_goals,
+            completed_advs=self.completed_advancements,
+            target_goal=self.target_goal,
+            ep_goal_fails=self.ep_goal_fails,
+            ep_goal_elapsed=self.ep_goal_elapsed,
+            telemetry=self.telemetry,
+        )
+
+    def current_goal_hint(self, state: State) -> str:
+        """返回当前最高性价比目标步的一行指引与缺口诊断（无待办目标时返回空串）。"""
+        ranked = self._rank(state)
+        if not ranked:
+            return ""
+        top = ranked[0]
+        step_g = top.step_goal
+        root_g = top.root_goal
+        gap = diagnose_goal_gap(step_g, state, self.completed_advancements, self.ledger)
+        if step_g.id != root_g.id:
+            return (
+                f"优先推进 {step_g.id}（{step_g.title}，服务于 {root_g.id} 链路 {top.path_score}分/预计{top.path_cost:.0f}s）"
+                f" | {gap['summary']}"
+            )
+        return (
+            f"优先推进 {step_g.id}（{step_g.title}，链路 {top.path_score}分/预计{top.path_cost:.0f}s）"
+            f" | {gap['summary']}"
+        )
+
+    def record_skill_outcome(
+        self,
+        skill_name: str,
+        *,
+        ok: bool,
+        elapsed_s: float = 0.0,
+        completed_advs: Collection[str] = (),
+    ) -> Optional[str]:
+        """同步服务端已达成进度，并将本轮技能耗时与失败次数记入对应目标以支持单轮止损。"""
+        if completed_advs:
+            self.completed_advancements.update(completed_advs)
+
+        gid = self._last_selected_goal_id
+        matched_goal = self.ledger_map.get(gid) if gid else None
+        if matched_goal is not None:
+            valid_for_goal = (
+                matched_goal.skill == skill_name
+                or any(fb_skill == skill_name for _, fb_skill, _ in matched_goal.gather_fallbacks)
+            )
+            if not valid_for_goal:
+                gid = None
+
+        if gid is None:
+            for g in self.active_goals:
+                if g.skill == skill_name and not is_goal_stopped_out(g, self.ep_goal_fails, self.ep_goal_elapsed):
+                    if g.done_advancements and any(a in self.completed_advancements for a in g.done_advancements):
+                        continue
+                    gid = g.id
+                    break
+
+        if gid is not None:
+            if elapsed_s > 0.0:
+                self.ep_goal_elapsed[gid] = self.ep_goal_elapsed.get(gid, 0.0) + float(elapsed_s)
+            if not ok:
+                self.ep_goal_fails[gid] = self.ep_goal_fails.get(gid, 0) + 1
+
+        self._last_selected_goal_id = None
+        return gid
+
     def choose(self, state: State) -> PlanDecision:
+        self._last_selected_goal_id = None
         hp = float(state.st.get("health", 20))
         food = float(state.st.get("food", 20))
 
@@ -84,7 +185,7 @@ class RulePlanner:
             if eat is not None:
                 return PlanDecision(eat, "rule", f"生存补给 hp={hp} food={food}")
 
-        # safe_mode 锁存期不主动发起高风险远征，只允许进食或原地轻度合成
+        # 2) safe_mode 锁存期不主动发起高风险远征，只允许进食或原地轻度合成
         if state.in_safe_mode:
             for item in ("stone_sword", "stone_pickaxe", "wooden_pickaxe"):
                 if state.count(item) < 1 and can_afford_gear(state, item, assume_no_table=True):
@@ -93,71 +194,36 @@ class RulePlanner:
                         return PlanDecision(c, "rule", f"safe_mode 期间原地合成 {item}")
             return PlanDecision(None, "idle", f"safe_mode 避险驻留中（剩 {state.safe_mode_remaining:.0f}s）")
 
-        pick = best_pickaxe(state)
-        assume_no_tbl = not has_known_table(state.pos)
+        # 3) 目标台账解析与按性价比顺序派发
+        ranked = self._rank(state)
+        if ranked:
+            for step in ranked:
+                g = step.step_goal
+                if all(check_item_expr(state, expr) for expr in g.prereq_items):
+                    inst = self._try_make(g.skill, g.args_dict, state)
+                    if inst is not None:
+                        self._last_selected_goal_id = g.id
+                        return PlanDecision(inst, "rule", f"推进目标 {g.id}（{g.title}）")
+                else:
+                    # 仅尝试首个未满足前置表达式对应的补料技能（避免缺圆石且采石冷却时盲目去砍树）
+                    for req_expr, fb_skill, fb_args in g.gather_fallbacks:
+                        if not check_item_expr(state, req_expr):
+                            inst = self._try_make(fb_skill, dict(fb_args), state)
+                            if inst is not None:
+                                self._last_selected_goal_id = g.id
+                                return PlanDecision(inst, "rule", f"为目标 {g.id} 补齐前置材料（{req_expr}）")
+                            break
 
-        # 2) 阶段一：无任何镐 -> 砍树 -> 合成木镐
-        if pick is None:
-            if can_afford_gear(state, "wooden_pickaxe", assume_no_table=assume_no_tbl):
-                s = self._try_make("craft_gear", {"item": "wooden_pickaxe"}, state)
-                if s is not None:
-                    return PlanDecision(s, "rule", "材料齐全，合成木镐")
-            w = self._try_make("gather_wood", {"count": 3}, state)
-            if w is not None:
-                return PlanDecision(w, "rule", "尚无镐，先砍 3 块原木")
-            sc = self._try_make("scout_island", {"radius": 32}, state)
+            sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
+            sc = self._try_make("scout_island", {"radius": sc_radius}, state)
             if sc is not None:
-                return PlanDecision(sc, "rule", "附近无可用树木或受保护区阻挡，外迁探索")
-            return PlanDecision(None, "idle", "无镐阶段所有候选技能均在冷却")
+                return PlanDecision(sc, "rule", f"目标 {ranked[0].step_goal.id} 当前位置受阻或冷却，外迁探索")
+            return PlanDecision(None, "idle", f"目标 {ranked[0].step_goal.id} 所有候选技能均在冷却")
 
-        # 3) 阶段二：仅有木镐 -> 挖圆石 -> 升级石镐（解锁 mine_stone + upgrade_tools）
-        if pick not in STONE_OR_BETTER_PICKS:
-            if can_afford_gear(state, "stone_pickaxe", assume_no_table=assume_no_tbl):
-                sp = self._try_make("craft_gear", {"item": "stone_pickaxe"}, state)
-                if sp is not None:
-                    return PlanDecision(sp, "rule", "圆石与木料充足，升级石镐")
-            if total_cobble(state) < 3:
-                ms = self._try_make("mine_stone", {"count": 8}, state)
-                if ms is not None:
-                    return PlanDecision(ms, "rule", "用木镐采集首批圆石")
-            else:
-                gw = self._try_make("gather_wood", {"count": 2}, state)
-                if gw is not None:
-                    return PlanDecision(gw, "rule", "补原木用于石镐木棍与工作台")
-            sc = self._try_make("scout_island", {"radius": 32}, state)
-            if sc is not None:
-                return PlanDecision(sc, "rule", "石器前置受阻，探索新区域")
-            return PlanDecision(None, "idle", "木镐升石镐阶段技能冷却中")
+        if self.target_goal:
+            return PlanDecision(None, "idle", f"目标 {self.target_goal} 已达成或本轮已止损")
 
-        # 4) 阶段三：已有石镐+ -> 补石剑防身 + 熔炉（铁器前置）+ 维持基础物资与探索
-        if state.count("stone_sword") < 1 and state.count("iron_sword") < 1:
-            if can_afford_gear(state, "stone_sword", assume_no_table=assume_no_tbl):
-                sw = self._try_make("craft_gear", {"item": "stone_sword"}, state)
-                if sw is not None:
-                    return PlanDecision(sw, "rule", "合成石剑保障夜间自卫")
-            if total_cobble(state) < 2:
-                ms = self._try_make("mine_stone", {"count": 6}, state)
-                if ms is not None:
-                    return PlanDecision(ms, "rule", "补圆石合成石剑")
-            else:
-                gw = self._try_make("gather_wood", {"count": 2}, state)
-                if gw is not None:
-                    return PlanDecision(gw, "rule", "补原木合成石剑")
-
-        if state.count("furnace") < 1:
-            if can_afford_gear(state, "furnace", assume_no_table=assume_no_tbl):
-                fn = self._try_make("craft_gear", {"item": "furnace"}, state)
-                if fn is not None:
-                    return PlanDecision(fn, "rule", "合成熔炉备烧铁与熟食")
-            if total_cobble(state) < 8:
-                ms = self._try_make("mine_stone", {"count": 8}, state)
-                if ms is not None:
-                    return PlanDecision(ms, "rule", "攒够 8 圆石合成熔炉")
-            else:
-                gw = self._try_make("gather_wood", {"count": 2}, state)
-                if gw is not None:
-                    return PlanDecision(gw, "rule", "补原木以放置工作台合熔炉")
-
+        # 常规战役模式：已激活台账目标全部达成后维持基础物资安全库存并持续探索
         if total_logs(state) * 4 + total_planks(state) < 8:
             gw = self._try_make("gather_wood", {"count": 3}, state)
             if gw is not None:
@@ -188,6 +254,9 @@ class CampaignPlanner:
         min_verified: str = "offline",
         registry: Optional[dict[str, type[Skill]]] = None,
         on_llm_telemetry: Optional[Callable[[dict], None]] = None,
+        target_goal: Optional[str] = None,
+        ledger: tuple[GoalSpec, ...] = GOALS,
+        telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ):
         if mode not in ("campaign", "focus"):
             raise ValueError(f"mode 只能是 'campaign' 或 'focus'；收到 {mode!r}")
@@ -200,12 +269,40 @@ class CampaignPlanner:
         self.llm = llm or (LLMClient() if use_llm else None)
         self.min_verified = min_verified
         self.registry = REGISTRY if registry is None else registry
-        self.rules = RulePlanner(self.registry)
+        self.target_goal = target_goal
+        include_stages = OFFICIAL_CAMPAIGN_STAGES if min_verified == "live" else DEFAULT_CAMPAIGN_STAGES
+        self.rules = RulePlanner(
+            self.registry,
+            ledger=ledger,
+            include_stages=include_stages,
+            target_goal=target_goal,
+            telemetry=telemetry,
+        )
         self.on_llm_telemetry = on_llm_telemetry
+        self._last_selected_goal_id: Optional[str] = None
+
+    def record_skill_outcome(
+        self,
+        skill_name: str,
+        *,
+        ok: bool,
+        elapsed_s: float = 0.0,
+        completed_advs: Collection[str] = (),
+    ) -> None:
+        if self._last_selected_goal_id and self.rules._last_selected_goal_id is None:
+            self.rules._last_selected_goal_id = self._last_selected_goal_id
+        self.rules.record_skill_outcome(
+            skill_name,
+            ok=ok,
+            elapsed_s=elapsed_s,
+            completed_advs=completed_advs,
+        )
+        self._last_selected_goal_id = None
 
     def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
         if self.mode == "focus":
             assert self.focus_skill is not None
+            self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
             if state.in_safe_mode:
                 return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
             skill = make(self.focus_skill, self.focus_args, registry=self.registry)
@@ -219,11 +316,16 @@ class CampaignPlanner:
             return PlanDecision(skill, "focus", f"定向验收 {skill}")
 
         if not self.use_llm or self.llm is None or state.in_safe_mode:
-            return self.rules.choose(state)
+            dec = self.rules.choose(state)
+            self._last_selected_goal_id = self.rules._last_selected_goal_id
+            return dec
         if not skill_choice.has_ready_skill(state, self.registry, self.min_verified):
-            return self.rules.choose(state)
+            dec = self.rules.choose(state)
+            self._last_selected_goal_id = self.rules._last_selected_goal_id
+            return dec
 
-        summary = build_state_summary(state)
+        goal_hint = self.rules.current_goal_hint(state)
+        summary = build_state_summary(state, goal_hint=goal_hint)
         fail_str = "\n".join(f"- {x}" for x in recent_failures[-5:])
         t0 = time.monotonic()
         errors: list[str] = []
@@ -271,12 +373,29 @@ class CampaignPlanner:
             })
 
         if chosen is not None:
+            matched_gid: Optional[str] = None
+            for step in self.rules._rank(state):
+                g = step.step_goal
+                if g.skill == chosen.name and (not g.args_dict or g.args_dict == chosen.args):
+                    matched_gid = g.id
+                    break
+                if any(fb_s == chosen.name for _, fb_s, _ in g.gather_fallbacks):
+                    matched_gid = g.id
+                    break
+            if matched_gid is None:
+                for g in self.rules.active_goals:
+                    if g.skill == chosen.name and not is_goal_achieved(g, state, self.rules.completed_advancements):
+                        matched_gid = g.id
+                        break
+            self._last_selected_goal_id = matched_gid
+            self.rules._last_selected_goal_id = matched_gid
             return PlanDecision(
                 chosen, "llm", f"LLM 选择 {chosen}",
                 dt_ms, used, tuple(errors), prompt_tok, comp_tok,
             )
 
         fallback = self.rules.choose(state)
+        self._last_selected_goal_id = self.rules._last_selected_goal_id
         return PlanDecision(
             fallback.skill,
             "llm_fallback_rule" if fallback.skill else "idle",

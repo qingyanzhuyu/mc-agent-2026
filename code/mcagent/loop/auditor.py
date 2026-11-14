@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from ..runtime import State, _inv_fingerprint
 from ..skills.items import AIR, bare
+from .goals import GOALS, GoalSpec, diagnose_goal_gap, is_goal_achieved
 from .tape import TapeRecorder
 
 # RULES v2 草案常见 T1/T2 计分表映射（用于计算进度分曲线）
@@ -187,6 +188,8 @@ class SoakObserver:
         replan_oscillation_threshold: int = 3,
         baseline_dir: Optional[str | Path] = None,
         run_meta: Optional[dict] = None,
+        target_goal: Optional[str] = None,
+        ledger: tuple[GoalSpec, ...] = GOALS,
     ):
         self.run_dir = Path(run_dir)
         self.incidents_dir = self.run_dir / "incidents"
@@ -205,6 +208,14 @@ class SoakObserver:
         self.baseline_dir = Path(baseline_dir) if baseline_dir else None
         self.git = git_provenance()
         self.run_meta = dict(run_meta or {})
+        self.ledger: tuple[GoalSpec, ...] = tuple(ledger)
+        self._ledger_map: dict[str, GoalSpec] = {g.id: g for g in self.ledger}
+        meta_goal = self.run_meta.get("target_goal")
+        self.target_goal: Optional[str] = (
+            target_goal if target_goal is not None else (str(meta_goal) if meta_goal else None)
+        )
+        if self.target_goal is not None:
+            self.run_meta.setdefault("target_goal", self.target_goal)
         self.started_at = time.time()
         self.started_mono = time.monotonic()
 
@@ -214,6 +225,8 @@ class SoakObserver:
         self._incidents: dict[str, dict] = {}
         self._incident_seq = 0
         self._skill_ctx: Optional[dict] = None
+        self._last_skill_snapshots: dict[str, tuple[dict, list[dict]]] = {}
+        self._last_replan: Optional[dict[str, Any]] = None
 
         self.skill_stats: dict[str, dict[str, int]] = {}
         self.env_variance_counts: dict[str, int] = {}
@@ -229,6 +242,7 @@ class SoakObserver:
 
         self.server_advancements: dict[str, float] = {}
         self.inferred_milestones: dict[str, float] = {}
+        self.goals_reached: dict[str, float] = {}
         self.curve_points: list[dict] = []
 
     def _elapsed_s(self) -> float:
@@ -428,7 +442,17 @@ class SoakObserver:
             stat["budget_stopped"] += 1
         else:
             stat["replan"] += 1
+            if outcome == "replan":
+                self._last_replan = {
+                    "skill": skill.name,
+                    "args": dict(skill.args),
+                    "error_code": error_code,
+                    "error_msg": error_msg[:200],
+                    "elapsed_s": self._elapsed_s(),
+                }
             self._classify_skill_failure(skill, outcome, error_code, error_msg, state, ctx, tape_slice)
+
+        self._last_skill_snapshots[skill.name] = (copy.deepcopy(ctx), copy.deepcopy(tape_slice))
 
         # 姿态泄漏检查：仅在未死亡、未断线的正常结束或软中断时核对（规范 §4.11 重生自动复位姿态）
         if not died_or_disconnected and state.st.get("alive", True):
@@ -590,7 +614,15 @@ class SoakObserver:
             "cumulative_total_tokens": self.prompt_tokens + self.completion_tokens,
         })
 
+    def update_goals_reached(self, state: State) -> dict[str, float]:
+        elapsed = self._elapsed_s()
+        for g in self.ledger:
+            if g.id not in self.goals_reached and is_goal_achieved(g, state, self.server_advancements):
+                self.goals_reached[g.id] = elapsed
+        return self.goals_reached
+
     def on_progress_tick(self, state: State, client=None, *, force: bool = False) -> dict:
+        self.update_goals_reached(state)
         elapsed = self._elapsed_s()
         if not force and self.curve_points and elapsed - self.curve_points[-1]["elapsed_s"] < 25.0:
             return self.curve_points[-1]
@@ -605,6 +637,8 @@ class SoakObserver:
             except Exception:
                 pass
 
+        self.update_goals_reached(state)
+
         for mid, items, _pts in _ITEM_MILESTONES:
             if mid not in self.inferred_milestones and any(state.count(it) >= 1 for it in items):
                 self.inferred_milestones[mid] = elapsed
@@ -618,6 +652,7 @@ class SoakObserver:
             "server_score_v2": srv_score,
             "inferred_milestones": sorted(self.inferred_milestones),
             "inferred_score_v2": inf_score,
+            "goals_reached": sorted(self.goals_reached),
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
@@ -626,11 +661,72 @@ class SoakObserver:
         self._append_jsonl(self.curve_path, point)
         return point
 
-    def on_run_end(self, state: State, client=None) -> None:
+    def on_run_end(self, state: State, client=None, *, stop_reason: str = "") -> None:
         self.on_progress_tick(state, client=client, force=True)
+        self.update_goals_reached(state)
+        target_reached = bool(self.target_goal and self.target_goal in self.goals_reached)
+
+        if self.target_goal and not target_reached and stop_reason != "keyboard_interrupt":
+            g = self._ledger_map.get(self.target_goal)
+            gap = diagnose_goal_gap(g, state, self.server_advancements, self.ledger) if g is not None else None
+            if g is not None and g.skill in self._last_skill_snapshots:
+                saved_ctx, saved_tape = copy.deepcopy(self._last_skill_snapshots[g.skill])
+            else:
+                saved_ctx = {
+                    "skill": g.skill if g is not None else "session",
+                    "args": g.args_dict if g is not None else {},
+                    "initial_status": state.snapshot(),
+                    "initial_inventory": copy.deepcopy(state.inventory),
+                    "before_counts": _inv_fingerprint(state.inventory) or {},
+                }
+                saved_tape = []
+
+            editable = list(g.editable_files) if g is not None else []
+            self._report_incident(
+                code="GOAL_MISS",
+                severity="P1",
+                category="strategy",
+                custom_fingerprint=f"GOAL_MISS:{self.target_goal}",
+                title=f"目标 {self.target_goal}（{g.title if g else self.target_goal}）未在本轮预算内达成",
+                detail={
+                    "goal_id": self.target_goal,
+                    "goal_title": g.title if g else self.target_goal,
+                    "tier": g.tier if g else "UNKNOWN",
+                    "score": g.score if g else 0,
+                    "budget_s": g.budget_s if g else 0.0,
+                    "elapsed_s": self._elapsed_s(),
+                    "stop_reason": stop_reason,
+                    "completed_prereqs": gap["completed_prereqs"] if gap else [],
+                    "missing_prereqs": gap["missing_prereqs"] if gap else [],
+                    "bottleneck_goal_id": gap["bottleneck_goal_id"] if gap else self.target_goal,
+                    "bottleneck_skill": gap["bottleneck_skill"] if gap else (g.skill if g else None),
+                    "missing_items": gap["missing_items"] if gap else [],
+                    "summary": gap["summary"] if gap else f"未知目标 {self.target_goal}",
+                    "target_skill_started": bool(g and g.skill in self._last_skill_snapshots),
+                    "last_replan": copy.deepcopy(self._last_replan),
+                    "skill_stats": copy.deepcopy(self.skill_stats),
+                    "editable_files": editable,
+                },
+                extra_top_fields={
+                    "goal_id": self.target_goal,
+                    "editable_files": editable,
+                },
+                state=state,
+                outcome="goal_miss",
+                skill_ctx=saved_ctx,
+                tape_slice=saved_tape,
+            )
+
         self._append_jsonl(self.timeline_path, {
             "event": "run_end",
             "elapsed_s": self._elapsed_s(),
+            "stop_reason": stop_reason,
+            "source": self.source,
+            "deaths": self.deaths_count,
+            "target_goal": self.target_goal,
+            "target_goal_reached": target_reached,
+            "target_goal_elapsed_s": self.goals_reached.get(self.target_goal) if self.target_goal else None,
+            "goals_reached": dict(self.goals_reached),
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
@@ -655,11 +751,16 @@ class SoakObserver:
         api_error_code: str = "",
         skill_ctx: Optional[dict] = None,
         tape_slice: Optional[list[dict]] = None,
+        custom_fingerprint: Optional[str] = None,
+        extra_top_fields: Optional[dict[str, Any]] = None,
     ) -> dict:
         ctx = skill_ctx or self._skill_ctx or {}
-        skill_name = ctx.get("skill", "session")
-        raw_fp = f"{code}|{category}|{skill_name}|{api_error_code}"
-        fp = hashlib.sha1(raw_fp.encode("utf-8")).hexdigest()[:10]
+        skill_name = ctx.get("skill") or "session"
+        if custom_fingerprint:
+            fp = custom_fingerprint
+        else:
+            raw_fp = f"{code}|{category}|{skill_name}|{api_error_code}"
+            fp = hashlib.sha1(raw_fp.encode("utf-8")).hexdigest()[:10]
         now_elapsed = self._elapsed_s()
 
         if fp in self._incidents:
@@ -667,6 +768,8 @@ class SoakObserver:
             inc["count"] += 1
             inc["last_seen_s"] = now_elapsed
             inc["last_detail"] = detail
+            if extra_top_fields:
+                inc.update(extra_top_fields)
             Path(inc["path"]).write_text(json.dumps(inc, ensure_ascii=False, indent=2), encoding="utf-8")
             return inc
 
@@ -678,12 +781,14 @@ class SoakObserver:
         if tape_data is None and self.tape is not None:
             tape_data = self.tape.current_skill_slice() or self.tape.recent(30)
 
-        bundle = {
+        bundle: dict[str, Any] = {
             "id": inc_id,
+            "incident_id": inc_id,
             "fingerprint": fp,
             "severity": severity,
             "category": category,  # "bug" | "strategy"
             "code": code,
+            "skill": skill_name,
             "title": title,
             "count": 1,
             "first_seen_s": now_elapsed,
@@ -709,6 +814,8 @@ class SoakObserver:
             "http_tape": tape_data or [],
             "path": str(fpath),
         }
+        if extra_top_fields:
+            bundle.update(extra_top_fields)
         fpath.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
         self._incidents[fp] = bundle
         return bundle
@@ -729,6 +836,11 @@ class SoakObserver:
         bugs.sort(key=lambda x: (_SEVERITY_RANK.get(x["severity"], 9), -x["count"]))
         strats.sort(key=lambda x: (_SEVERITY_RANK.get(x["severity"], 9), -x["count"]))
 
+        reached_str = (
+            "、".join(f"`{gid}` (`{t:.1f}s`)" for gid, t in self.goals_reached.items())
+            if self.goals_reached
+            else "暂无"
+        )
         lines = [
             f"# 运行诊断与进度汇总（`{self.source}`）",
             "",
@@ -739,7 +851,14 @@ class SoakObserver:
                if self.respawn_ms_samples else ""),
             f"- **服务端确认进度**：`{last_pt.get('server_advancements', 0)}` 项（v2 分值 `{last_pt.get('server_score_v2', 0)}`）",
             f"- **背包里程碑代理**：`{len(self.inferred_milestones)}` 项 `{sorted(self.inferred_milestones)}`（代理分值 `{last_pt.get('inferred_score_v2', 0)}`）",
+            f"- **台账目标达成**：`{len(self.goals_reached)}` 项（{reached_str}）",
         ]
+        if self.target_goal:
+            if self.target_goal in self.goals_reached:
+                t_val = self.goals_reached[self.target_goal]
+                lines.append(f"- 🎯 **本轮聚焦目标**：`{self.target_goal}` -> ✅ 已达成 (`{t_val}s`)")
+            else:
+                lines.append(f"- 🎯 **本轮聚焦目标**：`{self.target_goal}` -> ❌ 未达成")
         base_pt = self._load_baseline_last_point()
         if base_pt is not None:
             lines.append(
