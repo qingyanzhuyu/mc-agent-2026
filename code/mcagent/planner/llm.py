@@ -86,6 +86,30 @@ def extract_json(text: str) -> Optional[dict]:
     return None
 
 
+# ---------------------------------------------------------------- 并发闸门
+# 比赛期每组只有 2 路并发（官方 2026-11-14 口径，可能降至 1 路）。用**模块级**信号量，
+# 而不是实例级：同进程里可能有多个 LLMClient（主循环 + 预取槽 + monitor），
+# 每个实例各给 2 份就等于没限制。
+_SEM_LOCK = threading.Lock()
+_SEMS: dict[int, threading.BoundedSemaphore] = {}
+DEFAULT_MAX_CONCURRENCY = 2
+
+
+def _semaphore(capacity: int) -> threading.BoundedSemaphore:
+    with _SEM_LOCK:
+        sem = _SEMS.get(capacity)
+        if sem is None:
+            sem = threading.BoundedSemaphore(capacity)
+            _SEMS[capacity] = sem
+        return sem
+
+
+def _reset_semaphores() -> None:
+    """仅供单测：清空缓存，避免不同用例互相影响。"""
+    with _SEM_LOCK:
+        _SEMS.clear()
+
+
 class LLMClient:
     def __init__(
         self,
@@ -110,6 +134,12 @@ class LLMClient:
         self.fast_proxy = fast_proxy if fast_proxy is not None else (
             env_proxy if env_proxy is not None else DEFAULT_FAST_PROXY)
         self.timeout = timeout
+        conc_raw = os.environ.get("LLM_MAX_CONCURRENCY", "")
+        try:
+            self.max_concurrency = max(1, int(conc_raw)) if conc_raw else DEFAULT_MAX_CONCURRENCY
+        except ValueError:
+            self.max_concurrency = DEFAULT_MAX_CONCURRENCY
+        self._sem = _semaphore(self.max_concurrency)
         self._poster = poster or self._requests_poster
         self._sessions: dict[Optional[str], requests.Session] = {}
 
@@ -176,8 +206,17 @@ class LLMClient:
             }
 
     def _post_once(self, url: str, headers: dict, data: str, timeout: float, proxy: Optional[str]) -> str:
-        """发一次请求并取出 content；任何失败都抛带 `kind` 的 LLMError。"""
-        status, text = self._poster(url, headers, data, timeout, proxy)
+        """发一次请求并取出 content；任何失败都抛带 `kind` 的 LLMError。
+
+        进 HTTP 之前先占一个并发槽：比赛期只有 2 路，超发会被网关排队/429，
+        排队时间比"等槽"更长，所以宁可在本地排队。
+        """
+        if not self._sem.acquire(timeout=timeout):
+            raise LLMError(f"等并发槽超时（上限 {self.max_concurrency} 路，已等 {timeout:.0f}s）", kind="no_slot")
+        try:
+            status, text = self._poster(url, headers, data, timeout, proxy)
+        finally:
+            self._sem.release()
         if status != 200:
             raise LLMError(f"HTTP {status}: {text[:200]}", kind="http", status=status)
         try:
