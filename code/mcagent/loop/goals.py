@@ -691,17 +691,37 @@ def validate_ledger(
     return errors
 
 
+def normalize_goal_ids(target: Any) -> tuple[str, ...]:
+    """把聚焦目标统一成去重有序的 id 元组：接受 None、"a"、"a,b" 或 ["a", "b"]。
+
+    单目标聚焦是多目标的特例；多个目标表示「同一轮里一起追」，用来暴露只有并行时才出现的
+    抢材料、共享状态与规划摇摆问题。
+    """
+    if not target:
+        return ()
+    parts = target.split(",") if isinstance(target, str) else list(target)
+    out: list[str] = []
+    for part in parts:
+        gid = str(part).strip()
+        if gid and gid not in out:
+            out.append(gid)
+    return tuple(out)
+
+
 def resolve_active_goals(
     ledger: tuple[GoalSpec, ...] = GOALS,
     *,
     include_stages: Collection[str] = DEFAULT_CAMPAIGN_STAGES,
-    target_goal: Optional[str] = None,
+    target_goal: Any = None,
 ) -> tuple[GoalSpec, ...]:
-    """解析本轮激活的目标集合：指定 `target_goal` 时自动收敛为其传递前置闭包 + 目标自身。"""
+    """解析本轮激活的目标集合：指定 `target_goal`（一个或多个，见 normalize_goal_ids）时
+    自动收敛为这些目标的传递前置闭包 + 目标自身。"""
     by_id = {g.id: g for g in ledger}
-    if target_goal:
-        if target_goal not in by_id:
-            raise KeyError(f"未知目标 id: {target_goal!r}（可选: {', '.join(by_id)}）")
+    targets = normalize_goal_ids(target_goal)
+    if targets:
+        unknown = [gid for gid in targets if gid not in by_id]
+        if unknown:
+            raise KeyError(f"未知目标 id: {', '.join(unknown)}（可选: {', '.join(by_id)}）")
         needed: set[str] = set()
 
         def _collect(gid: str) -> None:
@@ -711,7 +731,8 @@ def resolve_active_goals(
             for pid in by_id[gid].prereq_goals:
                 _collect(pid)
 
-        _collect(target_goal)
+        for gid in targets:
+            _collect(gid)
         return tuple(g for g in ledger if g.id in needed)
 
     allowed = set(include_stages)
@@ -762,7 +783,7 @@ def rank_actionable_goals(
     active_goals: tuple[GoalSpec, ...],
     *,
     completed_advs: Collection[str] = (),
-    target_goal: Optional[str] = None,
+    target_goal: Any = None,
     ep_goal_fails: Optional[Mapping[str, int]] = None,
     ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -770,6 +791,7 @@ def rank_actionable_goals(
     """对所有尚未达成且未触发止损的目标计算未满足前置链，按性价比降序返回可执行步列表。"""
     by_id = {g.id: g for g in active_goals}
     order_idx = {g.id: idx for idx, g in enumerate(active_goals)}
+    target_ids = set(normalize_goal_ids(target_goal))
 
     def _unmet_chain(root: GoalSpec) -> Optional[list[GoalSpec]]:
         chain: list[GoalSpec] = []
@@ -807,7 +829,7 @@ def rank_actionable_goals(
         p_cost = sum(effective_goal_cost(x, telemetry) for x in chain)
         roi = p_score / max(1.0, p_cost)
         prio = (
-            1 if (target_goal and g.id == target_goal) else 0,
+            1 if g.id in target_ids else 0,
             1 if p_score > 0 else 0,
             round(roi, 6),
             -order_idx[g.id],

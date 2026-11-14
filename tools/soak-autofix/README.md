@@ -66,6 +66,17 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 
 命令行等价写法：`soak_ctl.py run ... --bot-user <名字>`（默认同上），加 `--rotate-user` 每轮换新角色。
 
+**聚焦目标（可多选）**：`--goal a,b` 或页面上勾多个。新目标晋级仍然一次只放一个 candidate，多选用于回归与抓互相干扰：
+
+| `--focus-mode` | 一轮里追什么 | 用途 |
+|---|---|---|
+| `together`（默认） | 所有选中的目标一起追，全部达成才停 | 抓只有并行才出现的问题：抢材料、共享工作台/冷却、规划摇摆 |
+| `rotate` | 每轮只追其中一个，按顺序轮换 | 单独看各自成功率 |
+
+每个没达成的目标各开一张 `GOAL_MISS:<id>`（单上 `co_targets` 写着同轮还有谁），Fixer 仍按各自白名单一单一单修；
+某个目标升级人工后自动不再追它，聚焦的目标全部升级人工时持续挂机自动写 `STOP`。挂机中切换：`set-goal --goal a,b --focus-mode rotate`。
+同轮一起跑时每轮时长要按几条链加起来给够，否则没达成其实是时间不够。
+
 **统一配置：工位 A 进哪个服务器**（一份 `code/mcagent/.env` 同时装两套端点，每次启动时选，挂机中不切）：
 
 | 选项 | 连哪里 | 角色名 | 模型 | 启动前要求 |

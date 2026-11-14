@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from ..runtime import State, _inv_fingerprint
 from ..skills.items import AIR, bare
-from .goals import GOALS, GoalSpec, diagnose_goal_gap, is_goal_achieved
+from .goals import GOALS, GoalSpec, diagnose_goal_gap, is_goal_achieved, normalize_goal_ids
 from .tape import TapeRecorder
 
 # RULES v2 草案常见 T1/T2 计分表映射（用于计算进度分曲线）
@@ -211,9 +211,11 @@ class SoakObserver:
         self.ledger: tuple[GoalSpec, ...] = tuple(ledger)
         self._ledger_map: dict[str, GoalSpec] = {g.id: g for g in self.ledger}
         meta_goal = self.run_meta.get("target_goal")
-        self.target_goal: Optional[str] = (
-            target_goal if target_goal is not None else (str(meta_goal) if meta_goal else None)
+        # 聚焦目标可以是一个或多个（"a,b"）；多个表示同一轮一起追，每个未达成的目标各开一张 GOAL_MISS
+        self.target_goals: tuple[str, ...] = normalize_goal_ids(
+            target_goal if target_goal is not None else meta_goal
         )
+        self.target_goal: Optional[str] = ",".join(self.target_goals) or None
         if self.target_goal is not None:
             self.run_meta.setdefault("target_goal", self.target_goal)
         self.started_at = time.time()
@@ -664,58 +666,13 @@ class SoakObserver:
     def on_run_end(self, state: State, client=None, *, stop_reason: str = "") -> None:
         self.on_progress_tick(state, client=client, force=True)
         self.update_goals_reached(state)
-        target_reached = bool(self.target_goal and self.target_goal in self.goals_reached)
+        reached_map = {gid: gid in self.goals_reached for gid in self.target_goals}
+        target_reached = bool(self.target_goals) and all(reached_map.values())
 
-        if self.target_goal and not target_reached and stop_reason != "keyboard_interrupt":
-            g = self._ledger_map.get(self.target_goal)
-            gap = diagnose_goal_gap(g, state, self.server_advancements, self.ledger) if g is not None else None
-            if g is not None and g.skill in self._last_skill_snapshots:
-                saved_ctx, saved_tape = copy.deepcopy(self._last_skill_snapshots[g.skill])
-            else:
-                saved_ctx = {
-                    "skill": g.skill if g is not None else "session",
-                    "args": g.args_dict if g is not None else {},
-                    "initial_status": state.snapshot(),
-                    "initial_inventory": copy.deepcopy(state.inventory),
-                    "before_counts": _inv_fingerprint(state.inventory) or {},
-                }
-                saved_tape = []
-
-            editable = list(g.editable_files) if g is not None else []
-            self._report_incident(
-                code="GOAL_MISS",
-                severity="P1",
-                category="strategy",
-                custom_fingerprint=f"GOAL_MISS:{self.target_goal}",
-                title=f"目标 {self.target_goal}（{g.title if g else self.target_goal}）未在本轮预算内达成",
-                detail={
-                    "goal_id": self.target_goal,
-                    "goal_title": g.title if g else self.target_goal,
-                    "tier": g.tier if g else "UNKNOWN",
-                    "score": g.score if g else 0,
-                    "budget_s": g.budget_s if g else 0.0,
-                    "elapsed_s": self._elapsed_s(),
-                    "stop_reason": stop_reason,
-                    "completed_prereqs": gap["completed_prereqs"] if gap else [],
-                    "missing_prereqs": gap["missing_prereqs"] if gap else [],
-                    "bottleneck_goal_id": gap["bottleneck_goal_id"] if gap else self.target_goal,
-                    "bottleneck_skill": gap["bottleneck_skill"] if gap else (g.skill if g else None),
-                    "missing_items": gap["missing_items"] if gap else [],
-                    "summary": gap["summary"] if gap else f"未知目标 {self.target_goal}",
-                    "target_skill_started": bool(g and g.skill in self._last_skill_snapshots),
-                    "last_replan": copy.deepcopy(self._last_replan),
-                    "skill_stats": copy.deepcopy(self.skill_stats),
-                    "editable_files": editable,
-                },
-                extra_top_fields={
-                    "goal_id": self.target_goal,
-                    "editable_files": editable,
-                },
-                state=state,
-                outcome="goal_miss",
-                skill_ctx=saved_ctx,
-                tape_slice=saved_tape,
-            )
+        if stop_reason != "keyboard_interrupt":
+            for gid in self.target_goals:
+                if not reached_map[gid]:
+                    self._report_goal_miss(gid, state, stop_reason)
 
         self._append_jsonl(self.timeline_path, {
             "event": "run_end",
@@ -724,8 +681,12 @@ class SoakObserver:
             "source": self.source,
             "deaths": self.deaths_count,
             "target_goal": self.target_goal,
+            "target_goals": list(self.target_goals),
+            "target_goals_reached": reached_map,
             "target_goal_reached": target_reached,
-            "target_goal_elapsed_s": self.goals_reached.get(self.target_goal) if self.target_goal else None,
+            "target_goal_elapsed_s": (
+                max(self.goals_reached[g] for g in self.target_goals) if target_reached else None
+            ),
             "goals_reached": dict(self.goals_reached),
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
@@ -736,6 +697,67 @@ class SoakObserver:
             "llm_fallbacks": self.llm_fallbacks,
         })
         self.write_summary()
+
+    def _report_goal_miss(self, gid: str, state: State, stop_reason: str) -> None:
+        g = self._ledger_map.get(gid)
+        gap = diagnose_goal_gap(g, state, self.server_advancements, self.ledger) if g is not None else None
+        if g is not None and g.skill in self._last_skill_snapshots:
+            saved_ctx, saved_tape = copy.deepcopy(self._last_skill_snapshots[g.skill])
+        else:
+            saved_ctx = {
+                "skill": g.skill if g is not None else "session",
+                "args": g.args_dict if g is not None else {},
+                "initial_status": state.snapshot(),
+                "initial_inventory": copy.deepcopy(state.inventory),
+                "before_counts": _inv_fingerprint(state.inventory) or {},
+            }
+            saved_tape = []
+
+        editable = list(g.editable_files) if g is not None else []
+        co_targets = [x for x in self.target_goals if x != gid]
+        budget_sum = sum(
+            self._ledger_map[x].budget_s for x in self.target_goals if x in self._ledger_map
+        )
+        self._report_incident(
+            code="GOAL_MISS",
+            severity="P1",
+            category="strategy",
+            custom_fingerprint=f"GOAL_MISS:{gid}",
+            title=f"目标 {gid}（{g.title if g else gid}）未在本轮预算内达成"
+            + (f"（与 {', '.join(co_targets)} 同轮）" if co_targets else ""),
+            detail={
+                "goal_id": gid,
+                "goal_title": g.title if g else gid,
+                "tier": g.tier if g else "UNKNOWN",
+                "score": g.score if g else 0,
+                "budget_s": g.budget_s if g else 0.0,
+                "elapsed_s": self._elapsed_s(),
+                "stop_reason": stop_reason,
+                # 同轮一起追的其他目标：缺口可能是互相抢材料/共享状态，而不是本目标技能本身
+                "co_targets": co_targets,
+                "co_targets_reached": [x for x in co_targets if x in self.goals_reached],
+                "round_budget_sum_s": budget_sum,
+                "completed_prereqs": gap["completed_prereqs"] if gap else [],
+                "missing_prereqs": gap["missing_prereqs"] if gap else [],
+                "bottleneck_goal_id": gap["bottleneck_goal_id"] if gap else gid,
+                "bottleneck_skill": gap["bottleneck_skill"] if gap else (g.skill if g else None),
+                "missing_items": gap["missing_items"] if gap else [],
+                "summary": gap["summary"] if gap else f"未知目标 {gid}",
+                "target_skill_started": bool(g and g.skill in self._last_skill_snapshots),
+                "last_replan": copy.deepcopy(self._last_replan),
+                "skill_stats": copy.deepcopy(self.skill_stats),
+                "editable_files": editable,
+            },
+            extra_top_fields={
+                "goal_id": gid,
+                "editable_files": editable,
+                "co_targets": co_targets,
+            },
+            state=state,
+            outcome="goal_miss",
+            skill_ctx=saved_ctx,
+            tape_slice=saved_tape,
+        )
 
     # ---- 去重立档与汇总看板 --------------------------------------------
     def _report_incident(
@@ -853,12 +875,12 @@ class SoakObserver:
             f"- **背包里程碑代理**：`{len(self.inferred_milestones)}` 项 `{sorted(self.inferred_milestones)}`（代理分值 `{last_pt.get('inferred_score_v2', 0)}`）",
             f"- **台账目标达成**：`{len(self.goals_reached)}` 项（{reached_str}）",
         ]
-        if self.target_goal:
-            if self.target_goal in self.goals_reached:
-                t_val = self.goals_reached[self.target_goal]
-                lines.append(f"- 🎯 **本轮聚焦目标**：`{self.target_goal}` -> ✅ 已达成 (`{t_val}s`)")
+        for gid in self.target_goals:
+            label = "本轮聚焦目标" if len(self.target_goals) == 1 else f"本轮聚焦目标（同轮 {len(self.target_goals)} 个）"
+            if gid in self.goals_reached:
+                lines.append(f"- 🎯 **{label}**：`{gid}` -> ✅ 已达成 (`{self.goals_reached[gid]}s`)")
             else:
-                lines.append(f"- 🎯 **本轮聚焦目标**：`{self.target_goal}` -> ❌ 未达成")
+                lines.append(f"- 🎯 **{label}**：`{gid}` -> ❌ 未达成")
         base_pt = self._load_baseline_last_point()
         if base_pt is not None:
             lines.append(
