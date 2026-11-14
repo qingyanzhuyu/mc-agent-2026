@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import tempfile
@@ -1193,6 +1194,81 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
                                     fixer_preset_name="codex:gpt-6-astra:high")
         self.assertEqual(soak_ctl.read_state(self.session)["incidents"]["fp1"]["last_fixer_preset"],
                          "codex:gpt-6-astra:high")
+        soak_ctl.teardown_session(self.session)
+
+    def test_server_target_local_vs_official_preflight_and_runner_env(self):
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("MC_USER", "MC_PASS", "LLM_KEY")}
+        env_file = self.repo / "code" / "mcagent" / ".env"
+        with patch.dict(os.environ, clean_env, clear=True):
+            self.assertEqual(soak_ctl.check_server_target(self.repo, "local", use_llm=True, account_reserved=False), [])
+            self.assertTrue(soak_ctl.check_server_target(self.repo, "moon", use_llm=False, account_reserved=True))
+            errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=False)
+            self.assertEqual(len(errs), 3)  # 缺账号、缺 LLM_KEY、未占位
+            env_file.write_text("MC_USER=team\nMC_PASS=secret\nLLM_KEY=\n", encoding="utf-8")
+            errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True)
+            self.assertEqual(len(errs), 1)
+            self.assertIn("LLM_KEY", errs[0])
+            self.assertNotIn("secret", " ".join(errs))
+            self.assertEqual(soak_ctl.check_server_target(self.repo, "official", use_llm=False, account_reserved=True), [])
+
+            soak_ctl.init_session(self.repo, self.session, target_branch="feat/server")
+            with patch.object(soak_ctl, "find_repo_root", return_value=self.repo):
+                rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--server", "official", "--llm"])
+            self.assertEqual(rc, 2)
+
+            class DummyProc:
+                def wait(self, timeout=None):
+                    return 0
+
+                def poll(self):
+                    return 0
+
+            spawned: list[list[str]] = []
+            with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+                 patch.object(soak_ctl, "init_session", return_value={}), \
+                 patch.object(soak_ctl.subprocess, "Popen",
+                              side_effect=lambda cmd, **kw: (spawned.append(list(cmd)), DummyProc())[1]):
+                rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/server",
+                                    "--episodes", "1", "--server", "official", "--no-llm", "--account-reserved"])
+            self.assertEqual(rc, 0)
+            r_cmd = next(c for c in spawned if "runner-loop" in c)
+            self.assertEqual(r_cmd[r_cmd.index("--server") + 1], "official")
+            self.assertEqual(soak_ctl.read_state(self.session)["server_target"], "official")
+
+        # runner：比赛服不传 --user / --local-target，强制官方端点与官方模型；自建服保持原样
+        (self.session / "STOP").unlink(missing_ok=True)
+        seen: list[tuple[list[str], dict]] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                seen.append((list(cmd), dict(kwargs.get("env") or {})))
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 5.0, "source": "official"}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="official",
+                                     player_model="DeepSeek-V4.1-Flash")
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="local",
+                                     user_prefix="me_soak", rotate_user=False, player_model="DeepSeek-V4.1-Flash")
+        (off_cmd, off_env), (loc_cmd, loc_env) = seen
+        self.assertNotIn("--user", off_cmd)
+        self.assertNotIn("--local-target", off_cmd)
+        self.assertIn("--live", off_cmd)
+        self.assertEqual(off_env["MC_API_BASE"], soak_ctl.OFFICIAL_MC_BASE)
+        self.assertEqual(off_env["LLM_PROFILE"], "official")
+        self.assertNotIn("LLM_CUSTOM_MODEL", off_env)
+        self.assertIn("--local-target", loc_cmd)
+        self.assertEqual(loc_cmd[loc_cmd.index("--user") + 1], "me_soak")
+        self.assertEqual(loc_env.get("LLM_CUSTOM_MODEL"), "DeepSeek-V4.1-Flash")
+        with self.assertRaises(ValueError):
+            soak_ctl.run_runner_loop(self.session, episodes=1, server="moon")
         soak_ctl.teardown_session(self.session)
 
 if __name__ == "__main__":

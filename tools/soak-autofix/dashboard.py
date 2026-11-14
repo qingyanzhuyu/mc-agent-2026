@@ -230,6 +230,7 @@ def summarize_live_episode(ep_dir: Path, now: Optional[float] = None) -> Optiona
         "stop_reason": (run_end or {}).get("stop_reason"),
         "bot_user": meta.get("bot_user"),
         "model": meta.get("llm_model") if meta.get("use_llm") else "规则",
+        "base": meta.get("base") or "",
         "target_goal": meta.get("target_goal") or "",
         "commit": ((head.get("git") or {}).get("commit") or "")[:7],
         "max_seconds": meta.get("max_seconds"),
@@ -354,6 +355,8 @@ class Console:
             "skip_live_canary": False,
             "bot_user": soak_ctl.DEFAULT_BOT_USER,
             "rotate_user": False,
+            "server": "local",
+            "account_reserved": False,
         }
         p = self.session_dir / LAST_START_NAME
         try:
@@ -361,6 +364,7 @@ class Console:
             defaults.update({k: v for k, v in saved.items() if k in defaults})
         except (OSError, json.JSONDecodeError):
             pass
+        defaults["account_reserved"] = False  # 占位确认每次启动都要重新勾，不记住
         return defaults
 
     def snapshot(self) -> dict[str, Any]:
@@ -421,6 +425,7 @@ class Console:
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
+                "server_target": st.get("server_target", "local"),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
@@ -452,6 +457,12 @@ class Console:
                 for k in soak_ctl.FIXER_PRESETS
             ],
             "player_models": [{"name": k, "note": v} for k, v in soak_ctl.PLAYER_MODEL_CHOICES.items()],
+            "servers": [{"key": k, "label": v} for k, v in soak_ctl.SERVER_TARGETS.items()],
+            # 比赛服前置检查（占位确认另算），页面据此提前提示；只给「缺什么」，不含任何值
+            "official_checks": {
+                "with_llm": soak_ctl.check_server_target(self.repo_root, "official", use_llm=True, account_reserved=True),
+                "rules_only": soak_ctl.check_server_target(self.repo_root, "official", use_llm=False, account_reserved=True),
+            },
             "bounds": {
                 "seconds": list(soak_ctl.EPISODE_SECONDS_BOUNDS),
                 "steps": list(soak_ctl.EPISODE_STEPS_BOUNDS),
@@ -568,6 +579,13 @@ class Console:
         p["skip_live_canary"] = bool(p["skip_live_canary"])
         p["bot_user"] = soak_ctl.validate_bot_user(str(p["bot_user"]))
         p["rotate_user"] = bool(p["rotate_user"])
+        p["server"] = str(p["server"] or "local")
+        p["account_reserved"] = bool(p["account_reserved"])
+        errs = soak_ctl.check_server_target(
+            self.repo_root, p["server"], use_llm=p["llm"], account_reserved=p["account_reserved"]
+        )
+        if errs:
+            raise ValueError("；".join(errs))
         return p
 
     def build_run_cmd(self, p: dict[str, Any]) -> list[str]:
@@ -586,6 +604,9 @@ class Console:
         ]
         if p["rotate_user"]:
             cmd.append("--rotate-user")
+        cmd.extend(["--server", p["server"]])
+        if p["server"] == "official" and p["account_reserved"]:
+            cmd.append("--account-reserved")
         if p["goal"]:
             cmd.extend(["--goal", p["goal"]])
         if p["skip_live_canary"]:
@@ -603,7 +624,8 @@ class Console:
 
     def _spawn_locked(self, p: dict[str, Any]) -> dict[str, Any]:
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        (self.session_dir / LAST_START_NAME).write_text(json.dumps(p, ensure_ascii=False, indent=2), encoding="utf-8")
+        saved = dict(p, account_reserved=False)
+        (self.session_dir / LAST_START_NAME).write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
         cmd = self.build_run_cmd(p)
         log = (self.session_dir / RUN_LOG_NAME).open("ab")
         log.write(f"\n===== [dashboard] {time.strftime('%Y-%m-%d %H:%M:%S')} 启动: {' '.join(cmd)}\n".encode("utf-8"))

@@ -175,6 +175,44 @@ class DashboardTests(unittest.TestCase):
         cmd = self.console.build_run_cmd(p)
         self.assertEqual(cmd[cmd.index("--fixer-preset") + 1], "codex:gpt-6-astra:max")
 
+    def test_start_official_server_needs_account_ack_and_never_remembers_it(self):
+        env_file = self.root / "code" / "mcagent" / ".env"
+        env_file.parent.mkdir(parents=True)
+        clean = {k: v for k, v in os.environ.items() if k not in ("MC_USER", "MC_PASS", "LLM_KEY")}
+        with patch.dict(os.environ, clean, clear=True), patch.object(self.console, "ledger", return_value=[]):
+            with self.assertRaises(ValueError):  # 缺账号
+                self.console._validate_start({"server": "official", "llm": False, "account_reserved": True})
+            env_file.write_text("MC_USER=team\nMC_PASS=pw\n", encoding="utf-8")
+            with self.assertRaises(ValueError):  # 没勾占位
+                self.console._validate_start({"server": "official", "llm": False})
+            with self.assertRaises(ValueError) as ctx:  # 比赛服 + LLM 但没有 LLM_KEY
+                self.console._validate_start({"server": "official", "llm": True, "account_reserved": True})
+            self.assertIn("LLM_KEY", str(ctx.exception))
+            p = self.console._validate_start({"server": "official", "llm": False, "account_reserved": True})
+            cmd = self.console.build_run_cmd(p)
+            self.assertEqual(cmd[cmd.index("--server") + 1], "official")
+            self.assertIn("--account-reserved", cmd)
+            local_cmd = self.console.build_run_cmd(self.console._validate_start({}))
+            self.assertEqual(local_cmd[local_cmd.index("--server") + 1], "local")
+            self.assertNotIn("--account-reserved", local_cmd)
+
+            class FakePopen:
+                def __init__(self, cmd, **kw):
+                    self.pid = 7
+
+                def poll(self):
+                    return None
+
+            with patch.object(dash, "find_soak_processes", return_value=[]), \
+                 patch.object(dash.subprocess, "Popen", FakePopen):
+                self.console.start({"server": "official", "llm": False, "account_reserved": True})
+            saved = json.loads((self.session / dash.LAST_START_NAME).read_text(encoding="utf-8"))
+            self.assertEqual((saved["server"], saved["account_reserved"]), ("official", False))
+            self.assertFalse(self.console.last_start_params()["account_reserved"])
+            snap_checks = self.console.snapshot()["official_checks"]
+            self.assertEqual(snap_checks["rules_only"], [])
+            self.assertTrue(any("LLM_KEY" in m for m in snap_checks["with_llm"]))
+
     def test_apply_settings_rejects_unknown_goal_when_ledger_known(self):
         self._init_state()
         with patch.object(self.console, "ledger", return_value=[{"id": "smelt_iron", "stage": "draft"}]):

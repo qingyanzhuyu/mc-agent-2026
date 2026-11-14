@@ -121,6 +121,18 @@ def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: s
     return default_name, default_tmpl
 
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
+
+# 工位 A 进哪个服务器（每次启动时选，挂机中不切）：
+# - local：本机联调网关 tools/local-api-bridge（.env 的 MC_API_BASE，默认 127.0.0.1:8787 → 队内测试服），
+#   角色名随意（--bot-user），玩家模型可用 custom；数据标 local-target。
+# - official：比赛服官方端点。只能用 .env 里的队伍正式账号（MC_USER/MC_PASS，不能改名、不能轮换），
+#   模型只能走 LLM_PROFILE=official（AGENTS.md §2B.3），账号是全队独占资源，启动前须在 docs/05 账号表占位（§3）。
+# 工位 B 的金丝雀验修始终在自建测试服跑，不占比赛账号。
+OFFICIAL_MC_BASE = "https://mc-api.windywindie.top/api/v1"
+SERVER_TARGETS: dict[str, str] = {
+    "local": "自建测试服（本机联调网关 → 队内测试服）",
+    "official": "比赛服（官方端点 mc-api.windywindie.top，用队伍正式账号）",
+}
 # 前端下拉用的已知玩家模型（并行云 custom 通道实测过；也可以手填别的名字）
 PLAYER_MODEL_CHOICES: dict[str, str] = {
     "DeepSeek-V4.1-Flash": "默认；关思考后单拍约 1.5–2.5s",
@@ -156,6 +168,42 @@ def default_fixer_user() -> str:
 
 DEFAULT_BOT_USER = default_bot_user()
 DEFAULT_FIXER_USER = default_fixer_user()
+
+
+def _read_dotenv_keys(repo_root: Path) -> dict[str, str]:
+    """只为判断「填没填」读取 code/mcagent/.env；进程环境变量优先（与 mcagent.client.Config.load 一致）。"""
+    vals: dict[str, str] = {}
+    env_path = repo_root / "code" / "mcagent" / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for k in ("MC_USER", "MC_PASS", "LLM_KEY"):
+        if os.environ.get(k):
+            vals[k] = os.environ[k]
+    return vals
+
+
+def check_server_target(repo_root: Path, server: str, *, use_llm: bool, account_reserved: bool) -> list[str]:
+    """启动前核对目标服务器的前置条件，返回中文问题清单（空表示可以启动）。不输出任何密钥值。"""
+    if server not in SERVER_TARGETS:
+        return [f"未知服务器 {server!r}（可选：{', '.join(SERVER_TARGETS)}）"]
+    if server == "local":
+        return []
+    errs: list[str] = []
+    env = _read_dotenv_keys(repo_root)
+    if not (env.get("MC_USER") and env.get("MC_PASS")):
+        errs.append("code/mcagent/.env 缺队伍正式账号 MC_USER / MC_PASS")
+    if use_llm and not env.get("LLM_KEY"):
+        errs.append("比赛服只能用官方模型（LLM_PROFILE=official），但 .env 没填 LLM_KEY；填上 key，或关掉 LLM 用纯规则跑")
+    if not account_reserved:
+        errs.append("比赛账号是全队独占资源：先在 docs/05 账号表占位，再确认「已占位」（AGENTS.md §3）")
+    return errs
 
 
 def validate_bot_user(name: str) -> str:
@@ -1167,7 +1215,10 @@ def run_runner_loop(
     use_llm: bool = True,
     target_goal: str = "",
     player_model: Optional[str] = None,
+    server: str = "local",
 ) -> list[dict[str, Any]]:
+    if server not in SERVER_TARGETS:
+        raise ValueError(f"未知服务器 {server!r}")
     results: list[dict[str, Any]] = []
     if (target_goal or "").strip() or player_model is not None:
         with locked_state(session_dir) as st_init:
@@ -1205,7 +1256,10 @@ def run_runner_loop(
         tip_sha = _branch_tip(repo_root, branch)
         _git(runner_wt, "checkout", "--detach", tip_sha)
 
-        bot_user = f"{user_prefix}{ep_num:03d}" if rotate_user else user_prefix
+        if server == "official":
+            bot_user = "official-account"  # 比赛服只能用 .env 里的正式账号，不传 --user
+        else:
+            bot_user = f"{user_prefix}{ep_num:03d}" if rotate_user else user_prefix
         prev_good = next(
             (e for e in reversed(st["episodes"]) if e.get("p0_bugs", 0) == 0 and not e.get("rolled_back")),
             st["episodes"][-1] if st["episodes"] else None,
@@ -1215,8 +1269,7 @@ def run_runner_loop(
             "uv", "run", "python", "-m", "mcagent.loop",
             "--mode", "campaign",
             "--soak",
-            "--local-target", "--live",
-            "--user", bot_user,
+            *(["--live"] if server == "official" else ["--local-target", "--live", "--user", bot_user]),
             "--world-snapshot", f"{ep_id}-{tip_sha[:7]}",
             "--run-dir", str(ep_dir),
             "--max-steps", str(ep_steps),
@@ -1235,13 +1288,19 @@ def run_runner_loop(
 
         print(
             f"[runner] 启动 {ep_id} @ {tip_sha[:7]} "
-            f"(bot={bot_user}, model={active_model if use_llm and active_model else ('env' if use_llm else 'rule')}, "
+            f"(server={server}, bot={bot_user}, "
+            f"model={('official' if server == 'official' else (active_model or 'env')) if use_llm else 'rule'}, "
             f"goal={active_goal or 'all'}, max={ep_seconds:g}s/{ep_steps} 步)..."
         )
+        run_env = _uv_env(runner_wt, player_model=active_model if (use_llm and server == "local") else "")
+        if server == "official":
+            run_env["MC_API_BASE"] = OFFICIAL_MC_BASE
+            run_env["LLM_PROFILE"] = "official"
+            run_env.pop("LLM_CUSTOM_MODEL", None)
         subprocess.run(
             cmd,
             cwd=str(runner_wt / "code"),
-            env=_uv_env(runner_wt, player_model=active_model if use_llm else ""),
+            env=run_env,
             check=False,
         )
         meta = ingest_episode_and_check_rollback(session_dir, ep_id, ep_dir, tip_sha, bot_user)
@@ -1498,7 +1557,8 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **会话目录**：`{session_dir}`",
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
-        f"- **玩家操控模型（工位 A）**：`{st.get('player_model') or '沿用 .env'}`",
+        f"- **工位 A 服务器**：`{SERVER_TARGETS.get(st.get('server_target') or 'local', st.get('server_target'))}`",
+        f"- **玩家操控模型（工位 A）**：`{'官方模型（LLM_PROFILE=official）' if st.get('server_target') == 'official' else (st.get('player_model') or '沿用 .env')}`",
         f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
@@ -1673,6 +1733,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run_ep.add_argument("--episode-steps", type=int, default=40)
     p_run_ep.add_argument("--user-prefix", default="agy_soak_r")
     p_run_ep.add_argument("--fixed-user", action="store_true", help="不按轮次轮换角色名")
+    p_run_ep.add_argument("--server", choices=tuple(SERVER_TARGETS), default="local",
+                          help="工位 A 进哪个服务器：local 自建测试服 | official 比赛服")
     p_run_ep.add_argument("--goal", default="", help="覆盖会话级聚焦目标 goal_id")
     p_run_ep.add_argument("--player-model", default=None, help="覆盖会话级工位 A 玩家模型名")
     p_run_ep.add_argument(
@@ -1730,6 +1792,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(FIXER_PRESETS),
         default="codex",
         help="工位 B 修单入口预设：codex（默认 gpt-6.1-sol xhigh）| agy（gemini-4-hydrogen-high）| claude",
+    )
+    p_dual.add_argument(
+        "--server",
+        choices=tuple(SERVER_TARGETS),
+        default="local",
+        help="工位 A 进哪个服务器：local 自建测试服（默认）| official 比赛服（正式账号 + 官方模型，须先在 docs/05 占位）",
+    )
+    p_dual.add_argument(
+        "--account-reserved",
+        action="store_true",
+        help="--server official 时必加：确认已在 docs/05 账号表占位比赛账号",
     )
     p_dual.add_argument(
         "--bot-user",
@@ -1832,6 +1905,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             use_llm=args.llm,
             target_goal=args.goal,
             player_model=args.player_model,
+            server=args.server,
         )
         return 0
 
@@ -1879,6 +1953,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"[run] {exc}", file=sys.stderr)
             return 2
         repo_root = find_repo_root()
+        server_errs = check_server_target(
+            repo_root, args.server, use_llm=args.llm, account_reserved=args.account_reserved
+        )
+        if server_errs:
+            for msg in server_errs:
+                print(f"[run] 不能启动：{msg}", file=sys.stderr)
+            return 2
         init_session(
             repo_root,
             session_dir,
@@ -1889,6 +1970,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         (session_dir / "STOP").unlink(missing_ok=True)
         with locked_state(session_dir) as st_fx:
+            st_fx["server_target"] = args.server
             if args.fixer_cmd:
                 st_fx.pop("fixer_preset", None)
             else:
@@ -1902,6 +1984,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--episode-seconds", str(args.episode_seconds),
             "--episode-steps", str(args.episode_steps),
             "--user-prefix", bot_user,
+            "--server", args.server,
         ]
         if not args.rotate_user:
             runner_cmd.append("--fixed-user")
@@ -1959,6 +2042,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "target_goal": st.get("target_goal", ""),
             "player_model": st.get("player_model", ""),
             "fixer_preset": st.get("fixer_preset", ""),
+            "server_target": st.get("server_target", "local"),
             "episode_budget_override": {
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
