@@ -71,6 +71,18 @@ runtime/   执行器        单飞锁 / 错误分类 / 重试 / 打点
 "直连"是不经本机代理访问**同一个官方端点**，不是换模型服务（`AGENTS.md` §2B.3 不允许后者）。
 状态用 `LLMClient.health()` 读：各线路成功次数、降级次数、熔断次数和剩余冷却。
 
+## 两套模型配置（`LLM_PROFILE`）
+
+| | `official`（默认） | `custom` |
+|---|---|---|
+| 用途 | 比赛唯一合法配置 | 只给赛前用自备 key 测试 |
+| 读哪些变量 | `LLM_BASE` `LLM_KEY` `LLM_MODEL` `LLM_PROXY_FAST` | `LLM_CUSTOM_BASE` `LLM_CUSTOM_KEY` `LLM_CUSTOM_MODEL` `LLM_CUSTOM_PROXY` |
+| 缺省值 | 官方端点 / `default` / 7897 快路径代理 | 无（三项必填），代理缺省直连 |
+| 关思考字段被拒 400 | 不处理，如实报错 | 去掉字段原线路重发一次，之后不再带 |
+
+一次进程只用一套，两套之间**不会**自动切换。三道拦截：`preflight` BLOCK；`mcagent.loop --llm` 在 MC 指向官方端点时拒绝 custom；
+custom 不借用官方的 `LLM_KEY`。临时切换：`LLM_PROFILE=custom uv run python -m mcagent.loop ...`。
+
 ## 现在**没有**的东西
 
 - 没有策略实现：挑哪个目标还是人定的
