@@ -221,7 +221,7 @@ GOALS: tuple[GoalSpec, ...] = (
         budget_s=210.0,
         max_fails_per_ep=4,
         est_cost_s=60.0,
-        stage="draft",
+        stage="candidate",
         editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
