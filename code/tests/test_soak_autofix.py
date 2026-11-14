@@ -221,12 +221,88 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertFalse(fixer_wt.exists())
         self.assertFalse(runner_wt.exists())
         self.assertTrue(report_path.exists())
-        self.assertIn("reverted", report_path.read_text(encoding="utf-8"))
+        report_text = report_path.read_text(encoding="utf-8")
+        self.assertIn("reverted", report_text)
+        self.assertIn("输入/输出 token", report_text)
+        self.assertIn("价值", report_text)
         # main 分支全程纹丝未动
         self.assertNotEqual(
             _git(self.repo, "rev-parse", "refs/heads/main"),
             _git(self.repo, "rev-parse", "refs/heads/feat/soak-autofix"),
         )
+
+    def test_run_subcommand_passes_llm_flag_and_review_report_renders_token_value(self):
+        # 1) 验证 `run` 默认开启 LLM，且支持显式 `--llm` / `--no-llm` 透传给 runner-loop -> run_runner_loop(use_llm=...)
+        parsed_default = soak_ctl.build_parser().parse_args(["run", "--session-dir", str(self.session), "--episodes", "2"])
+        self.assertTrue(parsed_default.llm)
+        parsed = soak_ctl.build_parser().parse_args(["run", "--session-dir", str(self.session), "--llm", "--episodes", "2"])
+        self.assertTrue(parsed.llm)
+        parsed_off = soak_ctl.build_parser().parse_args(["run", "--session-dir", str(self.session), "--no-llm", "--episodes", "2"])
+        self.assertFalse(parsed_off.llm)
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-llm")
+        spawned_cmds: list[list[str]] = []
+
+        class DummyProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+             patch.object(soak_ctl, "init_session", return_value={}), \
+             patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda cmd, **kw: (spawned_cmds.append(list(cmd)), DummyProc())[1]):
+            rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/soak-llm", "--episodes", "1", "--llm"])
+        self.assertEqual(rc, 0)
+        runner_invocations = [c for c in spawned_cmds if "runner-loop" in c]
+        self.assertEqual(len(runner_invocations), 1)
+        self.assertIn("--llm", runner_invocations[0])
+
+        # 验证 runner-loop 解析 --llm 后真正以 use_llm=True 调用 run_runner_loop
+        with patch.object(soak_ctl, "run_runner_loop", return_value=[]) as mock_rrl:
+            rc2 = soak_ctl.main(["runner-loop", "--session-dir", str(self.session), "--episodes", "1", "--llm"])
+        self.assertEqual(rc2, 0)
+        self.assertTrue(mock_rrl.call_args.kwargs["use_llm"])
+
+        # 2) 验证 ingest_episode_and_check_rollback 读取 token 用量并写入 REVIEW_REPORT.md 的两列
+        st = soak_ctl.read_state(self.session)
+        ep_dir = self.session / "episodes" / "ep-0001"
+        (ep_dir / "incidents").mkdir(parents=True)
+        (ep_dir / "progress_curve.jsonl").write_text(
+            json.dumps({
+                "elapsed_s": 288.0,
+                "server_score_v2": 5,
+                "inferred_score_v2": 10,
+                "prompt_tokens": 80_000,
+                "completion_tokens": 15_000,
+                "total_tokens": 95_000,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        (ep_dir / "timeline.jsonl").write_text(
+            json.dumps({"event": "skill_end", "outcome": "completed", "elapsed_s": 120.0}) + "\n"
+            + json.dumps({"event": "run_end", "elapsed_s": 288.0, "prompt_tokens": 80_000, "completion_tokens": 15_000}) + "\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict("os.environ", {"LLM_PRICE_IN_PER_M": "0", "LLM_PRICE_OUT_PER_M": "0"}):
+            meta = soak_ctl.ingest_episode_and_check_rollback(
+                self.session, "ep-0001", ep_dir, st["current_tip"], "agy_soak_r001"
+            )
+            report_default = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+
+        self.assertEqual((meta["prompt_tokens"], meta["completion_tokens"]), (80_000, 15_000))
+        self.assertIn("`80,000 / 15,000`", report_default)
+        self.assertIn("额度 入1.00%/出1.00%（8h≈入100.0%/出100.0%）", report_default)
+        self.assertNotIn("¥", report_default)  # 默认单价为 0，不显示金额
+
+        with patch.dict("os.environ", {"LLM_PRICE_IN_PER_M": "1.0", "LLM_PRICE_OUT_PER_M": "2.0"}):
+            soak_ctl.write_review_report(self.session)
+            report_priced = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("¥0.1100（8h≈¥11.00）", report_priced)
+
+        soak_ctl.teardown_session(self.session)
 
 
 if __name__ == "__main__":

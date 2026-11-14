@@ -32,12 +32,13 @@
 确保本地联调网关 `tools/local-api-bridge` 已启动后执行：
 
 ```bash
-# 启动 5 轮连续挂机 + Codex 自动修单，所有修复汇入 feat/soak-autofix 分支
+# 启动 5 轮连续挂机（默认已启用 --llm 让模型操纵角色；若跑纯规则基线可传 --no-llm）+ Codex 自动修单
 python3 tools/soak-autofix/soak_ctl.py run \
   --session-dir code/mcagent/logs/soak-night-01 \
   --branch feat/soak-autofix \
   --episodes 5 \
   --episode-seconds 180 \
+  --llm \
   --fixer-preset codex
 
 # 跑完后卸载临时 worktree（分支 feat/soak-autofix 与 REVIEW_REPORT.md 完整保留）
@@ -53,10 +54,10 @@ python3 tools/soak-autofix/soak_ctl.py init \
   --session-dir code/mcagent/logs/soak-agy-01 \
   --branch feat/soak-autofix
 
-# 2. 后台持续跑挂机轮次
+# 2. 后台持续跑挂机轮次（默认开启 --llm 走模型选技能；纯规则基线传 --no-llm）
 python3 tools/soak-autofix/soak_ctl.py runner-loop \
   --session-dir code/mcagent/logs/soak-agy-01 \
-  --episodes 5 --episode-seconds 180
+  --episodes 5 --episode-seconds 180 --llm
 
 # 3. 子代理认领一单（获取 fixer_wt 与生成的 prompt.md）→ 修改代码 → 跑四道机器门禁入分支
 python3 tools/soak-autofix/soak_ctl.py claim --session-dir code/mcagent/logs/soak-agy-01

@@ -19,7 +19,7 @@ class LLMError(Exception):
 
     net 连不上/代理错误 · timeout 超时 · http 非 200（`status` 是状态码）· bad_body 回复不是 JSON ·
     api 端点返回 error 字段 · empty 空 content · config 没配 key · circuit_open 熔断中没有发请求 ·
-    no_slot 本地并发槽没等到（没有发请求）
+    no_slot 本地并发槽没等到（没有发请求）· budget_exceeded 本地 token 预算已达上限（没有发请求）
     """
 
     def __init__(self, message: str = "", kind: str = "error", status: Optional[int] = None):
@@ -35,8 +35,8 @@ class LLMError(Exception):
     @property
     def endpoint_fault(self) -> bool:
         """计入端点熔断的失败。空 content 是模型行为（思考吃光 token），不是端点故障；
-        no_slot 是本地排队（请求根本没发出去），计入会让"本地忙"把健康的端点熔断掉。"""
-        return self.kind not in ("empty", "config", "circuit_open", "no_slot")
+        no_slot / budget_exceeded 是本地治理（请求根本没发出去），计入会误伤健康端点。"""
+        return self.kind not in ("empty", "config", "circuit_open", "no_slot", "budget_exceeded")
 
 
 class Breaker:
