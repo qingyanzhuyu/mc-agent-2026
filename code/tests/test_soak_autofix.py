@@ -781,6 +781,107 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
 
         soak_ctl.teardown_session(self.session)
 
+    def test_set_goal_hot_inject_gate_rollback_and_live_runner_goal_switch(self):
+        st = soak_ctl.init_session(
+            self.repo,
+            self.session,
+            target_branch="feat/hot-inject",
+            target_goal="smelt_iron",
+            max_goal_attempts=3,
+        )
+        base_tip = st["current_tip"]
+
+        # 在主工作区单独分支 feat/staging 上新增初版技能与台账变更（完全不打断 runner/fixer worktrees）
+        _git(self.repo, "checkout", "-b", "feat/staging")
+        (self.repo / "code" / "mcagent" / "skills" / "shield.py").write_text("SHIELD_V = 1\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-m", "feat: add initial shield skill and candidate goal")
+
+        real_run = subprocess.run
+
+        # 1) 模拟台账静态核验失败（如忘记把上一个 candidate 改成 graduated 导致 WIP>1）：必须自动回退待审分支且不改 target_goal
+        def mock_gate_fail_dry(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                if "--dry" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="validate_ledger: WIP>1 candidate")
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_gate_fail_dry):
+            rc_fail = soak_ctl.main([
+                "set-goal",
+                "--session-dir", str(self.session),
+                "--merge-ref", "feat/staging",
+                "--goal", "craft_shield",
+            ])
+        self.assertEqual(rc_fail, 1)
+        self.assertEqual(soak_ctl._branch_tip(self.repo, "feat/hot-inject"), base_tip)
+        self.assertEqual(soak_ctl.read_state(self.session)["target_goal"], "smelt_iron")
+
+        # 2) 修复后再次热合入（同时验证可清除遗留 STOP 文件）
+        (self.session / "STOP").write_text("paused", encoding="utf-8")
+
+        def mock_gate_ok(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                if "--run-dir" in cmd:
+                    rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                    (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                    (rdir / "timeline.jsonl").write_text(
+                        json.dumps({"event": "run_end", "elapsed_s": 12.0, "source": "local-target"}) + "\n",
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_gate_ok):
+            rc_ok = soak_ctl.main([
+                "set-goal",
+                "--session-dir", str(self.session),
+                "--merge-ref", "feat/staging",
+                "--goal", "craft_shield",
+                "--max-goal-attempts", "6",
+            ])
+        self.assertEqual(rc_ok, 0)
+        self.assertFalse((self.session / "STOP").exists())
+        st_injected = soak_ctl.read_state(self.session)
+        self.assertNotEqual(st_injected["current_tip"], base_tip)
+        self.assertEqual(st_injected["target_goal"], "craft_shield")
+        self.assertEqual(st_injected["max_goal_attempts"], 6)
+        self.assertTrue((Path(st["fixer_wt"]) / "code" / "mcagent" / "skills" / "shield.py").exists())
+
+        # 3) 验证持续运行的 run_runner_loop 即使启动时带了 target_goal="smelt_iron"，在轮间 set-goal 后第 2 轮立即热切换到新目标与新 commit
+        seen_goals: list[Optional[str]] = []
+
+        def mock_two_ep_hot_switch(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                g = cmd[cmd.index("--goal") + 1] if "--goal" in cmd else None
+                seen_goals.append(g)
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 10.0, "source": "local-target"}) + "\n",
+                    encoding="utf-8",
+                )
+                if len(seen_goals) == 1:
+                    # 在第 1 轮运行期间，外部调用 set-goal 热切换至 craft_shield，第 2 轮立即生效
+                    soak_ctl.inject_and_set_goal(self.session, target_goal="craft_shield")
+                elif len(seen_goals) == 2:
+                    # 第 2 轮运行期间切回全量已毕业目标模式（--clear-goal）
+                    soak_ctl.inject_and_set_goal(self.session, target_goal="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_two_ep_hot_switch):
+            soak_ctl.run_runner_loop(
+                self.session,
+                episodes=3,
+                target_goal="smelt_iron",
+                use_llm=False,
+            )
+        self.assertEqual(seen_goals, ["smelt_iron", "craft_shield", None])
+
+        soak_ctl.teardown_session(self.session)
+
 
 if __name__ == "__main__":
     unittest.main()
