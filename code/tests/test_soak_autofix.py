@@ -1297,5 +1297,86 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
             soak_ctl.run_runner_loop(self.session, episodes=1, server="moon")
         soak_ctl.teardown_session(self.session)
 
+    def test_multi_goal_focus_together_rotate_escalation_and_per_goal_results(self):
+        pick = soak_ctl.pick_round_goals
+        self.assertEqual(pick("", "together", 0), ("", []))
+        self.assertEqual(pick("a,b,c", "together", 5), ("a,b,c", []))
+        self.assertEqual([pick("a,b,c", "rotate", i)[0] for i in range(4)], ["a", "b", "c", "a"])
+        self.assertEqual(pick("a,b,c", "together", 0, {"b"}), ("a,c", ["b"]))
+        self.assertEqual(pick("a,b", "rotate", 1, {"a"}), ("b", ["a"]))
+        self.assertEqual(pick("a,b", "together", 0, {"a", "b"}), ("", ["a", "b"]))
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/multi", target_goal=" smelt_iron, kill_a_mob ,")
+        self.assertEqual(soak_ctl.read_state(self.session)["target_goal"], "smelt_iron,kill_a_mob")
+        bad = soak_ctl.inject_and_set_goal(self.session, focus_mode="sideways")
+        self.assertEqual(bad["failed_step"], "invalid_focus_mode")
+
+        goals_seen: list[str] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                goal = cmd[cmd.index("--goal") + 1] if "--goal" in cmd else ""
+                goals_seen.append(goal)
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                # 每轮只达成 kill_a_mob
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_start", "source": "local-target", "target_goal": goal}) + "\n"
+                    + json.dumps({"event": "run_end", "elapsed_s": 60.0, "source": "local-target",
+                                  "target_goal": goal, "goals_reached": {"kill_a_mob": 42.0}}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            # 默认同轮一起跑
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=False)
+            self.assertTrue(soak_ctl.inject_and_set_goal(self.session, focus_mode="rotate")["ok"])
+            soak_ctl.run_runner_loop(self.session, episodes=2, use_llm=False)
+        # ep-0001 同轮两个；ep-0002/0003 轮换（按已有轮数 1、2 取模）
+        self.assertEqual(goals_seen, ["smelt_iron,kill_a_mob", "kill_a_mob", "smelt_iron"])
+
+        st = soak_ctl.read_state(self.session)
+        ep1 = st["episodes"][0]
+        self.assertEqual(ep1["target_goals"], ["smelt_iron", "kill_a_mob"])
+        self.assertEqual(ep1["target_goals_reached"], {"smelt_iron": False, "kill_a_mob": True})
+        self.assertFalse(ep1["target_goal_reached"])
+        self.assertTrue(st["episodes"][1]["target_goal_reached"])
+        report = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("2 个，每轮轮换一个", report)
+        self.assertIn("❌ `smelt_iron` ✅ `kill_a_mob`", report)
+        tel = json.loads((self.session / "goal_telemetry.local-target.json").read_text(encoding="utf-8"))["goals"]
+        self.assertEqual((tel["kill_a_mob"]["hits"], tel["smelt_iron"]["hits"]), (3, 0))
+
+        # 实跑达成的目标自动关单；没达成的不动
+        with soak_ctl.locked_state(self.session) as st_mut:
+            for gid in ("smelt_iron", "kill_a_mob"):
+                st_mut["incidents"][f"GOAL_MISS:{gid}"] = {
+                    "fingerprint": f"GOAL_MISS:{gid}", "incident_id": "X", "code": "GOAL_MISS",
+                    "severity": "P1", "category": "strategy", "status": "pending", "attempts": 0,
+                }
+            st_mut["focus_mode"] = "together"
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=False)
+        st = soak_ctl.read_state(self.session)
+        self.assertEqual(st["incidents"]["GOAL_MISS:kill_a_mob"]["status"], "resolved_by_run")
+        self.assertEqual(st["incidents"]["GOAL_MISS:smelt_iron"]["status"], "pending")
+
+        # 一个目标升级人工：之后只追另一个；全部升级人工且持续挂机：自动写 STOP
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["incidents"]["GOAL_MISS:smelt_iron"]["status"] = "escalated_human"
+        goals_seen.clear()
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=False)
+            self.assertEqual(goals_seen, ["kill_a_mob"])
+            with soak_ctl.locked_state(self.session) as st_mut:
+                st_mut["incidents"]["GOAL_MISS:kill_a_mob"]["status"] = "escalated_human"
+            soak_ctl.run_runner_loop(self.session, episodes=0, use_llm=False)
+        self.assertEqual(goals_seen, ["kill_a_mob"])
+        self.assertTrue((self.session / "STOP").exists())
+        soak_ctl.teardown_session(self.session)
+
 if __name__ == "__main__":
     unittest.main()
