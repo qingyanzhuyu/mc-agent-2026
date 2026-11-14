@@ -13,7 +13,7 @@
                         │                              ▼
 ┌───────────────────────────────────────┐    ┌───────────────────────────────────────┐
 │ 工位 B：worktrees/fixer (检出分支)     │    │ 工位 A：worktrees/runner (游离 HEAD)   │
-│ Bot: agy_soak_fixer (--mode focus)    │    │ Bot: agy_soak_r001... (--mode campaign)│
+│ Bot: <用户名>_fixer (--mode focus)    │    │ Bot: <用户名>_soak (--mode campaign)   │
 │                                       │    │                                       │
 │ 1. claim 认领最高优 INC-*.json         │◀───┼─ 产出异常包 + progress_curve.jsonl     │
 │ 2. AI 修复（Codex/Claude/AGY 子代理）  │    │  若新 commit 诱发新 P0 bug → 自动 revert│
@@ -50,7 +50,7 @@
 4. 浏览器打开 **http://127.0.0.1:8790/** → 左侧「启动参数」确认一下 → 点右上角 **一键启动**。
    - 「进服角色名」默认是 `<你的系统用户名前 8 位>_soak`，**每轮同一个名字进服**，轮次号只记在 `ep-NNNN` 里。共享测试世界里同名会互踢，所以每人保持各自的名字，别改成同一个。
    - 同名意味着上一轮的背包、位置、已拿到的进度会带进下一轮；要每轮空包从头跑（测聚焦目标的真实成功率时），勾「每轮换新角色」，角色名变成 `<名字>001`、`002`…
-   - 修单工位的金丝雀角色目前固定叫 `agy_soak_fixer`，两人同时挂机且都在修单时会互踢；不修单或只一人挂机时无影响。
+   - 修单工位的金丝雀验修角色同样按本机区分，默认 `<系统用户名前 8 位>_fixer`。
 5. 想在别的机器上看：`ssh -L 8790:127.0.0.1:8790 <挂机那台机器>`，再在自己浏览器开 http://127.0.0.1:8790/ 。
 
 ```bash
@@ -60,11 +60,27 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 - 只监听 `127.0.0.1`，零第三方依赖；校验 `Host` / `Origin` / `Content-Type`，别的网页无法跨站调用。
 - **一键启动 / 重启**：按页面「启动参数」拼 `soak_ctl.py run`，以独立进程组后台运行，输出写到会话目录 `dashboard_run.log`；关掉控制台或网页不会停掉守护。同一会话已有守护（包括终端里手动起的）时拒绝重复启动。
 - **优雅停止** = 写 `STOP`；**立即中断** = 给 `run` 进程发 SIGINT（等同 Ctrl+C，当前轮不入账）；**重启并应用新代码** = 写 `STOP` → 等两个工位都退出 → 用启动参数重新起。
-- **实时参数**：秒数、步数、聚焦目标、玩家模型、单目标最大尝试直接写会话 `state.json`，Runner 下一轮开跑时读取。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
+- **实时参数**：秒数、步数、聚焦目标、工位 A 玩家模型、工位 B 修单模型、单目标最大尝试直接写会话 `state.json`；Runner 下一轮开跑时读取，Fixer 每接一单前读取（正在修的那一单不受影响）。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
 - **当前轮**：解析正在跑的 `timeline.jsonl` / `progress_curve.jsonl`，2 秒刷新用时、步数、正在跑的技能、LLM 延迟、Token、血量和最近事件；**轮次历史**点一行看该轮 `summary.md`。
 - **热合入开发分支**：后台调用 `inject_and_set_goal`（同样跑编译 + 全量单测 + `--dry` 门禁），页面显示任务进度与结果。
 
 命令行等价写法：`soak_ctl.py run ... --bot-user <名字>`（默认同上），加 `--rotate-user` 每轮换新角色。
+
+**工位 B 修单模型**（`--fixer-preset`，`run` 启动时指定，挂机中用页面或 `set-goal --fixer-preset` 热切换）：
+
+| 写法 | 含义 |
+|---|---|
+| `codex:gpt-6.1-sol:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6.1-sol -c model_reasoning_effort=...` |
+| `codex:gpt-6-astra:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6-astra ...` |
+| `agy:gemini-4-hydrogen-{low,medium,high,xhigh}` | `agy --model gemini-4-hydrogen-<档> --effort <档>` |
+| `agy:gemini-4-carbon-{low,medium,high}` | `agy --model gemini-4-carbon-<档> --effort <档>`（carbon 没有 xhigh） |
+| `codex` / `agy` / `claude` | 旧简写：6.1-sol xhigh / hydrogen high / `claude -p` |
+
+模型 id 与档位来自 2026-11-14 本机 `agy models` 与 `~/.codex/models_cache.json`；codex 的 `ultra` 档会自动派子代理，无人值守修单不收。
+
+```bash
+python3 tools/soak-autofix/soak_ctl.py set-goal --session-dir code/mcagent/logs/soak-cont --fixer-preset codex:gpt-6-astra:high
+```
 
 ### 方式一：一键双进程全自动挂机（外接本机 `codex` / `agy` / `claude` CLI）
 

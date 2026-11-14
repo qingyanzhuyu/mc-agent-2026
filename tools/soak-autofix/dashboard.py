@@ -287,6 +287,16 @@ def parse_ledger(text: str) -> list[dict[str, Any]]:
     return goals
 
 
+def _fixer_group(key: str) -> str:
+    if key.startswith("codex:"):
+        return "Codex · " + soak_ctl.CODEX_FIXER_MODELS[key.split(":")[1]][0]
+    if key.startswith("agy:"):
+        for model, (title, _cli, _effs) in soak_ctl.AGY_FIXER_MODELS.items():
+            if key.startswith(f"agy:{model}-"):
+                return "agy · " + title
+    return "简写 / 其他"
+
+
 # ============================================================================
 # 控制台核心：所有可变操作都在这里，HTTP 层只做路由与校验
 # ============================================================================
@@ -299,16 +309,17 @@ class Console:
         self._child: Optional[subprocess.Popen] = None
         self._job: dict[str, Any] = {}
         self._ledger_cache: tuple[str, list[dict[str, Any]]] = ("", [])
-        self._budget_feature_ct: Optional[float] = self._git_budget_feature_time()
+        self._budget_feature_ct: Optional[float] = self._git_feature_time("EPISODE_SECONDS_BOUNDS")
+        self._fixer_hot_ct: Optional[float] = self._git_feature_time("def resolve_fixer_template")
 
     # ---- git 辅助 ----
     def _git(self, *args: str) -> str:
         proc = subprocess.run(["git", *args], cwd=str(self.repo_root), capture_output=True, text=True)
         return proc.stdout.strip() if proc.returncode == 0 else ""
 
-    def _git_budget_feature_time(self) -> Optional[float]:
-        out = self._git("log", "-1", "--format=%ct", "-S", "EPISODE_SECONDS_BOUNDS", "--",
-                        "tools/soak-autofix/soak_ctl.py")
+    def _git_feature_time(self, marker: str) -> Optional[float]:
+        """某个热切换能力进入 soak_ctl.py 的提交时间；早于它启动的守护进程不认这个能力。"""
+        out = self._git("log", "-1", "--format=%ct", "-S", marker, "--", "tools/soak-autofix/soak_ctl.py")
         return float(out) if out.isdigit() else None
 
     def ledger(self, branch: str) -> list[dict[str, Any]]:
@@ -368,10 +379,14 @@ class Console:
         else:
             daemon = "running"
 
-        runner = next((p for p in procs if p["role"] == "runner-loop"), None)
-        hot_budget_ok: Optional[bool] = None
-        if runner and runner.get("started_at") and self._budget_feature_ct:
-            hot_budget_ok = runner["started_at"] >= self._budget_feature_ct
+        def _started_after(role: str, ct: Optional[float]) -> Optional[bool]:
+            pr = next((p for p in procs if p["role"] == role), None)
+            if pr and pr.get("started_at") and ct:
+                return pr["started_at"] >= ct
+            return None
+
+        hot_budget_ok = _started_after("runner-loop", self._budget_feature_ct)
+        hot_fixer_ok = _started_after("fixer-loop", self._fixer_hot_ct)
 
         episodes = list(st.get("episodes") or [])
         live = None
@@ -398,12 +413,14 @@ class Console:
             "managed_pid": managed_pid,
             "stop_flag": stop_flag,
             "hot_budget_supported": hot_budget_ok,
+            "hot_fixer_supported": hot_fixer_ok,
             "state": {
                 "target_branch": st.get("target_branch"),
                 "base_commit": (st.get("base_commit") or "")[:7],
                 "current_tip": (st.get("current_tip") or "")[:7],
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
+                "fixer_preset": st.get("fixer_preset", ""),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
@@ -422,7 +439,7 @@ class Console:
             "incidents": [
                 {k: r.get(k) for k in (
                     "incident_id", "fingerprint", "code", "severity", "category", "skill", "goal_id",
-                    "status", "attempts", "last_seen_ep", "fix_commit",
+                    "status", "attempts", "last_seen_ep", "fix_commit", "last_fixer_preset",
                 )}
                 for r in (st.get("incidents") or {}).values()
             ],
@@ -430,6 +447,11 @@ class Console:
             "ledger": self.ledger(branch),
             "start_defaults": self.last_start_params(),
             "fixer_presets": list(soak_ctl.FIXER_PRESETS),
+            "fixer_catalog": [
+                {"key": k, "label": soak_ctl.FIXER_PRESET_LABELS.get(k, k), "group": _fixer_group(k)}
+                for k in soak_ctl.FIXER_PRESETS
+            ],
+            "player_models": [{"name": k, "note": v} for k, v in soak_ctl.PLAYER_MODEL_CHOICES.items()],
             "bounds": {
                 "seconds": list(soak_ctl.EPISODE_SECONDS_BOUNDS),
                 "steps": list(soak_ctl.EPISODE_STEPS_BOUNDS),
@@ -486,6 +508,11 @@ class Console:
             changes["target_goal"] = goal
         if "player_model" in payload and payload["player_model"] is not None:
             changes["player_model"] = str(payload["player_model"]).strip()
+        if payload.get("fixer_preset") not in (None, ""):
+            fx = str(payload["fixer_preset"]).strip()
+            if fx not in soak_ctl.FIXER_PRESETS:
+                raise ValueError(f"未知修单模型 {fx!r}")
+            changes["fixer_preset"] = fx
         if payload.get("max_goal_attempts") not in (None, ""):
             n = int(payload["max_goal_attempts"])
             if not 1 <= n <= 20:
@@ -505,6 +532,7 @@ class Console:
                 "episode_steps": st.get("episode_steps"),
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
+                "fixer_preset": st.get("fixer_preset", ""),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
             }
         try:
