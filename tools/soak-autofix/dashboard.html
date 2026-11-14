@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>双工位挂机台</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e3e6eb; --text: #1d2330; --muted: #6b7385;
+  --accent: #2f6fde; --accent-soft: #e6eefc; --ok: #1f9d55; --ok-soft: #e3f5ea;
+  --warn: #b7791f; --warn-soft: #fdf3e1; --bad: #d64545; --bad-soft: #fde8e8;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1f27; --line: #2a313c; --text: #e4e8ef; --muted: #8b94a6;
+    --accent: #6b9cf5; --accent-soft: #1f2b44; --ok: #46c07c; --ok-soft: #173326;
+    --warn: #e0a548; --warn-soft: #3a2d15; --bad: #f07272; --bad-soft: #3d1c1c;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line);
+  padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+header h1 { font-size: 16px; margin: 0; }
+.meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.spacer { flex: 1; }
+main { padding: 16px; display: grid; gap: 16px; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr); }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+section h2 { font-size: 14px; margin: 0 0 10px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; word-break: keep-all; }
+section h2 small { color: var(--muted); font-weight: normal; font-size: 12px; word-break: normal; overflow-wrap: anywhere; min-width: 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+.pill.idle { background: var(--accent-soft); color: var(--muted); }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  padding: 6px 12px; border-radius: 7px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+label.f { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+label.f.inline { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
+input, select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 7px; padding: 6px 8px; width: 100%; min-width: 0; }
+input[type=checkbox] { width: auto; }
+input[type=range] { padding: 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.grid2 .wide { grid-column: 1 / -1; }
+.note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+.banner { border-radius: 8px; padding: 8px 10px; font-size: 13px; margin-bottom: 10px; }
+.banner.warn { background: var(--warn-soft); color: var(--warn); }
+.banner.bad { background: var(--bad-soft); color: var(--bad); }
+.banner.ok { background: var(--ok-soft); color: var(--ok); }
+.hidden { display: none !important; }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; margin: 10px 0; }
+.stat { background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.stat span { font-size: 12px; color: var(--muted); }
+.bar { height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 99px; transition: width .4s; }
+.bar.hot > i { background: var(--warn); }
+.barlabel { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+.events { list-style: none; margin: 10px 0 0; padding: 0; max-height: 260px; overflow: auto; font-size: 12.5px; }
+.events li { display: grid; grid-template-columns: 52px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+.events li span:first-child { color: var(--muted); font-family: var(--mono); text-align: right; }
+.k-skill_end { color: var(--ok); } .k-skill_fail { color: var(--bad); } .k-llm_call { color: var(--accent); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr.click { cursor: pointer; }
+tbody tr.click:hover { background: var(--accent-soft); }
+.mono { font-family: var(--mono); }
+.yes { color: var(--ok); } .no { color: var(--bad); } .dim { color: var(--muted); }
+pre.log { background: var(--bg); border-radius: 8px; padding: 10px; font: 12px/1.45 var(--mono);
+  max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 0; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+  width: min(860px, calc(100vw - 32px)); padding: 0; }
+dialog::backdrop { background: rgba(0,0,0,.4); }
+dialog header { position: static; }
+dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
+#toast { position: fixed; right: 16px; bottom: 16px; max-width: min(420px, calc(100vw - 32px)); z-index: 20;
+  padding: 10px 14px; border-radius: 8px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.15); }
+</style>
+</head>
+<body>
+<header>
+  <h1>双工位挂机台</h1>
+  <span id="daemonPill" class="pill idle">读取中</span>
+  <span class="meta" id="headMeta"></span>
+  <span class="spacer"></span>
+  <div class="row">
+    <button class="primary" id="btnStart">一键启动</button>
+    <button id="btnStop">优雅停止</button>
+    <button class="danger" id="btnInterrupt">立即中断</button>
+    <button id="btnRestart" title="写 STOP，等当前轮和修单收尾后用左侧启动参数重新起">重启并应用新代码</button>
+  </div>
+</header>
+
+<main>
+  <div class="col">
+    <section>
+      <h2>实时参数 <small>下一轮起生效，不用停机</small></h2>
+      <div id="budgetBanner" class="banner warn hidden"></div>
+      <div class="grid2">
+        <label class="f wide">每轮最长秒数：<b id="secOut" class="mono"></b>
+          <input type="range" id="secRange" step="30">
+        </label>
+        <label class="f">秒数<input type="number" id="secIn" step="10"></label>
+        <label class="f">步数<input type="number" id="stepsIn" step="5"></label>
+        <label class="f wide">聚焦目标<select id="goalSel"></select></label>
+        <label class="f">玩家模型<input id="modelIn" placeholder="空 = 沿用 .env"></label>
+        <label class="f">单目标最大尝试<input type="number" id="attemptsIn" min="1" max="20"></label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="btnApply">应用到下一轮</button>
+        <button id="btnClearBudget">清除轮长覆盖</button>
+      </div>
+      <p class="note" id="effNote"></p>
+    </section>
+
+    <section>
+      <h2>启动参数 <small>一键启动 / 重启时使用</small></h2>
+      <div class="grid2">
+        <label class="f wide">挂机分支<input id="sBranch"></label>
+        <label class="f">轮数（0 = 一直跑）<input type="number" id="sEpisodes" min="0"></label>
+        <label class="f">修单入口<select id="sFixer"></select></label>
+        <label class="f">每轮秒数<input type="number" id="sSec" step="10"></label>
+        <label class="f">每轮步数<input type="number" id="sSteps" step="5"></label>
+        <label class="f wide">聚焦目标<select id="sGoal"></select></label>
+        <label class="f">玩家模型<input id="sModel"></label>
+        <label class="f">单目标最大尝试<input type="number" id="sAttempts" min="1" max="20"></label>
+        <label class="f inline"><input type="checkbox" id="sLlm">用 LLM 选技能</label>
+        <label class="f inline"><input type="checkbox" id="sSkipCanary">跳过真机金丝雀</label>
+      </div>
+      <p class="note">守护输出写到会话目录下的 <span class="mono">dashboard_run.log</span>；关掉本页面或控制台不会停掉守护。</p>
+    </section>
+
+    <section>
+      <h2>热合入开发分支 <small>带编译 + 单测 + dry 门禁</small></h2>
+      <div class="grid2">
+        <label class="f wide">分支或 commit<input id="iRef" placeholder="feat/goal-staging"></label>
+        <label class="f wide">同时切换聚焦目标<select id="iGoal"></select></label>
+      </div>
+      <div class="row" style="margin-top:10px"><button id="btnInject">合入并切换</button></div>
+      <div id="jobBox" class="banner hidden" style="margin-top:10px"></div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section>
+      <h2>当前轮 <small id="liveSub"></small></h2>
+      <div id="liveEmpty" class="dim">还没有正在跑的轮次。</div>
+      <div id="liveBox" class="hidden">
+        <div class="barlabel"><span>用时</span><span id="tLabel" class="mono"></span></div>
+        <div class="bar" id="tBar"><i></i></div>
+        <div class="barlabel"><span>步数</span><span id="sLabel" class="mono"></span></div>
+        <div class="bar" id="sBar"><i></i></div>
+        <div class="stats" id="liveStats"></div>
+        <div class="row dim" id="liveGoals" style="font-size:12.5px"></div>
+        <ul class="events" id="liveEvents"></ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>轮次历史 <small>点一行看本轮报告</small></h2>
+      <div class="tablewrap" style="max-height:380px">
+        <table>
+          <thead><tr>
+            <th>轮次</th><th>结束时间</th><th>提交</th><th class="num">用时</th><th>结束原因</th>
+            <th class="num">技能完成</th><th class="num">Bug/P0</th><th>聚焦目标</th><th>达成的台账目标</th>
+            <th class="num">Token 入/出</th><th>回滚</th>
+          </tr></thead>
+          <tbody id="epBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>目标实测成本</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>目标</th><th>阶段</th><th class="num">达成/轮数</th><th class="num">达成率</th>
+            <th class="num">P50 用时</th><th class="num">中位 Token</th><th class="num">死亡</th></tr></thead>
+          <tbody id="telBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>异常单</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>单号</th><th>级别</th><th>代码</th><th>技能/目标</th><th>状态</th>
+            <th class="num">尝试</th><th>最近一轮</th><th>修复提交</th></tr></thead>
+          <tbody id="incBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>守护日志 <small>dashboard_run.log 末尾</small></h2>
+      <pre class="log" id="logBox">（还没有日志：只有从本页面启动的守护才会写这里）</pre>
+    </section>
+  </div>
+</main>
+
+<dialog id="epDialog">
+  <header><h1 id="dlgTitle"></h1><span class="spacer"></span><button id="dlgClose">关闭</button></header>
+  <div class="body"><pre class="log" id="dlgBody" style="max-height:none"></pre></div>
+</dialog>
+<div id="toast" class="hidden"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmtS = (s) => (s == null ? "-" : s >= 120 ? `${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, "0")}s` : `${Number(s).toFixed(1)}s`);
+const STAGE_CN = { draft: "草稿", candidate: "候选", graduated: "已毕业", live: "上线" };
+let snap = null;
+let formsFilled = false;
+
+function toast(msg, kind = "ok") {
+  const t = $("toast");
+  t.className = `banner ${kind}`;
+  t.textContent = msg;
+  clearTimeout(toast._h);
+  toast._h = setTimeout(() => t.classList.add("hidden"), kind === "bad" ? 9000 : 4000);
+}
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+function goalOptions(sel, goals, current, allowKeep) {
+  const groups = { candidate: [], graduated: [], live: [], draft: [] };
+  goals.forEach((g) => (groups[g.stage] || groups.draft).push(g));
+  let html = allowKeep ? `<option value="__keep__">（不改）</option>` : "";
+  html += `<option value="">全部已毕业目标（不聚焦）</option>`;
+  for (const st of ["candidate", "graduated", "live", "draft"]) {
+    if (!groups[st].length) continue;
+    html += `<optgroup label="${STAGE_CN[st]}">` + groups[st].map((g) =>
+      `<option value="${esc(g.id)}">${esc(g.id)} · ${esc(g.title || "")}${g.score ? ` · ${g.score}分` : ""}</option>`).join("") + `</optgroup>`;
+  }
+  sel.innerHTML = html;
+  sel.value = current;
+}
+
+function fillForms(s) {
+  const b = s.bounds, st = s.state, d = s.start_defaults;
+  for (const el of [$("secRange"), $("secIn"), $("sSec")]) { el.min = b.seconds[0]; el.max = b.seconds[1]; }
+  for (const el of [$("stepsIn"), $("sSteps")]) { el.min = b.steps[0]; el.max = b.steps[1]; }
+  const sec = st.episode_seconds ?? d.episode_seconds;
+  const steps = st.episode_steps ?? d.episode_steps;
+  $("secRange").value = sec; $("secIn").value = sec; $("secOut").textContent = fmtS(Number(sec));
+  $("stepsIn").value = steps;
+  $("modelIn").value = s.session_exists ? (st.player_model ?? "") : d.player_model;
+  $("attemptsIn").value = st.max_goal_attempts ?? d.max_goal_attempts;
+  goalOptions($("goalSel"), s.ledger, s.session_exists ? (st.target_goal || "") : d.goal, false);
+  goalOptions($("iGoal"), s.ledger, "__keep__", true);
+
+  $("sBranch").value = d.branch; $("sEpisodes").value = d.episodes;
+  $("sFixer").innerHTML = s.fixer_presets.map((p) => `<option>${esc(p)}</option>`).join("");
+  $("sFixer").value = d.fixer_preset;
+  $("sSec").value = d.episode_seconds; $("sSteps").value = d.episode_steps;
+  goalOptions($("sGoal"), s.ledger, d.goal, false);
+  $("sModel").value = d.player_model; $("sAttempts").value = d.max_goal_attempts;
+  $("sLlm").checked = !!d.llm; $("sSkipCanary").checked = !!d.skip_live_canary;
+}
+
+function startParams() {
+  return {
+    branch: $("sBranch").value.trim(), episodes: Number($("sEpisodes").value),
+    episode_seconds: Number($("sSec").value), episode_steps: Number($("sSteps").value),
+    goal: $("sGoal").value, max_goal_attempts: Number($("sAttempts").value),
+    llm: $("sLlm").checked, player_model: $("sModel").value.trim(),
+    fixer_preset: $("sFixer").value, skip_live_canary: $("sSkipCanary").checked,
+  };
+}
+
+function renderHeader(s) {
+  const pill = $("daemonPill");
+  const map = { running: ["ok", "运行中"], stopping: ["warn", "收尾中（已写 STOP）"], stopped: ["idle", "已停止"] };
+  const [cls, txt] = map[s.daemon];
+  pill.className = `pill ${cls}`; pill.textContent = txt;
+  const st = s.state;
+  const pids = s.processes.map((p) => `${p.role}:${p.pid}`).join(" ");
+  $("headMeta").textContent = s.session_exists
+    ? `${st.target_branch} @ ${st.current_tip}（基线 ${st.base_commit}，自动修复 ${st.commits} 个）${pids ? " · " + pids : ""}`
+    : `会话 ${s.session_dir} 尚未初始化`;
+  $("btnStart").disabled = s.daemon !== "stopped";
+  $("btnStop").disabled = s.daemon !== "running";
+  $("btnInterrupt").disabled = s.daemon === "stopped";
+  const jobRunning = s.job && s.job.status === "running";
+  $("btnRestart").disabled = jobRunning;
+  $("btnInject").disabled = jobRunning || !s.session_exists;
+}
+
+function renderSettingsNote(s) {
+  const st = s.state, live = s.live;
+  const bn = $("budgetBanner");
+  if (s.hot_budget_supported === false) {
+    bn.textContent = "当前守护是在「热改轮长」功能之前启动的，改秒数/步数不会生效（目标、模型照常生效）。点右上角「重启并应用新代码」。";
+    bn.classList.remove("hidden");
+  } else bn.classList.add("hidden");
+  const ov = (st.episode_seconds != null || st.episode_steps != null)
+    ? `热覆盖：${st.episode_seconds != null ? fmtS(st.episode_seconds) : "沿用启动参数"} / ${st.episode_steps != null ? st.episode_steps + " 步" : "沿用启动参数"}`
+    : "未设热覆盖，沿用启动参数";
+  const cur = live && !live.finished ? `；正在跑的 ${live.ep_id} 上限 ${fmtS(live.max_seconds)} / ${live.max_steps} 步` : "";
+  $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${st.player_model || "沿用 .env"}${cur}`;
+}
+
+function setBar(id, cur, max) {
+  const pct = max ? Math.min(100, (cur / max) * 100) : 0;
+  const bar = $(id);
+  bar.querySelector("i").style.width = `${pct}%`;
+  bar.classList.toggle("hot", pct >= 85);
+}
+
+function renderLive(s) {
+  const L = s.live;
+  if (!L) { $("liveEmpty").classList.remove("hidden"); $("liveBox").classList.add("hidden"); $("liveSub").textContent = ""; return; }
+  $("liveEmpty").classList.add("hidden"); $("liveBox").classList.remove("hidden");
+  const interrupted = ["keyboard_interrupt", "stopped"].includes(L.stop_reason);
+  const state = L.running ? "进行中"
+    : !L.finished ? "守护已停，本轮未写完"
+    : interrupted ? `已中断（${L.stop_reason}），未入账，下次启动会复用这个轮次号`
+    : s.daemon === "stopped" ? `已结束（${L.stop_reason}），守护已停，未入账` : `已结束（${L.stop_reason}），等待入账`;
+  $("liveSub").textContent = `${L.ep_id} · ${L.bot_user || "-"} · ${L.model || "-"} · @${L.commit || "-"} · 目标 ${L.target_goal || "全部"} · ${state}`;
+  $("tLabel").textContent = `${fmtS(L.elapsed_s)} / ${fmtS(L.max_seconds)}`;
+  $("sLabel").textContent = `${L.steps} / ${L.max_steps ?? "-"}`;
+  setBar("tBar", L.elapsed_s, L.max_seconds); setBar("sBar", L.steps, L.max_steps);
+  const stat = (v, k) => `<div class="stat"><b>${esc(v)}</b><span>${esc(k)}</span></div>`;
+  $("liveStats").innerHTML = [
+    stat(L.current_skill || "—", "正在跑的技能"),
+    stat(`${L.skills_completed} / ${L.skills_failed}`, "技能完成 / 失败"),
+    stat(`${L.llm_calls}${L.llm_fail ? ` (${L.llm_fail} 失败)` : ""}`, "LLM 调用"),
+    stat(L.llm_last_ms != null ? `${(L.llm_last_ms / 1000).toFixed(1)}s` : "—", `最近一次（P50 ${L.llm_p50_ms != null ? (L.llm_p50_ms / 1000).toFixed(1) + "s" : "—"}）`),
+    stat(L.tokens.toLocaleString(), "累计 Token"),
+    stat(`${L.hp ?? "—"} / ${L.food ?? "—"}`, "血量 / 饱食"),
+    stat(`${L.server_score} / ${L.inferred_score}`, "服务端分 / 代理分"),
+    stat(L.deaths, "死亡"),
+  ].join("");
+  $("liveGoals").innerHTML = `本轮已达成：${L.goals_reached.length ? L.goals_reached.map((g) => `<span class="pill ok">${esc(g)}</span>`).join(" ") : "暂无"}`;
+  $("liveEvents").innerHTML = L.recent.map((e) =>
+    `<li><span>${e.t != null ? Number(e.t).toFixed(1) : ""}</span><span class="k-${esc(e.kind)}">${esc(e.text)}</span></li>`).join("");
+}
+
+function renderTables(s) {
+  $("epBody").innerHTML = s.episodes.map((e) => {
+    const goal = e.target_goal ? `${e.target_goal_reached ? '<span class="yes">✓</span>' : '<span class="no">✗</span>'} ${esc(e.target_goal)}` : '<span class="dim">全部</span>';
+    const reached = Object.entries(e.goals_reached || {}).map(([g, t]) => `${esc(g)} <span class="dim">${fmtS(t)}</span>`).join("，") || '<span class="dim">无</span>';
+    const at = e.at ? new Date(e.at).toLocaleTimeString() : "-";
+    return `<tr class="click" data-ep="${esc(e.ep_id)}"><td class="mono">${esc(e.ep_id)}</td><td>${at}</td><td class="mono">${esc((e.commit || "").slice(0, 7))}</td>
+      <td class="num">${fmtS(e.elapsed_s)}</td><td>${esc(e.stop_reason || "-")}</td><td class="num">${e.skills_completed ?? 0}</td>
+      <td class="num ${e.p0_bugs ? "no" : ""}">${e.bugs_count ?? 0}/${e.p0_bugs ?? 0}</td><td>${goal}</td><td>${reached}</td>
+      <td class="num">${(e.prompt_tokens || 0).toLocaleString()} / ${(e.completion_tokens || 0).toLocaleString()}</td>
+      <td>${e.rolled_back ? `<span class="no">${esc(String(e.rolled_back).slice(0, 7))}</span>` : '<span class="dim">-</span>'}</td></tr>`;
+  }).join("") || `<tr><td colspan="11" class="dim">还没有入账的轮次</td></tr>`;
+
+  const stageOf = Object.fromEntries(s.ledger.map((g) => [g.id, g.stage]));
+  $("telBody").innerHTML = Object.entries(s.telemetry).map(([gid, t]) =>
+    `<tr><td class="mono">${esc(gid)}</td><td>${esc(STAGE_CN[stageOf[gid]] || stageOf[gid] || "-")}</td>
+      <td class="num">${t.hits}/${t.episodes}</td><td class="num">${(t.hit_rate * 100).toFixed(0)}%</td>
+      <td class="num">${fmtS(t.p50_elapsed_s)}</td><td class="num">${(t.p50_tokens || 0).toLocaleString()}</td><td class="num">${t.total_deaths}</td></tr>`
+  ).join("") || `<tr><td colspan="7" class="dim">暂无实测数据</td></tr>`;
+
+  const sevCls = { P0: "no", P1: "no", P2: "", P3: "dim" };
+  $("incBody").innerHTML = s.incidents.map((r) =>
+    `<tr><td class="mono">${esc(r.incident_id)}</td><td class="${sevCls[r.severity] || ""}">${esc(r.severity)}/${esc(r.category)}</td>
+      <td class="mono">${esc(r.code)}</td><td>${esc(r.skill || "-")}${r.goal_id ? " / " + esc(r.goal_id) : ""}</td><td>${esc(r.status)}</td>
+      <td class="num">${r.attempts ?? 0}</td><td class="mono">${esc(r.last_seen_ep || "-")}</td><td class="mono">${esc((r.fix_commit || "-").slice(0, 7))}</td></tr>`
+  ).join("") || `<tr><td colspan="8" class="dim">没有异常单</td></tr>`;
+}
+
+function renderJob(s) {
+  const j = s.job, box = $("jobBox");
+  if (!j || !j.kind) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  const label = j.kind === "restart" ? "重启" : j.kind;
+  if (j.status === "running") { box.className = "banner warn"; box.textContent = `${label}：进行中（${fmtS(s.now - j.started_at)}）…`; return; }
+  box.className = `banner ${j.status === "ok" ? "ok" : "bad"}`;
+  const d = typeof j.detail === "string" ? j.detail : (j.detail && (j.detail.detail || j.detail.failed_step)) || (j.status === "ok" ? "完成" : "失败");
+  box.textContent = `${label}：${j.status === "ok" ? "成功" : "失败"} — ${typeof d === "string" ? d : JSON.stringify(d)}`;
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch("/api/snapshot")).json();
+    snap = s;
+    if (!formsFilled) { fillForms(s); formsFilled = true; }
+    renderHeader(s); renderSettingsNote(s); renderLive(s); renderTables(s); renderJob(s);
+  } catch (e) {
+    $("daemonPill").className = "pill bad"; $("daemonPill").textContent = "控制台连接断开";
+  }
+}
+
+async function refreshLog() {
+  try {
+    const j = await (await fetch("/api/log?lines=300")).json();
+    if (j.log) {
+      const box = $("logBox"), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+      box.textContent = j.log;
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+  } catch (e) { /* 下次再试 */ }
+}
+
+// ---- 交互 ----
+$("secRange").addEventListener("input", (e) => { $("secIn").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
+$("secIn").addEventListener("input", (e) => { $("secRange").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
+
+$("btnApply").onclick = async () => {
+  const body = {
+    episode_seconds: $("secIn").value, episode_steps: $("stepsIn").value,
+    target_goal: $("goalSel").value, player_model: $("modelIn").value, max_goal_attempts: $("attemptsIn").value,
+  };
+  try { await api("/api/settings", body); toast("已写入，下一轮开跑时生效"); refresh(); }
+  catch (e) { toast(e.message, "bad"); }
+};
+$("btnClearBudget").onclick = async () => {
+  try { await api("/api/settings", { clear_budget: true }); formsFilled = false; toast("已清除轮长覆盖，下一轮回到启动参数"); refresh(); }
+  catch (e) { toast(e.message, "bad"); }
+};
+$("btnStart").onclick = async () => {
+  try { const j = await api("/api/start", startParams()); toast(`已启动双工位（pid ${j.result.pid}）`); formsFilled = false; setTimeout(refresh, 800); }
+  catch (e) { toast(e.message, "bad"); }
+};
+$("btnStop").onclick = async () => {
+  if (!confirm("写入 STOP：Runner 跑完当前一轮、Fixer 收尾当前单后退出。继续？")) return;
+  try { await api("/api/stop", {}); toast("已写 STOP，等待收尾"); refresh(); } catch (e) { toast(e.message, "bad"); }
+};
+$("btnInterrupt").onclick = async () => {
+  if (!confirm("立即中断：相当于在终端按 Ctrl+C，当前轮会被打断（不入账），正在修的单也会中断。继续？")) return;
+  try { const j = await api("/api/interrupt", {}); toast(`已发送中断信号到 ${j.result.signaled.join(", ")}`); refresh(); }
+  catch (e) { toast(e.message, "bad"); }
+};
+$("btnRestart").onclick = async () => {
+  if (!confirm("重启：先写 STOP，等当前轮和修单收尾（可能要几分钟），再用左侧「启动参数」重新起。继续？")) return;
+  try { await api("/api/restart", startParams()); toast("已开始重启，等旧守护退出…"); refresh(); }
+  catch (e) { toast(e.message, "bad"); }
+};
+$("btnInject").onclick = async () => {
+  const g = $("iGoal").value;
+  try { await api("/api/inject", { merge_ref: $("iRef").value.trim(), goal: g === "__keep__" ? null : g }); toast("已开始合入，门禁要跑几分钟"); refresh(); }
+  catch (e) { toast(e.message, "bad"); }
+};
+$("epBody").addEventListener("click", async (e) => {
+  const tr = e.target.closest("tr[data-ep]");
+  if (!tr) return;
+  try {
+    const j = await (await fetch(`/api/episode?id=${encodeURIComponent(tr.dataset.ep)}`)).json();
+    if (j.error) throw new Error(j.error);
+    $("dlgTitle").textContent = `${j.ep_id} 报告`;
+    $("dlgBody").textContent = j.summary_md + (j.incidents.length ? `\n\n异常单文件：\n${j.incidents.join("\n")}` : "");
+    $("epDialog").showModal();
+  } catch (err) { toast(err.message, "bad"); }
+});
+$("dlgClose").onclick = () => $("epDialog").close();
+
+refresh(); refreshLog();
+setInterval(refresh, 2000);
+setInterval(refreshLog, 4000);
+</script>
+</body>
+</html>

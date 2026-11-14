@@ -34,6 +34,20 @@
 
 ## 两种使用方式
 
+### 方式零：网页控制台（实时改轮长、看每一轮、一键启停）
+
+```bash
+python3 tools/soak-autofix/dashboard.py            # 默认会话 code/mcagent/logs/soak-cont，打开 http://127.0.0.1:8790/
+python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/logs/soak-night
+```
+
+- 只监听 `127.0.0.1`，零第三方依赖；校验 `Host` / `Origin` / `Content-Type`，别的网页无法跨站调用。
+- **一键启动 / 重启**：按页面「启动参数」拼 `soak_ctl.py run`，以独立进程组后台运行，输出写到会话目录 `dashboard_run.log`；关掉控制台或网页不会停掉守护。同一会话已有守护（包括终端里手动起的）时拒绝重复启动。
+- **优雅停止** = 写 `STOP`；**立即中断** = 给 `run` 进程发 SIGINT（等同 Ctrl+C，当前轮不入账）；**重启并应用新代码** = 写 `STOP` → 等两个工位都退出 → 用启动参数重新起。
+- **实时参数**：秒数、步数、聚焦目标、玩家模型、单目标最大尝试直接写会话 `state.json`，Runner 下一轮开跑时读取。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
+- **当前轮**：解析正在跑的 `timeline.jsonl` / `progress_curve.jsonl`，2 秒刷新用时、步数、正在跑的技能、LLM 延迟、Token、血量和最近事件；**轮次历史**点一行看该轮 `summary.md`。
+- **热合入开发分支**：后台调用 `inject_and_set_goal`（同样跑编译 + 全量单测 + `--dry` 门禁），页面显示任务进度与结果。
+
 ### 方式一：一键双进程全自动挂机（外接本机 `codex` / `agy` / `claude` CLI）
 
 内置模型分工（默认）：
