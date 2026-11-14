@@ -143,11 +143,23 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         # 校园网入口也是官方端点，但不等于 DEFAULT_BASE，所以按域名再判一次
         mc_official = official or any(h in cfg.base for h in OFFICIAL_HOSTS)
-        if mc_official and prof["profile"] != OFFICIAL_PROFILE:
-            print(f"拒绝运行：MC 指向官方端点时模型只能用 LLM_PROFILE=official（当前 {prof['profile']}，见 AGENTS.md §2B.3）",
+        # 赛前训练放行：比赛服 + 自备模型，只在挂机（--soak）且显式设 MCAGENT_TRAIN_ON_OFFICIAL=1 时允许；
+        # 比赛当天 preflight 会 BLOCK 这个开关和 LLM_PROFILE=custom，强制切回官方代理（AGENTS.md §2B.3）
+        train_override = (
+            mc_official and prof["profile"] != OFFICIAL_PROFILE and args.soak
+            and os.environ.get("MCAGENT_TRAIN_ON_OFFICIAL", "").strip() == "1"
+        )
+        if mc_official and prof["profile"] != OFFICIAL_PROFILE and not train_override:
+            print(f"拒绝运行：MC 指向官方端点时模型只能用 LLM_PROFILE=official（当前 {prof['profile']}，见 AGENTS.md §2B.3）；"
+                  "赛前挂机训练可设 MCAGENT_TRAIN_ON_OFFICIAL=1 并加 --soak",
                   file=sys.stderr)
             return 2
+        if train_override:
+            print(f"[loop] ⚠ 比赛服训练模式：使用自备模型 {prof['model']}（LLM_PROFILE={prof['profile']}）。"
+                  "仅限赛前训练，比赛当天必须切回 official（preflight 会拦）", file=sys.stderr)
         llm_meta = {"llm_profile": prof["profile"], "llm_model": prof["model"]}
+        if train_override:
+            llm_meta["train_on_official"] = True
         print(f"[loop] LLM 配置: {prof['profile']} (model={prof['model'] or '(未设置)'})")
 
     source_tag = "official" if (official and not args.local_target) else "local-target"

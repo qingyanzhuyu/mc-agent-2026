@@ -43,6 +43,8 @@ class DashboardTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.session = self.root / "session"
         self.session.mkdir()
+        # 默认启动目标已改为比赛服；与比赛服无关的用例统一从「上次用过自建测试服」开始
+        (self.session / dash.LAST_START_NAME).write_text(json.dumps({"server": "local"}), encoding="utf-8")
         self.console = dash.Console(self.root, self.session)
 
     def tearDown(self):
@@ -185,12 +187,17 @@ class DashboardTests(unittest.TestCase):
             env_file.write_text("MC_USER=team\nMC_PASS=pw\n", encoding="utf-8")
             with self.assertRaises(ValueError):  # 没勾占位
                 self.console._validate_start({"server": "official", "llm": False})
-            with self.assertRaises(ValueError) as ctx:  # 比赛服 + LLM 但没有 LLM_KEY
+            with self.assertRaises(ValueError) as ctx:  # 比赛服 + 自备 key 训练（默认）但没配 LLM_CUSTOM_*
                 self.console._validate_start({"server": "official", "llm": True, "account_reserved": True})
+            self.assertIn("LLM_CUSTOM_KEY", str(ctx.exception))
+            with self.assertRaises(ValueError) as ctx:  # 比赛服 + AIA 官方代理但没有 LLM_KEY
+                self.console._validate_start({"server": "official", "llm": True, "account_reserved": True,
+                                              "official_llm": "official"})
             self.assertIn("LLM_KEY", str(ctx.exception))
             p = self.console._validate_start({"server": "official", "llm": False, "account_reserved": True})
             cmd = self.console.build_run_cmd(p)
             self.assertEqual(cmd[cmd.index("--server") + 1], "official")
+            self.assertEqual(cmd[cmd.index("--official-llm") + 1], "custom")
             self.assertIn("--account-reserved", cmd)
             local_cmd = self.console.build_run_cmd(self.console._validate_start({}))
             self.assertEqual(local_cmd[local_cmd.index("--server") + 1], "local")
@@ -211,7 +218,10 @@ class DashboardTests(unittest.TestCase):
             self.assertFalse(self.console.last_start_params()["account_reserved"])
             snap_checks = self.console.snapshot()["official_checks"]
             self.assertEqual(snap_checks["rules_only"], [])
-            self.assertTrue(any("LLM_KEY" in m for m in snap_checks["with_llm"]))
+            self.assertTrue(any("LLM_CUSTOM_KEY" in m for m in snap_checks["custom"]))
+            self.assertTrue(any("LLM_KEY" in m for m in snap_checks["official"]))
+            env_file.write_text("MC_USER=team\nMC_PASS=pw\nLLM_CUSTOM_BASE=https://x/v1\nLLM_CUSTOM_KEY=k\n", encoding="utf-8")
+            self.assertEqual(self.console.snapshot()["official_checks"]["custom"], [])
 
     def test_apply_settings_rejects_unknown_goal_when_ledger_known(self):
         self._init_state()

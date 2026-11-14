@@ -66,14 +66,17 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 
 命令行等价写法：`soak_ctl.py run ... --bot-user <名字>`（默认同上），加 `--rotate-user` 每轮换新角色。
 
-**工位 A 进哪个服务器**（每次启动时选，挂机中不切）：
+**统一配置：工位 A 进哪个服务器**（一份 `code/mcagent/.env` 同时装两套端点，每次启动时选，挂机中不切）：
 
 | 选项 | 连哪里 | 角色名 | 模型 | 启动前要求 |
 |---|---|---|---|---|
-| `--server local`（默认） | `.env` 的 `MC_API_BASE`（本机联调网关 → 队内测试服） | `--bot-user` 随意起 | 可用 custom（DeepSeek 等） | 网关已启动 |
-| `--server official` | 比赛服官方端点 `mc-api.windywindie.top` | 只能用 `.env` 里的队伍正式账号 `MC_USER`/`MC_PASS`，不能改名、不能轮换 | 只能 `LLM_PROFILE=official`（§2B.3），开 LLM 时 `.env` 必须有 `LLM_KEY`，否则只能纯规则 | 先在 `docs/05` 账号表占位，再加 `--account-reserved`（页面上每次都要重新勾） |
+| `--server official --official-llm custom`（**默认**，日常训练） | 比赛服官方端点 `mc-api.windywindie.top` | 只能用 `.env` 里的队伍正式账号 `MC_USER`/`MC_PASS`，不能改名、不能轮换 | 自备 key（`LLM_CUSTOM_*`，如并行云 DeepSeek-V4.1-Flash），玩家模型可热切换 | `.env` 有账号与 `LLM_CUSTOM_BASE/KEY`；先在 `docs/05` 账号表占位，再加 `--account-reserved` |
+| `--server official --official-llm official`（比赛彩排） | 同上 | 同上 | AIA 官方代理（`LLM_KEY`），与比赛当天完全一致 | `.env` 有 `LLM_KEY`；同样要占位 |
+| `--server local`（备选） | `MC_LOCAL_API_BASE`（默认 `127.0.0.1:8787` 本机网关 → 队内测试服） | `--bot-user` 随意起 | 自备 key | 网关已启动 |
 
-比赛服的轮次数据标 `official`，不进 `goal_telemetry.local-target.json`；工位 B 的金丝雀验修始终在自建测试服跑，不占比赛账号。比赛账号同一时刻只能一个 bot 在线（§3），挂机期间别人不能用这个账号。
+- 比赛服 + 自备 key 是**赛前训练专用**：脚本给子进程设 `MCAGENT_TRAIN_ON_OFFICIAL=1`，`mcagent.loop` 只在 `--soak` 且有这个开关时放行；比赛当天 `preflight` 对 `LLM_PROFILE=custom` 与这个开关都会 BLOCK，必须切回官方代理（AGENTS.md §2B.3，公告：比赛统一用 AIA 代理上的 DeepSeek V4.1 Flash）。
+- 比赛服的轮次数据标 `official`，不进 `goal_telemetry.local-target.json`；工位 B 的金丝雀验修始终走 `MC_LOCAL_API_BASE`，不占比赛账号。比赛账号同一时刻只能一个 bot 在线（§3），挂机期间别人不能用这个账号。
+- 命令行里不写 `--server` 就是比赛服；只想在自建测试服跑，显式加 `--server local`。
 
 **工位 B 修单模型**（`--fixer-preset`，`run` 启动时指定，挂机中用页面或 `set-goal --fixer-preset` 热切换）：
 

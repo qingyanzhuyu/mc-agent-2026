@@ -105,6 +105,13 @@ def check_static(env: dict[str, str], gateway_open: bool | None = None,
         f"LLM_PROFILE={env.get('LLM_PROFILE') or '(未设置=official)'}" +
         ("" if profile == "official" else "  ← 自备模型只能赛前测试，比赛必须走官方代理")))
 
+    # 赛前在比赛服上用自备模型训练的开关（mcagent.loop --soak 才认），比赛当天必须关掉
+    train_flag = (env.get("MCAGENT_TRAIN_ON_OFFICIAL", "") or "").strip()
+    out.append(Check(
+        "没开「比赛服训练」开关", train_flag in ("", "0"),
+        f"MCAGENT_TRAIN_ON_OFFICIAL={train_flag or '(未设置)'}" +
+        ("" if train_flag in ("", "0") else "  ← 只许赛前训练用，比赛必须删掉这一行")))
+
     conc_raw = env.get("LLM_MAX_CONCURRENCY", "")
     try:
         conc = int(conc_raw)
