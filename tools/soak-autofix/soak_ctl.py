@@ -122,16 +122,23 @@ def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: s
 
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
 
-# 工位 A 进哪个服务器（每次启动时选，挂机中不切）：
-# - local：本机联调网关 tools/local-api-bridge（.env 的 MC_API_BASE，默认 127.0.0.1:8787 → 队内测试服），
-#   角色名随意（--bot-user），玩家模型可用 custom；数据标 local-target。
-# - official：比赛服官方端点。只能用 .env 里的队伍正式账号（MC_USER/MC_PASS，不能改名、不能轮换），
-#   模型只能走 LLM_PROFILE=official（AGENTS.md §2B.3），账号是全队独占资源，启动前须在 docs/05 账号表占位（§3）。
+# 统一配置：一份 .env 同时装比赛服与自建测试服两套端点，每次启动选工位 A 进哪个（挂机中不切）。
+# - official（默认，日常训练）：比赛服官方端点 + .env 里的队伍正式账号 MC_USER/MC_PASS（不能改名、不能轮换，
+#   全队独占，启动前须在 docs/05 账号表占位，AGENTS.md §3）。模型来源二选一：
+#     custom   = 赛前训练用自备 key（LLM_CUSTOM_*，如并行云 DeepSeek-V4.1-Flash），子进程带
+#                MCAGENT_TRAIN_ON_OFFICIAL=1 才被 mcagent.loop 放行；比赛当天 preflight 会 BLOCK 这一套；
+#     official = AIA 官方代理（LLM_KEY），与比赛当天完全一致。
+# - local（备选）：本机联调网关 MC_LOCAL_API_BASE（默认 127.0.0.1:8787 → 队内测试服），角色名随意，模型用 custom。
 # 工位 B 的金丝雀验修始终在自建测试服跑，不占比赛账号。
 OFFICIAL_MC_BASE = "https://mc-api.windywindie.top/api/v1"
+DEFAULT_LOCAL_MC_BASE = "http://127.0.0.1:8787/api/v1"
 SERVER_TARGETS: dict[str, str] = {
-    "local": "自建测试服（本机联调网关 → 队内测试服）",
     "official": "比赛服（官方端点 mc-api.windywindie.top，用队伍正式账号）",
+    "local": "自建测试服（本机联调网关 → 队内测试服）",
+}
+OFFICIAL_LLM_SOURCES: dict[str, str] = {
+    "custom": "赛前训练：自备 key（LLM_CUSTOM_*，如并行云 DeepSeek-V4.1-Flash）",
+    "official": "比赛同款：AIA 官方代理（LLM_KEY）",
 }
 # 前端下拉用的已知玩家模型（并行云 custom 通道实测过；也可以手填别的名字）
 PLAYER_MODEL_CHOICES: dict[str, str] = {
@@ -183,24 +190,36 @@ def _read_dotenv_keys(repo_root: Path) -> dict[str, str]:
             vals[k.strip()] = v.strip().strip('"').strip("'")
     except OSError:
         pass
-    for k in ("MC_USER", "MC_PASS", "LLM_KEY"):
+    for k in ("MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE"):
         if os.environ.get(k):
             vals[k] = os.environ[k]
     return vals
 
 
-def check_server_target(repo_root: Path, server: str, *, use_llm: bool, account_reserved: bool) -> list[str]:
+def local_mc_base(repo_root: Path) -> str:
+    """自建测试服网关地址：MC_LOCAL_API_BASE，未设时用 127.0.0.1:8787。"""
+    return _read_dotenv_keys(repo_root).get("MC_LOCAL_API_BASE") or DEFAULT_LOCAL_MC_BASE
+
+
+def check_server_target(
+    repo_root: Path, server: str, *, use_llm: bool, account_reserved: bool, official_llm: str = "custom"
+) -> list[str]:
     """启动前核对目标服务器的前置条件，返回中文问题清单（空表示可以启动）。不输出任何密钥值。"""
     if server not in SERVER_TARGETS:
         return [f"未知服务器 {server!r}（可选：{', '.join(SERVER_TARGETS)}）"]
+    env = _read_dotenv_keys(repo_root)
+    custom_ok = bool(env.get("LLM_CUSTOM_BASE") and env.get("LLM_CUSTOM_KEY"))
     if server == "local":
         return []
+    if official_llm not in OFFICIAL_LLM_SOURCES:
+        return [f"未知模型来源 {official_llm!r}（可选：{', '.join(OFFICIAL_LLM_SOURCES)}）"]
     errs: list[str] = []
-    env = _read_dotenv_keys(repo_root)
     if not (env.get("MC_USER") and env.get("MC_PASS")):
         errs.append("code/mcagent/.env 缺队伍正式账号 MC_USER / MC_PASS")
-    if use_llm and not env.get("LLM_KEY"):
-        errs.append("比赛服只能用官方模型（LLM_PROFILE=official），但 .env 没填 LLM_KEY；填上 key，或关掉 LLM 用纯规则跑")
+    if use_llm and official_llm == "official" and not env.get("LLM_KEY"):
+        errs.append("选了 AIA 官方代理，但 .env 没填 LLM_KEY；改用自备 key 训练，或关掉 LLM 用纯规则跑")
+    if use_llm and official_llm == "custom" and not custom_ok:
+        errs.append("选了自备 key 训练，但 .env 缺 LLM_CUSTOM_BASE / LLM_CUSTOM_KEY")
     if not account_reserved:
         errs.append("比赛账号是全队独占资源：先在 docs/05 账号表占位，再确认「已占位」（AGENTS.md §3）")
     return errs
@@ -1155,6 +1174,8 @@ def verify_and_promote(
                 "--disconnect-on-exit",
             ]
         canary_env = _uv_env(fixer_wt, player_model=(st_snap.get("player_model") or "").strip())
+        canary_env["MC_API_BASE"] = local_mc_base(Path(st_snap["repo_root"]))  # 金丝雀永远在自建测试服，不占比赛账号
+        canary_env.pop("MCAGENT_TRAIN_ON_OFFICIAL", None)
         proc = subprocess.run(cmd, cwd=str(code_dir), env=canary_env, capture_output=True, text=True, timeout=int(canary_max_seconds + 45))
         (attempt_dir / "gate3_live_canary.log").write_text(
             (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
@@ -1216,9 +1237,12 @@ def run_runner_loop(
     target_goal: str = "",
     player_model: Optional[str] = None,
     server: str = "local",
+    official_llm: str = "custom",
 ) -> list[dict[str, Any]]:
     if server not in SERVER_TARGETS:
         raise ValueError(f"未知服务器 {server!r}")
+    if official_llm not in OFFICIAL_LLM_SOURCES:
+        raise ValueError(f"未知模型来源 {official_llm!r}")
     results: list[dict[str, Any]] = []
     if (target_goal or "").strip() or player_model is not None:
         with locked_state(session_dir) as st_init:
@@ -1289,14 +1313,24 @@ def run_runner_loop(
         print(
             f"[runner] 启动 {ep_id} @ {tip_sha[:7]} "
             f"(server={server}, bot={bot_user}, "
-            f"model={('official' if server == 'official' else (active_model or 'env')) if use_llm else 'rule'}, "
+            f"model={('AIA官方代理' if (server == 'official' and official_llm == 'official') else (active_model or 'env')) if use_llm else 'rule'}, "
             f"goal={active_goal or 'all'}, max={ep_seconds:g}s/{ep_steps} 步)..."
         )
-        run_env = _uv_env(runner_wt, player_model=active_model if (use_llm and server == "local") else "")
+        use_custom = use_llm and not (server == "official" and official_llm == "official")
+        run_env = _uv_env(runner_wt, player_model=active_model if use_custom else "")
+        run_env.pop("MCAGENT_TRAIN_ON_OFFICIAL", None)
         if server == "official":
             run_env["MC_API_BASE"] = OFFICIAL_MC_BASE
-            run_env["LLM_PROFILE"] = "official"
-            run_env.pop("LLM_CUSTOM_MODEL", None)
+            if use_llm and official_llm == "official":
+                run_env["LLM_PROFILE"] = "official"
+                run_env.pop("LLM_CUSTOM_MODEL", None)
+            elif use_llm:
+                run_env["LLM_PROFILE"] = "custom"
+                run_env["MCAGENT_TRAIN_ON_OFFICIAL"] = "1"
+        else:
+            run_env["MC_API_BASE"] = local_mc_base(Path(st["repo_root"]))
+            if use_llm:
+                run_env["LLM_PROFILE"] = "custom"
         subprocess.run(
             cmd,
             cwd=str(runner_wt / "code"),
@@ -1558,7 +1592,8 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
         f"- **工位 A 服务器**：`{SERVER_TARGETS.get(st.get('server_target') or 'local', st.get('server_target'))}`",
-        f"- **玩家操控模型（工位 A）**：`{'官方模型（LLM_PROFILE=official）' if st.get('server_target') == 'official' else (st.get('player_model') or '沿用 .env')}`",
+        f"- **玩家操控模型（工位 A）**：`{'AIA 官方代理（LLM_PROFILE=official）' if (st.get('server_target') == 'official' and st.get('official_llm') == 'official') else (st.get('player_model') or '沿用 .env')}`"
+        + ("（比赛服赛前训练，自备 key）" if (st.get("server_target") == "official" and st.get("official_llm", "custom") == "custom") else ""),
         f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
@@ -1735,6 +1770,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run_ep.add_argument("--fixed-user", action="store_true", help="不按轮次轮换角色名")
     p_run_ep.add_argument("--server", choices=tuple(SERVER_TARGETS), default="local",
                           help="工位 A 进哪个服务器：local 自建测试服 | official 比赛服")
+    p_run_ep.add_argument("--official-llm", choices=tuple(OFFICIAL_LLM_SOURCES), default="custom",
+                          help="比赛服上的模型来源：custom 自备 key 训练 | official AIA 官方代理")
     p_run_ep.add_argument("--goal", default="", help="覆盖会话级聚焦目标 goal_id")
     p_run_ep.add_argument("--player-model", default=None, help="覆盖会话级工位 A 玩家模型名")
     p_run_ep.add_argument(
@@ -1796,8 +1833,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument(
         "--server",
         choices=tuple(SERVER_TARGETS),
-        default="local",
-        help="工位 A 进哪个服务器：local 自建测试服（默认）| official 比赛服（正式账号 + 官方模型，须先在 docs/05 占位）",
+        default="official",
+        help="工位 A 进哪个服务器：official 比赛服（默认，队伍正式账号，须先在 docs/05 占位并加 --account-reserved）| local 自建测试服",
+    )
+    p_dual.add_argument(
+        "--official-llm",
+        choices=tuple(OFFICIAL_LLM_SOURCES),
+        default="custom",
+        help="比赛服上的模型来源：custom 自备 key 赛前训练（默认）| official AIA 官方代理（比赛同款，需 LLM_KEY）",
     )
     p_dual.add_argument(
         "--account-reserved",
@@ -1906,6 +1949,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_goal=args.goal,
             player_model=args.player_model,
             server=args.server,
+            official_llm=args.official_llm,
         )
         return 0
 
@@ -1954,7 +1998,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         repo_root = find_repo_root()
         server_errs = check_server_target(
-            repo_root, args.server, use_llm=args.llm, account_reserved=args.account_reserved
+            repo_root, args.server, use_llm=args.llm, account_reserved=args.account_reserved,
+            official_llm=args.official_llm,
         )
         if server_errs:
             for msg in server_errs:
@@ -1971,6 +2016,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         (session_dir / "STOP").unlink(missing_ok=True)
         with locked_state(session_dir) as st_fx:
             st_fx["server_target"] = args.server
+            st_fx["official_llm"] = args.official_llm
             if args.fixer_cmd:
                 st_fx.pop("fixer_preset", None)
             else:
@@ -1985,6 +2031,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--episode-steps", str(args.episode_steps),
             "--user-prefix", bot_user,
             "--server", args.server,
+            "--official-llm", args.official_llm,
         ]
         if not args.rotate_user:
             runner_cmd.append("--fixed-user")
@@ -2043,6 +2090,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "player_model": st.get("player_model", ""),
             "fixer_preset": st.get("fixer_preset", ""),
             "server_target": st.get("server_target", "local"),
+            "official_llm": st.get("official_llm", "custom"),
             "episode_budget_override": {
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),

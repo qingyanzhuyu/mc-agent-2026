@@ -355,7 +355,8 @@ class Console:
             "skip_live_canary": False,
             "bot_user": soak_ctl.DEFAULT_BOT_USER,
             "rotate_user": False,
-            "server": "local",
+            "server": "official",
+            "official_llm": "custom",
             "account_reserved": False,
         }
         p = self.session_dir / LAST_START_NAME
@@ -426,6 +427,7 @@ class Console:
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
                 "server_target": st.get("server_target", "local"),
+                "official_llm": st.get("official_llm", "custom"),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
@@ -458,9 +460,13 @@ class Console:
             ],
             "player_models": [{"name": k, "note": v} for k, v in soak_ctl.PLAYER_MODEL_CHOICES.items()],
             "servers": [{"key": k, "label": v} for k, v in soak_ctl.SERVER_TARGETS.items()],
+            "official_llm_sources": [{"key": k, "label": v} for k, v in soak_ctl.OFFICIAL_LLM_SOURCES.items()],
             # 比赛服前置检查（占位确认另算），页面据此提前提示；只给「缺什么」，不含任何值
             "official_checks": {
-                "with_llm": soak_ctl.check_server_target(self.repo_root, "official", use_llm=True, account_reserved=True),
+                "custom": soak_ctl.check_server_target(self.repo_root, "official", use_llm=True,
+                                                       account_reserved=True, official_llm="custom"),
+                "official": soak_ctl.check_server_target(self.repo_root, "official", use_llm=True,
+                                                         account_reserved=True, official_llm="official"),
                 "rules_only": soak_ctl.check_server_target(self.repo_root, "official", use_llm=False, account_reserved=True),
             },
             "bounds": {
@@ -579,10 +585,12 @@ class Console:
         p["skip_live_canary"] = bool(p["skip_live_canary"])
         p["bot_user"] = soak_ctl.validate_bot_user(str(p["bot_user"]))
         p["rotate_user"] = bool(p["rotate_user"])
-        p["server"] = str(p["server"] or "local")
+        p["server"] = str(p["server"] or "official")
+        p["official_llm"] = str(p["official_llm"] or "custom")
         p["account_reserved"] = bool(p["account_reserved"])
         errs = soak_ctl.check_server_target(
-            self.repo_root, p["server"], use_llm=p["llm"], account_reserved=p["account_reserved"]
+            self.repo_root, p["server"], use_llm=p["llm"], account_reserved=p["account_reserved"],
+            official_llm=p["official_llm"],
         )
         if errs:
             raise ValueError("；".join(errs))
@@ -604,7 +612,7 @@ class Console:
         ]
         if p["rotate_user"]:
             cmd.append("--rotate-user")
-        cmd.extend(["--server", p["server"]])
+        cmd.extend(["--server", p["server"], "--official-llm", p["official_llm"]])
         if p["server"] == "official" and p["account_reserved"]:
             cmd.append("--account-reserved")
         if p["goal"]:

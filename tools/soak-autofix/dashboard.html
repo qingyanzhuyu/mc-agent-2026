@@ -135,6 +135,7 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
       <div class="grid2">
         <label class="f wide">工位 A 进哪个服务器<select id="sServer"></select></label>
         <div class="wide hidden" id="officialBox">
+          <label class="f" style="margin-bottom:6px">比赛服上的模型来源<select id="sOfficialLlm"></select></label>
           <div class="banner warn" id="officialWarn" style="margin:0 0 6px"></div>
           <label class="f inline"><input type="checkbox" id="sAck">已在 docs/05 账号表占位比赛账号（每次启动都要勾）</label>
         </div>
@@ -307,16 +308,22 @@ function fillForms(s) {
   $("sBot").value = d.bot_user; $("sRotate").checked = !!d.rotate_user;
   $("sServer").innerHTML = s.servers.map((x) => `<option value="${esc(x.key)}">${esc(x.label)}</option>`).join("");
   $("sServer").value = d.server; $("sAck").checked = false;
+  $("sOfficialLlm").innerHTML = s.official_llm_sources.map((x) => `<option value="${esc(x.key)}">${esc(x.label)}</option>`).join("");
+  $("sOfficialLlm").value = d.official_llm;
   syncServerForm();
 }
 
 function syncServerForm() {
   const official = $("sServer").value === "official";
+  const aia = official && $("sOfficialLlm").value === "official";
   $("officialBox").classList.toggle("hidden", !official);
-  for (const id of ["sBot", "sRotate", "sModel"]) $(id).disabled = official;
+  for (const id of ["sBot", "sRotate"]) $(id).disabled = official;
+  $("sModel").disabled = aia;
   if (!official || !snap) return;
-  const checks = $("sLlm").checked ? snap.official_checks.with_llm : snap.official_checks.rules_only;
-  const base = "比赛服只能用 .env 里的队伍正式账号（角色名、轮换不生效），模型固定官方模型（玩家模型不生效）；修单验证仍在自建测试服。";
+  const checks = !$("sLlm").checked ? snap.official_checks.rules_only : snap.official_checks[$("sOfficialLlm").value];
+  const base = aia
+    ? "比赛服 + AIA 官方代理：与比赛当天完全一致（玩家模型不生效）。只能用 .env 里的队伍正式账号；修单验证仍在自建测试服。"
+    : "比赛服赛前训练：队伍正式账号 + 自备 key 的玩家模型（比赛当天 preflight 会拦，必须切回官方代理）。角色名、轮换不生效；修单验证仍在自建测试服。";
   $("officialWarn").textContent = checks.length ? `${base} 还不能启动：${checks.join("；")}` : base;
   $("officialWarn").className = `banner ${checks.length ? "bad" : "warn"}`;
 }
@@ -329,7 +336,7 @@ function startParams() {
     llm: $("sLlm").checked, player_model: $("sModel").value.trim(),
     fixer_preset: $("sFixer").value, skip_live_canary: $("sSkipCanary").checked,
     bot_user: $("sBot").value.trim(), rotate_user: $("sRotate").checked,
-    server: $("sServer").value, account_reserved: $("sAck").checked,
+    server: $("sServer").value, account_reserved: $("sAck").checked, official_llm: $("sOfficialLlm").value,
   };
 }
 
@@ -340,7 +347,7 @@ function renderHeader(s) {
   pill.className = `pill ${cls}`; pill.textContent = txt;
   const st = s.state;
   const pids = s.processes.map((p) => `${p.role}:${p.pid}`).join(" ");
-  const srv = st.server_target === "official" ? "比赛服" : "自建测试服";
+  const srv = st.server_target === "official" ? (st.official_llm === "official" ? "比赛服·官方代理" : "比赛服·训练") : "自建测试服";
   $("headMeta").textContent = s.session_exists
     ? `[${srv}] ${st.target_branch} @ ${st.current_tip}（基线 ${st.base_commit}，自动修复 ${st.commits} 个）${pids ? " · " + pids : ""}`
     : `会话 ${s.session_dir} 尚未初始化`;
@@ -368,7 +375,7 @@ function renderSettingsNote(s) {
     ? `热覆盖：${st.episode_seconds != null ? fmtS(st.episode_seconds) : "沿用启动参数"} / ${st.episode_steps != null ? st.episode_steps + " 步" : "沿用启动参数"}`
     : "未设热覆盖，沿用启动参数";
   const cur = live && !live.finished ? `；正在跑的 ${live.ep_id} 上限 ${fmtS(live.max_seconds)} / ${live.max_steps} 步` : "";
-  const pm = st.server_target === "official" ? "官方模型（比赛服固定）" : (st.player_model || "沿用 .env");
+  const pm = (st.server_target === "official" && st.official_llm === "official") ? "AIA 官方代理（比赛同款）" : (st.player_model || "沿用 .env");
   $("effNote").textContent = `${ov}；聚焦目标：${st.target_goal || "全部"}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${cur}`;
 }
 
@@ -472,6 +479,7 @@ async function refreshLog() {
 // ---- 交互 ----
 $("sServer").addEventListener("change", syncServerForm);
 $("sLlm").addEventListener("change", syncServerForm);
+$("sOfficialLlm").addEventListener("change", syncServerForm);
 $("secRange").addEventListener("input", (e) => { $("secIn").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
 $("secIn").addEventListener("input", (e) => { $("secRange").value = e.target.value; $("secOut").textContent = fmtS(Number(e.target.value)); });
 

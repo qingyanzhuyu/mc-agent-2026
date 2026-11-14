@@ -255,7 +255,8 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
              patch.object(soak_ctl, "init_session", return_value={}), \
              patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda cmd, **kw: (spawned_cmds.append(list(cmd)), DummyProc())[1]):
-            rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/soak-llm", "--episodes", "1", "--llm"])
+            rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/soak-llm", "--episodes", "1", "--llm",
+                                "--server", "local"])
         self.assertEqual(rc, 0)
         runner_invocations = [c for c in spawned_cmds if "runner-loop" in c]
         self.assertEqual(len(runner_invocations), 1)
@@ -768,6 +769,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
              patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda c, **kw: (spawned_dual.append(list(c)), DummyProc())[1]):
             rc_dual = soak_ctl.main([
                 "run",
+                "--server", "local",
                 "--session-dir", str(self.session),
                 "--branch", "feat/goal-telemetry",
                 "--goal", "smelt_iron",
@@ -912,6 +914,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
              patch.object(soak_ctl.subprocess, "Popen", side_effect=lambda c, **kw: (spawned.append(list(c)), DummyProc())[1]):
             rc = soak_ctl.main([
                 "run",
+                "--server", "local",
                 "--session-dir", str(self.session),
                 "--branch", "feat/agy-preset",
                 "--fixer-preset", "agy",
@@ -1078,7 +1081,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
                  patch.object(soak_ctl.subprocess, "Popen",
                               side_effect=lambda cmd, **kw: (spawned.append(list(cmd)), DummyProc())[1]):
                 rc = soak_ctl.main(["run", "--session-dir", str(self.session), "--branch", "feat/fixed-bot",
-                                    "--episodes", "1", *extra])
+                                    "--episodes", "1", "--server", "local", *extra])
             self.assertEqual(rc, 0)
             return next(c for c in spawned if "runner-loop" in c)
 
@@ -1206,10 +1209,17 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
             self.assertEqual(len(errs), 3)  # 缺账号、缺 LLM_KEY、未占位
             env_file.write_text("MC_USER=team\nMC_PASS=secret\nLLM_KEY=\n", encoding="utf-8")
             errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True)
-            self.assertEqual(len(errs), 1)
+            self.assertEqual(len(errs), 1)  # 默认自备 key 训练，缺 LLM_CUSTOM_*
+            self.assertIn("LLM_CUSTOM_KEY", errs[0])
+            errs = soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True,
+                                                official_llm="official")
             self.assertIn("LLM_KEY", errs[0])
             self.assertNotIn("secret", " ".join(errs))
             self.assertEqual(soak_ctl.check_server_target(self.repo, "official", use_llm=False, account_reserved=True), [])
+            env_file.write_text("MC_USER=team\nMC_PASS=secret\nLLM_CUSTOM_BASE=https://x/v1\nLLM_CUSTOM_KEY=k\n"
+                                "MC_LOCAL_API_BASE=http://10.0.0.5:8787/api/v1\n", encoding="utf-8")
+            self.assertEqual(soak_ctl.check_server_target(self.repo, "official", use_llm=True, account_reserved=True), [])
+            self.assertEqual(soak_ctl.local_mc_base(self.repo), "http://10.0.0.5:8787/api/v1")
 
             soak_ctl.init_session(self.repo, self.session, target_branch="feat/server")
             with patch.object(soak_ctl, "find_repo_root", return_value=self.repo):
@@ -1252,21 +1262,37 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
             return real_run(cmd, *args, **kwargs)
 
-        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner), \
+             patch.dict(os.environ, {"MCAGENT_TRAIN_ON_OFFICIAL": "1"}):
+            soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="official",
+                                     official_llm="official", player_model="DeepSeek-V4.1-Flash")
             soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="official",
                                      player_model="DeepSeek-V4.1-Flash")
             soak_ctl.run_runner_loop(self.session, episodes=1, use_llm=True, server="local",
                                      user_prefix="me_soak", rotate_user=False, player_model="DeepSeek-V4.1-Flash")
-        (off_cmd, off_env), (loc_cmd, loc_env) = seen
-        self.assertNotIn("--user", off_cmd)
-        self.assertNotIn("--local-target", off_cmd)
-        self.assertIn("--live", off_cmd)
-        self.assertEqual(off_env["MC_API_BASE"], soak_ctl.OFFICIAL_MC_BASE)
-        self.assertEqual(off_env["LLM_PROFILE"], "official")
-        self.assertNotIn("LLM_CUSTOM_MODEL", off_env)
+        (aia_cmd, aia_env), (trn_cmd, trn_env), (loc_cmd, loc_env) = seen
+        for cmd in (aia_cmd, trn_cmd):
+            self.assertNotIn("--user", cmd)
+            self.assertNotIn("--local-target", cmd)
+            self.assertIn("--live", cmd)
+            self.assertIn("--soak", cmd)
+        # 比赛服 + AIA 官方代理：与比赛当天一致，训练开关被剥掉
+        self.assertEqual(aia_env["MC_API_BASE"], soak_ctl.OFFICIAL_MC_BASE)
+        self.assertEqual(aia_env["LLM_PROFILE"], "official")
+        self.assertNotIn("LLM_CUSTOM_MODEL", aia_env)
+        self.assertNotIn("MCAGENT_TRAIN_ON_OFFICIAL", aia_env)
+        # 比赛服 + 自备 key 训练（默认）：custom 模型 + 训练开关
+        self.assertEqual(trn_env["MC_API_BASE"], soak_ctl.OFFICIAL_MC_BASE)
+        self.assertEqual((trn_env["LLM_PROFILE"], trn_env["LLM_CUSTOM_MODEL"]), ("custom", "DeepSeek-V4.1-Flash"))
+        self.assertEqual(trn_env["MCAGENT_TRAIN_ON_OFFICIAL"], "1")
+        # 自建测试服：显式指向本地网关，不带训练开关
         self.assertIn("--local-target", loc_cmd)
         self.assertEqual(loc_cmd[loc_cmd.index("--user") + 1], "me_soak")
+        self.assertEqual(loc_env["MC_API_BASE"], soak_ctl.local_mc_base(self.repo))
         self.assertEqual(loc_env.get("LLM_CUSTOM_MODEL"), "DeepSeek-V4.1-Flash")
+        self.assertNotIn("MCAGENT_TRAIN_ON_OFFICIAL", loc_env)
+        with self.assertRaises(ValueError):
+            soak_ctl.run_runner_loop(self.session, episodes=1, server="official", official_llm="moon")
         with self.assertRaises(ValueError):
             soak_ctl.run_runner_loop(self.session, episodes=1, server="moon")
         soak_ctl.teardown_session(self.session)
