@@ -40,7 +40,7 @@ class ScoutAccountingTests(unittest.TestCase):
         _COOLDOWN.clear()
 
     def incidents(self):
-        return [json.loads(p.read_text()) for p in sorted(Path(self.tmp.name, "incidents").glob("*.json"))]
+        return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(Path(self.tmp.name, "incidents").glob("*.json"))]
 
     def scout(self, error_code="", *, postcondition_error=""):
         self.world.nav_error = error_code
@@ -88,7 +88,7 @@ class ScoutAccountingTests(unittest.TestCase):
         stats = self.obs.skill_stats["scout_island"]
         self.assertEqual((stats["started"], stats["ok"], stats["replan"], stats["budget_stopped"]), (4, 1, 2, 1))
         self.assertNotIn("scout_island:budget_stopped", self.obs.env_variance_counts)
-        timeline = [json.loads(line) for line in Path(self.tmp.name, "timeline.jsonl").read_text().splitlines()]
+        timeline = [json.loads(line) for line in Path(self.tmp.name, "timeline.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual([r["outcome"] for r in timeline if r["event"] == "skill_end"],
                          ["replan", "replan", "completed", "budget_stopped"])
 

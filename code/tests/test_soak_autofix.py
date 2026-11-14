@@ -105,11 +105,11 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         # 1) 模拟第 1 轮挂机同时产出 P2 strategy 与 P1 bug 两张单
         ep1 = self.session / "episodes" / "ep-0001"
         (ep1 / "incidents").mkdir(parents=True)
-        (ep1 / "progress_curve.jsonl").write_text(json.dumps({"server_score_v2": 15, "inferred_score_v2": 20}) + "\n")
+        (ep1 / "progress_curve.jsonl").write_text(json.dumps({"server_score_v2": 15, "inferred_score_v2": 20}) + "\n", encoding="utf-8")
         (ep1 / "timeline.jsonl").write_text(
             json.dumps({"event": "skill_end", "outcome": "completed"}) + "\n"
             + json.dumps({"event": "run_end", "elapsed_s": 60.0}) + "\n"
-        )
+        , encoding="utf-8")
         inc_p2 = {
             "incident_id": "INC-001",
             "fingerprint": "REPLAN_OSCILLATION:scout_island",
@@ -191,7 +191,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
 
         # Runner 轮次边界原子热切换到新 commit，无需改主工作区
         _git(runner_wt, "checkout", "--detach", _git(self.repo, "rev-parse", "refs/heads/feat/soak-autofix"))
-        self.assertIn("250", (runner_wt / "code" / "mcagent" / "loop" / "starter_skills.py").read_text())
+        self.assertIn("250", (runner_wt / "code" / "mcagent" / "loop" / "starter_skills.py").read_text(encoding="utf-8"))
 
         # 5) 模拟第 2 轮挂机在该新提交上触发了新 P0 bug -> 自动在 feat/soak-autofix 上 git revert 回滚！
         ep2 = self.session / "episodes" / "ep-0002"
@@ -214,7 +214,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         reverted_tip = _git(self.repo, "rev-parse", "refs/heads/feat/soak-autofix")
         self.assertNotEqual(reverted_tip, new_sha)
         _git(runner_wt, "checkout", "--detach", reverted_tip)
-        self.assertIn("40", (runner_wt / "code" / "mcagent" / "loop" / "starter_skills.py").read_text())
+        self.assertIn("40", (runner_wt / "code" / "mcagent" / "loop" / "starter_skills.py").read_text(encoding="utf-8"))
 
         # 6) teardown 卸载临时双 worktree，但保留 feat/soak-autofix 分支与 REVIEW_REPORT.md
         report_path = soak_ctl.teardown_session(self.session)
