@@ -987,6 +987,80 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertEqual(st_reinit["incidents"]["orphan_fp"]["status"], "pending")
         soak_ctl.teardown_session(self.session)
 
+    def test_set_goal_hot_episode_budget_override_bounds_and_clear(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/ep-budget")
+
+        # 1) 越界与互斥参数在合入前直接拒绝，不写 state.json
+        for kwargs in (
+            {"episode_seconds": 10.0},
+            {"episode_seconds": 99999.0},
+            {"episode_steps": 0},
+            {"episode_steps": 5000},
+            {"clear_episode_budget": True, "episode_steps": 60},
+        ):
+            res = soak_ctl.inject_and_set_goal(self.session, **kwargs)
+            self.assertFalse(res["ok"], kwargs)
+            self.assertEqual(res["failed_step"], "invalid_episode_budget")
+        st0 = soak_ctl.read_state(self.session)
+        self.assertNotIn("episode_seconds", st0)
+        self.assertNotIn("episode_steps", st0)
+
+        # 2) 持续运行的 runner：第 1 轮沿用启动参数，轮间热改后第 2 轮生效，清除后第 3 轮回到启动参数
+        seen: list[tuple[str, str]] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                seen.append((cmd[cmd.index("--max-seconds") + 1], cmd[cmd.index("--max-steps") + 1]))
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 5.0, "source": "local-target"}) + "\n",
+                    encoding="utf-8",
+                )
+                if len(seen) == 1:
+                    ok = soak_ctl.inject_and_set_goal(self.session, episode_seconds=420, episode_steps=80)
+                    self.assertTrue(ok["ok"])
+                    self.assertEqual(
+                        ok["episode_budget_override"], {"episode_seconds": 420.0, "episode_steps": 80}
+                    )
+                elif len(seen) == 2:
+                    self.assertTrue(soak_ctl.inject_and_set_goal(self.session, clear_episode_budget=True)["ok"])
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(
+                self.session, episodes=3, episode_seconds=240.0, episode_steps=45, use_llm=False
+            )
+        self.assertEqual(seen, [("240.0", "45"), ("420.0", "80"), ("240.0", "45")])
+
+        # 3) 只改一项时另一项沿用启动参数；报告与 CLI 透传
+        self.assertTrue(soak_ctl.inject_and_set_goal(self.session, episode_steps=120)["ok"])
+        self.assertEqual(
+            soak_ctl.effective_episode_budget(soak_ctl.read_state(self.session), 240.0, 45), (240.0, 120)
+        )
+        report_txt = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("每轮时长/步数热覆盖", report_txt)
+        self.assertIn("120 步", report_txt)
+
+        # 4) 手改 state.json 写入非法值时 runner 不崩，回落启动参数
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["episode_seconds"] = "abc"
+        self.assertEqual(
+            soak_ctl.effective_episode_budget(soak_ctl.read_state(self.session), 240.0, 45), (240.0, 45)
+        )
+
+        with patch.object(soak_ctl, "inject_and_set_goal", return_value={"ok": True}) as mock_inj:
+            rc = soak_ctl.main([
+                "set-goal", "--session-dir", str(self.session),
+                "--goal", "smelt_iron", "--episode-seconds", "420", "--episode-steps", "80",
+            ])
+        self.assertEqual(rc, 0)
+        kw = mock_inj.call_args.kwargs
+        self.assertEqual((kw["episode_seconds"], kw["episode_steps"], kw["clear_episode_budget"]), (420.0, 80, False))
+        soak_ctl.teardown_session(self.session)
+
 
 if __name__ == "__main__":
     unittest.main()
