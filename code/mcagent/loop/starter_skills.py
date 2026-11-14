@@ -140,10 +140,46 @@ def can_afford_gear(state: "State", item: str, *, assume_no_table: bool = True) 
         return False
     sticks = state.count("stick")
     missing_sticks = max(0, s_need - sticks)
-    planks_for_sticks = math.ceil(missing_sticks / 4) * 2
-    table_planks = 0 if (state.count("crafting_table") >= 1 or not assume_no_table) else 4
-    potential_planks = total_planks(state) + total_logs(state) * 4
-    return potential_planks >= (p_need + planks_for_sticks + table_planks)
+    recipes = ([2] * math.ceil(missing_sticks / 4)
+               + ([4] if state.count("crafting_table") < 1 and assume_no_table else [])
+               + ([p_need] if p_need else []))
+    # ep-0087 local-target 拒绝了 2 birch + 1 oak 合木镐；官方是否接受混种未确认。
+    # 保守按每次配方同种备料，并覆盖网关可能选择的任意可用树种，避免再次空转。
+    potential = tuple(state.count(p) + state.count(lg) * 4
+                      for p, lg in zip(ALL_PLANKS, ALL_LOGS))
+
+    def payable(stacks: tuple[int, ...], remaining: list[int]) -> bool:
+        if not remaining:
+            return True
+        need = remaining[0]
+        choices = [i for i, count in enumerate(stacks) if count >= need]
+        return bool(choices) and all(
+            payable(tuple(count - need if j == i else count
+                          for j, count in enumerate(stacks)), remaining[1:])
+            for i in choices
+        )
+
+    return payable(potential, recipes)
+
+
+def _prepare_recipe_planks(ex: "Executor", state: "State", needed: int,
+                           target: str) -> Iterator[dict]:
+    """每次配方前现查同种木板；最多 needed 次有进展的转化，动作后立即让出。"""
+    for _ in range(needed):
+        if max(state.count(p) for p in ALL_PLANKS) >= needed:
+            return
+        logs = [lg for lg in ALL_LOGS if state.count(lg) > 0]
+        if not logs:
+            raise Replan(f"合成 {target} 同种木板不足：单次需 {needed}，需补充原木")
+        log_item = max(logs, key=lambda lg: (state.count(_planks_for_log(lg)), state.count(lg)))
+        plank_item = _planks_for_log(log_item)
+        before = state.count(plank_item)
+        yield rec("craft", ex.craft(plank_item, 1), item=plank_item)
+        state.refresh_inventory(ex.client)
+        if state.count(plank_item) <= before:
+            raise Replan(f"合成 {plank_item} 后木板未增加，停止准备 {target}")
+    if max(state.count(p) for p in ALL_PLANKS) < needed:
+        raise Replan(f"合成 {target} 同种木板仍不足：单次需 {needed}，停止转化原木")
 
 
 @register
@@ -422,26 +458,20 @@ class CraftGear(Skill):
             break
         need_table = not table_ready and state.count("crafting_table") < 1
 
-        missing_sticks = max(0, s_need - state.count("stick"))
-        planks_needed = p_need + math.ceil(missing_sticks / 4) * 2 + (4 if need_table else 0)
-
-        while total_planks(state) < planks_needed:
-            # 优先转化存量最多的同种原木，避免杂木森林里木板分散成不同树种无法拼满单配方
-            avail_logs = [(state.count(lg), lg) for lg in ALL_LOGS if state.count(lg) >= 1]
-            if not avail_logs:
-                raise Replan(f"合成 {target} 木板不足：需 {planks_needed}，现 {total_planks(state)}")
-            avail_logs.sort(reverse=True)
-            log_item = avail_logs[0][1]
-            plank_item = _planks_for_log(log_item)
-            yield rec("craft", ex.craft(plank_item, 1), item=plank_item)
-            state.refresh_inventory(ex.client)
+        if not can_afford_gear(state, target, assume_no_table=need_table):
+            raise Replan(f"合成 {target} 木板不足：同种材料无法完成木棍、工作台与目标配方，需补充原木")
 
         while state.count("stick") < s_need:
+            yield from _prepare_recipe_planks(ex, state, 2, "stick")
+            before_sticks = state.count("stick")
             yield rec("craft", ex.craft("stick", 1), item="stick")
             state.refresh_inventory(ex.client)
+            if state.count("stick") <= before_sticks:
+                raise Replan("合成 stick 后木棍未增加，停止准备工具")
 
         if not table_ready:
             if state.count("crafting_table") < 1:
+                yield from _prepare_recipe_planks(ex, state, 4, "crafting_table")
                 yield rec("craft", ex.craft("crafting_table", 1), item="crafting_table")
                 state.refresh_inventory(ex.client)
             try:
@@ -457,6 +487,7 @@ class CraftGear(Skill):
                     _mark_protected(state.pos)
                     raise Replan("当前位置处于出生点保护区，无法放置工作台") from e
                 raise
+        yield from _prepare_recipe_planks(ex, state, p_need, target)
         yield rec("craft", ex.craft(target, 1), item=target)
         state.refresh_inventory(ex.client)
 
