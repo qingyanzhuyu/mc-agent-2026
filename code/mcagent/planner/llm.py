@@ -53,6 +53,13 @@ CUSTOM_PROFILE = "custom"
 PROFILES = (OFFICIAL_PROFILE, CUSTOM_PROFILE)
 
 
+def _fast_disable_thinking_field(profile: str, model: str) -> tuple[str, dict[str, Any]]:
+    """返回快路径关闭思考的请求体字段名与值。"""
+    if profile == CUSTOM_PROFILE and "deepseek" in (model or "").lower():
+        return "thinking", {"type": "disabled"}
+    return "chat_template_kwargs", {"enable_thinking": False}
+
+
 def resolve_profile(profile: Optional[str] = None, env: Optional[dict] = None) -> dict:
     """按 `LLM_PROFILE` 取出一套模型配置：`{profile, base, key, model, proxy, names}`。
 
@@ -355,6 +362,7 @@ class LLMClient:
         proxy: Optional[str],
         deadline: float,
         *,
+        fast_field: Optional[str] = None,
         usage_out: Optional[dict[str, int]] = None,
     ) -> str:
         """在一条线路上发一次；custom 端点 400 拒收关思考字段时，去掉字段用剩余预算原线路重发一次。
@@ -366,14 +374,14 @@ class LLMClient:
             return self._post_once(url, headers, json.dumps(body), budget, proxy, usage_out=usage_out)
         except LLMError as e:
             if not (self.profile == CUSTOM_PROFILE and e.kind == "http" and e.status == 400
-                    and "chat_template_kwargs" in body):
+                    and fast_field and fast_field in body):
                 raise
             remaining = deadline - self._clock()
-            body.pop("chat_template_kwargs")
+            body.pop(fast_field)
             with self._lock:
                 self.drop_thinking_field = True
                 self.stats["thinking_field_dropped"] += 1
-            self._log(f"  [llm] custom 端点拒收 chat_template_kwargs（{e}），本进程之后不再发送该字段")
+            self._log(f"  [llm] custom 端点拒收 {fast_field}（{e}），本进程之后不再发送该字段")
             if remaining < MIN_FALLBACK_BUDGET_S:
                 raise
         return self._post_once(url, headers, json.dumps(body), remaining, proxy, usage_out=usage_out)
@@ -407,8 +415,10 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        fast_field: Optional[str] = None
         if not thinking and not self.drop_thinking_field:
-            body["chat_template_kwargs"] = {"enable_thinking": False}
+            fast_field, fast_val = _fast_disable_thinking_field(self.profile, self.model)
+            body[fast_field] = fast_val
 
         url = f"{self.base}/chat/completions"
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
@@ -427,7 +437,9 @@ class LLMClient:
             if i > 0 and budget < MIN_FALLBACK_BUDGET_S:
                 break
             try:
-                content = self._send(url, headers, body, budget, proxy, deadline, usage_out=usage_out)
+                content = self._send(
+                    url, headers, body, budget, proxy, deadline, fast_field=fast_field, usage_out=usage_out
+                )
             except LLMError as e:
                 error, failed_via = e, proxy
                 if proxy and e.route_fault:

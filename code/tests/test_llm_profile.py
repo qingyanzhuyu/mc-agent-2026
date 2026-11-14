@@ -175,6 +175,33 @@ class ThinkingFieldTests(unittest.TestCase):
         self.assertEqual(len(wire.calls), 1)
         self.assertFalse(c.drop_thinking_field)
 
+    def test_custom_deepseek_uses_thinking_disabled_and_drops_on_400(self):
+        ds_env = dict(CUSTOM_ENV, LLM_CUSTOM_MODEL="DeepSeek-V4.1-Flash")
+        calls: list[dict] = []
+
+        def reject_thinking_once(url, headers, data, timeout, proxy):
+            body = json.loads(data)
+            calls.append(body)
+            if "thinking" in body:
+                return 400, '{"error": {"message": "Unrecognized request argument: thinking"}}'
+            return ok_body()
+
+        wire_ok = Recorder()
+        with patch.dict(os.environ, ds_env, clear=True):
+            c_ok = LLMClient(log=None, poster=wire_ok)
+        self.assertEqual(c_ok.chat(MSG, timeout=5), '{"a": 1}')
+        self.assertEqual(wire_ok.calls[0]["body"].get("thinking"), {"type": "disabled"})
+        self.assertNotIn("chat_template_kwargs", wire_ok.calls[0]["body"])
+
+        # 若某第三方兼容网关拒收 thinking 回 400，也能自动剥离重发且后续不再带
+        with patch.dict(os.environ, ds_env, clear=True):
+            c_drop = LLMClient(log=None, poster=reject_thinking_once)
+        self.assertEqual(c_drop.chat(MSG, timeout=5), '{"a": 1}')
+        self.assertEqual(len(calls), 2)
+        self.assertIn("thinking", calls[0])
+        self.assertNotIn("thinking", calls[1])
+        self.assertTrue(c_drop.drop_thinking_field)
+
 
 class LoopGuardTests(unittest.TestCase):
     """MC 指向官方端点 + custom 模型：loop 在登录之前就拒绝（返回 2，不发任何请求）。"""
