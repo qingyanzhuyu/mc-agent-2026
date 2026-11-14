@@ -222,6 +222,19 @@ def read_state(session_dir: Path) -> dict[str, Any]:
         return json.loads(json.dumps(st))
 
 
+@contextlib.contextmanager
+def locked_fixer_wt(session_dir: Path) -> Iterator[None]:
+    """序列化对 fixer worktree 的独占访问，确保运行期 set-goal 热合入新目标时绝不与 fixer-loop 撞车。"""
+    session_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = session_dir / ".fixer_wt.lock"
+    with lock_path.open("a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -983,13 +996,17 @@ def run_runner_loop(
     target_goal: str = "",
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    if (target_goal or "").strip():
+        with locked_state(session_dir) as st_init:
+            if st_init:
+                st_init["target_goal"] = target_goal.strip()
     idx = 0
     while episodes <= 0 or idx < episodes:
         if (session_dir / "STOP").exists():
             print("[runner] 检测到 STOP 标志文件，安全退出挂机循环。")
             break
         st = read_state(session_dir)
-        active_goal = (target_goal or st.get("target_goal") or "").strip()
+        active_goal = (st.get("target_goal") or "").strip()
         if episodes <= 0 and active_goal:
             goal_inc = st.get("incidents", {}).get(f"GOAL_MISS:{active_goal}", {})
             if goal_inc.get("status") == "escalated_human":
@@ -1058,52 +1075,177 @@ def run_fixer_once(
     live_canary: bool = True,
     fixer_bot_user: str = "agy_soak_fixer",
 ) -> Optional[dict[str, Any]]:
-    claimed = claim_next_incident(session_dir)
-    if claimed is None:
-        return None
-    st = read_state(session_dir)
-    repo_root = Path(st["repo_root"])
-    fixer_wt = Path(st["fixer_wt"])
-    branch = st["target_branch"]
+    with locked_fixer_wt(session_dir):
+        claimed = claim_next_incident(session_dir)
+        if claimed is None:
+            return None
+        st = read_state(session_dir)
+        fixer_wt = Path(st["fixer_wt"])
+        branch = st["target_branch"]
 
-    # 确保 fixer 工位处于待审分支最新干净状态
+        # 确保 fixer 工位处于待审分支最新干净状态
+        _clean_fixer_worktree(fixer_wt)
+        _git(fixer_wt, "checkout", branch)
+
+        cmd_str = fixer_cmd_template.format(
+            fixer_wt=shlex.quote(str(fixer_wt)),
+            prompt_file=shlex.quote(str(claimed["prompt_file"])),
+            incident_file=shlex.quote(str(claimed["incident_path"])),
+            skill=shlex.quote(str(claimed.get("skill", ""))),
+        )
+        attempt_dir = Path(claimed["active_attempt_dir"])
+        print(f"[fixer] 认领 {claimed['incident_id']} ({claimed['fingerprint']}) -> 执行修复器...")
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", cmd_str],
+                cwd=str(fixer_wt),
+                env=_uv_env(fixer_wt),
+                capture_output=True,
+                text=True,
+                timeout=fixer_timeout_s,
+            )
+            (attempt_dir / "fixer_agent.log").write_text(
+                (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
+            )
+        except subprocess.TimeoutExpired:
+            _clean_fixer_worktree(fixer_wt)
+            return verify_and_promote(
+                session_dir, claimed["fingerprint"], live_canary=live_canary, fixer_bot_user=fixer_bot_user
+            )
+
+        res = verify_and_promote(
+            session_dir,
+            claimed["fingerprint"],
+            live_canary=live_canary,
+            fixer_bot_user=fixer_bot_user,
+        )
+        print(f"[fixer] 门禁结果 ({claimed['incident_id']}): {res}")
+        return res
+
+
+def _rollback_branch_in_fixer_wt(fixer_wt: Path, branch: str, prev_tip: str) -> None:
+    """无 git reset --hard 回退 fixer_wt 上的待审分支到 prev_tip。"""
     _clean_fixer_worktree(fixer_wt)
+    _git(fixer_wt, "checkout", "--detach", prev_tip)
+    _git(fixer_wt, "branch", "-f", branch, prev_tip)
     _git(fixer_wt, "checkout", branch)
 
-    cmd_str = fixer_cmd_template.format(
-        fixer_wt=shlex.quote(str(fixer_wt)),
-        prompt_file=shlex.quote(str(claimed["prompt_file"])),
-        incident_file=shlex.quote(str(claimed["incident_path"])),
-        skill=shlex.quote(str(claimed.get("skill", ""))),
-    )
-    attempt_dir = Path(claimed["active_attempt_dir"])
-    print(f"[fixer] 认领 {claimed['incident_id']} ({claimed['fingerprint']}) -> 执行修复器...")
-    try:
-        proc = subprocess.run(
-            ["bash", "-lc", cmd_str],
-            cwd=str(fixer_wt),
-            env=_uv_env(fixer_wt),
-            capture_output=True,
-            text=True,
-            timeout=fixer_timeout_s,
-        )
-        (attempt_dir / "fixer_agent.log").write_text(
-            (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
-        )
-    except subprocess.TimeoutExpired:
-        _clean_fixer_worktree(fixer_wt)
-        return verify_and_promote(
-            session_dir, claimed["fingerprint"], live_canary=live_canary, fixer_bot_user=fixer_bot_user
-        )
 
-    res = verify_and_promote(
-        session_dir,
-        claimed["fingerprint"],
-        live_canary=live_canary,
-        fixer_bot_user=fixer_bot_user,
-    )
-    print(f"[fixer] 门禁结果 ({claimed['incident_id']}): {res}")
-    return res
+def inject_and_set_goal(
+    session_dir: Path,
+    *,
+    merge_ref: str = "",
+    target_goal: Optional[str] = None,
+    max_goal_attempts: Optional[int] = None,
+    skip_offline_gate: bool = False,
+) -> dict[str, Any]:
+    """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。"""
+    with locked_fixer_wt(session_dir):
+        st_snap = read_state(session_dir)
+        claimed_fps = [
+            fp for fp, rec in st_snap.get("incidents", {}).items() if rec.get("status") == "claimed"
+        ]
+        if claimed_fps:
+            return {
+                "ok": False,
+                "failed_step": "fixer_busy",
+                "detail": f"当前有手动认领中的异常单 {claimed_fps}，请先完成 verify-and-promote 再热合入",
+            }
+
+        repo_root = Path(st_snap["repo_root"])
+        fixer_wt = Path(st_snap["fixer_wt"])
+        branch = st_snap["target_branch"]
+        prev_tip = _branch_tip(repo_root, branch)
+        merged_sha: Optional[str] = None
+        merged_files: list[str] = []
+
+        norm_ref = (merge_ref or "").strip()
+        if norm_ref:
+            ver = _git(repo_root, "rev-parse", "--verify", norm_ref, check=False)
+            if ver.returncode != 0:
+                return {
+                    "ok": False,
+                    "failed_step": "invalid_ref",
+                    "detail": f"无法解析 Git 引用 {norm_ref!r}: {(ver.stderr or ver.stdout).strip()}",
+                }
+            _clean_fixer_worktree(fixer_wt)
+            _git(fixer_wt, "checkout", branch)
+            mproc = _git(fixer_wt, "merge", "--no-ff", "--no-edit", norm_ref, check=False)
+            if mproc.returncode != 0:
+                _git(fixer_wt, "merge", "--abort", check=False)
+                _clean_fixer_worktree(fixer_wt)
+                return {
+                    "ok": False,
+                    "failed_step": "git_merge",
+                    "detail": (mproc.stderr or mproc.stdout).strip(),
+                }
+
+            cur_tip = _branch_tip(repo_root, branch)
+            if cur_tip != prev_tip:
+                diff_txt = _git(fixer_wt, "diff", f"{prev_tip}..{cur_tip}").stdout
+                secret_hits = scan_diff_for_secrets(diff_txt)
+                if secret_hits:
+                    _rollback_branch_in_fixer_wt(fixer_wt, branch, prev_tip)
+                    return {
+                        "ok": False,
+                        "failed_step": "gate1_secrets",
+                        "detail": f"检测到疑似敏感凭据片段: {secret_hits}",
+                    }
+
+                if not skip_offline_gate:
+                    code_dir = fixer_wt / "code"
+                    uv_env = _uv_env(fixer_wt)
+                    for step_name, cmd in (
+                        ("compileall", ["uv", "run", "python", "-m", "compileall", "-q", "mcagent", "tests"]),
+                        ("unittest", ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests"]),
+                        ("loop_dry", ["uv", "run", "python", "-m", "mcagent.loop", "--dry"]),
+                    ):
+                        proc = subprocess.run(
+                            cmd, cwd=str(code_dir), env=uv_env, capture_output=True, text=True, timeout=180
+                        )
+                        if proc.returncode != 0:
+                            _rollback_branch_in_fixer_wt(fixer_wt, branch, prev_tip)
+                            tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-600:]
+                            return {"ok": False, "failed_step": f"gate2_{step_name}", "detail": tail}
+
+                merged_sha = cur_tip
+                merged_files = [
+                    ln.strip()
+                    for ln in _git(fixer_wt, "diff", "--name-only", f"{prev_tip}..{cur_tip}").stdout.splitlines()
+                    if ln.strip()
+                ]
+
+        with locked_state(session_dir) as st:
+            st["current_tip"] = _branch_tip(repo_root, branch)
+            if target_goal is not None:
+                st["target_goal"] = target_goal.strip()
+            if max_goal_attempts is not None:
+                st["max_goal_attempts"] = int(max_goal_attempts)
+            if merged_sha:
+                st["commits"].append({
+                    "sha": merged_sha,
+                    "at": _utc_now(),
+                    "fingerprint": f"INJECT:{norm_ref}",
+                    "incident_id": "MANUAL",
+                    "code": "GOAL_INJECT",
+                    "goal_id": st.get("target_goal", ""),
+                    "skill": "",
+                    "files": merged_files,
+                    "status": "manual_inject",
+                })
+            (session_dir / "STOP").unlink(missing_ok=True)
+            final_goal = st.get("target_goal", "")
+            final_tip = st["current_tip"]
+
+        write_review_report(session_dir)
+        return {
+            "ok": True,
+            "target_branch": branch,
+            "target_goal": final_goal,
+            "previous_tip": prev_tip,
+            "current_tip": final_tip,
+            "merged_files": merged_files,
+        }
 
 
 def write_review_report(session_dir: Path) -> Path:
@@ -1331,6 +1473,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument("--fixer-cmd", default="")
     p_dual.add_argument("--skip-live-canary", action="store_true")
 
+    p_set = sub.add_parser(
+        "set-goal",
+        help="不停机向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标",
+    )
+    p_set.add_argument("--session-dir", required=True)
+    p_set.add_argument(
+        "--merge-ref",
+        default="",
+        help="可选：将指定分支或 commit（如 feat/goal-staging）经离线门禁核验后合入待审分支",
+    )
+    g_grp = p_set.add_mutually_exclusive_group()
+    g_grp.add_argument("--goal", default=None, help="切换下一轮起跑的聚焦目标 goal_id")
+    g_grp.add_argument("--clear-goal", action="store_true", help="清空单目标聚焦，切回常规全量已毕业目标挂机")
+    p_set.add_argument("--max-goal-attempts", type=int, default=None, help="可选更新单目标最大自动尝试轮数")
+    p_set.add_argument("--skip-offline-gate", action="store_true", help="仅测试夹具用：跳过合入后的离线编译与单测")
+
     p_st = sub.add_parser("status", help="查看当前待修队列与待审分支进度")
     p_st.add_argument("--session-dir", required=True)
 
@@ -1421,6 +1579,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_goal=args.goal,
             max_goal_attempts=args.max_goal_attempts,
         )
+        (session_dir / "STOP").unlink(missing_ok=True)
         tmpl = args.fixer_cmd or FIXER_PRESETS[args.fixer_preset]
         script = str(Path(__file__).resolve())
         runner_cmd = [
@@ -1457,6 +1616,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 130
         finally:
             write_review_report(session_dir)
+
+    if args.cmd == "set-goal":
+        tgt_goal: Optional[str] = "" if args.clear_goal else args.goal
+        res = inject_and_set_goal(
+            session_dir,
+            merge_ref=args.merge_ref,
+            target_goal=tgt_goal,
+            max_goal_attempts=args.max_goal_attempts,
+            skip_offline_gate=args.skip_offline_gate,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 1
 
     if args.cmd == "status":
         st = read_state(session_dir)

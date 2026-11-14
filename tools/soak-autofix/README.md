@@ -48,16 +48,30 @@ python3 tools/soak-autofix/soak_ctl.py run \
   --llm \
   --fixer-preset codex
 
-# 单候选目标晋级聚焦模式（例如专项打通 smelt_iron，最多自动尝试 4 轮后止损）
+# 单候选目标晋级聚焦模式（--episodes 0 持续不间断挂机；可在挂机期间随时用 set-goal 热注入下一个目标）
 python3 tools/soak-autofix/soak_ctl.py run \
-  --session-dir code/mcagent/logs/soak-iron-01 \
+  --session-dir code/mcagent/logs/soak-cont \
   --branch feat/soak-autofix \
   --goal smelt_iron \
   --max-goal-attempts 4 \
-  --episodes 5 \
+  --episodes 0 \
   --episode-seconds 240 \
   --llm \
   --fixer-preset codex
+
+# 挂机不中断期间：在主仓库分支（如 feat/goal-staging）写好下一个初版技能并改好 goals.py 后，一键热合入并切换聚焦目标
+python3 tools/soak-autofix/soak_ctl.py set-goal \
+  --session-dir code/mcagent/logs/soak-cont \
+  --merge-ref feat/goal-staging \
+  --goal obtain_armor
+
+# 或切回常规全量已毕业目标挂机（不聚焦单一目标）
+python3 tools/soak-autofix/soak_ctl.py set-goal \
+  --session-dir code/mcagent/logs/soak-cont \
+  --clear-goal
+
+# 优雅停止持续挂机：写入 STOP 文件（Runner 跑完当前轮后自动收尾退出）
+touch code/mcagent/logs/soak-cont/STOP
 
 # 跑完后卸载临时 worktree（分支 feat/soak-autofix 与 REVIEW_REPORT.md 完整保留）
 python3 tools/soak-autofix/soak_ctl.py teardown \
