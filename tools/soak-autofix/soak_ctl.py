@@ -67,6 +67,8 @@ FIXER_PRESETS: dict[str, str] = {
     "claude": 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}',
 }
 
+DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
+
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 CATEGORY_RANK = {"bug": 0, "strategy": 1}
 
@@ -246,12 +248,15 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _uv_env(wt_dir: Path) -> dict[str, str]:
+def _uv_env(wt_dir: Path, *, player_model: str = "") -> dict[str, str]:
     """为指定 worktree 构造独立运行环境，显式锁定 PYTHONPATH 防 editable .pth 跨目录串包。"""
     env = dict(os.environ)
     env.pop("UV_PROJECT_ENVIRONMENT", None)
     env.setdefault("UV_LINK_MODE", "copy")
     env["PYTHONPATH"] = str((wt_dir / "code").resolve())
+    norm_model = (player_model or "").strip()
+    if norm_model:
+        env["LLM_CUSTOM_MODEL"] = norm_model
     local_bin = str((Path.home() / ".local" / "bin").resolve())
     cur_path = env.get("PATH", "")
     if local_bin not in cur_path.split(os.pathsep):
@@ -286,6 +291,7 @@ def init_session(
     max_attempts: int = 2,
     target_goal: str = "",
     max_goal_attempts: int = 4,
+    player_model: str = DEFAULT_PLAYER_MODEL,
 ) -> dict[str, Any]:
     branch = validate_target_branch(target_branch)
     session_dir = session_dir.resolve()
@@ -312,6 +318,7 @@ def init_session(
     _wire_worktree_env(repo_root, runner_wt)
 
     norm_goal = (target_goal or "").strip()
+    norm_player_model = (player_model if player_model is not None else DEFAULT_PLAYER_MODEL).strip()
     with locked_state(session_dir) as st:
         if not st:
             st.update({
@@ -326,6 +333,7 @@ def init_session(
                 "max_attempts": int(max_attempts),
                 "target_goal": norm_goal,
                 "max_goal_attempts": int(max_goal_attempts),
+                "player_model": norm_player_model,
                 "episodes": [],
                 "incidents": {},
                 "commits": [],
@@ -338,6 +346,8 @@ def init_session(
                 st.setdefault("target_goal", "")
             if "max_goal_attempts" not in st or int(max_goal_attempts) != 4:
                 st["max_goal_attempts"] = int(max_goal_attempts)
+            if "player_model" not in st or norm_player_model != DEFAULT_PLAYER_MODEL:
+                st["player_model"] = norm_player_model
     write_review_report(session_dir)
     return read_state(session_dir)
 
@@ -940,7 +950,8 @@ def verify_and_promote(
                 "--max-seconds", str(canary_max_seconds),
                 "--disconnect-on-exit",
             ]
-        proc = subprocess.run(cmd, cwd=str(code_dir), env=uv_env, capture_output=True, text=True, timeout=int(canary_max_seconds + 45))
+        canary_env = _uv_env(fixer_wt, player_model=(st_snap.get("player_model") or "").strip())
+        proc = subprocess.run(cmd, cwd=str(code_dir), env=canary_env, capture_output=True, text=True, timeout=int(canary_max_seconds + 45))
         (attempt_dir / "gate3_live_canary.log").write_text(
             (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
         )
@@ -999,12 +1010,16 @@ def run_runner_loop(
     rotate_user: bool = True,
     use_llm: bool = True,
     target_goal: str = "",
+    player_model: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    if (target_goal or "").strip():
+    if (target_goal or "").strip() or player_model is not None:
         with locked_state(session_dir) as st_init:
             if st_init:
-                st_init["target_goal"] = target_goal.strip()
+                if (target_goal or "").strip():
+                    st_init["target_goal"] = target_goal.strip()
+                if player_model is not None:
+                    st_init["player_model"] = player_model.strip()
     idx = 0
     while episodes <= 0 or idx < episodes:
         if (session_dir / "STOP").exists():
@@ -1012,6 +1027,7 @@ def run_runner_loop(
             break
         st = read_state(session_dir)
         active_goal = (st.get("target_goal") or "").strip()
+        active_model = (st.get("player_model") or "").strip()
         if episodes <= 0 and active_goal:
             goal_inc = st.get("incidents", {}).get(f"GOAL_MISS:{active_goal}", {})
             if goal_inc.get("status") == "escalated_human":
@@ -1060,8 +1076,17 @@ def run_runner_loop(
         if prev_good and Path(prev_good["run_dir"]).exists():
             cmd.extend(["--baseline", prev_good["run_dir"]])
 
-        print(f"[runner] 启动 {ep_id} @ {tip_sha[:7]} (bot={bot_user}, goal={active_goal or 'all'}, max={episode_seconds}s)...")
-        subprocess.run(cmd, cwd=str(runner_wt / "code"), env=_uv_env(runner_wt), check=False)
+        print(
+            f"[runner] 启动 {ep_id} @ {tip_sha[:7]} "
+            f"(bot={bot_user}, model={active_model if use_llm and active_model else ('env' if use_llm else 'rule')}, "
+            f"goal={active_goal or 'all'}, max={episode_seconds}s)..."
+        )
+        subprocess.run(
+            cmd,
+            cwd=str(runner_wt / "code"),
+            env=_uv_env(runner_wt, player_model=active_model if use_llm else ""),
+            check=False,
+        )
         meta = ingest_episode_and_check_rollback(session_dir, ep_id, ep_dir, tip_sha, bot_user)
         results.append(meta)
         print(
@@ -1142,6 +1167,7 @@ def inject_and_set_goal(
     merge_ref: str = "",
     target_goal: Optional[str] = None,
     max_goal_attempts: Optional[int] = None,
+    player_model: Optional[str] = None,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
     """在不停机的情况下向待审分支热合入新目标/初版技能提交，并原子切换下一轮聚焦目标。"""
@@ -1226,6 +1252,8 @@ def inject_and_set_goal(
                 st["target_goal"] = target_goal.strip()
             if max_goal_attempts is not None:
                 st["max_goal_attempts"] = int(max_goal_attempts)
+            if player_model is not None:
+                st["player_model"] = player_model.strip()
             if merged_sha:
                 st["commits"].append({
                     "sha": merged_sha,
@@ -1269,6 +1297,7 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **会话目录**：`{session_dir}`",
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
+        f"- **玩家操控模型（工位 A）**：`{st.get('player_model') or '沿用 .env'}`",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
     if st.get("target_goal"):
@@ -1420,6 +1449,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="单目标 GOAL_MISS 自动修复最大尝试轮数上限（超限自动转交人工，防单目标死磕耗尽时间）",
     )
+    p_init.add_argument(
+        "--player-model",
+        default=DEFAULT_PLAYER_MODEL,
+        help=f"工位 A 玩游戏的 custom 模型名（默认 {DEFAULT_PLAYER_MODEL}；传空串则沿用 .env）",
+    )
 
     p_run_ep = sub.add_parser("runner-loop", help="启动工位 A（挂机压测循环，轮间自动热切换新 commit）")
     p_run_ep.add_argument("--session-dir", required=True)
@@ -1429,6 +1463,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run_ep.add_argument("--user-prefix", default="agy_soak_r")
     p_run_ep.add_argument("--fixed-user", action="store_true", help="不按轮次轮换角色名")
     p_run_ep.add_argument("--goal", default="", help="覆盖会话级聚焦目标 goal_id")
+    p_run_ep.add_argument("--player-model", default=None, help="覆盖会话级工位 A 玩家模型名")
     p_run_ep.add_argument(
         "--llm",
         action=argparse.BooleanOptionalAction,
@@ -1475,6 +1510,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="使用 LLM API 操纵角色选技能（默认开启，接入 run_runner_loop(use_llm=...)；纯规则传 --no-llm）",
     )
     p_dual.add_argument(
+        "--player-model",
+        default=DEFAULT_PLAYER_MODEL,
+        help=f"工位 A 玩游戏的 custom 模型名（默认 {DEFAULT_PLAYER_MODEL}；传空串则沿用 .env）",
+    )
+    p_dual.add_argument(
         "--fixer-preset",
         choices=tuple(FIXER_PRESETS),
         default="codex",
@@ -1498,6 +1538,7 @@ def build_parser() -> argparse.ArgumentParser:
     g_grp.add_argument("--goal", default=None, help="切换下一轮起跑的聚焦目标 goal_id")
     g_grp.add_argument("--clear-goal", action="store_true", help="清空单目标聚焦，切回常规全量已毕业目标挂机")
     p_set.add_argument("--max-goal-attempts", type=int, default=None, help="可选更新单目标最大自动尝试轮数")
+    p_set.add_argument("--player-model", default=None, help="可选热切换下一轮起工位 A 玩家模型名")
     p_set.add_argument("--skip-offline-gate", action="store_true", help="仅测试夹具用：跳过合入后的离线编译与单测")
 
     p_st = sub.add_parser("status", help="查看当前待修队列与待审分支进度")
@@ -1523,11 +1564,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             max_attempts=args.max_attempts,
             target_goal=args.goal,
             max_goal_attempts=args.max_goal_attempts,
+            player_model=args.player_model,
         )
         print(json.dumps({
             "ok": True,
             "target_branch": st["target_branch"],
             "target_goal": st.get("target_goal", ""),
+            "player_model": st.get("player_model", ""),
             "runner_wt": st["runner_wt"],
             "fixer_wt": st["fixer_wt"],
             "review_report": str(session_dir / "REVIEW_REPORT.md"),
@@ -1544,6 +1587,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             rotate_user=not args.fixed_user,
             use_llm=args.llm,
             target_goal=args.goal,
+            player_model=args.player_model,
         )
         return 0
 
@@ -1589,6 +1633,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_branch=args.branch,
             target_goal=args.goal,
             max_goal_attempts=args.max_goal_attempts,
+            player_model=args.player_model,
         )
         (session_dir / "STOP").unlink(missing_ok=True)
         tmpl = args.fixer_cmd or FIXER_PRESETS[args.fixer_preset]
@@ -1636,6 +1681,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             merge_ref=args.merge_ref,
             target_goal=tgt_goal,
             max_goal_attempts=args.max_goal_attempts,
+            player_model=args.player_model,
             skip_offline_gate=args.skip_offline_gate,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1647,6 +1693,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps({
             "target_branch": st["target_branch"],
             "target_goal": st.get("target_goal", ""),
+            "player_model": st.get("player_model", ""),
             "base_commit": st["base_commit"][:7],
             "current_tip": st["current_tip"][:7],
             "episodes": len(st["episodes"]),

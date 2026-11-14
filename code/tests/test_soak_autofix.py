@@ -931,6 +931,40 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         out = subprocess.run(["bash", "-lc", rendered], capture_output=True, text=True, check=True).stdout
         self.assertEqual(out, "line1 $HOME `uname`\nline2 /api/v1/act")
 
+    def test_default_player_model_deepseek_and_live_env_injection(self):
+        self.assertEqual(soak_ctl.DEFAULT_PLAYER_MODEL, "DeepSeek-V4.1-Flash")
+        st = soak_ctl.init_session(
+            self.repo,
+            self.session,
+            target_branch="feat/ds-player",
+        )
+        self.assertEqual(st["player_model"], "DeepSeek-V4.1-Flash")
+
+        seen_models: list[Optional[str]] = []
+        real_run = subprocess.run
+
+        def mock_runner_env_capture(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                env = kwargs.get("env") or {}
+                seen_models.append(env.get("LLM_CUSTOM_MODEL"))
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 8.0, "source": "local-target"}) + "\n",
+                    encoding="utf-8",
+                )
+                if len(seen_models) == 1:
+                    soak_ctl.inject_and_set_goal(self.session, player_model="DeepSeek-V4-Pro-0813")
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner_env_capture):
+            soak_ctl.run_runner_loop(self.session, episodes=2, use_llm=True)
+        self.assertEqual(seen_models, ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Pro-0813"])
+        report_txt = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("`DeepSeek-V4-Pro-0813`", report_txt)
+        soak_ctl.teardown_session(self.session)
+
 
 if __name__ == "__main__":
     unittest.main()
