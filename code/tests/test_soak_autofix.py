@@ -1200,7 +1200,9 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         soak_ctl.teardown_session(self.session)
 
     def test_server_target_local_vs_official_preflight_and_runner_env(self):
-        clean_env = {k: v for k, v in os.environ.items() if k not in ("MC_USER", "MC_PASS", "LLM_KEY")}
+        clean_env = {k: v for k, v in os.environ.items() if k not in (
+            "MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE"
+        )}
         env_file = self.repo / "code" / "mcagent" / ".env"
         with patch.dict(os.environ, clean_env, clear=True):
             self.assertEqual(soak_ctl.check_server_target(self.repo, "local", use_llm=True, account_reserved=False), [])

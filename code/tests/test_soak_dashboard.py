@@ -180,7 +180,9 @@ class DashboardTests(unittest.TestCase):
     def test_start_official_server_needs_account_ack_and_never_remembers_it(self):
         env_file = self.root / "code" / "mcagent" / ".env"
         env_file.parent.mkdir(parents=True)
-        clean = {k: v for k, v in os.environ.items() if k not in ("MC_USER", "MC_PASS", "LLM_KEY")}
+        clean = {k: v for k, v in os.environ.items() if k not in (
+            "MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE"
+        )}
         with patch.dict(os.environ, clean, clear=True), patch.object(self.console, "ledger", return_value=[]):
             with self.assertRaises(ValueError):  # 缺账号
                 self.console._validate_start({"server": "official", "llm": False, "account_reserved": True})
