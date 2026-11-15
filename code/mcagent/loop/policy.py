@@ -52,6 +52,7 @@ class PlanDecision:
     llm_errors: tuple[str, ...] = ()
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    environment_recovery: bool = False
 
 
 @dataclass
@@ -161,8 +162,9 @@ class RulePlanner:
         bound, errors = bind_args(cls, args)
         return None if errors else self.environment_block(cls.goal.format(**bound))
 
-    def blocked_targets(self, state: State, target_goals: Any) -> dict[str, EnvBlocked]:
-        self.refresh_environment_blocks(state)
+    def blocked_targets(self, state: State, target_goals: Any, *, refresh: bool = True) -> dict[str, EnvBlocked]:
+        if refresh:
+            self.refresh_environment_blocks(state)
         if not self._environment_blocks:
             return {}
 
@@ -268,7 +270,6 @@ class RulePlanner:
         return gid
 
     def choose(self, state: State) -> PlanDecision:
-        self.refresh_environment_blocks(state)
         self._last_selected_goal_id = None
         hp = float(state.st.get("health", 20))
         food = float(state.st.get("food", 20))
@@ -289,6 +290,7 @@ class RulePlanner:
             return PlanDecision(None, "idle", f"safe_mode 避险驻留中（剩 {state.safe_mode_remaining:.0f}s）")
 
         # 3) 目标台账解析与按性价比顺序派发
+        self.refresh_environment_blocks(state)
         ranked = self._rank(state)
         if ranked:
             for step in ranked:
@@ -316,10 +318,10 @@ class RulePlanner:
                                 f"目标 {ranked[0].step_goal.id} 无符合 verified={self.min_verified} 且可启动的技能")
 
         if self.target_goal:
-            if self.blocked_targets(state, self.target_goal):
+            if self.blocked_targets(state, self.target_goal, refresh=False):
                 scout = self._try_make("scout_island", {"radius": 36}, state)
                 if scout is not None:
-                    return PlanDecision(scout, "rule", "聚焦目标因环境挂起，外迁重新观察")
+                    return PlanDecision(scout, "rule", "聚焦目标因环境挂起，外迁重新观察", environment_recovery=True)
                 return PlanDecision(None, "idle", "等待聚焦目标的环境条件变化")
             return PlanDecision(None, "idle", f"目标 {self.target_goal} 已达成或本轮已止损")
 
@@ -384,8 +386,8 @@ class CampaignPlanner:
         self.rules.record_environment_block(skill, error, state)
         self._last_selected_goal_id = None
 
-    def blocked_targets(self, state: State, target_goals: Any) -> dict[str, EnvBlocked]:
-        return self.rules.blocked_targets(state, target_goals)
+    def blocked_targets(self, state: State, target_goals: Any, *, refresh: bool = True) -> dict[str, EnvBlocked]:
+        return self.rules.blocked_targets(state, target_goals, refresh=refresh)
 
     def record_skill_outcome(
         self,
@@ -406,12 +408,12 @@ class CampaignPlanner:
         self._last_selected_goal_id = None
 
     def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
-        self.rules.refresh_environment_blocks(state)
         if self.mode == "focus":
             assert self.focus_skill is not None
             self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
             if state.in_safe_mode:
                 return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
+            self.rules.refresh_environment_blocks(state)
             cls = self.registry.get(self.focus_skill)
             if cls is not None and not skill_choice.meets_verification(cls, self.min_verified):
                 return PlanDecision(None, "idle", f"focus 技能 {self.focus_skill} 需要 verified={self.min_verified}，当前为 {cls.verified}")
@@ -432,6 +434,7 @@ class CampaignPlanner:
             dec = self.rules.choose(state)
             self._last_selected_goal_id = self.rules._last_selected_goal_id
             return dec
+        self.rules.refresh_environment_blocks(state)
         ready_registry = {
             name: cls for name, cls in self.registry.items()
             if self.rules.environment_block(cls.goal) is None
@@ -494,7 +497,8 @@ class CampaignPlanner:
 
         if chosen is not None:
             matched_gid: Optional[str] = None
-            for step in self.rules._rank(state):
+            ranked = self.rules._rank(state)
+            for step in ranked:
                 g = step.step_goal
                 if g.skill == chosen.name and (not g.args_dict or g.args_dict == chosen.args):
                     matched_gid = g.id
@@ -512,6 +516,10 @@ class CampaignPlanner:
             return PlanDecision(
                 chosen, "llm", f"LLM 选择 {chosen}",
                 dt_ms, used, tuple(errors), prompt_tok, comp_tok,
+                environment_recovery=(
+                    chosen.name == "scout_island" and not ranked
+                    and bool(self.rules.blocked_targets(state, self.target_goal, refresh=False))
+                ),
             )
 
         fallback = self.rules.choose(state)
@@ -525,4 +533,5 @@ class CampaignPlanner:
             tuple(errors),
             prompt_tok,
             comp_tok,
+            environment_recovery=fallback.environment_recovery,
         )

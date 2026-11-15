@@ -411,6 +411,7 @@ class MainLoop:
                                 error_msg=str(e),
                                 died_or_disconnected=is_death_err,
                                 **({"environment": environment} if environment is not None else {}),
+                                **({"environment_recovery": True} if decision.environment_recovery and not is_death_err else {}),
                             )
                         if environment is None and hasattr(self.planner, "record_skill_outcome"):
                             self.planner.record_skill_outcome(
@@ -453,7 +454,8 @@ class MainLoop:
             if monitor is not None:
                 monitor.close()
             if self.observer is not None:
-                blocked = self.planner.blocked_targets(self.state, self.observer.target_goals)
+                # 外迁最后一步可能耗尽预算。还未进入下一规划拍时，保留挂起证据。
+                blocked = self.planner.blocked_targets(self.state, self.observer.target_goals, refresh=False)
                 self.observer.on_run_end(
                     self.state, client=self.client, stop_reason=stop_reason,
                     **({"environment_blocked": blocked} if blocked else {}),

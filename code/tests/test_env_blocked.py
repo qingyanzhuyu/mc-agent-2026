@@ -12,10 +12,12 @@ from mcagent.loop.auditor import SoakObserver
 from mcagent.loop.engine import LoopConfig, MainLoop
 from mcagent.loop.goals import GoalSpec
 from mcagent.loop.policy import CampaignPlanner, PlanDecision, RulePlanner
+from mcagent.loop.starter_skills import reset_world_memo
 from mcagent.runtime import EnvBlocked, Replan, State
 from mcagent.skills import Param, Skill
 from mcagent.skills import base as skill_base
 from mcagent.skills.testing import CountingExecutor
+from tests.test_iron import IronWorld, view
 from tests.test_loop_soak import RichGridWorld
 
 
@@ -54,6 +56,25 @@ _IRON = GoalSpec("iron", "铁", "T1", 5, FindIron.name, done_items=("iron_ingot>
 _CHAIN = GoalSpec("tools", "工具", "T1", 5, FindShelter.name, prereq_goals=("iron",), stage="graduated")
 _OTHER = GoalSpec("shelter", "避难处", "T1", 5, FindShelter.name, stage="graduated")
 _REGISTRY = {cls.name: cls for cls in (FindIron, FindGem, FindShelter, Scout)}
+
+
+class IronScoutWorld(IronWorld, RichGridWorld):
+    def __init__(self, navigation_error=None):
+        super().__init__(
+            items={"oak_log": 3, "stone_pickaxe": 1, "stone_sword": 1, "furnace": 1, "coal": 1, "cobblestone": 3},
+            views=[view(), view(output=1), view()],
+        )
+        self.blocks = {(x, 63, 0): "grass_block" for x in (10, 21, 26)}
+        self.blocks.update({(70, 64, 0): "iron_ore", (71, 64, 0): "furnace"})
+        self.navigation_error = navigation_error
+
+    def find_blocks(self, *args, **kwargs):
+        return RichGridWorld.find_blocks(self, *args, **kwargs)
+
+    def move_to(self, *args, **kwargs):
+        if self.navigation_error:
+            raise ApiError(self.navigation_error, "夹具寻路失败")
+        return super().move_to(*args, **kwargs)
 
 
 class EnvironmentBlockTests(unittest.TestCase):
@@ -127,6 +148,16 @@ class EnvironmentBlockTests(unittest.TestCase):
             decision = planner.select(self.state, [])
         self.assertEqual(decision.skill.args, {"material": "coal"})
 
+    def test_model_scout_is_environment_recovery_only_when_no_other_focused_chain_can_progress(self):
+        for focused, expected in (("iron", True), ("iron,shelter", False)):
+            with self.subTest(focused=focused):
+                planner = CampaignPlanner(registry=_REGISTRY, ledger=(_IRON, _OTHER), use_llm=True,
+                                          target_goal=focused)
+                planner.record_environment_block(FindIron(), _no_iron(), self.state)
+                with patch("mcagent.loop.policy.skill_choice.choose", return_value=(Scout(), [], 1)):
+                    decision = planner.select(self.state, [])
+                self.assertEqual(decision.environment_recovery, expected)
+
     def test_run_end_records_environment_evidence_without_enqueuing_related_miss(self):
         world = RichGridWorld()
         registry = {FindIron.name: FindIron, FindShelter.name: FindShelter}
@@ -148,6 +179,55 @@ class EnvironmentBlockTests(unittest.TestCase):
             self.assertEqual(rows[-2]["environment"]["searched_volume"], "半径 64")
             tickets = [json.loads(p.read_text(encoding="utf-8")) for p in Path(run_dir).glob("incidents/*.json")]
             self.assertEqual([ticket["fingerprint"] for ticket in tickets], ["GOAL_MISS:shelter"])
+
+    def run_iron_scout(self, world, max_steps, run_dir):
+        reset_world_memo()
+        self.addCleanup(reset_world_memo)
+        self.state = State()
+        planner = CampaignPlanner(target_goal="smelt_iron")
+        observer = SoakObserver(run_dir, target_goal="smelt_iron")
+        config = LoopConfig(target_goal="smelt_iron", stop_on_goal=True, idle_sleep_s=0,
+                            enable_monitor=False, max_steps=max_steps, max_seconds=2)
+        executor = CountingExecutor(world, self.state)
+        result = MainLoop(world, self.state, executor, planner, config=config, observer=observer,
+                          log=lambda *_: None).run()
+        rows = [json.loads(line) for line in observer.timeline_path.read_text(encoding="utf-8").splitlines()]
+        tickets = [json.loads(path.read_text(encoding="utf-8"))
+                   for path in observer.incidents_dir.glob("*.json")]
+        return result, rows, tickets
+
+    def test_real_iron_and_scout_keep_suspend_at_budget_boundary_then_wake_on_next_plan(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            result, rows, tickets = self.run_iron_scout(IronScoutWorld(), 1, run_dir)
+            self.assertEqual(result.stop_reason, "max_steps_reached")
+            self.assertGreaterEqual(self.state.pos[0], 16)
+            self.assertEqual(rows[-1]["environment_blocked_goals"]["smelt_iron"]["wake_on"], "chunk_moved")
+            self.assertEqual(tickets, [])
+
+        with tempfile.TemporaryDirectory() as run_dir:
+            result, rows, tickets = self.run_iron_scout(IronScoutWorld(), 100, run_dir)
+            starts = [row["skill"] for row in rows if row.get("event") == "skill_start"]
+            self.assertEqual(starts, ["smelt_iron", "scout_island", "smelt_iron"])
+            self.assertEqual(result.stop_reason, "goal_reached")
+            self.assertEqual(rows[-1]["environment_blocked_goals"], {})
+            self.assertEqual(tickets, [])
+
+    def test_recovery_scout_path_failures_are_counted_without_a_strategy_ticket(self):
+        with tempfile.TemporaryDirectory() as run_dir, patch.object(Skill, "is_cooling", return_value=False):
+            result, rows, tickets = self.run_iron_scout(IronScoutWorld("path_not_found"), 10, run_dir)
+            self.assertEqual(result.skills_replan, 3)
+            failures = [row for row in rows if row.get("event") == "skill_end"
+                        and row["error_code"] == "path_not_found"]
+            self.assertEqual(len(failures), 3)
+            self.assertTrue(all(row.get("environment_recovery") for row in failures))
+            self.assertIn("smelt_iron", rows[-1]["environment_blocked_goals"])
+            self.assertEqual(tickets, [])
+
+    def test_recovery_scout_contract_bug_still_reports(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            _, _, tickets = self.run_iron_scout(IronScoutWorld("bad_args"), 10, run_dir)
+            self.assertEqual([(ticket["code"], ticket["category"]) for ticket in tickets],
+                             [("CONTRACT_OR_FATAL_ERROR", "bug")])
 
     def test_three_consecutive_path_failures_extend_existing_cooldown_and_success_resets(self):
         class StuckScout(Scout):
