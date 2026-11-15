@@ -14,9 +14,11 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from ..client import DEFAULT_BASE, Client, Config
+from ..client import Client, Config
 from ..planner.llm import OFFICIAL_PROFILE, resolve_profile
+from ..planner.skill_choice import meets_verification
 from ..preflight import OFFICIAL_HOSTS
 from ..runtime import Executor, State
 from ..skills import REGISTRY, contract_errors
@@ -72,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _run_dry(cfg: Config) -> int:
+def _run_dry(cfg: Config, *, min_verified: str = "offline") -> int:
     print(f"[dry] 已注册技能 ({len(REGISTRY)}): {', '.join(sorted(REGISTRY))}")
     for name, cls in sorted(REGISTRY.items()):
         errs = contract_errors(cls)
@@ -83,12 +85,13 @@ def _run_dry(cfg: Config) -> int:
     if ledger_errs:
         print(f"[dry] 目标台账契约不合格: {ledger_errs}")
         return 1
-    active_cnt = sum(1 for g in GOALS if g.stage != "draft")
+    planner = RulePlanner(min_verified=min_verified)
+    active_cnt = len(planner.active_goals)
     print(f"[dry] 目标台账核验通过: 共 {len(GOALS)} 项（已激活 {active_cnt} 项）")
     st = State()
     st.set_status({"ready": True, "alive": True, "health": 20, "food": 20, "pos": [0.5, 64.0, 0.5]})
     st.set_inventory({"items": []})
-    d = RulePlanner().choose(st)
+    d = planner.choose(st)
     print(f"[dry] 空包规则首拍决策 -> {d.skill} ({d.reason})")
     c = Client(cfg)
     code = c.probe()
@@ -128,9 +131,9 @@ def main(argv: list[str] | None = None) -> int:
         cfg.token_file = None  # 临时测试 bot 不污染默认 .token.json
 
     if args.dry:
-        return _run_dry(cfg)
+        return _run_dry(cfg, min_verified=args.min_verified or "offline")
 
-    official = cfg.base == DEFAULT_BASE
+    official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS
     if official and not args.live:
         print("拒绝登录：当前指向官方端点，请先在 docs/05 占位并显式加 --live（见 AGENTS.md §3）", file=sys.stderr)
         return 2
@@ -148,15 +151,13 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"参数错误: {e}", file=sys.stderr)
             return 2
-        # 校园网入口也是官方端点，但不等于 DEFAULT_BASE，所以按域名再判一次
-        mc_official = official or any(h in cfg.base for h in OFFICIAL_HOSTS)
         # 赛前训练放行：比赛服 + 自备模型，只在挂机（--soak）且显式设 MCAGENT_TRAIN_ON_OFFICIAL=1 时允许；
         # 比赛当天 preflight 会 BLOCK 这个开关和 LLM_PROFILE=custom，强制切回官方代理（AGENTS.md §2B.3）
         train_override = (
-            mc_official and prof["profile"] != OFFICIAL_PROFILE and args.soak
+            official and prof["profile"] != OFFICIAL_PROFILE and args.soak
             and os.environ.get("MCAGENT_TRAIN_ON_OFFICIAL", "").strip() == "1"
         )
-        if mc_official and prof["profile"] != OFFICIAL_PROFILE and not train_override:
+        if official and prof["profile"] != OFFICIAL_PROFILE and not train_override:
             print(f"拒绝运行：MC 指向官方端点时模型只能用 LLM_PROFILE=official（当前 {prof['profile']}，见 AGENTS.md §2B.3）；"
                   "赛前挂机训练可设 MCAGENT_TRAIN_ON_OFFICIAL=1 并加 --soak",
                   file=sys.stderr)
@@ -169,8 +170,16 @@ def main(argv: list[str] | None = None) -> int:
             llm_meta["train_on_official"] = True
         print(f"[loop] LLM 配置: {prof['profile']} (model={prof['model'] or '(未设置)'})")
 
-    source_tag = "official" if (official and not args.local_target) else "local-target"
+    source_tag = "official" if official else "local-target"
     min_ver = args.min_verified or ("live" if source_tag == "official" else "offline")
+    if args.mode == "focus":
+        cls = REGISTRY.get(args.skill)
+        if cls is None:
+            print(f"参数错误: focus 需要已注册的 --skill，收到 {args.skill!r}", file=sys.stderr)
+            return 2
+        if not meets_verification(cls, min_ver):
+            print(f"参数错误: --skill {args.skill} 需要 verified={min_ver}，当前为 {cls.verified}", file=sys.stderr)
+            return 2
     enable_obs = args.soak or args.run_dir is not None
     stop_on_goal = bool(args.goal and not args.no_stop_on_goal)
     telemetry = load_goal_telemetry(args.goal_telemetry)

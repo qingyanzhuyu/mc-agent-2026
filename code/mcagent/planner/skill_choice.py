@@ -37,9 +37,13 @@ SKILL_SYSTEM_PROMPT = """你是 Minecraft 生存 Agent 的目标选择器。每�
 - 科技推进顺序：空手先采木 -> 合成木镐 -> 已有木镐后选 mine_stone 挖圆石（勿重复合成已拥有的同级工具）-> 圆石够后再升级石镐/石剑/熔炉；选合成类技能前先核对背包原料是否够配方"""
 
 
+def meets_verification(cls: type[Skill], min_verified: str) -> bool:
+    """规则队列、模型和聚焦共用技能验证门槛。"""
+    return VERIFIED_LEVELS.index(cls.verified) >= VERIFIED_LEVELS.index(min_verified)
+
+
 def _usable(registry: dict, min_verified: str) -> dict[str, type[Skill]]:
-    floor = VERIFIED_LEVELS.index(min_verified)
-    return {n: c for n, c in sorted(registry.items()) if VERIFIED_LEVELS.index(c.verified) >= floor}
+    return {n: c for n, c in sorted(registry.items()) if meets_verification(c, min_verified)}
 
 
 def _fixed_goal_cooling(cls: type[Skill]) -> str:

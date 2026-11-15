@@ -109,14 +109,17 @@ class RulePlanner:
         self,
         registry: Optional[dict[str, type[Skill]]] = None,
         ledger: tuple[GoalSpec, ...] = GOALS,
-        include_stages: Collection[str] = DEFAULT_CAMPAIGN_STAGES,
+        include_stages: Optional[Collection[str]] = None,
         target_goal: Optional[str] = None,
         telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        min_verified: str = "offline",
     ):
         self.registry = REGISTRY if registry is None else registry
+        self.min_verified = min_verified
         self.ledger: tuple[GoalSpec, ...] = tuple(ledger)
         self.ledger_map: dict[str, GoalSpec] = {g.id: g for g in self.ledger}
-        self.include_stages: tuple[str, ...] = tuple(include_stages)
+        default_stages = OFFICIAL_CAMPAIGN_STAGES if min_verified == "live" else DEFAULT_CAMPAIGN_STAGES
+        self.include_stages: tuple[str, ...] = tuple(default_stages if include_stages is None else include_stages)
         self.target_goal: Optional[str] = target_goal
         self.telemetry: dict[str, Any] = dict(telemetry) if telemetry else {}
         self.active_goals: tuple[GoalSpec, ...] = resolve_active_goals(
@@ -186,7 +189,7 @@ class RulePlanner:
 
     def _try_make(self, name: str, args: Optional[dict], state: State) -> Optional[Skill]:
         cls = self.registry.get(name)
-        if cls is None or cls.blocked(state):
+        if cls is None or not skill_choice.meets_verification(cls, self.min_verified) or cls.blocked(state):
             return None
         inst = cls(**(args or {}))
         if self.environment_block(inst.goal) or inst.is_cooling() or not inst.can_start(state):
@@ -309,7 +312,8 @@ class RulePlanner:
             sc = self._try_make("scout_island", {"radius": sc_radius}, state)
             if sc is not None:
                 return PlanDecision(sc, "rule", f"目标 {ranked[0].step_goal.id} 当前位置受阻或冷却，外迁探索")
-            return PlanDecision(None, "idle", f"目标 {ranked[0].step_goal.id} 所有候选技能均在冷却")
+            return PlanDecision(None, "idle",
+                                f"目标 {ranked[0].step_goal.id} 无符合 verified={self.min_verified} 且可启动的技能")
 
         if self.target_goal:
             if self.blocked_targets(state, self.target_goal):
@@ -333,7 +337,7 @@ class RulePlanner:
         sc = self._try_make("scout_island", {"radius": 36}, state)
         if sc is not None:
             return PlanDecision(sc, "rule", "基础石器齐备，持续扫描岛屿结构与矿脉")
-        return PlanDecision(None, "idle", "候选技能全部冷却中")
+        return PlanDecision(None, "idle", f"无符合 verified={self.min_verified} 且可启动的兜底技能")
 
 
 class CampaignPlanner:
@@ -366,13 +370,12 @@ class CampaignPlanner:
         self.min_verified = min_verified
         self.registry = REGISTRY if registry is None else registry
         self.target_goal = target_goal
-        include_stages = OFFICIAL_CAMPAIGN_STAGES if min_verified == "live" else DEFAULT_CAMPAIGN_STAGES
         self.rules = RulePlanner(
             self.registry,
             ledger=ledger,
-            include_stages=include_stages,
             target_goal=target_goal,
             telemetry=telemetry,
+            min_verified=min_verified,
         )
         self.on_llm_telemetry = on_llm_telemetry
         self._last_selected_goal_id: Optional[str] = None
@@ -409,6 +412,9 @@ class CampaignPlanner:
             self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
             if state.in_safe_mode:
                 return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
+            cls = self.registry.get(self.focus_skill)
+            if cls is not None and not skill_choice.meets_verification(cls, self.min_verified):
+                return PlanDecision(None, "idle", f"focus 技能 {self.focus_skill} 需要 verified={self.min_verified}，当前为 {cls.verified}")
             skill = make(self.focus_skill, self.focus_args, registry=self.registry)
             environment = self.rules.environment_block(skill.goal)
             if environment is not None:
