@@ -5,6 +5,7 @@ Safe continuations are explicit fixture inputs: neither incident tape records
 enough blocks to establish that a safe route existed in the original world.
 """
 import unittest
+from unittest.mock import patch
 
 from mcagent.client import ApiError
 from mcagent.loop import reset_world_memo
@@ -93,6 +94,28 @@ class MiningReobserveTests(unittest.TestCase):
         self.assertEqual(ex.acts, ["dig"] * 6)
         self.assertEqual(world.blocks[(7, 77, 0)], "dirt")
         self.assertEqual(world.blocks[(6, 74, 0)], "dirt")
+
+    def test_ep0002_stair_peels_surface_without_collecting_before_mining_stone(self):
+        # Replay the grass, dirt and support in seq 202–210, with a second
+        # exposed stone beside the landing. Leaf litter is a separate variant.
+        for upper in ("grass_block", "leaf_litter"):
+            with self.subTest(upper=upper):
+                world = RichGridWorld(pos=(190.7, 75, 96.5), blocks={
+                    (191, 76, 96): upper,
+                    (191, 75, 96): "dirt",
+                    (191, 73, 96): "stone",
+                    (192, 73, 96): "stone",
+                }, items={"wooden_pickaxe": 1})
+                world.st["held"] = {"name": "wooden_pickaxe"}
+                ex, state = world.session()
+                with patch.object(world, "dig", wraps=world.dig) as dig:
+                    drive(make("mine_stone", {"count": 1}), ex, state)
+                self.assertEqual(
+                    [(call.args[0], call.kwargs["collect"]) for call in dig.call_args_list],
+                    [([191, 76, 96], False), ([191, 75, 96], False), ([192, 73, 96], True)],
+                )
+                self.assertEqual(world.blocks[(191, 73, 96)], "stone")
+                self.assertEqual(state.count("cobblestone"), 1)
 
     def test_ep41_shallow_stone_requires_observed_safe_adjacent_stance(self):
         class ObservedWorld(RichGridWorld):

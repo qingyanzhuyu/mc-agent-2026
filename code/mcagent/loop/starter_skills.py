@@ -34,7 +34,7 @@ AXE_ORDER: tuple[str, ...] = (
     "stone_axe", "golden_axe", "wooden_axe",
 )
 STONE_Targets: tuple[str, ...] = ("stone", "cobblestone", "deepslate", "cobbled_deepslate")
-PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol")
+PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter")
 SAFE_GROUND: tuple[str, ...] = (
     "grass_block", "dirt", "coarse_dirt", "stone", "cobblestone",
     "sand", "sandstone", "gravel", "andesite", "diorite", "granite", "oak_planks",
@@ -643,7 +643,8 @@ class MineStone(Skill):
                                     stair_origin = None
                                     reobserve_stair = True
                                     break
-                                dug_res = ex.dig([sx, clear_y, sz], collect=True)
+                                # 拾取表土可能让角色提前踩进还未清完的阶梯列。
+                                dug_res = ex.dig([sx, clear_y, sz], collect=bname not in PEEL_SURFACE)
                                 yield rec("dig", dug_res, pos=[sx, clear_y, sz])
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
