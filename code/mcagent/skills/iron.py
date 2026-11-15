@@ -8,7 +8,7 @@ import math
 import time
 from typing import TYPE_CHECKING, Iterator
 
-from ..runtime import Replan
+from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, rec
 from .items import AIR, bare, best_pickaxe
 from .registry import register
@@ -113,7 +113,8 @@ class SmeltIron(Skill):
         candidates = self._ore_candidates(ex, state, radius=64)
         if candidates:
             return candidates
-        start_y = math.floor(state.pos[1])
+        start = tuple(map(math.floor, state.pos))
+        start_y = start[1]
         max_steps = min(MAX_PROSPECT_STEPS, max(PROSPECT_STEPS, start_y - SHALLOW_IRON_Y))
         visited = set()
         completed_steps = 0
@@ -158,11 +159,14 @@ class SmeltIron(Skill):
             candidates = self._ore_candidates(ex, state)
             if candidates:
                 return candidates
-        end_y = math.floor(state.pos[1])
-        raise Replan(
+        end = tuple(map(math.floor, state.pos))
+        raise EnvBlocked(
             f"半径 32/64 内未找到可采的暴露铁矿，"
-            f"安全阶梯探矿仍未发现（Y={start_y} 到 {end_y}，走完 {completed_steps}/{max_steps} 级，"
-            f"浅矿目标 Y≈{SHALLOW_IRON_Y}）；需换区域探索"
+            f"安全阶梯探矿仍未发现（Y={start_y} 到 {end[1]}，走完 {completed_steps}/{max_steps} 级，"
+            f"浅矿目标 Y≈{SHALLOW_IRON_Y}）；需换区域探索",
+            missing_predicate="exposed_iron",
+            searched_volume=f"起点 {start} 暴露矿扫描半径 32/64；至 {end} 阶梯 {completed_steps}/{max_steps} 级",
+            wake_on="chunk_moved",
         )
 
     def _collect(self, ex: "Executor", state: "State") -> Iterator[dict]:

@@ -5,7 +5,7 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from mcagent.runtime import Replan
+from mcagent.runtime import EnvBlocked, Replan
 from mcagent.skills import REGISTRY
 from mcagent.skills.iron import SmeltIron
 from mcagent.skills.testing import GridWorld, drive
@@ -105,10 +105,13 @@ class SmeltIronTests(unittest.TestCase):
         self.assertIn("未增加", SmeltIron().verify_done(state, {"iron_ingot": 3}))
         self.assertEqual(self.sleep.call_count, 1)
 
-    def test_no_exposed_ore_replans(self):
+    def test_no_exposed_ore_suspends_until_new_chunk(self):
         world = IronWorld()
-        with self.assertRaisesRegex(Replan, "半径 32/64.*需换区域探索") as caught:
+        with self.assertRaisesRegex(EnvBlocked, "半径 32/64.*需换区域探索") as caught:
             self.run_skill(world)
+        self.assertEqual(caught.exception.missing_predicate, "exposed_iron")
+        self.assertEqual(caught.exception.wake_on, "chunk_moved")
+        self.assertIn("阶梯 0/48 级", caught.exception.searched_volume)
         self.assertNotIn("环境缺铁矿", str(caught.exception))
         self.assertEqual([args["radius"] for op, args in world.calls if op == "find_blocks"],
                          [32, 64])
