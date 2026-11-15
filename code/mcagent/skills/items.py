@@ -19,12 +19,12 @@ PLACEABLE_BLOCKS: tuple[str, ...] = (
     "cobblestone", "dirt", "stone", "cobbled_deepslate", "netherrack",
     "oak_planks", "birch_planks", "spruce_planks", "jungle_planks",
     "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks",
-    "sandstone", "andesite", "diorite", "granite",
+    "sandstone", "andesite", "diorite", "granite", "pale_oak_planks", "tuff",
 )
 #: 从好到差
 PICKAXE_ORDER: tuple[str, ...] = (
     "netherite_pickaxe", "diamond_pickaxe", "iron_pickaxe",
-    "stone_pickaxe", "golden_pickaxe", "wooden_pickaxe",
+    "copper_pickaxe", "stone_pickaxe", "golden_pickaxe", "wooden_pickaxe",
 )
 
 

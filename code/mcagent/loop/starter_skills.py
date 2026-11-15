@@ -23,14 +23,15 @@ if TYPE_CHECKING:
 
 ALL_LOGS: tuple[str, ...] = (
     "oak_log", "birch_log", "spruce_log", "jungle_log",
-    "acacia_log", "dark_oak_log", "cherry_log", "mangrove_log",
+    "acacia_log", "dark_oak_log", "cherry_log", "mangrove_log", "pale_oak_log",
 )
 ALL_PLANKS: tuple[str, ...] = (
     "oak_planks", "birch_planks", "spruce_planks", "jungle_planks",
-    "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks",
+    "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks", "pale_oak_planks",
 )
 AXE_ORDER: tuple[str, ...] = (
-    "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "golden_axe", "wooden_axe",
+    "netherite_axe", "diamond_axe", "iron_axe", "copper_axe",
+    "stone_axe", "golden_axe", "wooden_axe",
 )
 STONE_Targets: tuple[str, ...] = ("stone", "cobblestone", "deepslate", "cobbled_deepslate")
 PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol")

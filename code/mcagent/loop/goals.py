@@ -32,7 +32,7 @@ OFFICIAL_CAMPAIGN_STAGES: tuple[str, ...] = ("graduated", "live")
 GOAL_TIERS: tuple[str, ...] = ("T0_PREP", "T1", "T2", "T3")
 
 STONE_OR_BETTER_PICKS: frozenset[str] = frozenset({
-    "stone_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
+    "stone_pickaxe", "copper_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
 })
 IRON_OR_BETTER_PICKS: frozenset[str] = frozenset({
     "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
@@ -55,8 +55,8 @@ class GoalSpec:
     prereq_goals: tuple[str, ...] = ()         # 前置目标 id
     prereq_items: tuple[str, ...] = ()         # 启动主技能前需满足的物资表达式
     done_advancements: tuple[str, ...] = ()    # 服务端确认达成 advancement id
-    done_items: tuple[str, ...] = ()           # 背包代理/实物持有判据表达式
-    must_hold_for_children: bool = False       # 作为下游前置时，当前背包是否必须实际持有 done_items
+    done_items: tuple[str, ...] = ()           # 背包达成代理判据表达式
+    must_hold_for_children: bool = False       # 作为下游前置时，是否要求当前持有
     gather_fallbacks: tuple[tuple[str, str, tuple[tuple[str, Any], ...]], ...] = ()
     budget_s: float = 180.0                    # 单轮时间预算参考/止损上限（秒）
     max_fails_per_ep: int = 0                  # 单轮最大允许失败次数（0=不限，靠技能指数冷却退避）
@@ -64,6 +64,7 @@ class GoalSpec:
     est_cost_s: float = 30.0                   # 尚无实测遥测时的静态耗时初值（秒）
     stage: str = "draft"                       # "draft" | "candidate" | "graduated" | "live"
     editable_files: tuple[str, ...] = ()       # GOAL_MISS 自动修复时允许改动的收窄白名单
+    held_items: tuple[str, ...] = ()            # 下游所需实物，未指定时沿用 done_items
 
     @property
     def args_dict(self) -> dict[str, Any]:
@@ -154,8 +155,9 @@ GOALS: tuple[GoalSpec, ...] = (
         prereq_goals=("prep_wooden_pickaxe", "mine_stone"),
         prereq_items=("@gear_ready:stone_pickaxe>=1",),
         done_advancements=("minecraft:story/upgrade_tools",),
-        done_items=("@stone_plus_pickaxe>=1",),
+        done_items=("stone_pickaxe|iron_pickaxe|diamond_pickaxe|netherite_pickaxe>=1",),
         must_hold_for_children=True,
+        held_items=("@stone_plus_pickaxe>=1",),
         gather_fallbacks=(
             ("cobblestone|cobbled_deepslate>=3", "mine_stone", (("count", 8),)),
             ("@gear_ready:stone_pickaxe>=1", "gather_wood", (("count", 2),)),
@@ -583,10 +585,9 @@ def check_item_expr(state: State, expr: str) -> bool:
 
 
 def is_goal_held_in_state(goal: GoalSpec, state: State) -> bool:
-    """检查当前背包是否实际持有该目标声明的 `done_items`（用于重生装备丢失后的前置重补）。"""
-    if not goal.done_items:
-        return False
-    return all(check_item_expr(state, expr) for expr in goal.done_items)
+    """检查当前背包是否实际持有下游所需物资。"""
+    held_items = goal.held_items or goal.done_items
+    return bool(held_items) and all(check_item_expr(state, expr) for expr in held_items)
 
 
 def is_goal_achieved(
@@ -608,7 +609,7 @@ def is_prereq_satisfied(
     completed_advs: Collection[str] = (),
 ) -> bool:
     """作为下游目标前置时的满足判定：工具/工作站类前置要求当前背包确实持有（兼容 keepInventory=False）。"""
-    if goal.must_hold_for_children and goal.done_items:
+    if goal.must_hold_for_children and (goal.held_items or goal.done_items):
         return is_goal_held_in_state(goal, state)
     return is_goal_achieved(goal, state, completed_advs)
 
@@ -885,7 +886,10 @@ def diagnose_goal_gap(
 
     bottleneck = by_id[missing_prereqs[0]] if missing_prereqs else goal
     missing_items: list[str] = []
-    for expr in (*bottleneck.prereq_items, *bottleneck.done_items):
+    expected_items = bottleneck.done_items
+    if bottleneck.id != goal.id and bottleneck.must_hold_for_children:
+        expected_items = bottleneck.held_items or expected_items
+    for expr in (*bottleneck.prereq_items, *expected_items):
         ok, _, _, desc = eval_item_expr(state, expr)
         if not ok and desc not in missing_items:
             missing_items.append(desc)
