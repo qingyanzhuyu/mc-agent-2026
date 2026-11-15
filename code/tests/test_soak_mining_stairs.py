@@ -47,7 +47,7 @@ class MiningStairRecoveryTests(unittest.TestCase):
         _COOLDOWN.clear()
 
     def test_stair_turns_to_supported_branch_instead_of_abandoning_mining(self):
-        for unsafe in ("air", "water", "lava"):
+        for unsafe in ("air", "water", "lava", "dark_oak_leaves"):
             with self.subTest(next_floor=unsafe):
                 world = RichGridWorld(blocks={
                     (1, 63, 0): "dirt", (1, 62, 0): "dirt",
@@ -66,6 +66,17 @@ class MiningStairRecoveryTests(unittest.TestCase):
                 self.assertEqual(world.blocks[(1, 62, 0)], "dirt")
                 self.assertFalse(any(c[0] == "dig" and c[1]["pos"] == [2, 62, 0]
                                      for c in world.calls))
+
+    def test_ep0001_leaf_floor_is_not_a_stair_candidate(self):
+        world = RichGridWorld(pos=(207.5, 87, 107.5), blocks={
+            (208, 85, 107): "dark_oak_leaves", (208, 86, 107): "dark_oak_leaves",
+        }, items={"wooden_pickaxe": 1})
+        world.st["held"] = {"name": "wooden_pickaxe"}
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "附近未找到可安全挖掘"):
+            drive(make("mine_stone", {"count": 1}), ex, state)
+        self.assertEqual(ex.acts, [])
+        self.assertEqual(world.blocks[(208, 86, 107)], "dark_oak_leaves")
 
     def test_ep0031_water_floor_turns_from_observed_beach_landing(self):
         world = RecordedBeachLandingWorld(blocks={
