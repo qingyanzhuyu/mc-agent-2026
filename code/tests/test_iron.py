@@ -5,6 +5,7 @@ import copy
 import unittest
 from unittest.mock import patch
 
+from mcagent.client import ApiError
 from mcagent.runtime import EnvBlocked, Replan
 from mcagent.skills import REGISTRY
 from mcagent.skills.iron import SmeltIron
@@ -116,6 +117,30 @@ class SmeltIronTests(unittest.TestCase):
         self.assertEqual([args["radius"] for op, args in world.calls if op == "find_blocks"],
                          [32, 64])
         self.assertFalse(any(op in ("dig", "move_to", "place") for op, _ in world.calls))
+
+    def test_unreachable_deep_ore_does_not_preempt_bounded_prospecting(self):
+        deep_ore = [2, 35, 1]
+        world = ProspectingWorld(
+            blocks={tuple(deep_ore): "iron_ore", (1, 62, 0): "stone",
+                    (1, 64, 0): "dirt", (2, 64, 0): "iron_ore"},
+            exposed_after={(2, 64, 0): (1, 64, 0)},
+            views=[view(), view(output=1), view()],
+        )
+        move = world.move_to
+        moves = []
+
+        def reject_deep_path(*args, **kwargs):
+            moves.append(kwargs["pos"])
+            if kwargs["pos"] == deep_ore:
+                raise ApiError("path_not_found", "Stuck")
+            return move(*args, **kwargs)
+
+        world.move_to = reject_deep_path
+        steps, _, state = self.run_skill(world, count=1)
+        self.assertEqual(moves.count(deep_ore), 1)
+        self.assertEqual(steps[0]["op"], "ore_route_skip")
+        self.assertEqual(world.blocks[tuple(deep_ore)], "iron_ore")
+        self.assertEqual(state.count("iron_ingot"), 1)
 
     def test_expands_exposed_ore_search_before_digging_stairs(self):
         world = IronWorld(blocks={(40, 64, 0): "iron_ore", (41, 64, 0): "furnace",

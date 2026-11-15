@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Collection, Iterator
 
 from ..runtime import EnvBlocked, Replan
-from .base import Param, Skill, rec
+from .base import Param, Skill, failure, rec
 from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe
 from .registry import register
 
@@ -25,6 +25,7 @@ RADIUS = 32
 PROSPECT_STEPS = 6
 SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
+MAX_ORE_ROUTE_FAILURES = 3
 POLL_SECONDS = 2.0
 SOLID_SUPPORT = frozenset(("stone", "cobblestone", "deepslate", "cobbled_deepslate",
                            "dirt", "grass_block", "andesite", "diorite", "granite", "tuff"))
@@ -92,11 +93,14 @@ class SmeltIron(Skill):
         if result.get("warning") or state.count(drop) <= before:
             raise Replan(f"挖掘 {pos} 后背包 {drop} 未确认增加或工具告警：{result.get('warning', '')}")
 
-    def _ore_candidates(self, ex: "Executor", state: "State", radius=RADIUS) -> list:
+    def _ore_candidates(
+        self, ex: "Executor", state: "State", radius=RADIUS, *, excluded: Collection[tuple] = (),
+    ) -> list:
         blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=radius, limit=16).get("blocks") or []
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
         return [b["pos"] for b in blocks if isinstance(b.get("pos"), list)
-                and len(b["pos"]) == 3 and not _under_feet(cur, b["pos"])]
+                and len(b["pos"]) == 3 and tuple(b["pos"]) not in excluded
+                and not _under_feet(cur, b["pos"])]
 
     def _safe_column(self, ex: "Executor", pos) -> bool:
         x, y, z = pos
@@ -107,9 +111,9 @@ class SmeltIron(Skill):
                 and all(bare(ex.client.get_block([x, y + dy, z]).get("name")) in AIR | allowed
                         for dy in (2, 1, 0)))
 
-    def _prospect(self, ex: "Executor", state: "State") -> Iterator[dict]:
+    def _prospect(self, ex: "Executor", state: "State", excluded: set[tuple]) -> Iterator[dict]:
         # API §3.3 允许 radius <= 64，但仍只返回暴露矿，不能据空扫描断言环境无矿。
-        candidates = self._ore_candidates(ex, state, radius=64)
+        candidates = self._ore_candidates(ex, state, radius=64, excluded=excluded)
         if candidates:
             return candidates
         start = tuple(map(math.floor, state.pos))
@@ -142,7 +146,7 @@ class SmeltIron(Skill):
                 state.refresh_inventory(ex.client)
                 if result.get("warning") or best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
                     raise Replan("探矿工具告警或已无石镐，停止开凿")
-                candidates = self._ore_candidates(ex, state)
+                candidates = self._ore_candidates(ex, state, excluded=excluded)
                 if candidates or state.count("raw_iron"):
                     return candidates
             if not self._safe_column(ex, pos) or any(
@@ -155,7 +159,7 @@ class SmeltIron(Skill):
             if tuple(map(math.floor, cur)) != tuple(pos):
                 raise Replan("探矿阶梯未确认到达落脚点，停止下行")
             completed_steps += 1
-            candidates = self._ore_candidates(ex, state)
+            candidates = self._ore_candidates(ex, state, excluded=excluded)
             if candidates:
                 return candidates
         end = tuple(map(math.floor, state.pos))
@@ -164,22 +168,36 @@ class SmeltIron(Skill):
             f"安全阶梯探矿仍未发现（Y={start_y} 到 {end[1]}，走完 {completed_steps}/{max_steps} 级，"
             f"浅矿目标 Y≈{SHALLOW_IRON_Y}）；需换区域探索",
             missing_predicate="exposed_iron",
-            searched_volume=f"起点 {start} 暴露矿扫描半径 32/64；至 {end} 阶梯 {completed_steps}/{max_steps} 级",
+            searched_volume=(f"起点 {start} 暴露矿扫描半径 32/64；"
+                             f"跳过 {len(excluded)} 个已试不可达矿点；至 {end} 阶梯 {completed_steps}/{max_steps} 级"),
             wake_on="chunk_moved",
         )
 
     def _collect(self, ex: "Executor", state: "State") -> Iterator[dict]:
         if state.count("raw_iron"):
             return
-        for _ in range(self.args["count"]):
-            candidates = self._ore_candidates(ex, state)
+        excluded = set()
+        for _ in range(self.args["count"] + MAX_ORE_ROUTE_FAILURES):
+            candidates = self._ore_candidates(ex, state, excluded=excluded)
             if not candidates:
                 if state.count("raw_iron"):
                     return
-                candidates = yield from self._prospect(ex, state)
+                candidates = yield from self._prospect(ex, state, excluded)
                 if state.count("raw_iron"):
                     return
-            yield from self._mine(ex, state, candidates[0], IRON_ORES, "raw_iron")
+            pos = candidates[0]
+            try:
+                yield from self._mine(ex, state, pos, IRON_ORES, "raw_iron")
+            except Replan as err:
+                code, _ = failure(err)
+                if code not in ("path_not_found", "unreachable", "move_timeout"):
+                    raise
+                excluded.add(tuple(pos))
+                yield rec("ore_route_skip", pos=pos, error_code=code)
+                if len(excluded) >= MAX_ORE_ROUTE_FAILURES:
+                    raise
+                state.refresh_inventory(ex.client)
+                continue
             if state.count("raw_iron") >= self.args["count"]:
                 return
 
