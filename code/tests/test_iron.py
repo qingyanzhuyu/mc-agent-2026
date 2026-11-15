@@ -139,18 +139,33 @@ class SmeltIronTests(unittest.TestCase):
         self.assertTrue(any(step["op"] == "window_act" for step in steps))
 
     def test_prospecting_has_total_descent_budget_and_keeps_support(self):
+        start_y = 16
         blocks = {(x, y, 0): "stone" for x in range(1, 8)
-                  for y in range(63 - x, 64)}
+                  for y in range(start_y - 1 - x, start_y)}
         world = IronWorld(blocks=blocks)
+        world.st["pos"][1] = float(start_y)
         with self.assertRaisesRegex(Replan, "安全阶梯探矿仍未发现"):
             self.run_skill(world)
         moves = [args["pos"] for op, args in world.calls if op == "move_to"]
         self.assertEqual(len(moves), 6)
         self.assertLessEqual(sum(op == "dig" for op, _ in world.calls), 18)
         for x in range(1, 8):
-            self.assertEqual(world.blocks[(x, 63 - x, 0)], "stone")
-        self.assertEqual(world.blocks[(7, 57, 0)], "stone")
+            self.assertEqual(world.blocks[(x, start_y - 1 - x, 0)], "stone")
+        self.assertEqual(world.blocks[(7, start_y - 7, 0)], "stone")
         self.assertEqual(world.items.get("raw_iron", 0), 0)
+
+    def test_surface_prospecting_reaches_shallow_iron_band_before_exhaustion(self):
+        start_y = 26
+        blocks = {(x, y, 0): "stone" for x in range(1, 12)
+                  for y in range(start_y - 1 - x, start_y)}
+        world = IronWorld(blocks=blocks)
+        world.st["pos"][1] = float(start_y)
+        with self.assertRaisesRegex(Replan, "Y=26 到 16.*10/10"):
+            self.run_skill(world)
+        moves = [args["pos"] for op, args in world.calls if op == "move_to"]
+        self.assertEqual([int(pos[1]) for pos in moves], list(range(25, 15, -1)))
+        self.assertEqual(world.blocks[(10, 15, 0)], "stone")
+        self.assertEqual(world.blocks[(11, 16, 0)], "stone")
 
     def test_prospecting_rejects_unsafe_floor_clearance_and_roof(self):
         hazards = [(62, name) for name in ("air", "water", "lava", "sand", "gravel", "unknown")]

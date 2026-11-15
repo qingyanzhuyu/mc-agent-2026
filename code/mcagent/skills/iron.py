@@ -24,6 +24,8 @@ FUELS = (("coal", 16),) + tuple((f"{w}_{suffix}", 3)
                                 for suffix in ("planks", "log") for w in WOODS)
 RADIUS = 32
 PROSPECT_STEPS = 6
+SHALLOW_IRON_Y = 16
+MAX_PROSPECT_STEPS = 56
 POLL_SECONDS = 2.0
 SOLID_SUPPORT = frozenset(("stone", "cobblestone", "deepslate", "cobbled_deepslate",
                            "dirt", "grass_block", "andesite", "diorite", "granite"))
@@ -111,8 +113,11 @@ class SmeltIron(Skill):
         candidates = self._ore_candidates(ex, state, radius=64)
         if candidates:
             return candidates
+        start_y = math.floor(state.pos[1])
+        max_steps = min(MAX_PROSPECT_STEPS, max(PROSPECT_STEPS, start_y - SHALLOW_IRON_Y))
         visited = set()
-        for _ in range(PROSPECT_STEPS):
+        completed_steps = 0
+        for _ in range(max_steps):
             cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
             x, y, z = map(math.floor, cur)
             visited.add((x, z))
@@ -149,10 +154,16 @@ class SmeltIron(Skill):
             cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
             if tuple(map(math.floor, cur)) != tuple(pos):
                 raise Replan("探矿阶梯未确认到达落脚点，停止下行")
+            completed_steps += 1
             candidates = self._ore_candidates(ex, state)
             if candidates:
                 return candidates
-        raise Replan(f"半径 32/64 内未找到可采的暴露铁矿，最多 {PROSPECT_STEPS} 步安全阶梯探矿仍未发现；需换区域探索")
+        end_y = math.floor(state.pos[1])
+        raise Replan(
+            f"半径 32/64 内未找到可采的暴露铁矿，"
+            f"安全阶梯探矿仍未发现（Y={start_y} 到 {end_y}，走完 {completed_steps}/{max_steps} 级，"
+            f"浅矿目标 Y≈{SHALLOW_IRON_Y}）；需换区域探索"
+        )
 
     def _collect(self, ex: "Executor", state: "State") -> Iterator[dict]:
         if state.count("raw_iron"):
