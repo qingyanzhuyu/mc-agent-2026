@@ -8,14 +8,15 @@
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Collection, Mapping, Optional
 
 from ..planner import skill_choice
 from ..planner.llm import LLMClient, LLMError
-from ..runtime import State
-from ..skills import REGISTRY, Skill, make
+from ..runtime import EnvBlocked, State, _inv_fingerprint
+from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills.items import best_pickaxe
 from .goals import (
     DEFAULT_CAMPAIGN_STAGES,
@@ -27,6 +28,8 @@ from .goals import (
     diagnose_goal_gap,
     is_goal_achieved,
     is_goal_stopped_out,
+    is_prereq_satisfied,
+    normalize_goal_ids,
     rank_actionable_goals,
     resolve_active_goals,
 )
@@ -49,6 +52,36 @@ class PlanDecision:
     llm_errors: tuple[str, ...] = ()
     prompt_tokens: int = 0
     completion_tokens: int = 0
+
+
+@dataclass
+class _EnvironmentBlock:
+    error: EnvBlocked
+    observation: Any
+
+    @staticmethod
+    def observe(error: EnvBlocked, state: State) -> Any:
+        if error.wake_on == "inventory_changed":
+            return _inv_fingerprint(state.inventory) if not state.inventory_dirty else None
+        status = state.snapshot()
+        if error.wake_on in ("day", "night"):
+            is_day = status.get("is_day")
+            return is_day if isinstance(is_day, bool) else None
+        pos = status.get("pos")
+        if not isinstance(pos, (list, tuple)) or len(pos) != 3:
+            return None
+        if not all(isinstance(n, (int, float)) and math.isfinite(n) for n in (pos[0], pos[2])):
+            return None
+        return status.get("dimension"), math.floor(pos[0] / 16), math.floor(pos[2] / 16)
+
+    def wake_if_changed(self, state: State) -> bool:
+        current = self.observe(self.error, state)
+        if current is None or current == self.observation:
+            return False
+        previous, self.observation = self.observation, current
+        if self.error.wake_on in ("day", "night"):
+            return current is (self.error.wake_on == "day")
+        return previous is not None
 
 
 def build_state_summary(state: State, *, goal_hint: str = "") -> str:
@@ -95,17 +128,73 @@ class RulePlanner:
         self.ep_goal_fails: dict[str, int] = {}
         self.ep_goal_elapsed: dict[str, float] = {}
         self._last_selected_goal_id: Optional[str] = None
+        self._environment_blocks: dict[str, _EnvironmentBlock] = {}
+
+    def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
+        self._environment_blocks[skill.goal] = _EnvironmentBlock(error, _EnvironmentBlock.observe(error, state))
+        self._last_selected_goal_id = None
+
+    def refresh_environment_blocks(self, state: State) -> None:
+        for key, block in list(self._environment_blocks.items()):
+            if block.wake_if_changed(state):
+                del self._environment_blocks[key]
+
+    def environment_block(self, goal_key: str) -> Optional[EnvBlocked]:
+        block = self._environment_blocks.get(goal_key)
+        return block.error if block else None
+
+    def _block_for_goal(self, goal: GoalSpec, state: State) -> Optional[EnvBlocked]:
+        name, args = goal.skill, goal.args_dict
+        if not all(check_item_expr(state, expr) for expr in goal.prereq_items):
+            for expression, fallback, fallback_args in goal.gather_fallbacks:
+                if not check_item_expr(state, expression):
+                    name, args = fallback, dict(fallback_args)
+                    break
+            else:
+                return None
+        cls = self.registry.get(name)
+        if cls is None:
+            return None
+        bound, errors = bind_args(cls, args)
+        return None if errors else self.environment_block(cls.goal.format(**bound))
+
+    def blocked_targets(self, state: State, target_goals: Any) -> dict[str, EnvBlocked]:
+        self.refresh_environment_blocks(state)
+        if not self._environment_blocks:
+            return {}
+
+        def blocked_branch(goal: GoalSpec, seen: set[str]) -> Optional[EnvBlocked]:
+            if goal.id in seen:
+                return None
+            seen.add(goal.id)
+            for key in goal.prereq_goals:
+                prereq = self.ledger_map.get(key)
+                if prereq and not is_prereq_satisfied(prereq, state, self.completed_advancements):
+                    block = blocked_branch(prereq, seen)
+                    if block is not None:
+                        return block
+            return self._block_for_goal(goal, state)
+
+        targets = {}
+        for gid in normalize_goal_ids(target_goals):
+            goal = self.ledger_map.get(gid)
+            if goal is not None and not is_goal_achieved(goal, state, self.completed_advancements):
+                block = blocked_branch(goal, set())
+                if block is not None:
+                    targets[gid] = block
+        return targets
 
     def _try_make(self, name: str, args: Optional[dict], state: State) -> Optional[Skill]:
         cls = self.registry.get(name)
         if cls is None or cls.blocked(state):
             return None
         inst = cls(**(args or {}))
-        if inst.is_cooling() or not inst.can_start(state):
+        if self.environment_block(inst.goal) or inst.is_cooling() or not inst.can_start(state):
             return None
         return inst
 
     def _rank(self, state: State):
+        suspended = {g.id for g in self.active_goals if self._environment_blocks and self._block_for_goal(g, state)}
         return rank_actionable_goals(
             state,
             self.active_goals,
@@ -114,6 +203,7 @@ class RulePlanner:
             ep_goal_fails=self.ep_goal_fails,
             ep_goal_elapsed=self.ep_goal_elapsed,
             telemetry=self.telemetry,
+            suspended_goals=suspended,
         )
 
     def current_goal_hint(self, state: State) -> str:
@@ -175,6 +265,7 @@ class RulePlanner:
         return gid
 
     def choose(self, state: State) -> PlanDecision:
+        self.refresh_environment_blocks(state)
         self._last_selected_goal_id = None
         hp = float(state.st.get("health", 20))
         food = float(state.st.get("food", 20))
@@ -221,6 +312,11 @@ class RulePlanner:
             return PlanDecision(None, "idle", f"目标 {ranked[0].step_goal.id} 所有候选技能均在冷却")
 
         if self.target_goal:
+            if self.blocked_targets(state, self.target_goal):
+                scout = self._try_make("scout_island", {"radius": 36}, state)
+                if scout is not None:
+                    return PlanDecision(scout, "rule", "聚焦目标因环境挂起，外迁重新观察")
+                return PlanDecision(None, "idle", "等待聚焦目标的环境条件变化")
             return PlanDecision(None, "idle", f"目标 {self.target_goal} 已达成或本轮已止损")
 
         # 常规战役模式：已激活台账目标全部达成后维持基础物资安全库存并持续探索
@@ -281,6 +377,13 @@ class CampaignPlanner:
         self.on_llm_telemetry = on_llm_telemetry
         self._last_selected_goal_id: Optional[str] = None
 
+    def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
+        self.rules.record_environment_block(skill, error, state)
+        self._last_selected_goal_id = None
+
+    def blocked_targets(self, state: State, target_goals: Any) -> dict[str, EnvBlocked]:
+        return self.rules.blocked_targets(state, target_goals)
+
     def record_skill_outcome(
         self,
         skill_name: str,
@@ -300,12 +403,16 @@ class CampaignPlanner:
         self._last_selected_goal_id = None
 
     def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
+        self.rules.refresh_environment_blocks(state)
         if self.mode == "focus":
             assert self.focus_skill is not None
             self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
             if state.in_safe_mode:
                 return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
             skill = make(self.focus_skill, self.focus_args, registry=self.registry)
+            environment = self.rules.environment_block(skill.goal)
+            if environment is not None:
+                return PlanDecision(None, "idle", f"focus 技能环境挂起: {environment}")
             reason = type(skill).blocked(state)
             if reason:
                 return PlanDecision(None, "idle", f"focus 技能前置未满足: {reason}")
@@ -319,7 +426,11 @@ class CampaignPlanner:
             dec = self.rules.choose(state)
             self._last_selected_goal_id = self.rules._last_selected_goal_id
             return dec
-        if not skill_choice.has_ready_skill(state, self.registry, self.min_verified):
+        ready_registry = {
+            name: cls for name, cls in self.registry.items()
+            if self.rules.environment_block(cls.goal) is None
+        }
+        if not skill_choice.has_ready_skill(state, ready_registry, self.min_verified):
             dec = self.rules.choose(state)
             self._last_selected_goal_id = self.rules._last_selected_goal_id
             return dec
@@ -338,7 +449,7 @@ class CampaignPlanner:
                 summary,
                 state,
                 recent_failures=fail_str,
-                registry=self.registry,
+                registry=ready_registry,
                 min_verified=self.min_verified,
                 attempts=2,
                 thinking=False,
@@ -348,6 +459,9 @@ class CampaignPlanner:
         except LLMError as e:
             errors = [f"LLMError: {e}"]
             used = max(1, used)
+        if chosen is not None and self.rules.environment_block(chosen.goal):
+            errors.append(f"{chosen.goal} 环境条件尚未变化")
+            chosen = None
         dt_ms = round((time.monotonic() - t0) * 1000.0, 1)
         prompt_tok = int(usage.get("prompt_tokens", 0))
         comp_tok = int(usage.get("completion_tokens", 0))

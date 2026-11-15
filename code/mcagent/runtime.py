@@ -16,13 +16,38 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from .client import ApiError, FATAL, REPLAN, RETRY, Client
 
 
 class Replan(Exception):
     """前置条件不成立，当前任务作废，换一个目标。"""
+
+
+EnvironmentWake = Literal["chunk_moved", "day", "night", "inventory_changed"]
+
+
+class EnvBlocked(Replan):
+    """已有环境观察证据，挂起当前技能，等待对应条件变化。"""
+
+    def __init__(
+        self, message: str, *, missing_predicate: str, searched_volume: str, wake_on: EnvironmentWake,
+    ) -> None:
+        super().__init__(message)
+        if wake_on not in ("chunk_moved", "day", "night", "inventory_changed"):
+            raise ValueError(f"未知环境唤醒条件: {wake_on}")
+        self.missing_predicate = missing_predicate
+        self.searched_volume = searched_volume
+        self.wake_on = wake_on
+
+    def evidence(self) -> dict[str, str]:
+        return {
+            "message": str(self),
+            "missing_predicate": self.missing_predicate,
+            "searched_volume": self.searched_volume,
+            "wake_on": self.wake_on,
+        }
 
 
 class Fatal(Exception):

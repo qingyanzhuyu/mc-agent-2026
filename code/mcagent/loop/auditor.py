@@ -21,9 +21,9 @@ import subprocess
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from ..runtime import State, _inv_fingerprint
+from ..runtime import EnvBlocked, State, _inv_fingerprint
 from ..skills.items import AIR, bare
 from .goals import GOALS, GoalSpec, diagnose_goal_gap, is_goal_achieved, normalize_goal_ids
 from .tape import TapeRecorder
@@ -232,6 +232,7 @@ class SoakObserver:
 
         self.skill_stats: dict[str, dict[str, int]] = {}
         self.env_variance_counts: dict[str, int] = {}
+        self.environment_blocked_goals: dict[str, dict[str, str]] = {}
         self.decision_sources: dict[str, int] = {}
         self.step_sources: dict[str, int] = {}
         self.llm_latencies_ms: list[float] = []
@@ -409,6 +410,7 @@ class SoakObserver:
         error_code: str = "",
         error_msg: str = "",
         died_or_disconnected: bool = False,
+        environment: Optional[EnvBlocked] = None,
     ) -> None:
         tape_slice = self.tape.end_skill_slice() if self.tape is not None else []
         ctx = self._skill_ctx or {"skill": skill.name, "args": dict(skill.args), "before_counts": {}}
@@ -442,6 +444,10 @@ class SoakObserver:
         elif outcome == "budget_stopped":
             # 外层运行预算只说明未继续执行，不能判定技能失败；保留流水与姿态核对。
             stat["budget_stopped"] += 1
+        elif environment is not None:
+            key = f"{skill.name}:env_blocked"
+            self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
+            self._goal_failures.pop(skill.goal, None)
         else:
             stat["replan"] += 1
             if outcome == "replan":
@@ -482,6 +488,7 @@ class SoakObserver:
             "error_code": error_code,
             "error_msg": error_msg[:200],
             "postcondition_error": post_err,
+            **({"environment": environment.evidence()} if environment is not None else {}),
         })
         self._skill_ctx = None
         self.write_summary()
@@ -663,15 +670,22 @@ class SoakObserver:
         self._append_jsonl(self.curve_path, point)
         return point
 
-    def on_run_end(self, state: State, client=None, *, stop_reason: str = "") -> None:
+    def on_run_end(
+        self, state: State, client=None, *, stop_reason: str = "",
+        environment_blocked: Optional[Mapping[str, EnvBlocked]] = None,
+    ) -> None:
         self.on_progress_tick(state, client=client, force=True)
         self.update_goals_reached(state)
         reached_map = {gid: gid in self.goals_reached for gid in self.target_goals}
         target_reached = bool(self.target_goals) and all(reached_map.values())
+        self.environment_blocked_goals = {
+            gid: block.evidence() for gid, block in (environment_blocked or {}).items()
+            if gid in reached_map and not reached_map[gid]
+        }
 
         if stop_reason != "keyboard_interrupt":
             for gid in self.target_goals:
-                if not reached_map[gid]:
+                if not reached_map[gid] and gid not in self.environment_blocked_goals:
                     self._report_goal_miss(gid, state, stop_reason)
 
         self._append_jsonl(self.timeline_path, {
@@ -683,6 +697,7 @@ class SoakObserver:
             "target_goal": self.target_goal,
             "target_goals": list(self.target_goals),
             "target_goals_reached": reached_map,
+            "environment_blocked_goals": self.environment_blocked_goals,
             "target_goal_reached": target_reached,
             "target_goal_elapsed_s": (
                 max(self.goals_reached[g] for g in self.target_goals) if target_reached else None
@@ -879,6 +894,9 @@ class SoakObserver:
             label = "本轮聚焦目标" if len(self.target_goals) == 1 else f"本轮聚焦目标（同轮 {len(self.target_goals)} 个）"
             if gid in self.goals_reached:
                 lines.append(f"- 🎯 **{label}**：`{gid}` -> ✅ 已达成 (`{self.goals_reached[gid]}s`)")
+            elif gid in self.environment_blocked_goals:
+                block = self.environment_blocked_goals[gid]
+                lines.append(f"- 🎯 **{label}**：`{gid}` -> 环境挂起（{block['message']}；恢复条件 `{block['wake_on']}`）")
             else:
                 lines.append(f"- 🎯 **{label}**：`{gid}` -> ❌ 未达成")
         base_pt = self._load_baseline_last_point()
