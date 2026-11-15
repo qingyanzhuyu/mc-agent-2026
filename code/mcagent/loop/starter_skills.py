@@ -544,7 +544,8 @@ class MineStone(Skill):
     @staticmethod
     def _safe_stair_column(ex: "Executor", x: int, y: int, z: int) -> bool:
         floor = bare(ex.client.get_block([x, y - 1, z]).get("name", ""))
-        if not floor or floor in AIR or floor in ("lava", "water"):
+        # 树冠的叶片层也可能悬空，不能借它判定下面是可下挖的地层。
+        if not floor or floor in AIR or floor in ("lava", "water") or floor.endswith("_leaves"):
             return False
         # 三格净空上方若是落沙/砾石，挖开后会重新填入槽内；底板实心仍不足以安全下行。
         roof = bare(ex.client.get_block([x, y + 3, z]).get("name", ""))
@@ -576,12 +577,7 @@ class MineStone(Skill):
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.refresh_status(ex.client, max_age_s=0)
-        state.refresh_inventory(ex.client)
-        pick = best_pickaxe(state)
-        if not pick:
-            raise Replan("背包没有镐")
-        if bare((state.st.get("held") or {}).get("name")) != pick:
-            yield rec("equip", ex.equip(pick, "hand"), item=pick)
+        yield from self._prepare_pickaxe(ex, state)
 
         start_cobble = total_cobble(state)
         want = int(self.args["count"])
@@ -611,7 +607,7 @@ class MineStone(Skill):
             target = cands[0] if cands else None
 
             if target is None:
-                # 地表无平层裸露石头：从脚边安全方向向下开凿阶梯式探槽（每步先核对底板非空气/岩浆/水，防挖穿虚空，且人物随阶梯下行贴身拾取）
+                # 地表无平层裸露石头：从脚边安全方向开凿探槽，核对每列的底板，再沿阶梯下行贴身拾取。
                 if stair_origin is None and stair_steps_taken < 6:
                     ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                     stair_columns.add((ix, iz))

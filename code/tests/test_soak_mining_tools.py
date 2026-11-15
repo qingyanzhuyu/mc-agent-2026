@@ -73,12 +73,45 @@ class MiningToolsTests(unittest.TestCase):
 
     def test_tool_lost_after_initial_equip_is_not_used_for_surface_stone(self):
         world = ToolChangeWorld(after_equip=lose_pick)
+        world.held = None
         world.st["held"] = None
         ex, state = world.session()
         with self.assertRaisesRegex(Replan, "背包已无镐"):
             drive(make("mine_stone"), ex, state)
         self.assertEqual(ex.acts, ["equip"])
         self.assertEqual(world.dig_tools, [])
+
+    def test_initial_equip_must_survive_inventory_read_before_stair_dig(self):
+        # ep-0001: equip acknowledges the wooden pick, but status still has an
+        # empty hand. Use soil support to exercise the equipment gate alone.
+        for lose_from_bag, reason in ((True, "背包已无镐"), (False, "手持未确认")):
+            with self.subTest(lose_from_bag=lose_from_bag):
+                def reject_equip(world):
+                    if lose_from_bag:
+                        world.items.pop("wooden_pickaxe")
+                    world.held = None
+
+                world = ToolChangeWorld(
+                    blocks={(1, 63, 0): "dirt", (1, 62, 0): "dirt", (2, 62, 0): "stone"},
+                    after_equip=reject_equip,
+                )
+                world.held = None
+                world.st["held"] = None
+                ex, state = world.session()
+                with self.assertRaisesRegex(Replan, reason):
+                    drive(make("mine_stone", {"count": 1}), ex, state)
+                self.assertEqual(ex.acts, ["equip"])
+                self.assertEqual(world.blocks[(1, 63, 0)], "dirt")
+
+    def test_confirmed_inventory_hand_allows_mining_when_status_hand_is_null(self):
+        world = ToolChangeWorld()
+        world.held = None
+        world.st["held"] = None
+        ex, state = world.session()
+        drive(make("mine_stone", {"count": 1}), ex, state)
+        self.assertEqual(ex.acts, ["equip", "dig"])
+        self.assertEqual(world.dig_tools, ["wooden_pickaxe"])
+        self.assertEqual(state.count("cobblestone"), 1)
 
     def test_last_pick_breaks_after_stone_and_stale_status_cannot_authorize_next_dig(self):
         world = ToolChangeWorld(after_dig=lambda w, r: lose_pick(w))
