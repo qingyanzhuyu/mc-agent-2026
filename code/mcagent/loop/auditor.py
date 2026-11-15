@@ -386,6 +386,7 @@ class SoakObserver:
         error_msg: str = "",
         died_or_disconnected: bool = False,
         environment: Optional[EnvBlocked] = None,
+        environment_recovery: bool = False,
     ) -> None:
         tape_slice = self.tape.end_skill_slice() if self.tape is not None else []
         ctx = self._skill_ctx or {"skill": skill.name, "args": dict(skill.args), "before_counts": {}}
@@ -433,7 +434,10 @@ class SoakObserver:
                     "error_msg": error_msg[:200],
                     "elapsed_s": self._elapsed_s(),
                 }
-            self._classify_skill_failure(skill, outcome, error_code, error_msg, state, ctx, tape_slice)
+            self._classify_skill_failure(
+                skill, outcome, error_code, error_msg, state, ctx, tape_slice,
+                environment_recovery=environment_recovery,
+            )
 
         self._last_skill_snapshots[skill.name] = (copy.deepcopy(ctx), copy.deepcopy(tape_slice))
 
@@ -464,6 +468,7 @@ class SoakObserver:
             "error_msg": error_msg[:200],
             "postcondition_error": post_err,
             **({"environment": environment.evidence()} if environment is not None else {}),
+            **({"environment_recovery": True} if environment_recovery else {}),
         })
         self._skill_ctx = None
         self.write_summary()
@@ -477,6 +482,8 @@ class SoakObserver:
         state: State,
         ctx: dict,
         tape_slice: list[dict],
+        *,
+        environment_recovery: bool = False,
     ) -> None:
         if outcome in ("fatal", "unexpected_exception") or error_code in ("bad_args", "unknown_api"):
             self._report_incident(
@@ -496,6 +503,9 @@ class SoakObserver:
         # 常见单次环境波动：记入波动计数，只有短时间反复撞同一目标才升级为震荡问题单
         variance_key = f"{skill.name}:{error_code or outcome}"
         self.env_variance_counts[variance_key] = self.env_variance_counts.get(variance_key, 0) + 1
+        if environment_recovery and skill.name == "scout_island" and error_code == "path_not_found":
+            self._goal_failures.pop(skill.goal, None)
+            return
         now_m = time.monotonic()
         q = self._goal_failures.setdefault(skill.goal, deque(maxlen=10))
         q.append(now_m)
