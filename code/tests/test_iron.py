@@ -142,6 +142,29 @@ class SmeltIronTests(unittest.TestCase):
         self.assertEqual(world.blocks[tuple(deep_ore)], "iron_ore")
         self.assertEqual(state.count("iron_ingot"), 1)
 
+    def test_exhausted_direct_routes_switch_to_local_stair_scan(self):
+        deep_ores = [(x, 35, 1) for x in range(2, 6)]
+        world = ProspectingWorld(
+            blocks={**dict.fromkeys(deep_ores, "iron_ore"), (1, 62, 0): "stone",
+                    (1, 64, 0): "dirt", (2, 64, 0): "iron_ore"},
+            exposed_after={(2, 64, 0): (1, 64, 0)},
+            views=[view(), view(output=1), view()],
+        )
+        move = world.move_to
+        rejected = []
+
+        def reject_deep_paths(*args, **kwargs):
+            target = tuple(kwargs["pos"])
+            if target in deep_ores:
+                rejected.append(target)
+                raise ApiError("path_not_found", "No path")
+            return move(*args, **kwargs)
+
+        world.move_to = reject_deep_paths
+        _, _, state = self.run_skill(world, count=1)
+        self.assertEqual(rejected, deep_ores[:3])
+        self.assertEqual(state.count("iron_ingot"), 1)
+
     def test_expands_exposed_ore_search_before_digging_stairs(self):
         world = IronWorld(blocks={(40, 64, 0): "iron_ore", (41, 64, 0): "furnace",
                                   (40, 63, 0): "stone", (41, 63, 0): "stone"},

@@ -22,6 +22,7 @@ WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "ma
 FUELS = (("coal", 16),) + tuple((f"{w}_{suffix}", 3)
                                 for suffix in ("planks", "log") for w in WOODS)
 RADIUS = 32
+MINING_REACH = 4
 PROSPECT_STEPS = 6
 SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
@@ -75,7 +76,7 @@ class SmeltIron(Skill):
 
     def _mine(self, ex: "Executor", state: "State", pos, ores, drop: str) -> Iterator[dict]:
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-        if math.dist(cur, pos) > 4:
+        if math.dist(cur, pos) > MINING_REACH:
             yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
         if _under_feet(cur, pos):
@@ -94,12 +95,15 @@ class SmeltIron(Skill):
             raise Replan(f"挖掘 {pos} 后背包 {drop} 未确认增加或工具告警：{result.get('warning', '')}")
 
     def _ore_candidates(
-        self, ex: "Executor", state: "State", radius=RADIUS, *, excluded: Collection[tuple] = (),
+        self, ex: "Executor", state: "State", radius=RADIUS, *,
+        excluded: Collection[tuple[int, int, int]] = (), in_reach_only: bool = False,
     ) -> list:
-        blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=radius, limit=16).get("blocks") or []
+        search_radius = MINING_REACH if in_reach_only else radius
+        blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=search_radius, limit=16).get("blocks") or []
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
         return [b["pos"] for b in blocks if isinstance(b.get("pos"), list)
                 and len(b["pos"]) == 3 and tuple(b["pos"]) not in excluded
+                and (not in_reach_only or math.dist(cur, b["pos"]) <= MINING_REACH)
                 and not _under_feet(cur, b["pos"])]
 
     def _safe_column(self, ex: "Executor", pos) -> bool:
@@ -111,11 +115,15 @@ class SmeltIron(Skill):
                 and all(bare(ex.client.get_block([x, y + dy, z]).get("name")) in AIR | allowed
                         for dy in (2, 1, 0)))
 
-    def _prospect(self, ex: "Executor", state: "State", excluded: set[tuple]) -> Iterator[dict]:
+    def _prospect(
+        self, ex: "Executor", state: "State", excluded: set[tuple[int, int, int]], *,
+        in_reach_only: bool,
+    ) -> Iterator[dict]:
         # API §3.3 允许 radius <= 64，但仍只返回暴露矿，不能据空扫描断言环境无矿。
-        candidates = self._ore_candidates(ex, state, radius=64, excluded=excluded)
-        if candidates:
-            return candidates
+        if not in_reach_only:
+            candidates = self._ore_candidates(ex, state, radius=64, excluded=excluded)
+            if candidates:
+                return candidates
         start = tuple(map(math.floor, state.pos))
         start_y = start[1]
         max_steps = min(MAX_PROSPECT_STEPS, max(PROSPECT_STEPS, start_y - SHALLOW_IRON_Y))
@@ -146,7 +154,7 @@ class SmeltIron(Skill):
                 state.refresh_inventory(ex.client)
                 if result.get("warning") or best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
                     raise Replan("探矿工具告警或已无石镐，停止开凿")
-                candidates = self._ore_candidates(ex, state, excluded=excluded)
+                candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
                 if candidates or state.count("raw_iron"):
                     return candidates
             if not self._safe_column(ex, pos) or any(
@@ -159,16 +167,17 @@ class SmeltIron(Skill):
             if tuple(map(math.floor, cur)) != tuple(pos):
                 raise Replan("探矿阶梯未确认到达落脚点，停止下行")
             completed_steps += 1
-            candidates = self._ore_candidates(ex, state, excluded=excluded)
+            candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
             if candidates:
                 return candidates
         end = tuple(map(math.floor, state.pos))
+        scan_scope = f"仅查近场 {MINING_REACH} 格" if in_reach_only else "半径 32/64"
         raise EnvBlocked(
-            f"半径 32/64 内未找到可采的暴露铁矿，"
+            f"{scan_scope} 内未找到可采的暴露铁矿，"
             f"安全阶梯探矿仍未发现（Y={start_y} 到 {end[1]}，走完 {completed_steps}/{max_steps} 级，"
             f"浅矿目标 Y≈{SHALLOW_IRON_Y}）；需换区域探索",
             missing_predicate="exposed_iron",
-            searched_volume=(f"起点 {start} 暴露矿扫描半径 32/64；"
+            searched_volume=(f"起点 {start} 暴露矿扫描{scan_scope}；"
                              f"跳过 {len(excluded)} 个已试不可达矿点；至 {end} 阶梯 {completed_steps}/{max_steps} 级"),
             wake_on="chunk_moved",
         )
@@ -178,11 +187,13 @@ class SmeltIron(Skill):
             return
         excluded = set()
         for _ in range(self.args["count"] + MAX_ORE_ROUTE_FAILURES):
-            candidates = self._ore_candidates(ex, state, excluded=excluded)
+            # 同一深洞常返回多块矿。直达预算用完后，只找阶梯附近可直接挖的矿。
+            in_reach_only = len(excluded) >= MAX_ORE_ROUTE_FAILURES
+            candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
             if not candidates:
                 if state.count("raw_iron"):
                     return
-                candidates = yield from self._prospect(ex, state, excluded)
+                candidates = yield from self._prospect(ex, state, excluded, in_reach_only=in_reach_only)
                 if state.count("raw_iron"):
                     return
             pos = candidates[0]
@@ -190,12 +201,10 @@ class SmeltIron(Skill):
                 yield from self._mine(ex, state, pos, IRON_ORES, "raw_iron")
             except Replan as err:
                 code, _ = failure(err)
-                if code not in ("path_not_found", "unreachable", "move_timeout"):
+                if in_reach_only or code not in ("path_not_found", "unreachable", "move_timeout"):
                     raise
                 excluded.add(tuple(pos))
                 yield rec("ore_route_skip", pos=pos, error_code=code)
-                if len(excluded) >= MAX_ORE_ROUTE_FAILURES:
-                    raise
                 state.refresh_inventory(ex.client)
                 continue
             if state.count("raw_iron") >= self.args["count"]:
