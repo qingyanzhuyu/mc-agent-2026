@@ -544,8 +544,8 @@ class MineStone(Skill):
     @staticmethod
     def _safe_stair_column(ex: "Executor", x: int, y: int, z: int) -> bool:
         floor = bare(ex.client.get_block([x, y - 1, z]).get("name", ""))
-        # 树冠的叶片层也可能悬空，不能借它判定下面是可下挖的地层。
-        if not floor or floor in AIR or floor in ("lava", "water") or floor.endswith("_leaves"):
+        # 树冠的叶片和树干可能仍在地表上方，不能把它们当作采石地层。
+        if not floor or floor in AIR or floor in ("lava", "water") or floor.endswith(("_leaves", "_log", "_wood")):
             return False
         # 三格净空上方若是落沙/砾石，挖开后会重新填入槽内；底板实心仍不足以安全下行。
         roof = bare(ex.client.get_block([x, y + 3, z]).get("name", ""))
