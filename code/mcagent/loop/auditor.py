@@ -25,34 +25,9 @@ from typing import Any, Mapping, Optional
 
 from ..runtime import EnvBlocked, State, _inv_fingerprint
 from ..skills.items import AIR, bare
+from .draft_scores import ADVANCEMENT_SCORES_V2
 from .goals import GOALS, GoalSpec, diagnose_goal_gap, is_goal_achieved, normalize_goal_ids
 from .tape import TapeRecorder
-
-# RULES v2 草案常见 T1/T2 计分表映射（用于计算进度分曲线）
-ADVANCEMENT_SCORES_V2: dict[str, int] = {
-    "minecraft:story/mine_stone": 5,
-    "minecraft:story/upgrade_tools": 5,
-    "minecraft:story/smelt_iron": 5,
-    "minecraft:story/iron_tools": 5,
-    "minecraft:story/obtain_armor": 5,
-    "minecraft:story/lava_bucket": 15,
-    "minecraft:story/deflect_arrow": 15,
-    "minecraft:story/form_obsidian": 15,
-    "minecraft:story/mine_diamond": 15,
-    "minecraft:story/enchant_item": 30,
-    "minecraft:story/enter_the_nether": 30,
-    "minecraft:story/shiny_gear": 60,
-    "minecraft:story/follow_ender_eye": 60,
-    "minecraft:adventure/kill_a_mob": 5,
-    "minecraft:adventure/shoot_arrow": 5,
-    "minecraft:adventure/sleep_in_bed": 5,
-    "minecraft:adventure/ol_betsy": 15,
-    "minecraft:adventure/bullseye": 15,
-    "minecraft:adventure/use_lodestone": 15,
-    "minecraft:husbandry/plant_seed": 5,
-    "minecraft:husbandry/breed_an_animal": 5,
-    "minecraft:husbandry/fishy_business": 15,
-}
 
 # 本地靶场 /advancements 返回 0 时的背包里程碑代理判据（与服务端真实进度分列展示，绝不混同）
 _ITEM_MILESTONES: tuple[tuple[str, tuple[str, ...], int], ...] = (
