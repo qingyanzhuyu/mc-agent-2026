@@ -787,6 +787,7 @@ def rank_actionable_goals(
     ep_goal_fails: Optional[Mapping[str, int]] = None,
     ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    suspended_goals: Collection[str] = (),
 ) -> list[GoalPlanStep]:
     """对所有尚未达成且未触发止损的目标计算未满足前置链，按性价比降序返回可执行步列表。"""
     by_id = {g.id: g for g in active_goals}
@@ -802,6 +803,8 @@ def rank_actionable_goals(
                 return True
             if not is_root and is_prereq_satisfied(node, state, completed_advs):
                 return True
+            if node.id in suspended_goals:
+                return False
             if is_goal_stopped_out(node, ep_goal_fails, ep_goal_elapsed):
                 return False
             for pid in node.prereq_goals:
