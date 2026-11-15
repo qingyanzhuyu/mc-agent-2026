@@ -241,6 +241,18 @@ class SmeltIronTests(unittest.TestCase):
                 with self.assertRaisesRegex(Replan, "石镐"):
                     drive(SmeltIron(), ex, state)
 
+    def test_mines_with_copper_and_uses_pale_oak_fuel(self):
+        world = IronWorld(
+            items={"copper_pickaxe": 1, "furnace": 1, "pale_oak_planks": 1},
+            blocks={(1, 63, 0): "tuff", (2, 64, 0): "iron_ore"},
+            views=[view(), view(output=1), view()],
+        )
+        _, _, state = self.run_skill(world, count=1)
+        self.assertEqual(state.count("iron_ingot"), 1)
+        fuel = [a["ops"][0]["item"] for op, a in world.calls
+                if op == "window_act" and a["ops"][0].get("to") == "fuel"]
+        self.assertEqual(fuel, ["pale_oak_planks"])
+
     def test_raw_iron_skips_mining_and_no_pick_needed(self):
         world = IronWorld(items={"raw_iron": 1, "oak_planks": 1, "furnace": 1},
                           views=[view(), view(output=1), view()])

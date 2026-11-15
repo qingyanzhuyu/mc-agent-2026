@@ -26,6 +26,9 @@ PICKAXE_ORDER: tuple[str, ...] = (
     "netherite_pickaxe", "diamond_pickaxe", "iron_pickaxe",
     "copper_pickaxe", "stone_pickaxe", "golden_pickaxe", "wooden_pickaxe",
 )
+STONE_OR_BETTER_PICKS = frozenset({
+    "stone_pickaxe", "copper_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
+})
 
 
 def bare(name: object) -> str:

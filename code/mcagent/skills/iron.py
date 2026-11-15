@@ -10,15 +10,14 @@ from typing import TYPE_CHECKING, Iterator
 
 from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, rec
-from .items import AIR, bare, best_pickaxe
+from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe
 from .registry import register
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
 
 IRON_ORES = ("iron_ore", "deepslate_iron_ore")
-PICKS = frozenset(("stone_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe"))
-WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "mangrove")
+WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "mangrove", "pale_oak")
 # 半个冶炼单位：煤 8 个，木板/原木 1.5 个；不把下界木材当燃料。
 FUELS = (("coal", 16),) + tuple((f"{w}_{suffix}", 3)
                                 for suffix in ("planks", "log") for w in WOODS)
@@ -28,7 +27,7 @@ SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
 POLL_SECONDS = 2.0
 SOLID_SUPPORT = frozenset(("stone", "cobblestone", "deepslate", "cobbled_deepslate",
-                           "dirt", "grass_block", "andesite", "diorite", "granite"))
+                           "dirt", "grass_block", "andesite", "diorite", "granite", "tuff"))
 
 
 def _under_feet(cur, pos) -> bool:
@@ -55,21 +54,21 @@ class SmeltIron(Skill):
 
     @classmethod
     def blocked(cls, state: "State") -> str:
-        if state.count("raw_iron") < 1 and best_pickaxe(state) not in PICKS:
+        if state.count("raw_iron") < 1 and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包无粗铁且缺石镐或更好的镐（木镐、金镐不能采铁）"
-        if not any(state.count(n) for n, _ in FUELS) and best_pickaxe(state) not in PICKS:
+        if not any(state.count(n) for n, _ in FUELS) and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包缺煤、木板或原木燃料，且无可采煤的镐"
         return ""
 
     def _prepare_pick(self, ex: "Executor", state: "State") -> Iterator[dict]:
         inv = state.refresh_inventory(ex.client)
         pick = best_pickaxe(state)
-        if pick not in PICKS:
+        if pick not in STONE_OR_BETTER_PICKS:
             raise Replan("挖掘前检查背包缺石镐或更好的镐")
         if bare((inv.get("held", state.st.get("held")) or {}).get("name")) != pick:
             yield rec("equip", ex.equip(pick, "hand"), item=pick)
             inv = state.refresh_inventory(ex.client)
-            if best_pickaxe(state) not in PICKS or ("held" in inv and
+            if best_pickaxe(state) not in STONE_OR_BETTER_PICKS or ("held" in inv and
                     bare((inv.get("held") or {}).get("name")) != pick):
                 raise Replan(f"挖掘前装备 {pick} 后手持未确认")
 
@@ -141,7 +140,7 @@ class SmeltIron(Skill):
                 result = ex.dig(target, collect=True)
                 yield rec("dig", result, pos=target)
                 state.refresh_inventory(ex.client)
-                if result.get("warning") or best_pickaxe(state) not in PICKS:
+                if result.get("warning") or best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
                     raise Replan("探矿工具告警或已无石镐，停止开凿")
                 candidates = self._ore_candidates(ex, state)
                 if candidates or state.count("raw_iron"):
@@ -234,7 +233,7 @@ class SmeltIron(Skill):
         yield from self._collect(ex, state)
         count = min(self.args["count"], state.count("raw_iron"))
         # 有镐才顺路采煤，最多两块；没有则转用背包木材，不等待环境刷新。
-        if state.count("coal") * 8 < count and best_pickaxe(state) in PICKS:
+        if state.count("coal") * 8 < count and best_pickaxe(state) in STONE_OR_BETTER_PICKS:
             for _ in range(2):
                 coal = ex.client.find_blocks(types=["coal_ore", "deepslate_coal_ore"], radius=8, limit=4).get("blocks") or []
                 cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
