@@ -500,6 +500,15 @@ class PortalTests(unittest.TestCase):
         with self.assertRaisesRegex(Replan, "ready=false"):
             drive(BuildAndEnterPortal(), ex2, state2)
 
+    def test_portal_stop_released_false_replans_before_landing_reads(self):
+        world = _active_world()
+        world.queue("move_to", _arrive())
+        world.queue("stop", {"stopped": True, "action": "move_to", "released": False, "wait_ms": 5000})
+        with self.assertRaisesRegex(Replan, "released=false"):
+            self.run_skill(world)
+        self.assertNotIn("destination_block", [op for op, _ in world.calls])
+        world.assert_exhausted()
+
     def test_flint_preparation_reads_gravel_change_and_pickup(self):
         pos = (2, 64, 1)
         world = NetherWorld(extra={pos: "gravel"}, observed=(pos,))

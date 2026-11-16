@@ -77,8 +77,14 @@ class ScriptedWorld(GridWorld):
     def equip(self, item, slot="hand", *, stop_on=None):
         return self._reply("equip", dict(item=item, slot=slot, stop_on=stop_on), fallback=super().equip)
 
-    def posture(self, sneak=None, shield=None):
-        return self._reply("posture", dict(sneak=sneak, shield=shield), fallback=super().posture)
+    def posture(self, sneak=None, shield=None, *, jump=None):
+        req = dict(sneak=sneak, shield=shield)
+        if jump is not None:
+            req["jump"] = jump
+        return self._reply("posture", req, fallback=super().posture)
+
+    def stop(self):
+        return self._reply("stop", {}, fallback=super().stop)
 
     def craft(self, item, count=1, *, stop_on=None):
         return self._reply("craft", dict(item=item, count=count, stop_on=stop_on))

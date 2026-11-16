@@ -320,13 +320,18 @@ def traverse_portal(ex, state, entry):
                              searched_volume=f"1 次进门，最多 {_POLL_LIMIT} 次状态读取",
                              wake_on="chunk_moved")
         try:
-            ex.stop(raise_on_error=True)
-        except Replan as exc:
+            stop_receipt = ex.client.stop()
+        except Exception as exc:
             if failure(exc)[0] == "not_ready":
                 raise Replan("下界切维度加载期间动作接口返回 not_ready，请等 ready=true 后复核落点") from exc
-            raise
+            raise Replan(f"穿门后 /stop 失败: {exc}") from exc
         stopped = True
-        yield rec("stop", purpose="portal_landing")
+        yield rec("stop", stop_receipt, purpose="portal_landing")
+        if isinstance(stop_receipt, dict) and stop_receipt.get("released") is False:
+            raise Replan(
+                f"穿门后 /stop 等待 {stop_receipt.get('wait_ms')}ms 仍未释放动作锁"
+                f"（released=false，action={stop_receipt.get('action')}），暂停后续动作防撞 busy"
+            )
         return verify_portal_landing(ex, state)
     finally:
         if not stopped:

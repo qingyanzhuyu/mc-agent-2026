@@ -412,6 +412,27 @@ class RangedTests(CombatTestCase):
         self.assert_replan(world, ShootMob(), "hurt", ("shoot", "move_to"))
         self.assertIsNone(world.st["using_item"])
 
+    def test_jumping_blocks_combat_and_stop_cause_skips_retreat_move(self):
+        jumping_world = CombatWorld({"bow": 1, "arrow": 1}, entities=[mob()])
+        jumping_world.st["jumping"] = True
+        _, jump_state = jumping_world.session()
+        self.assertIn("跳跃", ShootMob.blocked(jump_state))
+
+        world = CombatWorld({"bow": 1, "arrow": 1}, entities=[mob()])
+        world.queue("shoot", ApiError(
+            "interrupted", "stopped by user", {"cause": "stop", "inner_code": "path_not_found"},
+        ))
+        ex, state = world.session()
+        skill = ShootMob()
+        seen = []
+        with self.assertRaisesRegex(Replan, "stopped by user"):
+            while not skill.step(ex, state):
+                seen.append(skill.last)
+        self.assertEqual(ex.acts, ["shoot"])
+        self.assertEqual(seen[-1]["op"], "combat_interrupted")
+        self.assertEqual((seen[-1]["cause"], seen[-1]["inner_code"]), ("stop", "path_not_found"))
+        world.assert_exhausted()
+
 
 class CombatMaterialTests(CombatTestCase):
     def test_material_plan_pure_only_active_recipe_and_gear(self):

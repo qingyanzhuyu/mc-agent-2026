@@ -85,12 +85,16 @@ def use_item(ex, state, item, target=None, *, ms=None, timeout_ms=None, source=N
     return _finish(receipt, before, _snapshot(ex, state), verify)
 
 
-def _clear_posture(ex, state, *, sneak, shield):
+def _clear_posture(ex, state, *, sneak=None, shield=None, jump=None):
     # abort() 透过 GeneratorExit 收尾；清理错误不能覆盖已经在处理的抢占或死亡。
     unwinding = sys.exc_info()[0] is not None
     try:
-        cleared = ex.posture(sneak=sneak, shield=shield)
-        for requested, key in ((sneak, "sneaking"), (shield, "blocking")):
+        # §4.11：死亡、断线、重生后姿态自动复位，异常栈展开时不再向死亡角色补发。
+        if unwinding and state.st.get("alive") is False:
+            return {"sneaking": False, "jumping": False, "blocking": False}
+        jump_opts = {} if jump is None else {"jump": jump}
+        cleared = ex.posture(sneak=sneak, shield=shield, **jump_opts)
+        for requested, key in ((sneak, "sneaking"), (shield, "blocking"), (jump, "jumping")):
             if requested is not None and cleared.get(key) is not requested:
                 raise Replan(f"姿态收尾后未确认 {key}={requested}")
         return cleared
@@ -102,30 +106,35 @@ def _clear_posture(ex, state, *, sneak, shield):
             state.invalidate_inventory()
 
 
-def hold_posture(ex, state, *, sneak=None, shield=None, duration_ms=1000, verify=None):
-    """§4.11：有限保持指定姿态；verify(evidence) 可提前终止等待。
+def hold_posture(ex, state, *, sneak=None, shield=None, jump=None, duration_ms=1000, verify=None):
+    """§4.11：有限保持指定姿态（sneak / shield / jump 持续跳跃）；verify(evidence) 可提前终止等待。
 
-    只复位本次指定的姿态字段。保持姿态不代表真正挡箭或触发进度。
+    通过 Executor/Client 的全量覆盖合并语义只复位本次指定的姿态字段。保持姿态不代表真正挡箭或触发进度。
     """
     _bounded(duration_ms, 1, 10000, "姿态保持时长")
-    if (sneak is None and shield is None
-            or any(flag is not None and type(flag) is not bool for flag in (sneak, shield))):
-        raise Replan("请指定要维持的 sneak 或 shield 姿态")
+    flags = (sneak, shield, jump)
+    if (all(flag is None for flag in flags)
+            or any(flag is not None and type(flag) is not bool for flag in flags)):
+        raise Replan("请指定要维持的 sneak、shield 或 jump 姿态")
     if shield:
         state.refresh_inventory(ex.client)
         _check_item(state, "shield")
     before = state.refresh_status(ex.client, max_age_s=0)
+    jump_opts = {} if jump is None else {"jump": jump}
+    rec_extra = {} if jump is None else {"jump": jump}
+    clear_jump = False if jump is not None else None
+    clear_extra = {} if jump is None else {"jump": False}
     try:
-        entered = ex.posture(sneak=sneak, shield=shield)
+        entered = ex.posture(sneak=sneak, shield=shield, **jump_opts)
         deadline = time.monotonic() + duration_ms / 1000
-        yield rec("posture", entered, sneak=sneak, shield=shield)
+        yield rec("posture", entered, sneak=sneak, shield=shield, **rec_extra)
         count = (duration_ms + 499) // 500 + 1
         for _ in range(count):
             after = state.refresh_status(ex.client, max_age_s=0)
             if (not after.get("alive", True) or after.get("health", 20) < before.get("health", 20)
                     or after.get("dimension") != before.get("dimension")):
                 raise Replan("维持姿态期间观察到受伤、死亡或维度变化，退出交战")
-            for requested, key in ((sneak, "sneaking"), (shield, "blocking")):
+            for requested, key in ((sneak, "sneaking"), (shield, "blocking"), (jump, "jumping")):
                 if requested is not None and after.get(key) is not requested:
                     raise Replan(f"未观察到要求的姿态 {key}={requested}")
             evidence = {"receipt": entered, "before": before, "after": after, "confirmed": False}
@@ -136,12 +145,20 @@ def hold_posture(ex, state, *, sneak=None, shield=None, duration_ms=1000, verify
             if delay <= 0:
                 break
             time.sleep(delay)
-            yield rec("wait_posture", None, sneak=sneak, shield=shield)
+            yield rec("wait_posture", None, sneak=sneak, shield=shield, **rec_extra)
     finally:
-        cleared = _clear_posture(ex, state, sneak=False if sneak is not None else None,
-                                 shield=False if shield is not None else None)
-    yield rec("posture", cleared, sneak=False if sneak is not None else None,
-              shield=False if shield is not None else None)
+        cleared = _clear_posture(
+            ex, state,
+            sneak=False if sneak is not None else None,
+            shield=False if shield is not None else None,
+            jump=clear_jump,
+        )
+    yield rec(
+        "posture", cleared,
+        sneak=False if sneak is not None else None,
+        shield=False if shield is not None else None,
+        **clear_extra,
+    )
     if verify is not None and not evidence["confirmed"]:
         raise Replan("姿态等待已到上限，未确认目标效果")
     return evidence

@@ -195,6 +195,29 @@ class InteractionTests(unittest.TestCase):
         ])
         world.assert_exhausted()
 
+    def test_hold_posture_supports_jump_and_skips_clear_after_death(self):
+        world = ScriptedWorld()
+        world.st["sneaking"] = True
+        ex, state = world.session()
+        steps = drive(hold_posture(ex, state, jump=True, duration_ms=500,
+                                   verify=lambda ev: ev["after"]["jumping"] is True), ex)
+        self.assertEqual([s["op"] for s in steps], ["posture", "posture"])
+        self.assertEqual(world.calls, [
+            ("posture", {"sneak": None, "shield": None, "jump": True}),
+            ("posture", {"sneak": None, "shield": None, "jump": False}),
+        ])
+        self.assertTrue(world.st["sneaking"])
+        self.assertFalse(world.st["jumping"])
+
+        dead_world = ScriptedWorld()
+        ex2, state2 = dead_world.session()
+        flow = hold_posture(ex2, state2, jump=True, duration_ms=1000)
+        next(flow)
+        dead_world.st["alive"] = False
+        state2.set_status(dead_world.status())
+        flow.close()
+        self.assertEqual(len([c for c in dead_world.calls if c[0] == "posture"]), 1)
+
 
 class EncounterTests(unittest.TestCase):
     def test_crossbow_requires_available_ammo_before_actions(self):

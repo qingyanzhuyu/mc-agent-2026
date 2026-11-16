@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
-from .base import rec
+from .base import failure, rec
 from .encounter import _line_cells, _retreat_clear, verify_shot_lane
 from .field import _cell, _grounded, _position, _safe_support, _standable_cell, move_local, scan_entities
 from .items import bare
@@ -37,8 +37,10 @@ def gate_reason(state, status):
     if status.get("ready") is not True or not status.get("dimension") or status.get("alive") is not True:
         return "缺少就绪且存活的战斗状态"
     if state.in_safe_mode or status.get("on_ground") is not True or any(
-            status.get(field) for field in ("in_lava", "in_water", "submerged", "on_fire", "in_vehicle", "is_sleeping")):
-        return "需要在干燥、有支撑的位置且脱离安全模式"
+            status.get(field) for field in (
+                "in_lava", "in_water", "submerged", "on_fire", "in_vehicle", "is_sleeping", "jumping",
+            )):
+        return "需要在干燥、有支撑且未持续跳跃的位置，并脱离安全模式"
     health = status.get("health")
     if type(health) not in (int, float) or not math.isfinite(health) or health < 14:
         return "战斗前至少需要 14 点生命"
@@ -199,15 +201,19 @@ def prepared_scene(ex, state, scene, choose, *, aimed=False):
 
 
 def stop_activity(ex, state, *, busy=None, items=()):
-    """§3.1、§4.15 只中止状态仍报告的同类追击或物品使用。"""
+    """§3.1、§4.15 只中止状态仍报告的同类追击或物品使用，返回 /stop 的锁释放回执。"""
     try:
         status = state.refresh_status(ex.client, max_age_s=0)
     except (ApiError, Replan):
-        return
+        return None
     using = status.get("using_item")
     if ((busy is not None and status.get("busy") == busy)
             or (isinstance(using, dict) and bare(using.get("name")) in items)):
-        ex.stop()
+        try:
+            return ex.client.stop()
+        except Exception:
+            return None
+    return None
 
 
 def retreat_after_failure(ex, state, scene):
@@ -229,8 +235,17 @@ def retreat_after_failure(ex, state, scene):
 
 
 def interrupted(ex, state, scene, error):
-    # 失败的阻塞动作也占一拍，先留给 Safety，再按新快照撤离。
-    yield rec("combat_interrupted", None, reason=str(error))
+    # 失败的阻塞动作也占一拍，先留给 Safety；若因主动 /stop、死亡或断线/未就绪中断，则不再补发撤离移动。
+    code, extra = failure(error)
+    cause = extra.get("cause") or extra.get("interrupted_by")
+    meta = {
+        key: value
+        for key, value in (("error_code", code), ("cause", cause), ("inner_code", extra.get("inner_code")))
+        if value is not None
+    }
+    yield rec("combat_interrupted", None, reason=str(error), **meta)
+    if cause in ("stop", "death") or code in ("dead", "not_connected", "not_ready"):
+        return
     yield from retreat_after_failure(ex, state, scene)
 
 
