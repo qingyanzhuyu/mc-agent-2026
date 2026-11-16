@@ -1,6 +1,6 @@
-# Local NMO Agent API v1.3.1 Bridge（队内本地/局域网联调网关）
+# Local NMO Agent API Bridge（队内本地/局域网联调网关）
 
-将 NMO 官方 [`Minecraft Agent API v1.3.1`](../../docs/99-原始记录/api-spec-v1.3.1.md)（HTTP JSON 契约）1:1 映射到本地或局域网自建的 **Minecraft Java `1.21.11` 原版测试服（`online-mode=false`）**。
+为本地或局域网自建的 **Minecraft Java `1.21.11` 原版测试服（`online-mode=false`）** 提供联调接口。覆盖下表列出的 [NMO Minecraft Agent API v1.3.11](../../docs/99-原始记录/api-spec-v1.3.11.md) 行为。
 
 用于在官方测试服暂不可用或单皮肤站账号被队友占用时，支撑多人并行完成 `AGENTS.md` §2A.6 要求的 **`verified: live` 真机物理闭环验证**（对应 `docs/04` `B9`）。
 
@@ -96,10 +96,12 @@ curl -s http://127.0.0.1:8787/healthz
 
 ## 4. 协议对齐范围与已知近似说明
 
-| 模块 | 对齐情况（对照 `api-spec-v1.3.1.md`） |
+| 模块 | 对齐情况（对照 `api-spec-v1.3.11.md`） |
 |---|---|
 | 响应封装与状态码（§0.1） | 业务成败统一 HTTP 200 `{ok, ms, result\|error}`；非法 JSON 返 400 `bad_json`；未授权/过期返 401 `unauthorized`/`invalid_token`；未知路由返 404 `unknown_api` |
 | 认证与会话互斥（§1 / §2 / §7） | 同名 `username` 重登立即踢废旧 Token；断线重连 ≥30s 节流；60s 内死亡 3 次触发 5 分钟 `death_loop_cooldown` |
-| 观察接口（§3.1–§3.7） | `/status`、`/inventory`、`/find_blocks`（严格执行**仅暴露方块**过滤，无矿透）、`/get_block`、`/get_entities`、`/events`（`seq` 自增、GET+POST 参数合并）、`/advancements`（解析原版进度包） |
-| 动作互斥与中断（§0 / §4 / §4.15） | 单会话同步阻塞互斥锁（并发动作返 `busy`）；支持 `stop_on`（`hurt`/`death`）自动中断并附 `nearest_hostile`；`/stop` 即时终止寻路与挖掘；服务端回滚识别为 `protected_region` |
-| 已知与官方实现的细微差异 | 1. 载具骑乘态下的 `move_to` 逐帧掌舵（§4.1 炽足兽/船速度曲线）当前仍走通用寻路近似；<br>2. `/use_item` 的钓鱼咬钩与末影之眼 `bearing_deg` 为简化近似；<br>3. `/craft` 的 `count` 按“最少期望产出数量”折算配方次数（官方精确语义仍挂 `docs/04` `C2` 待官方服核对） |
+| 观察接口（§3.1–§3.7） | `/status` 返回 20 格满氧、逐物理 tick 的 `speed` 和 `velocity`。`/events` 在配对到原版伤害包时附 `hurt.source` 与可识别的 `source_entity`。`/find_blocks` 只返回暴露方块，`/advancements` 解析原版进度包。 |
+| 动作互斥与中断（§0 / §4 / §4.15） | 单会话阻塞动作互斥（并发动作返 `busy`）；`stop_on` 控制受伤中断，死亡会中断动作；错误使用 `cause`；`/stop` 取消寻路和挖掘并等待动作释放，返回 `action`、`released`、`wait_ms` |
+| 动作扩展（§4.6 / §4.11 / §4.16–§4.17） | `/attack` 支持 `max_hits` 和 `interval_ms`；`/control` 提供短时按键和视线挥击；`/look` 转向不占动作锁；用 `/posture {"jump": true}` 显式开启水中踩水，用 `/posture {}` 复位 |
+| 寻路与挖掘（§4.1 / §4.2 / §5） | 寻路连续 8 秒无位移进展返回 `stalled`。已确认的挖掘回滚仍映射为 `protected_region`，挖掘的其他服务端确认行为与新版窗口错误码由官方端点验证 |
+| 其他已知差异 | 1. 载具骑乘态下的 `move_to` 仍通过通用寻路近似；<br>2. `/use_item` 的钓鱼咬钩与末影之眼 `bearing_deg` 为简化近似；<br>3. `/craft` 的 `count` 按“最少期望产出数量”折算配方次数（官方精确语义待 `docs/04` `C2` 复核） |

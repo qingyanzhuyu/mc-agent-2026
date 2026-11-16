@@ -4,6 +4,8 @@ const mineflayer = require("mineflayer");
 const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
 const PrismarineRecipe = require("prismarine-recipe");
 const { Vec3 } = require("vec3");
+const { RaycastIterator } = require("prismarine-world").iterators;
+const { setTimeout: delay } = require("node:timers/promises");
 
 const {
   ApiBizError,
@@ -30,6 +32,71 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function round3(n) {
+  return Math.round(n * 1000) / 1000 || 0;
+}
+
+const CONTROL_KEYS = ["forward", "back", "left", "right", "jump", "sneak", "sprint"];
+const EMPTY_POSTURE = Object.freeze({ sneak: false, shield: false, jump: false });
+const NON_ATTACKABLE = new Set(["item", "experience_orb", "arrow", "spectral_arrow", "area_effect_cloud"]);
+
+function meleeInterval(item) {
+  const name = item?.name || "";
+  if (name.endsWith("_sword")) return 625;
+  if (name.endsWith("_pickaxe")) return 833;
+  if (name.endsWith("_shovel")) return 1000;
+  if (name.endsWith("_axe")) {
+    if (name === "wooden_axe" || name === "stone_axe") return 1250;
+    return name === "iron_axe" ? 1111 : 1000;
+  }
+  if (name.endsWith("_hoe")) {
+    if (name === "wooden_hoe" || name === "golden_hoe") return 1000;
+    if (name === "stone_hoe") return 500;
+    return name === "iron_hoe" ? 333 : 250;
+  }
+  if (name === "trident") return 909;
+  if (name === "mace") return 1667;
+  return 250;
+}
+
+function attackInterval(requested, held) {
+  if (requested === undefined) return meleeInterval(held);
+  if (!Number.isInteger(requested) || requested < 50 || requested > 5000) {
+    throw new ApiBizError("bad_args", "Attack interval must be an integer in 50–5000 ms");
+  }
+  return requested;
+}
+
+function strikeInView(bot, elapsedMs) {
+  const { position, eyeHeight, pitch, yaw } = bot.entity;
+  const eye = position.offset(0, eyeHeight ?? 1.62, 0);
+  const direction = new Vec3(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch));
+  const block = bot.world.raycast(eye, direction, 3);
+  const ray = new RaycastIterator(eye, direction, 3);
+  let bestDistance = block ? Math.min(3, eye.distanceTo(block.intersect)) : 3;
+  let target = null;
+  for (const entity of Object.values(bot.entities)) {
+    if (entity.id === bot.entity.id || entity.isValid === false || !entity.position || NON_ATTACKABLE.has(entity.name)) continue;
+    const halfWidth = entity.width / 2;
+    if (!(halfWidth > 0 && entity.height > 0)) continue;
+    const hit = ray.intersect([[-halfWidth, 0, -halfWidth, halfWidth, entity.height, halfWidth]], entity.position);
+    if (!hit) continue;
+    const distance = hit.pos.minus(eye).dot(direction);
+    if (distance >= 0 && distance <= bestDistance) {
+      target = entity;
+      bestDistance = distance;
+    }
+  }
+  if (target) {
+    bot.attack(target);
+    return { t_ms: elapsedMs, entity: { id: target.id, name: target.name, dist: round1(bestDistance) } };
+  }
+  bot.swingArm("right");
+  const miss = { t_ms: elapsedMs, entity: null };
+  if (block) miss.block = { name: block.name, pos: vecToBlockPos(block.position) };
+  return miss;
+}
+
 class BotSession {
   constructor({ username, mcHost, mcPort, mcVersion, reconnectIntervalMs = 30000, log = console.log }) {
     this.username = username;
@@ -48,9 +115,11 @@ class BotSession {
     this.spawned = false;
     this.busy = null;
     this._currentAbort = null;
+    this._actionDone = null;
 
-    this.postureState = { sneak: false, shield: false };
+    this.postureState = EMPTY_POSTURE;
     this.usingItemState = null;
+    this.measuredVelocity = null;
     this.lastChatAt = 0;
     this.lastDisconnectAt = 0;
 
@@ -129,7 +198,7 @@ class BotSession {
     this.connected = false;
     this.spawned = false;
     this._manualDisconnect = false;
-    this.postureState = { sneak: false, shield: false };
+    this.postureState = EMPTY_POSTURE;
 
     this.log(`[bridge:${this.username}] Connecting to ${this.mcHost}:${this.mcPort} (version=${this.mcVersion || "auto"})...`);
     const bot = mineflayer.createBot({
@@ -145,6 +214,54 @@ class BotSession {
     bot.loadPlugin(pathfinder);
 
     let lastHealth = 20;
+    let lastTickPosition = null;
+    let damageTypes = [];
+    let pendingDamage = null;
+    const clearMotion = () => {
+      if (this.bot !== bot) return;
+      lastTickPosition = null;
+      this.measuredVelocity = null;
+    };
+    const resetObservation = () => {
+      clearMotion();
+      pendingDamage = null;
+    };
+    resetObservation();
+
+    // §3.1：用物理 tick 的实际位移，服务端校正和换乘时丢弃旧坐标。
+    bot.on("physicsTick", () => {
+      if (this.bot !== bot) return;
+      if (!this.isAlive() || bot.vehicle || !bot.entity?.position) {
+        clearMotion();
+        return;
+      }
+      const current = bot.entity.position;
+      this.measuredVelocity = lastTickPosition ? current.minus(lastTickPosition).scaled(20) : null;
+      lastTickPosition = current.clone();
+    });
+    bot.on("forcedMove", clearMotion);
+    bot.on("respawn", resetObservation);
+
+    // §3.6：现代协议用本次连接的动态注册表索引传递伤害类型。
+    bot._client.on("registry_data", (packet) => {
+      if (this.bot !== bot || packet.id !== "minecraft:damage_type" || !Array.isArray(packet.entries)) return;
+      damageTypes = packet.entries.map(({ key }) =>
+        typeof key === "string" ? key.replace(/^minecraft:/, "") : undefined
+      );
+      pendingDamage = null;
+    });
+    bot._client.on("damage_event", (packet) => {
+      if (this.bot !== bot || packet.entityId !== bot.entity?.id) return;
+      const fields = {};
+      const source = damageTypes[packet.sourceTypeId];
+      if (source) fields.source = source;
+      // 协议中的实体引用用 id + 1，0 表示无关联实体。优先采用伤害责任实体。
+      const sourceId = packet.sourceCauseId || packet.sourceDirectId;
+      const cause = sourceId ? bot.entities?.[sourceId - 1] : null;
+      const name = cause?.username || cause?.name;
+      if (name) fields.source_entity = { id: cause.id, name };
+      pendingDamage = { fields, at: performance.now() };
+    });
 
     bot.once("login", () => {
       if (this.bot !== bot) return;
@@ -160,7 +277,8 @@ class BotSession {
       this.connected = true;
       this.spawned = true;
       lastHealth = typeof bot.health === "number" ? bot.health : 20;
-      this.postureState = { sneak: false, shield: false };
+      this.postureState = EMPTY_POSTURE;
+      resetObservation();
 
       try {
         const moves = new Movements(bot);
@@ -194,12 +312,16 @@ class BotSession {
         const dmg = round1(lastHealth - h);
         const attacker = this._nearestHostile(16);
         const ev = { health: round1(h), damage: dmg };
+        if (pendingDamage && performance.now() - pendingDamage.at <= 150) {
+          Object.assign(ev, pendingDamage.fields);
+        }
         if (attacker) ev.likely_attacker = attacker;
         this._pushEvent("hurt", ev);
         if (this._currentAbort) {
           this._currentAbort("hurt");
         }
       }
+      if (h !== lastHealth) pendingDamage = null;
       lastHealth = h;
     });
 
@@ -207,7 +329,8 @@ class BotSession {
       if (this.bot !== bot) return;
       const now = Date.now();
       const pos = bot.entity ? vecToPos(bot.entity.position) : [0, 0, 0];
-      this.postureState = { sneak: false, shield: false };
+      this.postureState = EMPTY_POSTURE;
+      resetObservation();
       this.lastDeath = { pos, t: now, cause: `${this.username} died` };
       this._pushEvent("death", { pos, t: now, dropped_items_at: pos });
 
@@ -260,12 +383,14 @@ class BotSession {
 
     bot.on("mount", () => {
       if (this.bot !== bot) return;
+      clearMotion();
       const v = bot.vehicle;
       this._pushEvent("vehicle", { action: "mount", name: v ? v.name : "unknown" });
     });
 
     bot.on("dismount", () => {
       if (this.bot !== bot) return;
+      clearMotion();
       this._pushEvent("vehicle", { action: "dismount", name: "vehicle" });
     });
 
@@ -282,7 +407,8 @@ class BotSession {
       this.connected = false;
       this.spawned = false;
       this.lastDisconnectAt = Date.now();
-      this.postureState = { sneak: false, shield: false };
+      this.postureState = EMPTY_POSTURE;
+      resetObservation();
       this._pushEvent("disconnected", { reason: String(reason || "end") });
       if (this._currentAbort) {
         this._currentAbort("disconnected");
@@ -300,25 +426,6 @@ class BotSession {
 
     bot.on("error", (err) => {
       this.log(`[bridge:${this.username}] Bot error: ${err.message}`);
-    });
-
-    // Keep bot afloat in water whenever pathfinder is not actively steering (prevents drowning during idle/dig/craft)
-    let idleFloating = false;
-    bot.on("physicsTick", () => {
-      const pfMoving = bot.pathfinder && typeof bot.pathfinder.isMoving === "function" && bot.pathfinder.isMoving();
-      if (this.bot !== bot || !this.spawned || pfMoving || !bot.entity) {
-        idleFloating = false;
-        return;
-      }
-      const headBlk = bot.blockAt(bot.entity.position.offset(0, 1.5, 0).floored());
-      const inWater = Boolean(bot.entity.isInWater || (headBlk && headBlk.name === "water"));
-      if (inWater) {
-        idleFloating = true;
-        bot.setControlState("jump", true);
-      } else if (idleFloating) {
-        idleFloating = false;
-        bot.setControlState("jump", false);
-      }
     });
 
     // Track vanilla advancements packets
@@ -389,7 +496,7 @@ class BotSession {
       this.connected = false;
       this.spawned = false;
       this.lastDisconnectAt = Date.now();
-      this.postureState = { sneak: false, shield: false };
+      this.postureState = EMPTY_POSTURE;
       try {
         b.quit();
       } catch (_) {}
@@ -455,7 +562,9 @@ class BotSession {
     if (!bot || !this.spawned || !this.isAlive()) return;
     try {
       bot.setControlState("sneak", Boolean(this.postureState.sneak));
+      bot.setControlState("jump", Boolean(this.postureState.jump));
       if (this.postureState.shield) {
+        bot.setControlState("sprint", false);
         const off = bot.inventory.slots[45];
         if (off && off.name === "shield") {
           bot.activateItem(true);
@@ -479,6 +588,8 @@ class BotSession {
       return {
         username: this.username,
         pos: [0, 0, 0],
+        speed: null,
+        velocity: null,
         yaw: 0,
         pitch: 0,
         dimension: "overworld",
@@ -500,6 +611,7 @@ class BotSession {
         in_lava: false,
         in_vehicle: null,
         sneaking: false,
+        jumping: false,
         blocking: false,
         using_item: null,
         time_of_day: 0,
@@ -550,6 +662,7 @@ class BotSession {
     const tod = bot.time && typeof bot.time.timeOfDay === "number" ? bot.time.timeOfDay : 0;
     const isDay = bot.time && typeof bot.time.isDay === "boolean" ? bot.time.isDay : (tod < 12542 || tod > 23460);
     const alive = (typeof bot.health === "number" ? bot.health : 20) > 0;
+    const motion = alive && !bot.vehicle ? this.measuredVelocity : null;
 
     let dim = (bot.game && bot.game.dimension) || "overworld";
     if (typeof dim === "string" && dim.startsWith("minecraft:")) {
@@ -559,6 +672,8 @@ class BotSession {
     const out = {
       username: bot.username || this.username,
       pos: vecToPos(pos),
+      speed: motion ? round3(Math.hypot(motion.x, motion.z)) : null,
+      velocity: motion ? [round3(motion.x), round3(motion.y), round3(motion.z)] : null,
       yaw: round1(bot.entity.yaw || 0),
       pitch: round1(bot.entity.pitch || 0),
       dimension: dim,
@@ -580,6 +695,7 @@ class BotSession {
       in_lava: inLava,
       in_vehicle: bot.vehicle ? { id: bot.vehicle.id, name: bot.vehicle.name || "vehicle" } : null,
       sneaking: Boolean(this.postureState.sneak || bot.getControlState("sneak")),
+      jumping: this.postureState.jump,
       blocking: Boolean(this.postureState.shield),
       using_item: this.usingItemState
         ? { name: this.usingItemState.name, elapsed_ms: Date.now() - this.usingItemState.startedAt }
@@ -905,7 +1021,7 @@ class BotSession {
   // 4. Action Mutex & Blocking Actions
   // ================================================================
 
-  async _runAction(actionName, stopOn, fn) {
+  async _runAction(actionName, stopOn, fn, { partialOnAbort = false } = {}) {
     this._requireReady();
     if (!this.isAlive()) {
       throw new ApiBizError("dead", "Bot is dead, waiting for respawn");
@@ -918,59 +1034,60 @@ class BotSession {
 
     this.busy = actionName;
     const stopSet = new Set(Array.isArray(stopOn) ? stopOn : ["hurt", "death"]);
-    let abortReject = null;
-    const abortCbs = [];
-
-    const abortPromise = new Promise((_, reject) => {
-      abortReject = reject;
-    });
+    const controller = new AbortController();
+    const { signal } = controller;
 
     this._currentAbort = (reason) => {
-      if (reason === "hurt" && !stopSet.has("hurt")) return;
-      if (reason === "death" && !stopSet.has("death")) return;
+      if (signal.aborted || (reason === "hurt" && !stopSet.has("hurt"))) return;
 
-      for (const cb of abortCbs) {
-        try {
-          cb();
-        } catch (_) {}
+      let error;
+      if (reason === "disconnected") {
+        error = new ApiBizError("not_connected", "Bot disconnected during action");
+      } else {
+        const extra = {
+          cause: reason,
+          health: this.bot && typeof this.bot.health === "number" ? round1(this.bot.health) : 0,
+          pos: this.bot && this.bot.entity ? vecToPos(this.bot.entity.position) : [0, 0, 0],
+        };
+        const nh = this._nearestHostile(24);
+        if (nh) extra.nearest_hostile = nh;
+        const code = reason === "death" ? "dead" : "interrupted";
+        error = new ApiBizError(code, `Action ${actionName} interrupted by ${reason}`, extra);
       }
+      controller.abort(error);
       try {
         if (this.bot && this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
         if (this.bot) this.bot.stopDigging();
       } catch (_) {}
+    };
 
-      if (reason === "disconnected") {
-        abortReject(new ApiBizError("not_connected", "Bot disconnected during action"));
-        return;
+    const abortPromise = partialOnAbort ? null : new Promise((_, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+    const action = (async () => {
+      try {
+        const result = await fn({ signal });
+        if (!partialOnAbort) signal.throwIfAborted();
+        return result;
+      } catch (error) {
+        throw signal.aborted ? signal.reason : error;
+      } finally {
+        this.usingItemState = null;
+        await this._applyPosture();
+        this._currentAbort = null;
+        this._actionDone = null;
+        this.busy = null;
       }
-      const extra = {
-        interrupted_by: reason,
-        health: this.bot && typeof this.bot.health === "number" ? round1(this.bot.health) : 0,
-        pos: this.bot && this.bot.entity ? vecToPos(this.bot.entity.position) : [0, 0, 0],
-      };
-      const nh = this._nearestHostile(24);
-      if (nh) extra.nearest_hostile = nh;
-      abortReject(new ApiBizError("interrupted", `Action ${actionName} interrupted by ${reason}`, extra));
-    };
+    })();
+    this._actionDone = action.then(() => undefined, () => undefined);
 
-    const ctx = {
-      onAbort(cb) {
-        abortCbs.push(cb);
-      },
-    };
-
-    try {
-      return await Promise.race([fn(ctx), abortPromise]);
-    } finally {
-      this._currentAbort = null;
-      this.busy = null;
-      this.usingItemState = null;
-      await this._applyPosture();
-    }
+    return abortPromise ? Promise.race([action, abortPromise]) : action;
   }
 
   async _gotoGoal(goal, timeoutMs = 60000, ctx = null) {
     const bot = this.bot;
+    const signal = ctx?.signal;
+    signal?.throwIfAborted();
     if (!bot || !bot.pathfinder) {
       throw new ApiBizError("path_not_found", "Pathfinder unavailable");
     }
@@ -990,7 +1107,7 @@ class BotSession {
             bot.pathfinder.setGoal(null);
           } catch (_) {}
           reject(
-            new ApiBizError("path_not_found", "Stuck for 8s without movement progress", {
+            new ApiBizError("stalled", "Stuck for 8s without movement progress", {
               pos: vecToPos(bot.entity.position),
             })
           );
@@ -1003,6 +1120,11 @@ class BotSession {
         clearInterval(stuckInterval);
         bot.removeListener("goal_reached", onReached);
         bot.removeListener("path_update", onPathUpdate);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(signal.reason);
       };
       const onReached = () => {
         cleanup();
@@ -1033,15 +1155,7 @@ class BotSession {
         );
       }, timeoutMs);
 
-      if (ctx) {
-        ctx.onAbort(() => {
-          cleanup();
-          try {
-            bot.pathfinder.setGoal(null);
-          } catch (_) {}
-        });
-      }
-
+      signal?.addEventListener("abort", onAbort, { once: true });
       bot.on("goal_reached", onReached);
       bot.on("path_update", onPathUpdate);
       bot.pathfinder.setGoal(goal);
@@ -1049,6 +1163,9 @@ class BotSession {
   }
 
   async stop() {
+    const startedAt = Date.now();
+    const action = this.busy;
+    const done = this._actionDone;
     if (this._currentAbort) {
       this._currentAbort("stop");
     }
@@ -1057,29 +1174,32 @@ class BotSession {
         if (this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
         this.bot.stopDigging();
         this.bot.clearControlStates();
+        this.bot.deactivateItem();
       } catch (_) {}
+    }
+
+    let released = true;
+    if (done) {
+      const timeout = new AbortController();
+      const deadline = delay(5000, false, { signal: timeout.signal });
+      released = await Promise.race([done.then(() => true), deadline]);
+      timeout.abort();
+    } else {
       await this._applyPosture();
     }
-    return { stopped: true };
+    return { stopped: true, action, released, wait_ms: Date.now() - startedAt };
   }
 
   async posture(body = {}) {
     this._requireReady();
-    const keys = Object.keys(body || {});
-    let targetSneak = false;
-    let targetShield = false;
-    if (keys.length > 0) {
-      if (body.sneak !== undefined && typeof body.sneak !== "boolean") {
-        throw new ApiBizError("bad_args", "sneak must be boolean");
+    for (const key of Object.keys(EMPTY_POSTURE)) {
+      if (body[key] !== undefined && typeof body[key] !== "boolean") {
+        throw new ApiBizError("bad_args", `${key} must be boolean`);
       }
-      if (body.shield !== undefined && typeof body.shield !== "boolean") {
-        throw new ApiBizError("bad_args", "shield must be boolean");
-      }
-      targetSneak = Boolean(body.sneak);
-      targetShield = Boolean(body.shield);
     }
+    const { sneak = false, shield = false, jump = false } = body;
 
-    if (targetShield) {
+    if (shield) {
       const off = this.bot.inventory.slots[45];
       if (!off || off.name !== "shield") {
         const shieldItem = this.bot.inventory.items().find((i) => i.name === "shield");
@@ -1090,13 +1210,102 @@ class BotSession {
       }
     }
 
-    this.postureState = { sneak: targetSneak, shield: targetShield };
+    this.postureState = { sneak, shield, jump };
     await this._applyPosture();
     return {
-      sneaking: targetSneak,
-      blocking: targetShield,
+      sneaking: sneak,
+      jumping: jump,
+      blocking: shield,
       offhand: this._getOffhandItem(),
     };
+  }
+
+  async look(body = {}) {
+    this._requireReady();
+    const bot = this.bot;
+    if (body.entity_id !== undefined) {
+      if (!Number.isInteger(body.entity_id)) {
+        throw new ApiBizError("bad_args", "entity_id must be integer");
+      }
+      const entity = bot.entities[body.entity_id];
+      if (!entity?.position) throw new ApiBizError("no_such_entity", `Entity ${body.entity_id} not found`);
+      await bot.lookAt(entity.position.offset(0, (entity.height || 1.5) * 0.7, 0), true);
+    } else if (["pos", "x", "y", "z"].some((key) => body[key] !== undefined)) {
+      const pos = body.pos ?? [body.x, body.y, body.z];
+      if (!Array.isArray(pos) || pos.length !== 3 || !pos.every(isFiniteNum)) {
+        throw new ApiBizError("bad_args", "look target must be [x, y, z] finite numbers");
+      }
+      await bot.lookAt(new Vec3(...pos), true);
+    } else {
+      if (body.yaw === undefined && body.pitch === undefined) {
+        throw new ApiBizError("bad_args", "look requires yaw, pitch, coordinates or entity_id");
+      }
+      await this._lookAngles(bot, body);
+    }
+    return { yaw: bot.entity.yaw, pitch: bot.entity.pitch };
+  }
+
+  async _lookAngles(bot, { yaw = bot.entity.yaw, pitch = bot.entity.pitch }) {
+    if (!isFiniteNum(yaw) || !isFiniteNum(pitch)) {
+      throw new ApiBizError("bad_args", "yaw and pitch must be finite numbers");
+    }
+    await bot.look(yaw, pitch, true);
+  }
+
+  async control(body = {}) {
+    return this._runAction("control", body.stop_on, async ({ signal }) => {
+      const bot = this.bot;
+      for (const key of CONTROL_KEYS) {
+        if (body[key] !== undefined && typeof body[key] !== "boolean") {
+          throw new ApiBizError("bad_args", `${key} must be boolean`);
+        }
+      }
+      const pressed = CONTROL_KEYS.filter((key) => body[key]);
+      const hitCount = body.hit === true ? 1 : (body.hit === false || body.hit === undefined ? 0 : body.hit);
+      if (!Number.isInteger(hitCount) || hitCount < 0 || hitCount > 20 || body.hit === 0) {
+        throw new ApiBizError("bad_args", "hit must be a boolean or an integer in 1–20");
+      }
+      if (!pressed.length && !hitCount) throw new ApiBizError("bad_args", "control requires a key or hit");
+      const held = bot.heldItem;
+      const intervalMs = attackInterval(body.hit_interval_ms, held);
+      const requiredMs = hitCount ? (hitCount - 1) * intervalMs + 50 : 50;
+      const ms = body.ms === undefined ? (hitCount && !pressed.length ? requiredMs : 300) : body.ms;
+      if (!Number.isInteger(ms) || ms < 50 || ms > 3000 || ms < requiredMs) {
+        throw new ApiBizError("bad_args", "ms must be 50–3000 and allow time for all hits", { required_ms: requiredMs });
+      }
+      if (body.yaw !== undefined || body.pitch !== undefined) await this._lookAngles(bot, body);
+      signal.throwIfAborted();
+
+      const startPos = bot.entity.position.clone();
+      const startedAt = Date.now();
+      const hits = [];
+      try {
+        for (const key of pressed) bot.setControlState(key, true);
+        for (let i = 0; i < hitCount; i += 1) {
+          if (i) await delay(intervalMs, undefined, { signal });
+          hits.push(strikeInView(bot, Date.now() - startedAt));
+        }
+        await delay(Math.max(0, ms - (Date.now() - startedAt)), undefined, { signal });
+      } catch (error) {
+        if (!signal.aborted || signal.reason.code === "not_connected") throw error;
+      } finally {
+        for (const key of pressed) bot.setControlState(key, false);
+      }
+      const pos = bot.entity.position;
+      return {
+        ms: Date.now() - startedAt,
+        pos: vecToPos(pos),
+        moved: round1(startPos.distanceTo(pos)),
+        on_ground: Boolean(bot.entity.onGround),
+        in_water: Boolean(bot.entity.isInWater),
+        yaw: bot.entity.yaw,
+        pitch: bot.entity.pitch,
+        hits,
+        hit_interval_ms: intervalMs,
+        held: held?.name ?? null,
+        ...(signal.aborted ? { interrupted_by: signal.reason.extra.cause } : {}),
+      };
+    }, { partialOnAbort: true });
   }
 
   async moveTo(body = {}) {
@@ -1159,6 +1368,7 @@ class BotSession {
   async dig(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("dig", stopOn, async (ctx) => {
+      const { signal } = ctx;
       const bot = this.bot;
       const pos = parseBlockPos(body);
       const collect = body.collect !== false;
@@ -1194,6 +1404,7 @@ class BotSession {
           await bot.equip(bestTool, "hand");
         }
       } catch (_) {}
+      signal.throwIfAborted();
 
       const beforeInv = inventorySummaryMap(bot);
       const dugName = blk.name;
@@ -1220,7 +1431,7 @@ class BotSession {
         const t0 = Date.now();
         await bot.dig(blk);
         digMs = Date.now() - t0;
-        await sleep(150);
+        await delay(150, undefined, { signal });
       } finally {
         bot._client.removeListener("block_change", onBlockChangePkt);
       }
@@ -1255,7 +1466,7 @@ class BotSession {
               await this._gotoGoal(new goals.GoalNear(dropEnt.position.x, dropEnt.position.y, dropEnt.position.z, 1), 2500, ctx);
             } catch (_) {}
           }
-          await sleep(120);
+          await delay(120, undefined, { signal });
         }
       }
 
@@ -1283,6 +1494,7 @@ class BotSession {
   async place(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("place", stopOn, async (ctx) => {
+      const { signal } = ctx;
       const bot = this.bot;
       const itemName = String(body.item || "").replace(/^minecraft:/, "").trim();
       if (!itemName) {
@@ -1366,10 +1578,11 @@ class BotSession {
       }
 
       await bot.equip(invItem, "hand");
+      signal.throwIfAborted();
       bot.setControlState("sneak", true);
       try {
         await bot.placeBlock(refBlock, faceVec);
-        await sleep(150);
+        await delay(150, undefined, { signal });
       } catch (e) {
         if (bot.currentWindow) {
           bot.closeWindow(bot.currentWindow);
@@ -1402,6 +1615,7 @@ class BotSession {
   async interact(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("interact", stopOn, async (ctx) => {
+      const { signal } = ctx;
       const bot = this.bot;
       const itemName = body.item ? String(body.item).replace(/^minecraft:/, "").trim() : null;
       const beforeInv = inventorySummaryMap(bot);
@@ -1412,6 +1626,7 @@ class BotSession {
           throw new ApiBizError("missing_item", `Missing item: ${itemName}`, { item: itemName });
         }
         await bot.equip(invItem, "hand");
+        signal.throwIfAborted();
       }
 
       if (body.entity_id !== undefined && body.entity_id !== null) {
@@ -1431,10 +1646,10 @@ class BotSession {
         const wasVehicle = bot.vehicle ? bot.vehicle.id : null;
         if (!itemName && (ent.name.includes("boat") || ent.name.includes("minecart") || ent.name === "horse")) {
           bot.mount(ent);
-          await sleep(250);
+          await delay(250, undefined, { signal });
         } else {
           await bot.useOn(ent);
-          await sleep(200);
+          await delay(200, undefined, { signal });
         }
         const afterInv = inventorySummaryMap(bot);
         const used = {};
@@ -1525,7 +1740,7 @@ class BotSession {
 
   async useItem(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
-    return this._runAction("use_item", stopOn, async () => {
+    return this._runAction("use_item", stopOn, async ({ signal }) => {
       const bot = this.bot;
       const itemName = String(body.item || "").replace(/^minecraft:/, "").trim();
       if (!itemName) {
@@ -1545,6 +1760,7 @@ class BotSession {
       }
       if (source === "hand") {
         await bot.equip(invItem, "hand");
+        signal.throwIfAborted();
       }
 
       if (body.target && typeof body.target === "object") {
@@ -1558,6 +1774,7 @@ class BotSession {
         }
       }
 
+      signal.throwIfAborted();
       this.usingItemState = { name: itemName, startedAt: Date.now() };
 
       // Food / drink
@@ -1581,8 +1798,11 @@ class BotSession {
       if (itemName === "shield" || itemName === "spyglass") {
         const holdMs = Math.min(10000, Math.max(100, Number(body.ms || 1000)));
         bot.activateItem(source === "off-hand");
-        await sleep(holdMs);
-        bot.deactivateItem();
+        try {
+          await delay(holdMs, undefined, { signal });
+        } finally {
+          bot.deactivateItem();
+        }
         return itemName === "shield"
           ? { used: itemName, blocked_ms: holdMs }
           : { used: itemName, observed_ms: holdMs };
@@ -1590,8 +1810,11 @@ class BotSession {
 
       // Throwables (ender_pearl, ender_eye, snowball, egg, splash_potion, etc.)
       bot.activateItem(source === "off-hand");
-      await sleep(300);
-      bot.deactivateItem();
+      try {
+        await delay(300, undefined, { signal });
+      } finally {
+        bot.deactivateItem();
+      }
       return {
         used: itemName,
         thrown: true,
@@ -1603,10 +1826,16 @@ class BotSession {
   async attack(body = {}) {
     const stopOn = body.stop_on || ["death"];
     return this._runAction("attack", stopOn, async (ctx) => {
+      const { signal } = ctx;
       const bot = this.bot;
       if (!Number.isInteger(body.entity_id)) {
         throw new ApiBizError("bad_args", "entity_id must be integer");
       }
+      const { max_hits: maxHits, interval_ms: requestedInterval } = body;
+      if (maxHits !== undefined && (!Number.isInteger(maxHits) || maxHits < 1)) {
+        throw new ApiBizError("bad_args", "max_hits must be a positive integer");
+      }
+      if (requestedInterval !== undefined) attackInterval(requestedInterval);
       const targetId = body.entity_id;
       let ent = bot.entities[targetId];
       if (!ent || !ent.position) {
@@ -1627,17 +1856,14 @@ class BotSession {
           break;
         }
       }
+      signal.throwIfAborted();
+      const intervalMs = attackInterval(requestedInterval, bot.heldItem);
 
       const t0 = Date.now();
       let hits = 0;
       let killed = false;
       let lastPos = ent.position.clone();
-      let aborted = false;
-      ctx.onAbort(() => {
-        aborted = true;
-      });
-
-      while (!aborted && Date.now() - t0 < timeoutMs) {
+      while (Date.now() - t0 < timeoutMs) {
         ent = bot.entities[targetId];
         if (!ent || !ent.isValid || (typeof ent.health === "number" && ent.health <= 0)) {
           killed = true;
@@ -1647,22 +1873,27 @@ class BotSession {
         const dist = bot.entity.position.distanceTo(ent.position);
         if (dist > 3.2) {
           bot.pathfinder.setGoal(new goals.GoalFollow(ent, 2), true);
-          await sleep(200);
+          await delay(200, undefined, { signal });
         } else {
           bot.pathfinder.setGoal(null);
           await bot.lookAt(ent.position.offset(0, (ent.height || 1.5) * 0.7, 0), true);
+          signal.throwIfAborted();
           bot.attack(ent);
           hits += 1;
-          await sleep(620); // Sword attack cooldown (~0.625s)
+          if (hits === maxHits) {
+            killed = !ent.isValid || (typeof ent.health === "number" && ent.health <= 0);
+            break;
+          }
+          await delay(Math.min(intervalMs, Math.max(0, timeoutMs - (Date.now() - t0))), undefined, { signal });
         }
       }
       bot.pathfinder.setGoal(null);
 
       // Brief drop collection if killed nearby
-      if (killed && bot.entity.position.distanceTo(lastPos) < 8) {
+      if (hits !== maxHits && killed && bot.entity.position.distanceTo(lastPos) < 8) {
         try {
           await this._gotoGoal(new goals.GoalNear(lastPos.x, lastPos.y, lastPos.z, 1), 3500, ctx);
-          await sleep(250);
+          await delay(250, undefined, { signal });
         } catch (_) {}
       }
 
@@ -1677,7 +1908,7 @@ class BotSession {
 
   async shoot(body = {}) {
     const stopOn = body.stop_on || ["death"];
-    return this._runAction("shoot", stopOn, async () => {
+    return this._runAction("shoot", stopOn, async ({ signal }) => {
       const bot = this.bot;
       const weapon = String(body.weapon || "bow").replace(/^minecraft:/, "");
       const chargeMs = Math.min(3000, Math.max(200, Number(body.charge_ms || 1100)));
@@ -1709,15 +1940,20 @@ class BotSession {
       }
 
       await bot.equip(wItem, "hand");
+      signal.throwIfAborted();
       const eye = bot.entity.position.offset(0, 1.62, 0);
       const dist = eye.distanceTo(targetVec);
       // Simple gravity compensation (~0.05 blocks drop factor per m)
       const aimVec = targetVec.offset(0, dist * 0.08, 0);
       await bot.lookAt(aimVec, true);
+      signal.throwIfAborted();
 
       bot.activateItem();
-      await sleep(chargeMs);
-      bot.deactivateItem();
+      try {
+        await delay(chargeMs, undefined, { signal });
+      } finally {
+        bot.deactivateItem();
+      }
 
       return {
         fired: true,
@@ -1739,6 +1975,7 @@ class BotSession {
   async craft(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("craft", stopOn, async (ctx) => {
+      const { signal } = ctx;
       const bot = this.bot;
       const itemName = String(body.item || "").replace(/^minecraft:/, "").trim();
       const count = body.count === undefined ? 1 : body.count;
@@ -1793,13 +2030,14 @@ class BotSession {
         const beforeCount = inventorySummaryMap(bot)[itemName] || 0;
         try {
           for (let i = 0; i < times; i += 1) {
+            signal.throwIfAborted();
             await bot.craft(rec, 1, null);
-            if (i + 1 < times) await sleep(60);
+            if (i + 1 < times) await delay(60, undefined, { signal });
           }
         } catch (err) {
           wrapCraftErr(err, needs);
         }
-        await sleep(100);
+        await delay(100, undefined, { signal });
         const invAfter = inventorySummaryMap(bot);
         return {
           crafted: itemName,
@@ -1833,7 +2071,7 @@ class BotSession {
           } catch (err) {
             wrapCraftErr(err, needs);
           }
-          await sleep(100);
+          await delay(100, undefined, { signal });
           const invAfter = inventorySummaryMap(bot);
           return {
             crafted: itemName,
@@ -1978,6 +2216,7 @@ class BotSession {
   async windowAct(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("window/act", stopOn, async (ctx) => {
+      const { signal } = ctx;
       const bot = this.bot;
       const ops = body.ops;
       if (!Array.isArray(ops) || ops.length === 0) {
@@ -1994,6 +2233,7 @@ class BotSession {
         const villager = await bot.openVillager(ent);
         try {
           for (const op of ops) {
+            signal.throwIfAborted();
             if (op.op === "select") {
               const idx = Number(op.option || 0);
               const times = Number(op.times || 1);
@@ -2016,6 +2256,7 @@ class BotSession {
         const f = await bot.openFurnace(blk);
         try {
           for (const op of ops) {
+            signal.throwIfAborted();
             if (op.op === "put") {
               const itemName = String(op.item || "").replace(/^minecraft:/, "");
               const itemDef = bot.registry.itemsByName[itemName];
@@ -2058,6 +2299,7 @@ class BotSession {
       const container = await bot.openContainer(blk);
       try {
         for (const op of ops) {
+          signal.throwIfAborted();
           const itemName = String(op.item || "").replace(/^minecraft:/, "");
           const itemDef = bot.registry.itemsByName[itemName];
           if (!itemDef) throw new ApiBizError("missing_item", `Unknown item ${itemName}`);

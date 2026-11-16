@@ -139,6 +139,12 @@ def _cross_rules(action: str, args: dict) -> list[str]:
     elif action == "attack":
         if not _is_int(args.get("entity_id")):
             errs.append("attack 的 entity_id 必须是整数")
+        max_hits = args.get("max_hits")
+        if max_hits is not None and (not _is_int(max_hits) or max_hits < 1):
+            errs.append("attack 的 max_hits 必须是 >=1 的整数")
+        interval_ms = args.get("interval_ms")
+        if interval_ms is not None and (not _is_int(interval_ms) or not 50 <= interval_ms <= 5000):
+            errs.append("attack 的 interval_ms 必须是 50–5000 的整数")
     elif action in ("craft", "drop", "place", "use_item", "equip"):
         item = args.get("item")
         if not isinstance(item, str) or not item.strip():
