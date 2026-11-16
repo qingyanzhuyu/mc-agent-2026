@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from mcagent.client import CODE_CLASS, FATAL, REPLAN, ApiError, Client, Config
+from mcagent.planner.decision import validate as validate_decision
 from mcagent.runtime import Executor, Fatal, Replan, State
 from tests.test_d0_core import FakeResponse, FakeSession
 
@@ -172,6 +173,28 @@ class ControlRetryTests(unittest.TestCase):
         with self.assertRaises(Replan):
             ex.attack(812, max_hits=1)
         self.assertEqual(hits.count("attack"), 1)
+
+
+class DecisionAttackCrossRuleTests(unittest.TestCase):
+    def test_attack_max_hits_and_interval_bounds(self) -> None:
+        ok, errs = validate_decision({
+            "goal": "combat:creeper",
+            "action": "attack",
+            "args": {"entity_id": 812, "max_hits": 1, "interval_ms": 300},
+        })
+        self.assertTrue(ok, errs)
+
+        for bad_args in (
+            {"entity_id": 812, "max_hits": 0},
+            {"entity_id": 812, "max_hits": True},
+            {"entity_id": 812, "interval_ms": 49},
+            {"entity_id": 812, "interval_ms": 5001},
+            {"entity_id": 812, "interval_ms": "300"},
+        ):
+            with self.subTest(bad_args=bad_args):
+                ok, errs = validate_decision({"goal": "combat:creeper", "action": "attack", "args": bad_args})
+                self.assertFalse(ok)
+                self.assertTrue(errs)
 
 
 if __name__ == "__main__":
