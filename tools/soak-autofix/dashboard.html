@@ -159,6 +159,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
       <h2>启动参数 <small>一键启动 / 重启时使用</small></h2>
       <div class="grid2">
         <label class="f wide">工位 A 进哪个服务器<select id="sServer"></select></label>
+        <div class="wide hidden" id="localBox">
+          <div class="banner info" id="localWarn" style="margin:0"></div>
+        </div>
         <div class="wide hidden" id="officialBox">
           <label class="f" style="margin-bottom:6px">比赛服官方入口（校园网 vs 公网）<select id="sOfficialEp"></select></label>
           <label class="f" style="margin-bottom:6px">比赛服上的模型来源<select id="sOfficialLlm"></select></label>
@@ -428,9 +431,27 @@ function syncServerForm() {
   const official = $("sServer").value === "official";
   const aia = official && $("sOfficialLlm").value === "official";
   $("officialBox").classList.toggle("hidden", !official);
+  $("localBox").classList.toggle("hidden", official);
   for (const id of ["sBot", "sRotate"]) $(id).disabled = official;
   $("sModel").disabled = aia;
-  if (!official || !snap) return;
+  if (!snap) return;
+  if (!official) {
+    const br = snap.bridge || {}, be = snap.bridge_env || {};
+    const target = br.mc_target || be.mc_target || "未配置";
+    const lw = $("localWarn");
+    if (br.reachable) {
+      const bots = (br.active_bots || []).length;
+      lw.className = "banner ok";
+      lw.textContent = `本地联调网关在线（${snap.local_base || "-"} → MC ${target} · ${br.mc_version || "-"} · 在线 bot ${bots} 个）`;
+    } else if (br.skipped) {
+      lw.className = "banner info";
+      lw.textContent = `自建测试服目标：${snap.local_base || "-"}（可点下方「探测本地网关 & preflight」检查连通性）`;
+    } else {
+      lw.className = "banner warn";
+      lw.textContent = `本地联调网关未运行（${snap.local_base || "-"} · 预期 MC ${target}），启动轮次前请先在 tools/local-api-bridge 运行网关。`;
+    }
+    return;
+  }
   let checks = !$("sLlm").checked ? snap.official_checks.rules_only : snap.official_checks[$("sOfficialLlm").value];
   const epOverride = $("sOfficialEp").value;
   if (epOverride) {
@@ -475,9 +496,13 @@ function renderHeader(s) {
   const map = { running: ["ok", "运行中"], stopping: ["warn", "收尾中（已写 STOP）"], stopped: ["idle", "已停止"] };
   const [cls, txt] = map[s.daemon];
   pill.className = `pill ${cls}`; pill.textContent = txt;
-  const st = s.state;
+  const st = s.state, br = s.bridge || {}, be = s.bridge_env || {};
   const pids = s.processes.map((p) => `${p.role}:${p.pid}`).join(" ");
-  const srvHost = (st.server_target === "official" && st.server_base) ? (" @ " + (st.server_base.split("/")[2] || st.server_base)) : "";
+  const srvHost = (st.server_target === "official" && st.server_base)
+    ? (" @ " + (st.server_base.split("/")[2] || st.server_base))
+    : (st.server_target !== "official" && (br.mc_target || be.mc_target))
+      ? (" → " + (br.mc_target || be.mc_target) + (br.reachable ? "" : "(网关未起)"))
+      : "";
   const srv = (st.server_target === "official" ? (st.official_llm === "official" ? "比赛服·官方代理" : "比赛服·训练") : "自建测试服") + srvHost;
   const sk = s.skills_summary || { total: 0, live: 0, offline: 0 };
   const qTxt = quotaPctText(st.total_prompt_tokens || 0, st.total_completion_tokens || 0, st.total_elapsed_s || 0, s.quota);
@@ -531,18 +556,24 @@ function renderSettingsNote(s) {
 
 function renderEnvSummary(s) {
   const e = s.env_summary || {}, sk = s.skills_summary || { total: 0, live: 0, offline: 0 };
+  const br = s.bridge || {}, be = s.bridge_env || {};
+  const mcTarget = br.mc_target || be.mc_target || "";
+  const bridgeTag = br.reachable
+    ? `<span class="tag ok">网关在线 ${esc(mcTarget || "ok")}</span>`
+    : `<span class="tag warn">网关未起${mcTarget ? " (" + esc(mcTarget) + ")" : ""}</span>`;
   const liveTag = sk.live > 0 ? `<span class="tag ok">live ${sk.live}</span>` : `<span class="tag local">live 0 / offline ${sk.offline}</span>`;
   const acct = e.has_mc_account ? '<span class="tag ok">正式账号✓</span>' : '<span class="tag bad">缺正式账号</span>';
   const keyTag = e.has_llm_key ? '<span class="tag ok">AIA Key✓</span>' : '<span class="tag">无 AIA Key</span>';
   const cusTag = e.has_custom_llm ? '<span class="tag ok">Custom Key✓</span>' : '<span class="tag">无 Custom Key</span>';
   $("envSummaryBox").innerHTML =
-    `<div class="row" style="margin-bottom:6px">${liveTag}${acct}${keyTag}${cusTag}` +
+    `<div class="row" style="margin-bottom:6px">${bridgeTag}${liveTag}${acct}${keyTag}${cusTag}` +
     `${e.train_on_official_flag ? '<span class="tag bad">TRAIN_ON_OFFICIAL=1</span>' : ""}</div>` +
     `<div class="mono" style="font-size:11.5px;line-height:1.6">` +
-    `<div>.env MC=${esc(e.mc_api_host || "(未设)")} · 本地=${esc(e.local_base || "-")}</div>` +
+    `<div>.env MC=${esc(e.mc_api_host || "(未设)")} · 本地=${esc(e.local_base || "-")}${mcTarget ? " → MC " + esc(mcTarget) : ""}</div>` +
     `<div>官方=${esc(e.official_base_error ? ("错误: " + e.official_base_error) : (e.official_base || "-"))}</div>` +
     `<div>LLM_PROFILE=${esc(e.llm_profile)} · 并发=${esc(e.llm_max_concurrency || "2(默认)")} · 预算=${esc(e.llm_token_budget)} · 氧阈值=${esc(e.mc_oxygen_warn || "6(默认)")}</div>` +
     `</div>`;
+  if (formsFilled) syncServerForm();
 }
 
 function setBar(id, cur, max) {
@@ -725,10 +756,10 @@ $("btnProbeEnv").onclick = async () => {
   box.innerHTML = '<div class="dim">探测中…</div>';
   try {
     const j = await api("/api/probe_env");
-    const br = j.bridge || {};
+    const br = j.bridge || {}, be = j.bridge_env || {};
     const brHtml = br.reachable
       ? `<div class="banner ok" style="margin-bottom:6px">本地网关在线（${esc(br.mc_target || "-")} · MC ${esc(br.mc_version || "-")} · 在线 bot ${(br.active_bots || []).length} 个）</div>`
-      : `<div class="banner warn" style="margin-bottom:6px">本地网关未运行（${esc(br.url || "-")}）</div>`;
+      : `<div class="banner warn" style="margin-bottom:6px">本地网关未运行（${esc(br.url || "-")}${be.mc_target ? " · 预期 MC " + esc(be.mc_target) : ""}）</div>`;
     const listHtml = (j.preflight_checks || []).map((c) =>
       `<div><span>${c.ok ? "✅" : "⛔"} ${esc(c.name)}</span><span class="mono dim">${esc(c.detail)}</span></div>`
     ).join("");

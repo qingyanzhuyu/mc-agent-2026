@@ -460,15 +460,51 @@ def _read_env_snapshot(repo_root: Path) -> dict[str, str]:
     return vals
 
 
-def _probe_local_bridge(local_base: str) -> dict[str, Any]:
-    """非阻塞检查本地联调网关 /healthz，仅用于控制台自检按钮。"""
+def _read_bridge_env_target(repo_root: Path) -> dict[str, Any]:
+    """读取 tools/local-api-bridge/.env（回退 .env.example）中配置的目标 MC 测试服地址。"""
+    bridge_dir = repo_root / "tools" / "local-api-bridge"
+    vals: dict[str, str] = {}
+    source_file = ""
+    for name in (".env", ".env.example"):
+        p = bridge_dir / name
+        if not p.is_file():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip().strip('"').strip("'")
+            source_file = name
+            break
+        except OSError:
+            continue
+    if not vals:
+        return {}
+    mc_host = vals.get("MC_HOST") or "frp-net.com"
+    mc_port = vals.get("MC_PORT") or "64463"
+    b_host = vals.get("BRIDGE_HOST") or "127.0.0.1"
+    b_port = vals.get("BRIDGE_PORT") or "8787"
+    return {
+        "mc_host": mc_host,
+        "mc_port": mc_port,
+        "mc_target": f"{mc_host}:{mc_port}",
+        "mc_version": vals.get("MC_VERSION") or "1.21.11",
+        "bridge_url": f"http://{b_host}:{b_port}/api/v1",
+        "source_file": source_file,
+    }
+
+
+def _probe_local_bridge(local_base: str, timeout: float = 0.6) -> dict[str, Any]:
+    """非阻塞检查本地联调网关 /healthz，供实时快照与控制台自检按钮复用。"""
     parts = urlsplit(local_base)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return {"reachable": False, "url": local_base, "error": "本地网关地址无效"}
     health_url = f"{parts.scheme}://{parts.netloc}/healthz"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(health_url, timeout=0.6) as resp:
+        with opener.open(health_url, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         return {
             "reachable": True,
@@ -710,6 +746,12 @@ class Console:
 
         env_cfg = _read_env_snapshot(self.repo_root)
         local_base = soak_ctl.local_mc_base(self.repo_root)
+        bridge_env = _read_bridge_env_target(self.repo_root)
+        local_host = (urlsplit(local_base).hostname or "").lower()
+        if local_host in ("127.0.0.1", "localhost", "::1"):
+            bridge = _probe_local_bridge(local_base, timeout=0.25)
+        else:
+            bridge = {"reachable": False, "url": local_base, "skipped": True}
         official_base = ""
         official_base_error = ""
         try:
@@ -804,6 +846,8 @@ class Console:
             "official_base": official_base,
             "official_base_error": official_base_error,
             "local_base": local_base,
+            "bridge": bridge,
+            "bridge_env": bridge_env,
             "min_verified_choices": [
                 {"key": k, "label": v} for k, v in soak_ctl.MIN_VERIFIED_CHOICES.items()
             ],
@@ -934,7 +978,11 @@ class Console:
             {"name": "本地联调网关已停", "ok": not bridge["reachable"],
              "detail": "监听中" if bridge["reachable"] else "未运行"},
         ]
-        return {"bridge": bridge, "preflight_checks": checks}
+        return {
+            "bridge": bridge,
+            "bridge_env": _read_bridge_env_target(self.repo_root),
+            "preflight_checks": checks,
+        }
 
     def log_tail(self, lines: int = 200) -> str:
         p = self.session_dir / RUN_LOG_NAME
