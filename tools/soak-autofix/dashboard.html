@@ -376,7 +376,8 @@ function renderHeader(s) {
   pill.className = `pill ${cls}`; pill.textContent = txt;
   const st = s.state;
   const pids = s.processes.map((p) => `${p.role}:${p.pid}`).join(" ");
-  const srv = st.server_target === "official" ? (st.official_llm === "official" ? "比赛服·官方代理" : "比赛服·训练") : "自建测试服";
+  const srvHost = (st.server_target === "official" && st.server_base) ? (" @ " + (st.server_base.split("/")[2] || st.server_base)) : "";
+  const srv = (st.server_target === "official" ? (st.official_llm === "official" ? "比赛服·官方代理" : "比赛服·训练") : "自建测试服") + srvHost;
   $("headMeta").textContent = s.session_exists
     ? `[${srv}] ${st.target_branch} @ ${st.current_tip}（基线 ${st.base_commit}，自动修复 ${st.commits} 个）${pids ? " · " + pids : ""}`
     : `会话 ${s.session_dir} 尚未初始化`;

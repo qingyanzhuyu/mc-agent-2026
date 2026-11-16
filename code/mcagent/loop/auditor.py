@@ -668,7 +668,8 @@ class SoakObserver:
             if gid in reached_map and not reached_map[gid]
         }
 
-        if stop_reason != "keyboard_interrupt":
+        # 人工中断与接口长时间不可用都不是策略或代码问题，不派 GOAL_MISS 修单
+        if stop_reason not in ("keyboard_interrupt", "transient_outage"):
             for gid in self.target_goals:
                 if not reached_map[gid] and gid not in self.environment_blocked_goals:
                     self._report_goal_miss(gid, state, stop_reason)
