@@ -68,7 +68,8 @@ SECRET_SCAN_RE = re.compile(
 # - codex：gpt-6.1-sol / gpt-6-astra 都支持 low/medium/high/xhigh/max（另有 ultra 会自动派子代理，无人值守修单不收）
 # - agy：hydrogen 有 low/medium/high/xhigh 四档，carbon 有 low/medium/high 三档；档位写在模型名里，--effort 同步传
 _CODEX_FIXER_TMPL = (
-    "codex exec -C {{fixer_wt}} -s workspace-write -m {model} "
+    "codex exec -C {{fixer_wt}} -s workspace-write "
+    "-c 'sandbox_workspace_write.network_access=true' -m {model} "
     "-c 'model_reasoning_effort=\"{effort}\"' - < {{prompt_file}}"
 )
 _AGY_FIXER_TMPL = (
@@ -127,6 +128,7 @@ def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: s
 
 
 FIXER_WORKERS_BOUNDS: tuple[int, int] = (1, 6)
+DEFAULT_FIXER_TIMEOUT_S: int = 1200
 
 
 def _validate_fixer_workers(val: Any) -> int:
@@ -1722,11 +1724,171 @@ def run_runner_loop(
     return results
 
 
+def _read_proc_stat_info(pid: int) -> Optional[tuple[int, int, str]]:
+    """读取 Linux /proc/<pid>/stat 中的 (ppid, pgid, starttime)。"""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    rparen = raw.rfind(")")
+    if rparen < 0:
+        return None
+    parts = raw[rparen + 1 :].split()
+    if len(parts) <= 19:
+        return None
+    try:
+        return int(parts[1]), int(parts[2]), parts[19]
+    except ValueError:
+        return None
+
+
+def _snapshot_descendants(root_pid: int) -> list[tuple[int, int, str]]:
+    """快照 root_pid 下的所有子孙进程 (pid, pgid, starttime)，兼容切了新 PGID 的 MCP 子服务。"""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    children_map: dict[int, list[tuple[int, int, str]]] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        info = _read_proc_stat_info(pid)
+        if info is None:
+            continue
+        ppid, pgid, start_tok = info
+        children_map.setdefault(ppid, []).append((pid, pgid, start_tok))
+
+    descendants: list[tuple[int, int, str]] = []
+    seen = {root_pid}
+    queue = [root_pid]
+    while queue:
+        cur = queue.pop(0)
+        for pid, pgid, start_tok in children_map.get(cur, ()):
+            if pid not in seen:
+                seen.add(pid)
+                descendants.append((pid, pgid, start_tok))
+                queue.append(pid)
+    return descendants
+
+
+def _signal_process_tree(
+    root_pid: int,
+    descendants: Sequence[tuple[int, int, str]],
+    sig: int,
+    *,
+    only_matching_start: bool = False,
+) -> None:
+    """向 root_pid 所属进程组及快照到的子孙进程（含独立 PGID）发送信号。"""
+    if os.name != "posix":
+        return
+    try:
+        os.killpg(root_pid, sig)
+    except OSError:
+        pass
+    try:
+        os.kill(root_pid, sig)
+    except OSError:
+        pass
+
+    active = [
+        (pid, pgid, start_tok)
+        for pid, pgid, start_tok in descendants
+        if not only_matching_start
+        or ((cur := _read_proc_stat_info(pid)) is not None and cur[2] == start_tok)
+    ]
+    active_pid_set = {pid for pid, _, _ in active}
+    desc_pgids = {pgid for _, pgid, _ in active if pgid != root_pid and pgid in active_pid_set}
+    for pgid in desc_pgids:
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            pass
+    for pid, _, _ in active:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def _decode_subproc_output(raw: Any) -> str:
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    return raw or ""
+
+
+def _merge_timeout_stream(initial: Any, remainder: Any) -> str:
+    """合并 TimeoutExpired 首次 output 与进程终止后 communicate() 读出的完整缓冲，避免重复拼接。"""
+    head = _decode_subproc_output(initial)
+    tail = _decode_subproc_output(remainder)
+    if not head:
+        return tail
+    if not tail:
+        return head
+    if tail.startswith(head):
+        return tail
+    return head + tail
+
+
+def _write_timeout_agent_log(
+    attempt_dir: Path,
+    header: str,
+    exc: subprocess.TimeoutExpired,
+) -> None:
+    out_s = _decode_subproc_output(exc.stdout)
+    err_s = _decode_subproc_output(exc.stderr)
+    (attempt_dir / "fixer_agent.log").write_text(f"{header}\n{out_s}\n{err_s}", encoding="utf-8")
+
+
+def _run_fixer_command(
+    cmd_str: str,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: int,
+) -> subprocess.CompletedProcess[str]:
+    """在独立会话中执行 fixer 命令，超时后清理整个进程树（含子进程组/MCP 服务）。"""
+    popen_kw: dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "posix":
+        popen_kw["start_new_session"] = True
+    proc = subprocess.Popen(["bash", "-lc", cmd_str], **popen_kw)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout=stdout, stderr=stderr)
+    except subprocess.TimeoutExpired as exc:
+        descendants = _snapshot_descendants(proc.pid) if os.name == "posix" else []
+        rem_out, rem_err = "", ""
+        if os.name == "posix":
+            _signal_process_tree(proc.pid, descendants, signal.SIGTERM)
+            try:
+                rem_out, rem_err = proc.communicate(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                _signal_process_tree(proc.pid, descendants, signal.SIGKILL, only_matching_start=True)
+                try:
+                    rem_out, rem_err = proc.communicate(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            else:
+                _signal_process_tree(proc.pid, descendants, signal.SIGKILL, only_matching_start=True)
+        else:
+            proc.kill()
+            rem_out, rem_err = proc.communicate()
+
+        out_s = _merge_timeout_stream(exc.stdout, rem_out)
+        err_s = _merge_timeout_stream(exc.stderr, rem_err)
+        raise subprocess.TimeoutExpired(exc.cmd, exc.timeout, output=out_s, stderr=err_s) from exc
+
+
 def run_fixer_once(
     session_dir: Path,
     *,
     fixer_cmd_template: str,
-    fixer_timeout_s: int = 600,
+    fixer_timeout_s: int = DEFAULT_FIXER_TIMEOUT_S,
     live_canary: bool = True,
     fixer_bot_user: str = DEFAULT_FIXER_USER,
     fixer_preset_name: str = "",
@@ -1760,18 +1922,17 @@ def run_fixer_once(
             f"{' ' + fixer_preset_name if fixer_preset_name else ''}..."
         )
         try:
-            proc = subprocess.run(
-                ["bash", "-lc", cmd_str],
-                cwd=str(fixer_wt),
+            proc = _run_fixer_command(
+                cmd_str,
+                cwd=fixer_wt,
                 env=_uv_env(fixer_wt),
-                capture_output=True,
-                text=True,
-                timeout=fixer_timeout_s,
+                timeout_s=fixer_timeout_s,
             )
             (attempt_dir / "fixer_agent.log").write_text(
                 (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            _write_timeout_agent_log(attempt_dir, f"[fixer] timeout after {fixer_timeout_s}s", exc)
             _clean_fixer_worktree(fixer_wt)
             return verify_and_promote(
                 session_dir, claimed["fingerprint"], live_canary=live_canary, fixer_bot_user=fixer_bot_user
@@ -1792,7 +1953,7 @@ def run_fixer_batch(
     *,
     fixer_cmd_template: str,
     max_workers: int = 3,
-    fixer_timeout_s: int = 600,
+    fixer_timeout_s: int = DEFAULT_FIXER_TIMEOUT_S,
     live_canary: bool = True,
     fixer_bot_user: str = DEFAULT_FIXER_USER,
     fixer_preset_name: str = "",
@@ -1826,13 +1987,11 @@ def run_fixer_batch(
             skill=shlex.quote(str(item.get("skill", ""))),
         )
         try:
-            proc = subprocess.run(
-                ["bash", "-lc", cmd_str],
-                cwd=str(worker_wt),
+            proc = _run_fixer_command(
+                cmd_str,
+                cwd=worker_wt,
                 env=_uv_env(worker_wt),
-                capture_output=True,
-                text=True,
-                timeout=fixer_timeout_s,
+                timeout_s=fixer_timeout_s,
             )
             (attempt_dir / "fixer_agent.log").write_text(
                 (proc.stdout or "") + "\n" + (proc.stderr or ""),
@@ -1840,12 +1999,7 @@ def run_fixer_batch(
             )
             return item, False, ""
         except subprocess.TimeoutExpired as exc:
-            out_s = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            err_s = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-            (attempt_dir / "fixer_agent.log").write_text(
-                f"[fixer] worker timeout after {fixer_timeout_s}s\n{out_s}\n{err_s}",
-                encoding="utf-8",
-            )
+            _write_timeout_agent_log(attempt_dir, f"[fixer] worker timeout after {fixer_timeout_s}s", exc)
             _clean_fixer_worktree(worker_wt)
             return item, True, f"fixer worker timeout after {fixer_timeout_s}s"
 
@@ -2379,7 +2533,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_fix.add_argument("--once", action="store_true", help="只处理一单即退出")
     p_fix.add_argument("--skip-live-canary", action="store_true")
     p_fix.add_argument("--fixer-user", default=DEFAULT_FIXER_USER)
-    p_fix.add_argument("--fixer-timeout", type=int, default=600)
+    p_fix.add_argument(
+        "--fixer-timeout",
+        type=int,
+        default=DEFAULT_FIXER_TIMEOUT_S,
+        help=f"单次 AI 修单命令超时秒数（默认 {DEFAULT_FIXER_TIMEOUT_S}s）",
+    )
     p_fix.add_argument(
         "--fixer-workers",
         type=int,
@@ -2447,7 +2606,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="每轮换新角色 <bot-user>001、002…（空包冷启动；不加则每轮同名、继承上一轮背包与进度）",
     )
     p_dual.add_argument("--fixer-cmd", default="")
-    p_dual.add_argument("--fixer-timeout", type=int, default=600, help="单次 AI 修单命令超时秒数（默认 600s）")
+    p_dual.add_argument(
+        "--fixer-timeout",
+        type=int,
+        default=DEFAULT_FIXER_TIMEOUT_S,
+        help=f"单次 AI 修单命令超时秒数（默认 {DEFAULT_FIXER_TIMEOUT_S}s）",
+    )
     p_dual.add_argument(
         "--fixer-workers",
         type=int,

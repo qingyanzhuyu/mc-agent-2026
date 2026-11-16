@@ -763,6 +763,87 @@ else:
         self.assertEqual(st_after["incidents"]["GOAL_MISS:slow"]["attempts"], 1)
         self.assertEqual(list((self.session / "worktrees").glob("worker-*")), [])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process group semantics required")
+    def test_batch_worker_timeout_kills_descendant_pgids_and_keeps_logs(self):
+        import time
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "GOAL_MISS:slow": {
+                    "incident_id": "INC-TREE",
+                    "fingerprint": "GOAL_MISS:slow",
+                    "code": "GOAL_MISS",
+                    "skill": "slow",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": ["code/mcagent/skills/slow.py"],
+                    "attempts": 0,
+                }
+            }
+
+        pid_file = self.root / "detached_child.pid"
+        detached_script = self.root / "detached_child.py"
+        detached_script.write_text(
+            f"""import os, signal, time
+from pathlib import Path
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path({repr(str(pid_file))}).write_text(str(os.getpid()), encoding="utf-8")
+print("partial-before-timeout", flush=True)
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+        wrapper_script = self.root / "spawn_detached.py"
+        wrapper_script.write_text(
+            f"""import subprocess, sys, time
+subprocess.Popen([sys.executable, {repr(str(detached_script))}])
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+        template = f"{sys.executable} {shlex.quote(str(wrapper_script))}"
+
+        real_run = subprocess.run
+
+        def mock_uv_only(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        t0 = time.monotonic()
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_only):
+            results = soak_ctl.run_fixer_batch(
+                self.session,
+                fixer_cmd_template=template,
+                max_workers=1,
+                fixer_timeout_s=1,
+                live_canary=False,
+            )
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 6.0)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["ok"])
+
+        self.assertTrue(pid_file.exists(), "detached child did not start before timeout")
+        child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 1.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        self.assertFalse(alive, f"detached child PID {child_pid} leaked after timeout")
+
+        agent_log = (self.session / "fixer_runs" / "attempt-0001" / "fixer_agent.log").read_text(encoding="utf-8")
+        self.assertIn("[fixer] worker timeout after 1s", agent_log)
+        self.assertEqual(agent_log.count("partial-before-timeout"), 1)
+
     def test_teardown_session_cleans_stray_worker_worktrees(self):
         soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
         stray_wt = self.session / "worktrees" / "worker-stray"
@@ -1029,6 +1110,18 @@ class TestWorkerBoundsAndCli(unittest.TestCase):
             "--fixer-workers", "9",
         ])
         self.assertEqual(rc_bad, 2)
+
+    def test_codex_fixer_presets_and_default_timeout(self):
+        self.assertEqual(soak_ctl.DEFAULT_FIXER_TIMEOUT_S, 1200)
+        parser = soak_ctl.build_parser()
+        self.assertEqual(parser.parse_args(["fixer-loop", "--session-dir", "/tmp/s"]).fixer_timeout, 1200)
+        self.assertEqual(parser.parse_args(["run", "--session-dir", "/tmp/s"]).fixer_timeout, 1200)
+
+        for preset_name, tmpl in soak_ctl.FIXER_PRESETS.items():
+            if not (preset_name == "codex" or preset_name.startswith("codex:")):
+                continue
+            self.assertIn("-s workspace-write", tmpl, preset_name)
+            self.assertIn("sandbox_workspace_write.network_access=true", tmpl, preset_name)
 
 
 if __name__ == "__main__":
