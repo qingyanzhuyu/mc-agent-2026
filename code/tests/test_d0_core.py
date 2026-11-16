@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from mcagent.client import ApiError, Client, Config
 from mcagent.planner import validate
-from mcagent.runtime import Safety, State
+from mcagent.runtime import Executor, Safety, State
 
 
 class FakeResponse:
@@ -204,6 +204,43 @@ class ClientSemanticsTests(unittest.TestCase):
         # 无参调用保持全量复位 `{}` 语义
         c.posture()
         self.assertEqual(sent_bodies[-1], {})
+
+    def test_posture_preserves_jump_and_clears_it_on_reset_or_death(self) -> None:
+        bodies: list[dict] = []
+        status = {"alive": True, "jumping": True, "sneaking": False, "blocking": True}
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            if url.endswith("/status"):
+                return FakeResponse(200, {"ok": True, "result": status.copy()})
+            self.assertTrue(url.endswith("/posture"))
+            bodies.append(body)
+            return FakeResponse(200, {"ok": True, "result": {
+                "sneaking": body.get("sneak", False),
+                "blocking": body.get("shield", False),
+                "jumping": body.get("jump", False),
+            }})
+
+        c = Client(Config("https://mock.local/api/v1", "u", "p", token_file=None))
+        c.token = "tok"
+        c.session = FakeSession(handler)
+        ex = Executor(c, State())
+
+        c.status()
+        ex.posture(sneak=True)
+        self.assertEqual(bodies[-1], {"sneak": True, "shield": True, "jump": True})
+        ex.posture(jump=False)
+        self.assertEqual(bodies[-1], {"sneak": True, "shield": True, "jump": False})
+        ex.posture(jump=True)
+        ex.posture()
+        self.assertEqual(bodies[-1], {})
+        ex.posture(shield=True)
+        self.assertEqual(bodies[-1], {"sneak": False, "shield": True})
+
+        ex.posture(jump=True)
+        status["alive"] = False
+        c.status()
+        ex.posture(sneak=True)
+        self.assertEqual(bodies[-1], {"sneak": True, "shield": False})
 
     def test_chat_sanitizes_leading_slash_and_equip_normalizes_slot(self) -> None:
         calls: list[tuple[str, dict]] = []

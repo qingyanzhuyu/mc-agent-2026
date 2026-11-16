@@ -1,6 +1,6 @@
 # mcagent — Minecraft Agent API 的最小骨架
 
-对应规范 **v1.3.1**（`https://mc-api.windywindie.top/api/v1`）。
+协议参考为[上游规范 v1.3.11](../../docs/99-原始记录/api-spec-v1.3.11.md)。比赛服端点为 `https://mc-api.windywindie.top/api/v1`，部署版本见[待确认 B18](../../docs/04-待确认.md)。
 目标不是"能打的 bot"，而是**把管道接对**：认证与 Token 持久化复用 / ready 状态机 / 观察 /
 可抢占串行动作 / 非幂等超时判重 / 错误分类 / 安全闸 / 打点。
 

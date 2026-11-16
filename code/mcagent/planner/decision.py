@@ -153,7 +153,7 @@ def _cross_rules(action: str, args: dict) -> list[str]:
         if not isinstance(msg, str) or not msg.strip():
             errs.append("chat 的 message 必须是非空字符串")
     elif action == "posture":
-        for k in ("sneak", "shield"):
+        for k in ("sneak", "shield", "jump"):
             if k in args and args[k] is not None and not isinstance(args[k], bool):
                 errs.append(f"posture 的 {k} 必须是布尔值")
     elif action in ("window_view", "window_act"):

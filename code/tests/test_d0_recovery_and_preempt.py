@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from typing import Any, Callable
+from unittest import mock
 
 import requests
 
@@ -147,6 +148,228 @@ class NonIdempotentTimeoutTests(unittest.TestCase):
         res = ex.act("move_to", lambda: c.move_to(10, 10), retries=1, backoff=0.01)
         self.assertEqual(res["pos"], [10, 64, 10])
         self.assertEqual(stops, 1)
+
+
+TIMEOUT_ERR = {"ok": False, "error": {"code": "timeout", "message": "server timeout"}}
+READY_STATUS = {"ok": True, "result": {"ready": True, "alive": True, "busy": None}}
+
+
+class ServerTimeoutNonIdempotentTests(unittest.TestCase):
+    """规范 §5：`timeout` =「寻路失败 / 超时」。非幂等动作遇服务端 timeout 时，
+    副作用可能已经发生，必须与 network 一样先核对背包再决定是否重发。"""
+
+    def setUp(self) -> None:
+        # 重试退避与 busy 轮询都走 runtime 模块的 time.sleep；替换成记录器，测试不依赖真实计时
+        self.sleeps: list[float] = []
+        patcher = mock.patch("mcagent.runtime.time.sleep", side_effect=self.sleeps.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.calls: list[str] = []
+
+    def _executor(self, handler: Callable[[str, str, dict, Any], FakeResponse]) -> Executor:
+        def recording(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            self.calls.append(url.rsplit("/api/v1/", 1)[-1])
+            return handler(method, url, headers, body)
+
+        cfg = Config("https://mock.local/api/v1", "u", "p", token_file=None)
+        c = Client(cfg, log=lambda *_: None)
+        c.token = "tok"
+        c.session = FakeSession(recording)
+        c._limiter = mock.Mock()  # 限速器按 max_rps≤4 真实等待；判重逻辑与计时无关，这里免等
+        return Executor(c, State(), log=lambda *_: None)
+
+    @staticmethod
+    def _inv(counts: dict[str, int]) -> dict:
+        items = [{"name": n, "count": k, "slot": i} for i, (n, k) in enumerate(counts.items()) if k > 0]
+        return {"ok": True, "result": {"items": items, "armor": {}, "offhand": None,
+                                       "empty_slots": 36 - len(items)}}
+
+    def test_craft_timeout_after_server_crafted_recovers_without_resend(self) -> None:
+        inv = {"oak_planks": 4}
+        crafts = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal crafts
+            if url.endswith("/inventory"):
+                return FakeResponse(200, self._inv(inv))
+            if url.endswith("/status"):
+                return FakeResponse(200, READY_STATUS)
+            if url.endswith("/craft"):
+                crafts += 1
+                inv["oak_planks"] -= 4
+                inv["crafting_table"] = inv.get("crafting_table", 0) + 1
+                return FakeResponse(200, TIMEOUT_ERR)
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        res = ex.craft("crafting_table", 1)
+        self.assertTrue(res.get("recovered"))
+        self.assertEqual(crafts, 1)
+        self.assertEqual(inv, {"oak_planks": 0, "crafting_table": 1})
+
+    def test_craft_timeout_with_inventory_changed_replans_without_resend(self) -> None:
+        inv = {"cobblestone": 6, "stick": 4}
+        crafts = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal crafts
+            if url.endswith("/inventory"):
+                return FakeResponse(200, self._inv(inv))
+            if url.endswith("/status"):
+                return FakeResponse(200, READY_STATUS)
+            if url.endswith("/craft"):
+                crafts += 1
+                inv["cobblestone"] -= 3  # 材料已扣但产物未见：无法确认完成，也不能盲目重发
+                return FakeResponse(200, TIMEOUT_ERR)
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        with self.assertRaises(Replan):
+            ex.craft("stone_pickaxe", 1)
+        self.assertEqual(crafts, 1)
+        self.assertEqual(inv["cobblestone"], 3)
+
+    def test_craft_timeout_with_inventory_unchanged_retries_once(self) -> None:
+        inv = {"oak_planks": 4}
+        crafts = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal crafts
+            if url.endswith("/inventory"):
+                return FakeResponse(200, self._inv(inv))
+            if url.endswith("/status"):
+                return FakeResponse(200, READY_STATUS)
+            if url.endswith("/craft"):
+                crafts += 1
+                if crafts == 1:
+                    return FakeResponse(200, TIMEOUT_ERR)
+                inv["oak_planks"] -= 4
+                inv["crafting_table"] = 1
+                return FakeResponse(200, {"ok": True, "result": {"crafted": "crafting_table", "gained": 1}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        res = ex.craft("crafting_table", 1)
+        self.assertEqual(res.get("crafted"), "crafting_table")
+        self.assertFalse(res.get("recovered", False))
+        self.assertEqual(crafts, 2)
+        self.assertEqual(inv, {"oak_planks": 0, "crafting_table": 1})
+        self.assertEqual(len(self.sleeps), 1)  # 只退避一次，随后重发成功
+
+    def test_window_act_timeout_with_inventory_changed_does_not_resend(self) -> None:
+        inv = {"raw_iron": 3, "coal": 2}
+        acts = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal acts
+            if url.endswith("/inventory"):
+                return FakeResponse(200, self._inv(inv))
+            if url.endswith("/status"):
+                return FakeResponse(200, READY_STATUS)
+            if url.endswith("/window/act"):
+                acts += 1
+                inv["raw_iron"] -= 3  # 已投料进熔炉，响应却报 timeout
+                return FakeResponse(200, TIMEOUT_ERR)
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        with self.assertRaises(Replan):
+            ex.window_act({"pos": [0, 64, 0]}, [{"op": "deposit", "item": "raw_iron", "count": 3}])
+        self.assertEqual(acts, 1)
+        self.assertEqual(inv["raw_iron"], 0)
+        self.assertNotIn("stop", self.calls)  # window/act 不在 STOP_ON_TIMEOUT_ACTIONS，且服务端不 busy
+
+    def test_window_act_timeout_with_inventory_unchanged_retries_once(self) -> None:
+        inv = {"raw_iron": 3, "coal": 2}
+        acts = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal acts
+            if url.endswith("/inventory"):
+                return FakeResponse(200, self._inv(inv))
+            if url.endswith("/status"):
+                return FakeResponse(200, READY_STATUS)
+            if url.endswith("/window/act"):
+                acts += 1
+                if acts == 1:
+                    return FakeResponse(200, TIMEOUT_ERR)
+                inv["raw_iron"] -= 3
+                return FakeResponse(200, {"ok": True, "result": {"done": 1}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        res = ex.window_act({"pos": [0, 64, 0]}, [{"op": "deposit", "item": "raw_iron", "count": 3}])
+        self.assertEqual(res, {"done": 1})
+        self.assertEqual(acts, 2)
+        self.assertEqual(inv["raw_iron"], 0)
+
+    def test_use_item_timeout_still_stops_then_checks_inventory(self) -> None:
+        """use_item 同属 STOP_ON_TIMEOUT_ACTIONS：止动不能丢，且背包已变化时不重发。"""
+        inv = {"ender_eye": 2}
+        uses = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal uses
+            if url.endswith("/inventory"):
+                return FakeResponse(200, self._inv(inv))
+            if url.endswith("/status"):
+                return FakeResponse(200, READY_STATUS)
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            if url.endswith("/use_item"):
+                uses += 1
+                inv["ender_eye"] -= 1
+                return FakeResponse(200, TIMEOUT_ERR)
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        with self.assertRaises(Replan):
+            ex.use_item("ender_eye")
+        self.assertEqual(uses, 1)
+        self.assertEqual(self.calls.count("stop"), 1)
+        self.assertLess(self.calls.index("stop"), len(self.calls) - 1)
+        self.assertEqual(self.calls[-1], "inventory")
+
+    def test_move_to_timeout_behaviour_unchanged(self) -> None:
+        """幂等动作：timeout -> /stop -> 退避重发，不触发 status/inventory 判重。"""
+        moves = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal moves
+            if url.endswith("/move_to"):
+                moves += 1
+                if moves == 1:
+                    return FakeResponse(200, TIMEOUT_ERR)
+                return FakeResponse(200, {"ok": True, "result": {"pos": [10, 64, 10]}})
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        res = ex.move_to(10, 10)
+        self.assertEqual(res["pos"], [10, 64, 10])
+        self.assertEqual(self.calls, ["move_to", "stop", "move_to"])
+        self.assertEqual(len(self.sleeps), 1)
+
+    def test_move_to_timeout_exhausts_retries_then_replans(self) -> None:
+        moves = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal moves
+            if url.endswith("/move_to"):
+                moves += 1
+                return FakeResponse(200, TIMEOUT_ERR)
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        with self.assertRaises(Replan):
+            ex.move_to(10, 10)
+        self.assertEqual(moves, 3)  # 默认 retries=2：首发 + 2 次重发
+        self.assertEqual(self.calls.count("stop"), 3)
+        self.assertNotIn("inventory", self.calls)
+        self.assertNotIn("status", self.calls)
 
 
 class PreemptionAndSessionTests(unittest.TestCase):
