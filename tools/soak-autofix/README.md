@@ -60,9 +60,10 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 - 只监听 `127.0.0.1`，零第三方依赖；校验 `Host` / `Origin` / `Content-Type`，别的网页无法跨站调用。
 - **一键启动 / 重启**：按页面「启动参数」拼 `soak_ctl.py run`，以独立进程组后台运行，输出写到会话目录 `dashboard_run.log`；关掉控制台或网页不会停掉守护。同一会话已有守护（包括终端里手动起的）时拒绝重复启动。
 - **优雅停止** = 写 `STOP`；**立即中断** = 给 `run` 进程发 SIGINT（等同 Ctrl+C，当前轮不入账）；**重启并应用新代码** = 写 `STOP` → 等两个工位都退出 → 用启动参数重新起。
-- **实时参数**：秒数、步数、聚焦目标、工位 A 玩家模型、工位 B 修单模型、单目标最大尝试直接写会话 `state.json`；Runner 下一轮开跑时读取，Fixer 每接一单前读取（正在修的那一单不受影响）。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
-- **当前轮**：解析正在跑的 `timeline.jsonl` / `progress_curve.jsonl`，2 秒刷新用时、步数、正在跑的技能、LLM 延迟、Token、血量和最近事件；**轮次历史**点一行看该轮 `summary.md`。
-- **热合入开发分支**：后台调用 `inject_and_set_goal`（同样跑编译 + 全量单测 + `--dry` 门禁），页面显示任务进度与结果。
+- **实时参数**：秒数、步数、聚焦目标、工位 A 玩家模型、工位 B 修单模型、技能验证门槛（`--min-verified`）、单目标最大尝试直接写会话 `state.json`；Runner 下一轮开跑时读取，Fixer 每接一单前读取（正在修的那一单不受影响）。守护若是在「热改轮长」功能之前启动的，页面会提示改轮长不生效、需要重启。
+- **当前轮**：解析正在跑的 `timeline.jsonl` / `progress_curve.jsonl`，2 秒刷新用时、步数、正在跑的技能（及战略目标/坐标）、完成/环境挂起(`env_blocked`)/失败、LLM 延迟与决策来源、Token、血量和最近事件（含 `death_recovered` / `objective_decision`）；**轮次历史**与**异常单**均支持点击一行弹出详情报告（`summary.md` 与 `INC-*.json`/门禁历史）。
+- **多源遥测隔离与环境自检**：`目标实测成本` 汇总所有 `goal_telemetry.*.json` 并显式标明 `local-target` / `official` 数据来源（严守 `AGENTS.md §4`）；页头支持在 `code/mcagent/logs/` 各已有会话间切换；左侧「仓库与环境自检」可一键探测本地联调网关 `/healthz` 与 `preflight` 比赛就绪项，并在选择比赛服时直接切换校园网/公网入口与提示当前分支 `verified="live"` 技能数量。
+- **热合入开发分支**：后台调用 `inject_and_set_goal`（同样跑编译 + 全量单测 + `--dry` 门禁），页面显示任务进度与结果，并在 `main` 领先当前挂机分支时主动提醒合入。
 
 命令行等价写法：`soak_ctl.py run ... --bot-user <名字>`（默认同上），加 `--rotate-user` 每轮换新角色。
 

@@ -254,6 +254,12 @@ FOCUS_MODES: dict[str, str] = {
     "rotate": "每轮轮换一个",
 }
 
+MIN_VERIFIED_CHOICES: dict[str, str] = {
+    "": "默认（比赛服仅 live / 自建服含 offline）",
+    "offline": "offline（允许未标 live 的联调/离线技能）",
+    "live": "live（仅已真机验收技能）",
+}
+
 
 def split_goal_ids(target: Any) -> list[str]:
     """与 mcagent.loop.goals.normalize_goal_ids 同规则（本脚本不导入 mcagent）：逗号分隔、去重保序。"""
@@ -676,6 +682,8 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                 pass
 
     skills_ok = 0
+    skills_env_blocked = 0
+    skills_budget_stopped = 0
     tl_sum_prompt = 0
     tl_sum_comp = 0
     tl_cum_prompt = 0
@@ -689,6 +697,10 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
     target_goal_reached = False
     target_goal_elapsed_s: Optional[float] = None
     goals_reached: dict[str, float] = {}
+    environment_blocked_goals: dict[str, Any] = {}
+    decision_sources: dict[str, int] = {}
+    llm_calls = 0
+    llm_fallbacks = 0
     tl_path = ep_dir / "timeline.jsonl"
     if tl_path.exists():
         for line in tl_path.read_text(encoding="utf-8").splitlines():
@@ -708,8 +720,14 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                     deaths_recovered_count += 1
                 elif ev_type == "goal_reached" and ev.get("goal_id"):
                     goals_reached.setdefault(str(ev["goal_id"]), float(ev.get("elapsed_s", 0.0) or 0.0))
-                elif ev_type == "skill_end" and ev.get("outcome") == "completed":
-                    skills_ok += 1
+                elif ev_type == "skill_end":
+                    out = ev.get("outcome")
+                    if out == "completed":
+                        skills_ok += 1
+                    elif out == "env_blocked":
+                        skills_env_blocked += 1
+                    elif out == "budget_stopped":
+                        skills_budget_stopped += 1
                 elif ev_type == "llm_call":
                     tl_sum_prompt += int(ev.get("prompt_tokens", 0) or 0)
                     tl_sum_comp += int(ev.get("completion_tokens", 0) or 0)
@@ -738,6 +756,14 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                                 goals_reached[str(k)] = float(v)
                             except (TypeError, ValueError):
                                 pass
+                    if isinstance(ev.get("environment_blocked_goals"), dict):
+                        environment_blocked_goals = dict(ev["environment_blocked_goals"])
+                    if isinstance(ev.get("decision_sources"), dict):
+                        decision_sources = {str(k): int(v or 0) for k, v in ev["decision_sources"].items()}
+                    if ev.get("llm_calls") is not None:
+                        llm_calls = int(ev.get("llm_calls") or 0)
+                    if ev.get("llm_fallbacks") is not None:
+                        llm_fallbacks = int(ev.get("llm_fallbacks") or 0)
             except Exception:
                 pass
 
@@ -759,6 +785,8 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
         "server_score": server_score,
         "inferred_score": inferred_score,
         "skills_completed": skills_ok,
+        "skills_env_blocked": skills_env_blocked,
+        "skills_budget_stopped": skills_budget_stopped,
         "elapsed_s": elapsed_s,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -772,6 +800,10 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
         "target_goal_reached": target_goal_reached,
         "target_goal_elapsed_s": target_goal_elapsed_s,
         "goals_reached": goals_reached,
+        "environment_blocked_goals": environment_blocked_goals,
+        "decision_sources": decision_sources,
+        "llm_calls": llm_calls,
+        "llm_fallbacks": llm_fallbacks,
         "parsed_incidents": parsed_incidents,
     }
 
@@ -1303,19 +1335,27 @@ def run_runner_loop(
     player_model: Optional[str] = None,
     server: str = "local",
     official_llm: str = "custom",
+    min_verified: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     if server not in SERVER_TARGETS:
         raise ValueError(f"未知服务器 {server!r}")
     if official_llm not in OFFICIAL_LLM_SOURCES:
         raise ValueError(f"未知模型来源 {official_llm!r}")
+    if min_verified is not None and min_verified not in MIN_VERIFIED_CHOICES:
+        raise ValueError(f"未知验证门槛 {min_verified!r}")
     results: list[dict[str, Any]] = []
-    if (target_goal or "").strip() or player_model is not None:
+    if (target_goal or "").strip() or player_model is not None or min_verified is not None:
         with locked_state(session_dir) as st_init:
             if st_init:
                 if (target_goal or "").strip():
                     st_init["target_goal"] = target_goal.strip()
                 if player_model is not None:
                     st_init["player_model"] = player_model.strip()
+                if min_verified is not None:
+                    if min_verified:
+                        st_init["min_verified"] = min_verified
+                    else:
+                        st_init.pop("min_verified", None)
     idx = 0
     while episodes <= 0 or idx < episodes:
         if (session_dir / "STOP").exists():
@@ -1375,7 +1415,11 @@ def run_runner_loop(
         ]
         if active_goal:
             cmd.extend(["--goal", active_goal])
-        telemetry_path = session_dir / "goal_telemetry.local-target.json"
+        active_min_verified = str(st.get("min_verified") or min_verified or "").strip()
+        if active_min_verified in ("offline", "live"):
+            cmd.extend(["--min-verified", active_min_verified])
+        tel_source = "official" if server == "official" else "local-target"
+        telemetry_path = session_dir / f"goal_telemetry.{tel_source}.json"
         if telemetry_path.exists():
             cmd.extend(["--goal-telemetry", str(telemetry_path)])
         if use_llm:
@@ -1752,11 +1796,16 @@ def write_review_report(session_dir: Path) -> Path:
                 rb = "-"
             if e.get("target_goal"):
                 reached_map = e.get("target_goals_reached") or {}
+                blocked_map = e.get("environment_blocked_goals") or {}
                 ids = split_goal_ids(e["target_goal"])
                 if len(ids) > 1:
-                    goal_s = " ".join(
-                        f"{'✅' if reached_map.get(g, g in (e.get('goals_reached') or {})) else '❌'} `{g}`" for g in ids
-                    )
+                    def _fmt_g(g: str) -> str:
+                        if reached_map.get(g, g in (e.get("goals_reached") or {})):
+                            return f"✅ `{g}`"
+                        if g in blocked_map:
+                            return f"⏸ `{g}`(环境挂起)"
+                        return f"❌ `{g}`"
+                    goal_s = " ".join(_fmt_g(g) for g in ids)
                 elif e.get("target_goal_reached"):
                     t_el = e.get("target_goal_elapsed_s")
                     goal_s = (
@@ -1764,6 +1813,8 @@ def write_review_report(session_dir: Path) -> Path:
                         if t_el is not None
                         else f"✅ `{e['target_goal']}`"
                     )
+                elif e["target_goal"] in blocked_map:
+                    goal_s = f"⏸ `{e['target_goal']}` (环境挂起)"
                 else:
                     goal_s = f"❌ `{e['target_goal']}`"
             else:
@@ -1864,6 +1915,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="比赛服上的模型来源：custom 自备 key 训练 | official AIA 官方代理")
     p_run_ep.add_argument("--goal", default="", help="覆盖会话级聚焦目标 goal_id")
     p_run_ep.add_argument("--player-model", default=None, help="覆盖会话级工位 A 玩家模型名")
+    p_run_ep.add_argument("--min-verified", choices=("", "offline", "live"), default=None,
+                          help="可选覆盖技能验证门槛（默认空=比赛服仅 live，自建服含 offline）")
     p_run_ep.add_argument(
         "--llm",
         action=argparse.BooleanOptionalAction,
@@ -1952,6 +2005,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument("--fixer-cmd", default="")
     p_dual.add_argument("--fixer-timeout", type=int, default=600, help="单次 AI 修单命令超时秒数（默认 600s）")
     p_dual.add_argument("--skip-live-canary", action="store_true")
+    p_dual.add_argument("--min-verified", choices=("", "offline", "live"), default="",
+                        help="可选覆盖技能验证门槛（默认空=比赛服仅 live，自建服含 offline）")
 
     p_set = sub.add_parser(
         "set-goal",
@@ -2045,6 +2100,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             player_model=args.player_model,
             server=args.server,
             official_llm=args.official_llm,
+            min_verified=args.min_verified,
         )
         return 0
 
@@ -2121,6 +2177,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 st_fx.pop("fixer_preset", None)
             else:
                 st_fx["fixer_preset"] = args.fixer_preset
+            if args.min_verified:
+                st_fx["min_verified"] = args.min_verified
+            else:
+                st_fx.pop("min_verified", None)
         tmpl = args.fixer_cmd or FIXER_PRESETS[args.fixer_preset]
         script = str(Path(__file__).resolve())
         runner_cmd = [
@@ -2137,6 +2197,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             runner_cmd.append("--fixed-user")
         if (args.goal or "").strip():
             runner_cmd.extend(["--goal", args.goal.strip()])
+        if args.min_verified in ("offline", "live"):
+            runner_cmd.extend(["--min-verified", args.min_verified])
         runner_cmd.append("--llm" if args.llm else "--no-llm")
         fixer_cmd = [
             sys.executable, script, "fixer-loop",
