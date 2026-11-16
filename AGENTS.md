@@ -179,7 +179,7 @@ J16（虚空防坠）、J17（模型会编坐标和实体 id），这里不重�
 
 **"用了 `@register`" 就等于"模型能选到"。** 所以 L2 永远不注册；想让模型用一个原语，就写一个 L3 技能包住它。
 
-### 9.2 七条硬规则（括号里是谁在替你检查）
+### 9.2 八条硬规则（括号里是谁在替你检查）
 
 1. **每发一个阻塞动作就 `yield` 一次**。Safety 只能在动作之间抢占；一步里连发两个动作，中间掉血没人知道。
    （`skills.testing.drive()`：一步内发两个动作直接断言失败。`posture` 和所有观察不占动作锁，不算。）
@@ -197,6 +197,9 @@ J16（虚空防坠）、J17（模型会编坐标和实体 id），这里不重�
 7. **`verified` 如实标**。技能类默认 `verified = "offline"`；真机跑通、`docs/06` 留了日志路径之后才改成 `"live"`。
    赛中菜单默认只收 `"live"`（联调时传 `min_verified="offline"`）。这是 §2A.6 在代码里的落点，不是它的替代品：
    没上过真机的技能仍然不进 `main`。
+8. **距离、瞄准与近场可达一律复用 `skills.sightline`，禁止脚底算角点**。`/status` 的 `pos` 为玩家脚底坐标（站立眼高 `+1.62`、潜行 `+1.27`），
+   方块 `pos` 为整数角点 `[bx, by, bz]`（几何中心 `+0.5`；规范 §3.1 / §3.3 / §4.2 / §8 1.3.10 ①）。编写任何技能或原语判断挖掘、交互、瞄准距离与可达性时，
+   **必须复用 `skills.sightline`**（`eye_pos` / `eye_to_block_dist` / `can_see_block` / `can_reach_block`），禁止手写 `math.dist(state.pos, block_pos)` 脚底角点距离或跳过 3D 体素视线遮挡检查。（代码评审与回归单测。）
 
 ### 9.3 一文件一职责
 
@@ -207,6 +210,7 @@ code/mcagent/
   skills/base.py        Skill 基类、Param 声明、rec()、failure()
   skills/registry.py    @register、REGISTRY、make()、契约检查、自动发现
   skills/items.py       只读选择器：最好的镐、垫块、空气判断
+  skills/sightline.py   眼高（1.62/1.27）、方块中心眼距与 3D 体素视线遮挡检查（只读固定模块）
   skills/nav.py         L2 原语（真机验过的三段手动兜底序列）
   skills/testing.py     离线夹具：GridWorld 替身 + drive()
   skills/<领域>.py       L3 技能：wood / stone_iron / survival / explore ……（待写，一个领域一个文件）
@@ -228,7 +232,7 @@ code/mcagent/
 ```python
 # skills/stone_iron.py
 from ..runtime import Replan
-from . import nav
+from . import nav, sightline
 from .base import Param, Skill, rec
 from .items import best_pickaxe
 from .registry import register
@@ -248,11 +252,15 @@ class MineOre(Skill):
         return "" if best_pickaxe(state) else "背包没有镐"
 
     def run(self, ex, state):
+        st = state.refresh_status(ex.client, max_age_s=0)
         found = ex.client.find_blocks(types=[self.args["target"]], radius=32, limit=4)   # 观察，不用 yield
-        if not found.get("blocks"):
+        blocks = found.get("blocks") or []
+        if not blocks:
             raise Replan(f"半径 32 内没有裸露的 {self.args['target']}")                    # 这句话会回喂给模型
-        pos = found["blocks"][0]["pos"]
-        yield rec("move_to", ex.move_to(pos=pos, rng=3), pos=pos)                        # 一个动作，一个 yield
+        blocks.sort(key=lambda b: sightline.eye_to_block_dist(st, b["pos"]))             # 按眼睛到方块中心距离排序
+        pos = blocks[0]["pos"]
+        if not sightline.can_reach_block(ex, st, pos, reach=sightline.DIG_EYE_REACH):    # 眼距 + 3D 视线遮挡复核
+            yield rec("move_to", ex.move_to(pos=pos, rng=3), pos=pos)                    # 一个动作，一个 yield
         yield from nav.breach_1x2(ex, state, [pos])                                      # 组合 L2 原语
 ```
 
