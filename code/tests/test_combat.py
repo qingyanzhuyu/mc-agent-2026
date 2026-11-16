@@ -240,6 +240,20 @@ class HuntMobTests(CombatTestCase):
         self.assertIsNone(world.st["busy"])
         self.assertEqual(ex.acts, ["attack"])
 
+    def test_attack_no_such_entity_stalled_and_interrupted_by_stop(self):
+        for err, expected in (
+            (ApiError("no_such_entity", "entity 91 not visible"), "no_such_entity"),
+            (ApiError("stalled", "stuck on boat"), "stalled"),
+        ):
+            with self.subTest(code=err.code):
+                world = CombatWorld({"stone_sword": 1}, entities=[mob()], held="stone_sword")
+                world.queue("attack", err)
+                self.assert_replan(world, HuntMob(), expected, ("attack", "move_to"))
+
+        stop_world = CombatWorld({"stone_sword": 1}, entities=[mob()], held="stone_sword")
+        stop_world.queue("attack", {"killed": False, "hits": 2, "interrupted_by": "stop"})
+        self.assert_replan(stop_world, HuntMob(), "interrupted_by=stop", ("attack",))
+
 
 class DeflectTests(CombatTestCase):
     def test_daytime_parched_equips_offhand_and_releases(self):
@@ -291,6 +305,25 @@ class DeflectTests(CombatTestCase):
         world = CombatWorld()
         world.seen.add(DEFLECT)
         self.assertFalse(self.run_skill(world, DeflectSkeletonArrow())[0].acts)
+
+    def test_deflect_succeeds_after_knockback_push_and_halts_on_interrupted_by_stop(self):
+        world = CombatWorld({"shield": 1}, entities=[mob()], offhand="shield")
+
+        def pushed_block(w, **_):
+            w.st["blocking"] = True
+            w.st["pos"] = [-0.5, 64.0, 0.5]
+            w.seen.add(DEFLECT)
+            return {"used": "shield", "blocked_ms": 1100}
+
+        world.queue("use_item", pushed_block)
+        ex, _, records = self.run_skill(world, DeflectSkeletonArrow())
+        self.assertEqual(ex.acts, ["use_item"])
+        self.assertEqual(progress_records(records), [{DEFLECT: True}])
+        self.assertFalse(world.st["blocking"])
+
+        stop_world = CombatWorld({"shield": 1}, entities=[mob()], offhand="shield")
+        stop_world.queue("use_item", {"used": "shield", "blocked_ms": 220, "interrupted_by": "stop"})
+        self.assert_replan(stop_world, DeflectSkeletonArrow(), "interrupted_by=stop", ("use_item",))
 
 
 class RangedTests(CombatTestCase):

@@ -16,7 +16,7 @@ from .combat_scene import (
     gate_reason, interrupted, prepared_scene, refresh_encounter, select_encounter, stop_activity,
 )
 from .encounter import combat_melee, shoot_projectile
-from .field import collect_drops, equip_item, scan_blocks
+from .field import _cell, collect_drops, equip_item, scan_blocks
 from .items import bare
 from .observations import refresh_inventory as _fresh_inventory
 from .registry import register
@@ -137,6 +137,8 @@ def _shield_pulse(ex, target):
 
 def _lower_shield(ex, state, *, suppress_error):
     try:
+        if suppress_error and state.st.get("alive") is False:
+            return
         if ex.posture(shield=False).get("blocking") is not False:
             raise Replan("收盾后未确认 blocking=false")
     except (ApiError, Replan):
@@ -186,13 +188,17 @@ class DeflectSkeletonArrow(Skill):
                     attempted = True
                     receipt = _shield_pulse(ex, scene.target)
                     yield rec("use_item", receipt, item="shield", target=scene.target["id"])
-                    check_after_action(ex, state, scene)
+                    after_pulse = check_after_action(ex, state, scene, stay=False)
                     _fresh_inventory(ex, state)
                     confirmed = bare(DEFLECT) in completed(ex)
                     yield rec("combat_progress", {DEFLECT: confirmed})
                     if confirmed:
                         successful = True
                         break
+                    if receipt.get("interrupted_by") == "stop":
+                        raise Replan("举盾被 /stop 主动停止（interrupted_by=stop）")
+                    if _cell(after_pulse["pos"]) != _cell(scene.origin["pos"]):
+                        raise Replan("交战期间受伤、换维度或离开已核对的站位，撤离重规划")
                     scene = refresh_encounter(ex, state, scene, aimed=True)
                     if state.count("shield") == 0:
                         raise Replan("本次举盾后盾牌已不可用")

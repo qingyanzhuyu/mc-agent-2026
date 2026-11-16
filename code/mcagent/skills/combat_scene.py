@@ -238,6 +238,8 @@ def interrupted(ex, state, scene, error):
     # 失败的阻塞动作也占一拍，先留给 Safety；若因主动 /stop、死亡或断线/未就绪中断，则不再补发撤离移动。
     code, extra = failure(error)
     cause = extra.get("cause") or extra.get("interrupted_by")
+    if cause is None and "interrupted_by=stop" in str(error):
+        cause = "stop"
     meta = {
         key: value
         for key, value in (("error_code", code), ("cause", cause), ("inner_code", extra.get("inner_code")))

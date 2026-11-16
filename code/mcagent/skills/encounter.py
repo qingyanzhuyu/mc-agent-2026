@@ -5,7 +5,7 @@ import math
 import time
 
 from ..runtime import EnvBlocked, Replan
-from .base import rec
+from .base import failure, rec
 from .field import _bounded, _cell, _grounded, _observed_block, _position, _standable_cell, scan_entities
 from .items import AIR, bare
 from .observations import completed_advancements
@@ -132,12 +132,34 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
     if not _grounded(ex, st) or not _retreat_clear(ex, _position(st.get("pos")), retreat_pos):
         raise Replan("近战前未确认站位支撑及短退路")
     initial_inventory = state.refresh_inventory(ex.client)
-    receipt = ex.attack(target["id"], timeout_ms=timeout_ms, stop_on=("hurt", "death"))
+    try:
+        receipt = ex.attack(target["id"], timeout_ms=timeout_ms, stop_on=("hurt", "death"))
+    except Replan as exc:
+        state.refresh_status(ex.client, max_age_s=0)
+        state.refresh_inventory(ex.client)
+        code, extra = failure(exc)
+        if code == "no_such_entity":
+            raise Replan(
+                f"近战目标实体 id={target['id']} 已脱离追踪范围或失效（no_such_entity），请重新 get_entities 选怪"
+            ) from exc
+        if code == "stalled":
+            raise Replan(
+                f"近战追击目标 id={target['id']} 寻路 8 秒无位移（stalled），停止追击"
+            ) from exc
+        if code == "interrupted":
+            raise Replan(
+                f"近战被中断（interrupted，cause={extra.get('cause')}）"
+            ) from exc
+        raise
     yield rec("attack", receipt, entity_id=target["id"])
+    state.refresh_status(ex.client, max_age_s=0)
     after_inventory = state.refresh_inventory(ex.client)
     after = _current_entity(ex, state, target, radius, required=False)
     health = (after or {}).get("health")
     if receipt.get("killed") is not True or (type(health) in (int, float) and health > 0):
+        interrupted_by = receipt.get("interrupted_by")
+        if interrupted_by:
+            raise Replan(f"本次近战被中断（interrupted_by={interrupted_by}），未确认击杀")
         raise Replan("本次近战未确认击杀")
     confirmed = yield from _verify_advancement(ex, advancement, advancement_polls)
     return {"receipt": receipt, "target_before": target, "target_after": after,
