@@ -39,6 +39,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Collection, Iterator, Optional, Sequence
+from urllib.parse import urlsplit
 
 PROTECTED_BRANCHES = frozenset({"main", "master", "HEAD"})
 
@@ -130,10 +131,15 @@ DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
 #     official = AIA 官方代理（LLM_KEY），与比赛当天完全一致。
 # - local（备选）：本机联调网关 MC_LOCAL_API_BASE（默认 127.0.0.1:8787 → 队内测试服），角色名随意，模型用 custom。
 # 工位 B 的金丝雀验修始终在自建测试服跑，不占比赛账号。
+# 比赛服有两个官方入口，同一套 API：公网（默认）与校园网（仅校内网络可达，延迟低两个数量级）。
+# 用 MC_OFFICIAL_API_BASE（进程环境或 code/mcagent/.env）选其一；主机名须在 OFFICIAL_MC_HOSTS 内，
+# 与 mcagent.preflight.OFFICIAL_HOSTS 保持一致（本脚本不导入 mcagent，改一处要同步另一处）。
 OFFICIAL_MC_BASE = "https://mc-api.windywindie.top/api/v1"
+CAMPUS_MC_BASE = "https://apiin.nmo.net.cn/api/v1"
+OFFICIAL_MC_HOSTS: tuple[str, ...] = ("apiin.nmo.net.cn", "mc-api.windywindie.top")
 DEFAULT_LOCAL_MC_BASE = "http://127.0.0.1:8787/api/v1"
 SERVER_TARGETS: dict[str, str] = {
-    "official": "比赛服（官方端点 mc-api.windywindie.top，用队伍正式账号）",
+    "official": "比赛服（官方端点：公网或校园网，由 MC_OFFICIAL_API_BASE 选择；用队伍正式账号）",
     "local": "自建测试服（本机联调网关 → 队内测试服）",
 }
 OFFICIAL_LLM_SOURCES: dict[str, str] = {
@@ -190,7 +196,8 @@ def _read_dotenv_keys(repo_root: Path) -> dict[str, str]:
             vals[k.strip()] = v.strip().strip('"').strip("'")
     except OSError:
         pass
-    for k in ("MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE"):
+    for k in ("MC_USER", "MC_PASS", "LLM_KEY", "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "MC_LOCAL_API_BASE",
+              "MC_OFFICIAL_API_BASE"):
         if os.environ.get(k):
             vals[k] = os.environ[k]
     return vals
@@ -199,6 +206,17 @@ def _read_dotenv_keys(repo_root: Path) -> dict[str, str]:
 def local_mc_base(repo_root: Path) -> str:
     """自建测试服网关地址：MC_LOCAL_API_BASE，未设时用 127.0.0.1:8787。"""
     return _read_dotenv_keys(repo_root).get("MC_LOCAL_API_BASE") or DEFAULT_LOCAL_MC_BASE
+
+
+def official_mc_base(repo_root: Path) -> str:
+    """比赛服端点：MC_OFFICIAL_API_BASE 未设时用公网入口；设了必须是 https 且主机名属于官方入口。"""
+    raw = (_read_dotenv_keys(repo_root).get("MC_OFFICIAL_API_BASE") or OFFICIAL_MC_BASE).strip()
+    parts = urlsplit(raw)
+    if parts.scheme != "https" or parts.hostname not in OFFICIAL_MC_HOSTS:
+        raise ValueError(
+            f"MC_OFFICIAL_API_BASE={raw!r} 不是官方入口（须为 https 且主机名属于 {', '.join(OFFICIAL_MC_HOSTS)}）"
+        )
+    return raw.rstrip("/")
 
 
 def check_server_target(
@@ -214,6 +232,10 @@ def check_server_target(
     if official_llm not in OFFICIAL_LLM_SOURCES:
         return [f"未知模型来源 {official_llm!r}（可选：{', '.join(OFFICIAL_LLM_SOURCES)}）"]
     errs: list[str] = []
+    try:
+        official_mc_base(repo_root)
+    except ValueError as e:
+        errs.append(str(e))
     if not (env.get("MC_USER") and env.get("MC_PASS")):
         errs.append("code/mcagent/.env 缺队伍正式账号 MC_USER / MC_PASS")
     if use_llm and official_llm == "official" and not env.get("LLM_KEY"):
@@ -1363,7 +1385,7 @@ def run_runner_loop(
 
         print(
             f"[runner] 启动 {ep_id} @ {tip_sha[:7]} "
-            f"(server={server}, bot={bot_user}, "
+            f"(server={server}{('@' + urlsplit(official_mc_base(repo_root)).hostname) if server == 'official' else ''}, bot={bot_user}, "
             f"model={('AIA官方代理' if (server == 'official' and official_llm == 'official') else (active_model or 'env')) if use_llm else 'rule'}, "
             f"goal={active_goal or 'all'}, max={ep_seconds:g}s/{ep_steps} 步)..."
         )
@@ -1371,7 +1393,7 @@ def run_runner_loop(
         run_env = _uv_env(runner_wt, player_model=active_model if use_custom else "")
         run_env.pop("MCAGENT_TRAIN_ON_OFFICIAL", None)
         if server == "official":
-            run_env["MC_API_BASE"] = OFFICIAL_MC_BASE
+            run_env["MC_API_BASE"] = official_mc_base(repo_root)
             if use_llm and official_llm == "official":
                 run_env["LLM_PROFILE"] = "official"
                 run_env.pop("LLM_CUSTOM_MODEL", None)
@@ -1649,7 +1671,8 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **会话目录**：`{session_dir}`",
         f"- **基线提交 → 当前分支尖端**：`{base_sha}` → `{tip_sha}`（目标待审分支：`{branch}`，**未自动合并 `main`**）",
         f"- **已完成挂机轮次**：`{len(st['episodes'])}` 轮 · **自动修复提交数**：`{len(st['commits'])}` 个",
-        f"- **工位 A 服务器**：`{SERVER_TARGETS.get(st.get('server_target') or 'local', st.get('server_target'))}`",
+        f"- **工位 A 服务器**：`{SERVER_TARGETS.get(st.get('server_target') or 'local', st.get('server_target'))}`"
+        + (f"（端点 `{st['server_base']}`）" if st.get("server_target") == "official" and st.get("server_base") else ""),
         f"- **玩家操控模型（工位 A）**：`{'AIA 官方代理（LLM_PROFILE=official）' if (st.get('server_target') == 'official' and st.get('official_llm') == 'official') else (st.get('player_model') or '沿用 .env')}`"
         + ("（比赛服赛前训练，自备 key）" if (st.get("server_target") == "official" and st.get("official_llm", "custom") == "custom") else ""),
         f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
@@ -2088,6 +2111,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         (session_dir / "STOP").unlink(missing_ok=True)
         with locked_state(session_dir) as st_fx:
             st_fx["server_target"] = args.server
+            if args.server == "official":
+                st_fx["server_base"] = official_mc_base(repo_root)
+            else:
+                st_fx.pop("server_base", None)
             st_fx["focus_mode"] = args.focus_mode
             st_fx["official_llm"] = args.official_llm
             if args.fixer_cmd:
@@ -2165,6 +2192,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "fixer_preset": st.get("fixer_preset", ""),
             "focus_mode": st.get("focus_mode", "together"),
             "server_target": st.get("server_target", "local"),
+            "server_base": st.get("server_base", ""),
             "official_llm": st.get("official_llm", "custom"),
             "episode_budget_override": {
                 "episode_seconds": st.get("episode_seconds"),

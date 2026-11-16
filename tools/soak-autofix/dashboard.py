@@ -429,6 +429,7 @@ class Console:
                 "fixer_preset": st.get("fixer_preset", ""),
                 "focus_mode": st.get("focus_mode", "together"),
                 "server_target": st.get("server_target", "local"),
+                "server_base": st.get("server_base", ""),
                 "official_llm": st.get("official_llm", "custom"),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
                 "episode_seconds": st.get("episode_seconds"),
