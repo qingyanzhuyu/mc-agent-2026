@@ -17,6 +17,14 @@ from ..runtime import Replan
 from ..skills.base import Param, Skill, failure, rec
 from ..skills.items import AIR, bare, best_pickaxe
 from ..skills.registry import register
+from ..skills.sightline import (
+    API_DIG_EYE_REACH,
+    DIG_EYE_REACH,
+    STATION_EYE_REACH,
+    block_center,
+    can_reach_block,
+    eye_to_block_dist,
+)
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -96,6 +104,14 @@ def _is_protected(pos, radius: float = 6.0) -> bool:
 def _is_under_feet(player_pos: list[float], block_pos: list) -> bool:
     fx, fy, fz = math.floor(player_pos[0]), player_pos[1], math.floor(player_pos[2])
     return int(block_pos[0]) == fx and int(block_pos[2]) == fz and float(block_pos[1]) <= fy
+
+
+def _refresh_stance(ex: "Executor", state: "State") -> tuple[dict, list[float]]:
+    st = state.refresh_status(ex.client, max_age_s=0)
+    cur = st.get("pos") or state.pos
+    if not st.get("pos"):
+        st = {**st, "pos": cur}
+    return st, cur
 
 
 def total_logs(state: "State") -> int:
@@ -326,7 +342,7 @@ class GatherWood(Skill):
         attempts = 0
         while total_logs(state) - start_logs < want and attempts < want + 6:
             attempts += 1
-            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            st, cur = _refresh_stance(ex, state)
             found = ex.client.find_blocks(types=list(ALL_LOGS), radius=32, limit=32)
             cands = []
             for b in (found.get("blocks") or []):
@@ -336,8 +352,13 @@ class GatherWood(Skill):
                 pt = (int(p[0]), int(p[1]), int(p[2]))
                 if pt in bad_positions or _is_under_feet(cur, p) or _is_protected(p):
                     continue
-                # 跳过头顶已悬空的高树冠原木（水平 <3 格且高于脚底 >4 格时地面寻路 GoalNear 必报 path_not_found）
-                if math.hypot(p[0] - cur[0], p[2] - cur[2]) < 3.0 and (p[1] - cur[1]) > 4.0:
+                # 跳过头顶超出眼距上限的悬空高树冠原木（水平 <3 格、高于脚底 >4 格且眼距 >4.5 时地面寻路必报 path_not_found）
+                cx, _, cz = block_center(p)
+                if (
+                    math.hypot(cx - cur[0], cz - cur[2]) < 3.0
+                    and (p[1] - cur[1]) > 4.0
+                    and eye_to_block_dist(st, p) > DIG_EYE_REACH
+                ):
                     bad_positions.add(pt)
                     continue
                 cands.append(b)
@@ -353,16 +374,21 @@ class GatherWood(Skill):
                 preferred_species = bare(cands[0].get("name", "")) or None
             cands.sort(
                 key=lambda b: (
-                    # 先试当前高度附近的树干，避免近处树冠耗尽尝试预算。
-                    # 沿用上面的 4 格高差，只作排序；山坡上的高树仍可后备尝试。
-                    float(b["pos"][1]) > cur[1] + 4.0,
-                    0 if (preferred_species and bare(b.get("name", "")) == preferred_species and float(b.get("dist", 99)) <= 18.0) else 1,
-                    float(b.get("dist", math.dist(cur, b["pos"]))),
+                    # 先试当前高度附近或原地眼距可达的树干，避免远端高树冠耗尽尝试预算；山坡高树仍可后备尝试。
+                    float(b["pos"][1]) > cur[1] + 4.0 and eye_to_block_dist(st, b["pos"]) > DIG_EYE_REACH,
+                    0
+                    if (
+                        preferred_species
+                        and bare(b.get("name", "")) == preferred_species
+                        and eye_to_block_dist(st, b["pos"]) <= 18.0
+                    )
+                    else 1,
+                    eye_to_block_dist(st, b["pos"]),
                 )
             )
             target = cands[0]["pos"]
             t_key = (int(target[0]), int(target[1]), int(target[2]))
-            if math.dist(cur, target) > 4.2:
+            if not can_reach_block(ex, st, target, reach=DIG_EYE_REACH):
                 try:
                     yield rec("move_to", ex.move_to(pos=target, rng=3), pos=target)
                 except Replan as e:
@@ -429,7 +455,7 @@ class CraftGear(Skill):
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         target = str(self.args["item"])
         p_need, s_need, c_need = _GEAR_NEEDS[target]
-        state.refresh_status(ex.client, max_age_s=0)
+        st, _ = _refresh_stance(ex, state)
         state.refresh_inventory(ex.client)
 
         if total_cobble(state) < c_need:
@@ -441,7 +467,7 @@ class CraftGear(Skill):
         table_ready = False
         for tb in valid_tables:
             tpos = tb["pos"]
-            if math.dist(state.pos, tpos) > 3.5:
+            if not can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
                 try:
                     moved = ex.move_to(pos=tpos, rng=2)
                 except Replan as e:
@@ -451,12 +477,12 @@ class CraftGear(Skill):
                     _forget_known_table(tpos)
                     # 失败动作也必须让出一步，给 Safety 抢占与状态刷新留出边界。
                     yield rec("move_to", pos=tpos, error_code=code)
-                    state.refresh_status(ex.client, max_age_s=0)
+                    st, _ = _refresh_stance(ex, state)
                     continue
                 yield rec("move_to", moved, pos=tpos)
-                state.refresh_status(ex.client, max_age_s=0)
-                if math.dist(state.pos, tpos) > 3.5:
-                    # 成功响应也要核对实际到达位置，不能把仍够不到的台当作可用锚点。
+                st, _ = _refresh_stance(ex, state)
+                if not can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
+                    # 成功响应也要核对实际到达后的眼距与视线遮挡，不能把仍够不到或隔墙的台当作可用锚点。
                     _forget_known_table(tpos)
                     continue
             _record_known_table(tpos)
@@ -593,17 +619,23 @@ class MineStone(Skill):
         for _ in range(budget):
             if total_cobble(state) - start_cobble >= want:
                 return
-            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            st, cur = _refresh_stance(ex, state)
             stones = ex.client.find_blocks(types=list(STONE_Targets), radius=16, limit=24).get("blocks") or []
-            # 仅选与当前脚底高差在 [-1.5, +2.5] 内的平层/浅层石头，避开地下洞穴暴露块（否则寻路卡 8s 且掉落物掉入洞底捡不到）
+            # 下界保持 cur[1] - 1.5 防深坑掉物，上界放宽至头顶眼距可达层（cur[1] + 4.0 且眼距合理，或原地眼距可达）
             cands = [
                 b["pos"] for b in stones
                 if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
                 and (int(b["pos"][0]), int(b["pos"][1]), int(b["pos"][2])) not in bad_positions
-                and (cur[1] - 1.5) <= float(b["pos"][1]) <= (cur[1] + 2.5)
+                and (cur[1] - 1.5) <= float(b["pos"][1])
+                and (
+                    float(b["pos"][1]) <= (cur[1] + 2.5)
+                    or (float(b["pos"][1]) <= (cur[1] + 4.0) and eye_to_block_dist(st, b["pos"]) <= 8.0)
+                    or eye_to_block_dist(st, b["pos"]) <= DIG_EYE_REACH
+                )
                 and not _is_under_feet(cur, b["pos"])
                 and not _is_protected(b["pos"])
             ]
+            cands.sort(key=lambda p: eye_to_block_dist(st, p))
             target = cands[0] if cands else None
 
             if target is None:
@@ -689,7 +721,7 @@ class MineStone(Skill):
                 raise Replan("附近未找到可安全挖掘的石头或非悬空表土")
 
             t_key = (int(target[0]), int(target[1]), int(target[2]))
-            if math.dist(cur, target) > 4.0:
+            if not can_reach_block(ex, st, target, reach=DIG_EYE_REACH):
                 try:
                     yield rec("move_to", ex.move_to(pos=target, rng=2), pos=target)
                 except Replan as e:
@@ -701,8 +733,8 @@ class MineStone(Skill):
                     raise
             try:
                 yield from self._prepare_pickaxe(ex, state)
-                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-                if _is_under_feet(cur, target):
+                st, cur = _refresh_stance(ex, state)
+                if _is_under_feet(cur, target) or not can_reach_block(ex, st, target, reach=API_DIG_EYE_REACH):
                     bad_positions.add(t_key)
                     continue
                 before_dig_cobble = total_cobble(state)
