@@ -23,6 +23,7 @@ from mcagent.loop import (
     CampaignPlanner,
     LoopConfig,
     MainLoop,
+    RulePlanner,
     SoakObserver,
     reset_world_memo,
 )
@@ -613,6 +614,109 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
             rc = loop_main.main(["--dry", "--strategy", "llm"])
         self.assertEqual(rc, 0)
         self.assertIn("strategy=llm", out.getvalue())
+
+    def test_strategy_legacy_matches_rule_planner_choose_and_supports_legacy_llm(self) -> None:
+        # 默认值仍为 rule
+        self.assertEqual(CampaignPlanner().strategy, "rule")
+        self.assertEqual(loop_main.build_parser().parse_args([]).strategy, "rule")
+        self.assertEqual(loop_main.build_parser().parse_args(["--strategy", "legacy"]).strategy, "legacy")
+
+        def _inv(*pairs: tuple[str, int]) -> list[dict]:
+            return [{"name": name, "count": cnt, "slot": idx} for idx, (name, cnt) in enumerate(pairs)]
+
+        all_achieved_items = _inv(
+            ("oak_log", 4), ("wooden_pickaxe", 1), ("cobblestone", 20),
+            ("stone_pickaxe", 1), ("stone_sword", 1), ("furnace", 1), ("iron_ingot", 3),
+        )
+        scenarios: list[tuple[str, dict, list[dict], dict]] = [
+            ("cold_start", {}, [], {}),
+            ("logs_ready", {}, _inv(("oak_log", 4)), {}),
+            ("wooden_pick_ready", {}, _inv(("oak_log", 4), ("wooden_pickaxe", 1)), {}),
+            ("cobble_sticks_ready", {}, _inv(("oak_log", 4), ("wooden_pickaxe", 1), ("cobblestone", 4), ("stick", 2), ("oak_planks", 4)), {}),
+            ("stone_pick_ready", {}, _inv(("oak_log", 4), ("wooden_pickaxe", 1), ("cobblestone", 6), ("stick", 2), ("stone_pickaxe", 1)), {}),
+            ("stone_sword_ready", {}, _inv(("oak_log", 4), ("wooden_pickaxe", 1), ("cobblestone", 12), ("stone_pickaxe", 1), ("stone_sword", 1)), {}),
+            ("furnace_ready", {}, _inv(("oak_log", 4), ("wooden_pickaxe", 1), ("cobblestone", 12), ("stone_pickaxe", 1), ("stone_sword", 1), ("furnace", 1)), {}),
+            ("hungry_eat", {"food": 12, "health": 16}, _inv(("bread", 2)), {}),
+            ("safe_mode_craft", {}, _inv(("oak_planks", 3), ("stick", 2)), {"safe_mode": True}),
+            ("safe_mode_idle", {}, [], {"safe_mode": True}),
+            ("cooldown_scout", {}, [], {"cooldown_goal": "wood:3"}),
+            ("focused_env_blocked", {}, [], {"target_goal": "prep_wood", "env_block_wood": True}),
+            ("stock_wood", {}, [x for x in all_achieved_items if x["name"] != "oak_log"], {"advs": {"story/mine_stone", "story/upgrade_tools", "story/smelt_iron"}}),
+            ("stock_cobble", {}, [x if x["name"] != "cobblestone" else {**x, "count": 4} for x in all_achieved_items], {"advs": {"story/mine_stone", "story/upgrade_tools", "story/smelt_iron"}}),
+            ("all_done_scout", {}, all_achieved_items, {"advs": {"story/mine_stone", "story/upgrade_tools", "story/smelt_iron"}}),
+        ]
+
+        obj_events: list[dict] = []
+        for label, st_over, items, extra in scenarios:
+            with self.subTest(scenario=label):
+                skill_base._COOLDOWN.clear()
+                st = self._fresh_state(**st_over)
+                st.set_inventory({"items": items})
+                if extra.get("safe_mode"):
+                    st.safe_mode_until = time.monotonic() + 30.0
+                if extra.get("cooldown_goal"):
+                    skill_base._COOLDOWN[extra["cooldown_goal"]] = time.monotonic() + 30.0
+
+                t_goal = extra.get("target_goal")
+                legacy_cp = CampaignPlanner(
+                    mode="campaign", strategy="legacy", min_verified="offline",
+                    target_goal=t_goal, on_objective_telemetry=obj_events.append,
+                )
+                ref_rules = RulePlanner(min_verified="offline", target_goal=t_goal)
+                if extra.get("advs"):
+                    legacy_cp.rules.completed_advancements.update(extra["advs"])
+                    ref_rules.completed_advancements.update(extra["advs"])
+                if extra.get("env_block_wood"):
+                    err = EnvBlocked("无树", missing_predicate="wood", searched_volume="r16", wake_on="chunk_moved")
+                    legacy_cp.record_environment_block(REGISTRY["gather_wood"](count=3), err, st)
+                    ref_rules.record_environment_block(REGISTRY["gather_wood"](count=3), err, st)
+
+                d_leg = legacy_cp.select(st, [])
+                d_ref = ref_rules.choose(st)
+                self.assertEqual(
+                    (d_leg.skill.name, d_leg.skill.args) if d_leg.skill else None,
+                    (d_ref.skill.name, d_ref.skill.args) if d_ref.skill else None,
+                )
+                self.assertEqual((d_leg.source, d_leg.reason, d_leg.environment_recovery), (d_ref.source, d_ref.reason, d_ref.environment_recovery))
+                self.assertIsNone(d_leg.objective)
+                self.assertIsNone(legacy_cp.current_objective)
+                self.assertEqual(len(legacy_cp.recent_objectives), 0)
+
+                if d_leg.skill is not None:
+                    legacy_cp.record_skill_outcome(d_leg.skill.name, ok=False, elapsed_s=4.0)
+                    ref_rules.record_skill_outcome(d_ref.skill.name, ok=False, elapsed_s=4.0)
+                    self.assertEqual(legacy_cp.rules.ep_goal_fails, ref_rules.ep_goal_fails)
+                    self.assertEqual(legacy_cp.rules.ep_goal_elapsed, ref_rules.ep_goal_elapsed)
+        self.assertEqual(obj_events, [])
+
+        # --strategy legacy + --llm 走 _select_legacy_skill_llm（同步菜单选择 + 非法输出回退规则）
+        llm_rows: list[dict] = []
+        st_llm = self._fresh_state()
+        ok_llm = LLMClient(
+            key="k", fast_proxy="", poster=lambda *a: _ok_json({"skill": "gather_wood", "args": {"count": 2}, "why": "基线对照"}), log=None
+        )
+        cp_leg_llm = CampaignPlanner(
+            mode="campaign", strategy="legacy", use_llm=True, llm=ok_llm,
+            min_verified="offline", on_llm_telemetry=llm_rows.append, on_objective_telemetry=obj_events.append,
+        )
+        d_llm = cp_leg_llm.select(st_llm, [])
+        self.assertEqual((d_llm.source, d_llm.skill.name, d_llm.skill.args), ("llm", "gather_wood", {"count": 2}))
+        self.assertIsNone(d_llm.objective)
+        self.assertEqual(len(llm_rows), 1)
+        self.assertEqual(obj_events, [])
+
+        bad_llm = LLMClient(
+            key="k", fast_proxy="", poster=lambda *a: _ok_json({"skill": "nonexistent_skill", "args": {}}), log=None
+        )
+        cp_leg_fb = CampaignPlanner(mode="campaign", strategy="legacy", use_llm=True, llm=bad_llm, min_verified="offline")
+        d_fb = cp_leg_fb.select(st_llm, [])
+        self.assertEqual((d_fb.source, d_fb.skill.name, d_fb.skill.args), ("llm_fallback_rule", "gather_wood", {"count": 3}))
+
+        out = io.StringIO()
+        with patch.object(loop_main.Client, "probe", return_value="unauthorized"), redirect_stdout(out):
+            rc = loop_main.main(["--dry", "--strategy", "legacy"])
+        self.assertEqual(rc, 0)
+        self.assertIn("strategy=legacy", out.getvalue())
 
 
 if __name__ == "__main__":
