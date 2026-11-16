@@ -154,13 +154,13 @@ def _table_position(ex: Executor, state: State) -> Generator[dict, None, list[in
     )
 
 
-def craft_recipe(ex: Executor, state: State, item: str, count: int = 1) -> Generator[dict, None, dict]:
-    """持有至少 count 件指定成品；逐次合成，返回前后库存和实耗的差量。"""
+def craft_recipe(ex: Executor, state: State, item: str, *, goal_qty: int = 1) -> Generator[dict, None, dict]:
+    """逐次合成至至少持有 goal_qty 件成品，返回前后库存和实耗差量。"""
     item = bare(item)
     recipe = RECIPES.get(item)
     if recipe is None:
         raise Replan(f"不支持的 T1 合成物品 {item}，请选择已登记的成品 ID")
-    if type(count) is not int or count < 1:
+    if type(goal_qty) is not int or goal_qty < 1:
         raise Replan(f"合成 {item} 的目标数量必须为正整数")
 
     state.invalidate_inventory()
@@ -175,18 +175,18 @@ def craft_recipe(ex: Executor, state: State, item: str, count: int = 1) -> Gener
     table = None
     table_dimension = None
     batches = 0
-    while current < count:
+    while current < goal_qty:
         if batches >= _MAX_BATCHES:
             raise Replan(f"合成 {item} 已用完 {_MAX_BATCHES} 批的本轮预算，请按已实收数量重新规划")
         stock = {name: state.count(name) for name in input_items}
         capacity = {variant: _craft_capacity(variant, stock) for variant in variants}
         # 木板木棍与竹子木棍的原料不重叠，合并后才是完整的生产额度。
-        if current + sum(variant.output * batches for variant, batches in capacity.items()) < count:
+        if current + sum(variant.output * batches for variant, batches in capacity.items()) < goal_qty:
             requirements = " 或 ".join(
                 "、".join(f"{ingredient} ×{needed}" for ingredient, needed in variant.ingredients)
                 for variant in variants
             )
-            raise Replan(f"合成 {item} 缺材料：还需 {count - current} 件成品，每批需要 {requirements}")
+            raise Replan(f"合成 {item} 缺材料：还需 {goal_qty - current} 件成品，每批需要 {requirements}")
 
         if recipe.requires_table:
             if table is None:

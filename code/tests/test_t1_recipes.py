@@ -38,12 +38,12 @@ class CraftWorld(GridWorld):
 
 
 class CraftRecipeTests(unittest.TestCase):
-    def run_recipe(self, world, item, count=1):
+    def run_recipe(self, world, item, *, goal_qty=1):
         ex, state = world.session()
         outcome = {}
 
         def capture_result():
-            outcome.update((yield from craft_recipe(ex, state, item, count)))
+            outcome.update((yield from craft_recipe(ex, state, item, goal_qty=goal_qty)))
 
         return drive(capture_result(), ex), outcome
 
@@ -55,7 +55,7 @@ class CraftRecipeTests(unittest.TestCase):
             crafts=[({"gained": 1}, arrows), ({"gained": 99}, arrows)],
         )
 
-        steps, result = self.run_recipe(world, "minecraft:arrow", 6)
+        steps, result = self.run_recipe(world, "minecraft:arrow", goal_qty=6)
 
         self.assertEqual([s["op"] for s in steps], ["craft", "craft"])
         self.assertEqual([args["count"] for name, args in world.calls if name == "craft"], [1, 1])
@@ -71,11 +71,27 @@ class CraftRecipeTests(unittest.TestCase):
         self.assertEqual(world.calls, [])
         self.assertEqual((result["before"], result["after"], result["gained"], result["consumed"]), (1, 1, 0, {}))
 
+    def test_keyword_goal_qty_counts_product_already_held(self):
+        world = CraftWorld(items={"shears": 1, "iron_ingot": 2},
+                           crafts=[({}, {"shears": 1, "iron_ingot": -2})])
+
+        steps, result = self.run_recipe(world, "shears", goal_qty=2)
+
+        self.assertEqual([step["op"] for step in steps], ["craft"])
+        self.assertEqual((result["before"], result["after"], result["gained"]), (1, 2, 1))
+
+    def test_goal_qty_is_keyword_only_and_count_is_not_accepted(self):
+        ex, state = CraftWorld(items={}).session()
+        for extra_args, kwargs in (((2,), {}), ((), {"count": 2})):
+            with self.subTest(extra_args=extra_args, kwargs=kwargs):
+                with self.assertRaises(TypeError):
+                    craft_recipe(ex, state, "shears", *extra_args, **kwargs)
+
     def test_total_recipe_materials_are_checked_before_any_action(self):
         world = CraftWorld(items={"diamond": 7}, tables=[(1, 64, 0)])
 
         with self.assertRaisesRegex(Replan, "diamond ×4"):
-            self.run_recipe(world, "diamond_boots", 2)
+            self.run_recipe(world, "diamond_boots", goal_qty=2)
 
         self.assertEqual(world.calls, [])
 
@@ -141,7 +157,7 @@ class CraftRecipeTests(unittest.TestCase):
     def test_abandoned_generator_does_not_issue_next_craft(self):
         world = CraftWorld(items={"iron_ingot": 4}, crafts=[({}, {"shears": 1, "iron_ingot": -2})])
         ex, state = world.session()
-        flow = craft_recipe(ex, state, "shears", 2)
+        flow = craft_recipe(ex, state, "shears", goal_qty=2)
 
         self.assertEqual(next(flow)["op"], "craft")
         flow.close()
