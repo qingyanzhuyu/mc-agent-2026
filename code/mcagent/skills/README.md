@@ -7,7 +7,7 @@
 base.py       Skill 基类 / Param 参数声明 / rec() / failure()
 registry.py   @register、REGISTRY、make()、契约检查、自动发现
 items.py      只读选择器：最好的镐、垫块、空气判断
-sightline.py  只读视线几何：眼高、方块中心/碰撞箱眼距与 3D 体素视线遮挡
+sightline.py  眼高（1.62/1.27）、方块中心眼距与 3D 体素视线遮挡检查（只读）
 nav.py        L2 战术原语：breach_1x2 / sneak_bridge / step_up_1x2
 testing.py    离线夹具：GridWorld 替身 + drive()
 <领域>.py      L3 意图技能
@@ -40,13 +40,26 @@ def run(self, ex, state):
 
 ```python
 def run(self, ex, state):
+    st = state.refresh_status(ex.client, max_age_s=0)
     for b in blocks:                                  # 观察随便调，不用 yield
-        yield rec("move_to", ex.move_to(pos=b, rng=3), pos=b)
+        if not sightline.can_reach_block(ex, st, b, reach=sightline.DIG_EYE_REACH):
+            yield rec("move_to", ex.move_to(pos=b, rng=3), pos=b)
+            st = state.refresh_status(ex.client, max_age_s=0)
         yield rec("dig", ex.dig(b), pos=b)
 ```
 
 基类的 `step()` 每次只推进到下一个 `yield`，所以对主循环来说它仍然是"一步一动作"的状态机。
 要用 L2 原语就 `yield from nav.breach_1x2(ex, state, [...])`。
+
+## 眼高、方块中心与视线遮挡（强制复用 `sightline`）
+
+根据 `docs/99-原始记录/api-spec-v1.3.11.md` §3.1 / §3.3 / §4.2 / §8 1.3.10 ①：
+- `/status` 返回的 `pos` 是**玩家脚底坐标**（站立眼高 `+1.62`，潜行 `status.sneaking == True` 时 `+1.27`）；
+- `/find_blocks` 与 `/get_block` 的 `pos` 是**整数格角点** `[bx, by, bz]`，几何中心为 `[bx + 0.5, by + 0.5, bz + 0.5]`。
+
+编写任何技能或原语判断挖掘、工作站交互、瞄准距离与可达性时，**必须复用 `skills.sightline`**
+（`eye_pos` / `eye_to_block_dist` / `can_see_block` / `can_reach_block` 及 `DIG_EYE_REACH`、`API_DIG_EYE_REACH`、`STATION_EYE_REACH`），
+**禁止**手写 `math.dist(state.pos, block_pos)` 脚底角点距离或跳过 3D 体素视线遮挡检查。
 
 ## 加一个技能
 
