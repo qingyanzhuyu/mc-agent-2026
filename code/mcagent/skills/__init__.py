@@ -3,7 +3,7 @@
     base.py       Skill 基类 / Param 参数声明 / rec() / failure()
     registry.py   @register、REGISTRY、make()、自动发现
     items.py      选择器：最好的镐、垫块、空气判断（只读）
-    sightline.py  眼高、方块中心/碰撞箱眼距与 3D 体素视线遮挡（只读）
+    sightline.py  眼高（1.62/1.27）、方块中心眼距与 3D 体素视线遮挡检查（只读）
     nav.py        L2 原语：breach_1x2 / sneak_bridge / step_up_1x2（probe 直接导入验收）
     testing.py    离线夹具：GridWorld 替身 + drive()（强制"一步一动作"）
     <领域>.py      L3 技能，一个文件一个领域，`@register` 即接入
