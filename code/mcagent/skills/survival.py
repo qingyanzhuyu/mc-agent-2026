@@ -1,0 +1,127 @@
+"""生存与农牧技能共用的近场观察和库存计算。"""
+from __future__ import annotations
+
+import math
+
+from ..client import ApiError
+from ..runtime import EnvBlocked, Replan
+from .field import move_local
+from .items import AIR, PLACEABLE_BLOCKS, bare
+from .recipes import RECIPES
+
+
+_SUPPORT = frozenset(PLACEABLE_BLOCKS) | {
+    "grass_block", "coarse_dirt", "rooted_dirt", "sand", "gravel", "clay",
+    "bedrock", "deepslate", "stone_bricks", "bricks", "blackstone", "soul_soil",
+}
+_PLANKS = tuple(item for item in RECIPES if item.endswith("_planks"))
+_SIDES = ((1, 0), (-1, 0), (0, 1), (0, -1))
+_PLANT_PROGRESS = "husbandry/plant_seed"
+_BREED_PROGRESS = "husbandry/breed_an_animal"
+_SLEEP_PROGRESS = "adventure/sleep_in_bed"
+_FISH_PROGRESS = "husbandry/fishy_business"
+
+
+def _fresh_inventory(ex, state):
+    state.invalidate_inventory()
+    return state.refresh_inventory(ex.client)
+
+
+def _has_progress(ex, advancement):
+    try:
+        snapshot = ex.client.advancements(status="completed", include_recipes=False)
+    except ApiError as exc:
+        if exc.code == "not_ready":
+            return False
+        raise
+    return snapshot.get("ready") is True and any(
+        bare(row.get("id")) == advancement and row.get("status") == "completed"
+        for row in (snapshot.get("advancements") or ())
+    )
+
+
+def _plank_plan(state, count):
+    plan = []
+    for item in _PLANKS:
+        qty = min(count, state.count(item))
+        if qty > 0:
+            plan.append((item, qty, "consume"))
+            count -= qty
+        if not count:
+            return tuple(plan)
+    return ()
+
+
+def _block(ex, pos):
+    try:
+        return bare(ex.client.get_block(pos).get("name"))
+    except ApiError as exc:
+        if exc.code == "not_loaded":
+            return ""
+        raise
+
+
+def _cell(pos):
+    return tuple(math.floor(axis) for axis in pos)
+
+
+def _above(pos, offset=1):
+    return pos[0], pos[1] + offset, pos[2]
+
+
+def _neighbors(pos, radius=1):
+    return [(pos[0] + dx * radius, pos[1], pos[2] + dz * radius) for dx, dz in _SIDES]
+
+
+def _center(pos):
+    return pos[0] + 0.5, pos[1], pos[2] + 0.5
+
+
+def _on_ground(status):
+    return (status.get("ready") is True and status.get("alive") is True
+            and status.get("on_ground") is True
+            and not any(status.get(key) for key in ("in_water", "submerged", "in_lava", "on_fire", "in_vehicle")))
+
+
+def _standable(ex, pos):
+    return (_block(ex, _above(pos, -1)) in _SUPPORT and _block(ex, pos) in AIR
+            and _block(ex, _above(pos)) in AIR)
+
+
+def _can_reach(status, target, reach):
+    eye = _above(status["pos"], 1.62)
+    return math.dist(eye, target) <= reach
+
+
+def _stand_for(ex, status, target, reach=4, clear=None):
+    """仅使用目标周围已复核的整格站位。实际交互触达阈值待实测。"""
+    if not _on_ground(status):
+        return None
+    current = status["pos"]
+    if (_can_reach(status, target, reach) and _standable(ex, _cell(current))
+            and (clear is None or clear(current))):
+        return tuple(current)
+    cell = _cell(target)
+    candidates = [_above(p, dy) for p in _neighbors(cell) for dy in (0, 1)]
+    candidates.sort(key=lambda pos: math.dist(current, _center(pos)))
+    for pos in candidates:
+        spot = _center(pos)
+        if (math.dist(current, spot) <= 16 and math.dist(_above(spot, 1.62), target) <= reach
+                and _standable(ex, pos) and (clear is None or clear(spot))):
+            return spot
+    return None
+
+
+def _approach(ex, state, status, stand, target, reach=4):
+    if tuple(status["pos"]) != tuple(stand):
+        status = yield from move_local(ex, state, stand, require_move=True)
+    fresh = state.refresh_status(ex.client, max_age_s=0)
+    if (fresh.get("dimension") != status.get("dimension") or not _on_ground(fresh)
+            or not _can_reach(fresh, target, reach) or not _standable(ex, _cell(fresh["pos"]))):
+        raise Replan("到点后未确认脚下支撑和交互距离，请换可达位置")
+    return fresh
+
+
+def _site_missing(message, predicate, radius, limit, *, wake="chunk_moved"):
+    return EnvBlocked(message, missing_predicate=predicate,
+                      searched_volume=f"半径 {radius} 格内最多 {limit} 个候选", wake_on=wake)
