@@ -154,17 +154,22 @@ class TestFixerPromptRendering(unittest.TestCase):
         fixer_wt = Path("/tmp/test/fixer_wt")
 
         prompt_default = soak_ctl._render_fixer_prompt(inc_rec, {}, fixer_wt)
-        self.assertIn("2B. **子代理协作权限（可选）**", prompt_default)
+        self.assertIn("2B. **子代理协作权限与模型配置（可选）**", prompt_default)
         self.assertIn("spawn_agent", prompt_default)
+        self.assertIn('model="gpt-6.1-terra"', prompt_default)
+        self.assertIn('reasoning_effort="xhigh"', prompt_default)
+        self.assertIn('fork_turns="none"', prompt_default)
+        self.assertIn("同时活跃的子代理最多 `3` 个", prompt_default)
         self.assertIn("严格互不重叠的可写文件", prompt_default)
         self.assertIn("递归深度 `<= 2`", prompt_default)
         self.assertIn(f"cd {fixer_wt}/code && uv run python -m unittest discover -s tests", prompt_default)
+        self.assertIn("codex:gpt-6.1-terra:xhigh", soak_ctl.FIXER_PRESETS)
 
         prompt_true = soak_ctl._render_fixer_prompt(inc_rec, {}, fixer_wt, allow_subagents=True)
-        self.assertIn("2B. **子代理协作权限（可选）**", prompt_true)
+        self.assertIn("2B. **子代理协作权限与模型配置（可选）**", prompt_true)
 
         prompt_false = soak_ctl._render_fixer_prompt(inc_rec, {}, fixer_wt, allow_subagents=False)
-        self.assertNotIn("2B. **子代理协作权限（可选）**", prompt_false)
+        self.assertNotIn("2B. **子代理协作权限", prompt_false)
         self.assertNotIn("spawn_agent", prompt_false)
 
 
