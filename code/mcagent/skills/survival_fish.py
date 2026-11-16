@@ -5,7 +5,7 @@ import math
 
 from ..client import ApiError
 from ..runtime import Replan
-from .base import Skill, rec
+from .base import Skill, failure, rec
 from .field import scan_blocks
 from .items import AIR, bare
 from .recipes import craft_recipe
@@ -112,8 +112,17 @@ class CatchFish(Skill):
             raise Replan("抛竿前复读背包未见钓竿")
         before = {name: state.count(name) for name in _FISH}
         try:
-            result = ex.use_item(_ROD, target={"pos": list(pos)},
-                                 timeout_ms=_CAST_TIMEOUT_MS, stop_on=("hurt", "death"))
+            # §4.5 / §8 1.3.2：没钓到时服务端已抛竿并满时等待返回 timeout；retries=0 避免单步重复抛满 3×45s。
+            result = ex.act(
+                "use_item",
+                lambda: ex.client.use_item(
+                    _ROD,
+                    target={"pos": list(pos)},
+                    timeout_ms=_CAST_TIMEOUT_MS,
+                    stop_on=("hurt", "death"),
+                ),
+                retries=0,
+            )
             yield rec("use_item", result, item=_ROD, pos=pos)
             after = state.refresh_status(ex.client, max_age_s=0)
             _fresh_inventory(ex, state)
@@ -126,7 +135,31 @@ class CatchFish(Skill):
             added = state.count(caught) - before[caught]
             if added <= 0 and not completed:
                 raise Replan("钓竿回执中的鱼未获入包差量或服务器进度证实")
-        except (GeneratorExit, Replan):
+        except GeneratorExit:
             _stop_active_fishing(ex, state)
             raise
-        yield rec("verify_fish", {"caught": caught, "gained": added, "advancement_confirmed": completed})
+        except Replan as exc:
+            _stop_active_fishing(ex, state)
+            code, extra = failure(exc)
+            if code == "timeout":
+                raise Replan(
+                    f"钓鱼超时未钓到（timeout，casts={extra.get('casts')}，"
+                    f"false_bites={extra.get('false_bites')}，in_water={extra.get('in_water')}），请换开阔自然水域"
+                ) from exc
+            if code == "cannot_use":
+                raise Replan("钓鱼首竿未生成浮标（cannot_use），请换无遮挡岸位重试") from exc
+            if code == "interrupted":
+                raise Replan(
+                    f"钓鱼被中断（interrupted，cause={extra.get('cause')}，casts={extra.get('casts')}）"
+                ) from exc
+            raise
+        telemetry = {
+            key: result[key]
+            for key in ("casts", "false_bites", "wait_ms")
+            if key in result
+        }
+        yield rec(
+            "verify_fish",
+            {"caught": caught, "gained": added, "advancement_confirmed": completed},
+            **telemetry,
+        )

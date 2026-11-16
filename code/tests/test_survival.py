@@ -315,6 +315,30 @@ class SurvivalTests(unittest.TestCase):
         self.assertEqual((req["timeout_ms"], req["target"], req["stop_on"]), (45000, {"pos": list(WATER)}, ("hurt", "death")))
         self.assertEqual(steps[-1]["result"], {"caught": "salmon", "gained": 1, "advancement_confirmed": True})
 
+    def test_fish_records_casts_false_bites_and_handles_timeout_cannot_use_interrupted(self):
+        world = self.fish_world()
+        world.queue("advancements", progress(), progress(FISH))
+
+        def recast_catch(w, **_):
+            w.items["cod"] = 1
+            return {"used": "fishing_rod", "caught": "cod", "wait_ms": 14200, "casts": 2, "false_bites": 1}
+
+        world.queue("use_item", recast_catch)
+        _, steps = self.run_skill(world, "catch_fish")
+        self.assertEqual((steps[-1]["casts"], steps[-1]["false_bites"], steps[-1]["wait_ms"]), (2, 1, 14200))
+
+        for error, expected in (
+            (ApiError("timeout", "no bite", {"casts": 3, "false_bites": 2, "in_water": True}), "casts=3.*false_bites=2"),
+            (ApiError("cannot_use", "no bobber"), "cannot_use"),
+            (ApiError("interrupted", "hurt", {"cause": "hurt", "casts": 1, "inner_code": "timeout"}), "cause=hurt.*casts=1"),
+        ):
+            with self.subTest(code=error.code):
+                err_world = self.fish_world()
+                err_world.queue("advancements", progress())
+                err_world.queue("use_item", error)
+                with self.assertRaisesRegex(Replan, expected):
+                    self.run_skill(err_world, "catch_fish")
+
     def test_fish_missing_rod_and_string_replan(self):
         world = SurvivalWorld({"stick": 3, "string": 1})
         world.queue("advancements", progress())
