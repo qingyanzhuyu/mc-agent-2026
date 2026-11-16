@@ -1123,6 +1123,217 @@ class TestWorkerBoundsAndCli(unittest.TestCase):
             self.assertIn("-s workspace-write", tmpl, preset_name)
             self.assertIn("sandbox_workspace_write.network_access=true", tmpl, preset_name)
 
+    def test_verify_and_promote_handles_gate2_and_gate3_timeouts(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "GOAL_MISS:combat": {
+                    "incident_id": "INC-G3",
+                    "fingerprint": "GOAL_MISS:combat",
+                    "code": "GOAL_MISS",
+                    "skill": "combat",
+                    "goal_id": "kill_a_mob",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": ["code/mcagent/skills/combat.py"],
+                    "attempts": 0,
+                }
+            }
+
+        claimed = soak_ctl.claim_next_incident(self.session)
+        self.assertIsNotNone(claimed)
+        fixer_wt = Path(soak_ctl.read_state(self.session)["fixer_wt"])
+        (fixer_wt / "code" / "mcagent" / "skills" / "combat.py").write_text("# candidate\n", encoding="utf-8")
+
+        real_run = subprocess.run
+
+        def mock_gate3_timeout(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                if "--live" in cmd:
+                    raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 90), output="connecting...", stderr="stuck")
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_gate3_timeout):
+            res_g3 = soak_ctl.verify_and_promote(self.session, "GOAL_MISS:combat", live_canary=True)
+
+        self.assertFalse(res_g3["ok"])
+        self.assertEqual(res_g3["failed_gate"], "gate3_live_canary_timeout")
+        g3_log = (Path(claimed["active_attempt_dir"]) / "gate3_live_canary.log").read_text(encoding="utf-8")
+        self.assertIn("live canary timeout", g3_log)
+        self.assertIn("connecting...", g3_log)
+        self.assertEqual(_git(fixer_wt, "status", "--porcelain"), "")
+        st_after_g3 = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after_g3["incidents"]["GOAL_MISS:combat"]["status"], "pending")
+        self.assertEqual(st_after_g3["incidents"]["GOAL_MISS:combat"]["attempts"], 1)
+
+        claimed2 = soak_ctl.claim_next_incident(self.session)
+        self.assertIsNotNone(claimed2)
+        (fixer_wt / "code" / "mcagent" / "skills" / "combat.py").write_text("# candidate 2\n", encoding="utf-8")
+
+        def mock_gate2_timeout(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                if "unittest" in cmd:
+                    raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 180), output="hung test", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_gate2_timeout):
+            res_g2 = soak_ctl.verify_and_promote(self.session, "GOAL_MISS:combat", live_canary=False)
+
+        self.assertFalse(res_g2["ok"])
+        self.assertEqual(res_g2["failed_gate"], "gate2_unittest_timeout")
+        g2_log = (Path(claimed2["active_attempt_dir"]) / "gate2_unittest.log").read_text(encoding="utf-8")
+        self.assertIn("unittest timeout after 180s", g2_log)
+        self.assertIn("hung test", g2_log)
+        self.assertEqual(_git(fixer_wt, "status", "--porcelain"), "")
+
+    def test_run_fixer_batch_isolates_promotion_exception_and_keeps_siblings(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "GOAL_MISS:combat": {
+                    "incident_id": "INC-001",
+                    "fingerprint": "GOAL_MISS:combat",
+                    "code": "GOAL_MISS",
+                    "skill": "combat",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": ["code/mcagent/skills/combat.py"],
+                    "attempts": 0,
+                },
+                "GOAL_MISS:diamond": {
+                    "incident_id": "INC-002",
+                    "fingerprint": "GOAL_MISS:diamond",
+                    "code": "GOAL_MISS",
+                    "skill": "diamond",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": ["code/mcagent/skills/diamond.py"],
+                    "attempts": 0,
+                },
+            }
+
+        worker_script = self.root / "batch_ok_worker.py"
+        worker_script.write_text(
+            """import sys
+from pathlib import Path
+
+wt = Path(sys.argv[1])
+skill = sys.argv[2]
+(wt / "code" / "mcagent" / "skills" / f"{skill}.py").write_text(f"# fixed {skill}\\n", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        template = f"{sys.executable} {shlex.quote(str(worker_script))} {{fixer_wt}} {{skill}}"
+
+        real_run = subprocess.run
+        real_verify = soak_ctl.verify_and_promote
+
+        def mock_uv_only(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        def fail_combat_verify(session_dir, fp, **kw):
+            if fp == "GOAL_MISS:combat":
+                raise RuntimeError("transient promotion boom")
+            return real_verify(session_dir, fp, **kw)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_only), \
+             patch.object(soak_ctl, "verify_and_promote", side_effect=fail_combat_verify):
+            results = soak_ctl.run_fixer_batch(
+                self.session,
+                fixer_cmd_template=template,
+                max_workers=2,
+                live_canary=False,
+            )
+
+        res_by_fp = {r["fingerprint"]: r for r in results}
+        self.assertEqual(len(res_by_fp), 2)
+        self.assertFalse(res_by_fp["GOAL_MISS:combat"]["ok"])
+        self.assertEqual(res_by_fp["GOAL_MISS:combat"]["failed_gate"], "batch_promotion_error")
+        self.assertTrue(res_by_fp["GOAL_MISS:diamond"]["ok"])
+
+        st_after = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after["incidents"]["GOAL_MISS:combat"]["status"], "pending")
+        self.assertEqual(st_after["incidents"]["GOAL_MISS:diamond"]["status"], "fixed")
+        self.assertEqual(_git(Path(st_after["fixer_wt"]), "status", "--porcelain"), "")
+        self.assertEqual(list((self.session / "worktrees").glob("worker-*")), [])
+
+    def test_fixer_loop_daemon_continues_after_batch_exception(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        calls = 0
+
+        def flaky_batch(session_dir, **kw):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient batch crash")
+            (session_dir / "STOP").write_text("done", encoding="utf-8")
+            return []
+
+        with patch.object(soak_ctl, "run_fixer_batch", side_effect=flaky_batch), \
+             patch.object(soak_ctl.time, "sleep"):
+            rc = soak_ctl.main([
+                "fixer-loop",
+                "--session-dir", str(self.session),
+                "--fixer-preset", "codex",
+                "--fixer-workers", "3",
+                "--poll-s", "0.5",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, 2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process group semantics required")
+    def test_gate_subprocess_timeout_kills_child_tree(self):
+        import time
+
+        pid_file = self.root / "gate_detached.pid"
+        child_script = self.root / "gate_child.py"
+        child_script.write_text(
+            f"""import os, signal, time
+from pathlib import Path
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path({repr(str(pid_file))}).write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+        parent_script = self.root / "gate_parent.py"
+        parent_script.write_text(
+            f"""import subprocess, sys, time
+subprocess.Popen([sys.executable, {repr(str(child_script))}])
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            soak_ctl._run_gate_subprocess(
+                [sys.executable, str(parent_script)],
+                cwd=self.root,
+                env=dict(os.environ),
+                timeout_s=1,
+            )
+
+        self.assertTrue(pid_file.exists())
+        child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 1.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        self.assertFalse(alive, f"gate child PID {child_pid} leaked after timeout")
+
 
 if __name__ == "__main__":
     unittest.main()
