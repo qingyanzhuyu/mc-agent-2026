@@ -1,8 +1,6 @@
 """有界选择可见岸位并验证单次渔获。"""
 from __future__ import annotations
 
-import math
-
 from ..client import ApiError
 from ..runtime import Replan
 from .base import Skill, failure, rec
@@ -10,8 +8,9 @@ from .field import scan_blocks
 from .items import AIR, bare
 from .recipes import craft_recipe
 from .registry import register
+from .sightline import block_center, eye_pos, ray_clear_to_point
 from .survival import (
-    _FISH_PROGRESS, _above, _approach, _block, _cell, _center, _fresh_inventory,
+    _FISH_PROGRESS, _above, _approach, _block, _center, _fresh_inventory,
     _has_progress, _on_ground, _require_ready, _site_missing, _stand_for,
 )
 
@@ -30,11 +29,7 @@ def _open_water_surface(ex, pos):
 
 def _cast_clear(ex, stand, pos):
     """静态短视线作为可抛门槛，浮漂弹道由服务端决定。"""
-    eye, target = _above(stand, 1.62), _above(_center(pos), 0.95)
-    samples = max(1, math.ceil(math.dist(eye, target) * 4))
-    cells = {_cell(tuple(a + (b - a) * index / samples for a, b in zip(eye, target)))
-             for index in range(1, samples)}
-    return all(_block(ex, cell) in AIR for cell in cells - {tuple(pos)})
+    return ray_clear_to_point(ex, eye_pos(stand), _above(_center(pos), 0.95), target_cell=pos)
 
 
 def _cast_site(ex, state):
@@ -48,8 +43,13 @@ def _cast_site(ex, state):
         pos = tuple(row["pos"])
         if not _open_water_surface(ex, pos):
             continue
-        stand = _stand_for(ex, status, _center(pos), reach=_CAST_REACH,
-                           clear=lambda candidate: _cast_clear(ex, candidate, pos))
+        stand = _stand_for(
+            ex,
+            status,
+            block_center(pos),
+            reach=_CAST_REACH,
+            clear=lambda candidate: _cast_clear(ex, {"pos": candidate, "sneaking": status.get("sneaking")}, pos),
+        )
         if stand is not None:
             return pos, stand, status
     raise _site_missing("未观察到有安全岸位且水面上方无遮挡的钓点",
@@ -104,8 +104,8 @@ class CatchFish(Skill):
             _cast_site(ex, state)
             yield from craft_recipe(ex, state, _ROD, goal_qty=1)
         pos, stand, status = _cast_site(ex, state)
-        fresh = yield from _approach(ex, state, status, stand, _center(pos), reach=_CAST_REACH)
-        if not _open_water_surface(ex, pos) or not _cast_clear(ex, fresh["pos"], pos):
+        fresh = yield from _approach(ex, state, status, stand, block_center(pos), reach=_CAST_REACH)
+        if not _open_water_surface(ex, pos) or not _cast_clear(ex, fresh, pos):
             raise Replan("抛竿前复读水面已变化，请换钓点")
         _fresh_inventory(ex, state)
         if not state.count(_ROD):

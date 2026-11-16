@@ -8,7 +8,6 @@ JAR SHA-1 64bb6d763bed0a9f1d632ec347938594144943ed。内嵌
 """
 from __future__ import annotations
 
-import math
 from collections.abc import Generator
 from dataclasses import dataclass
 
@@ -16,6 +15,7 @@ from ..client import ApiError
 from ..runtime import EnvBlocked, Executor, Replan, State
 from .base import failure, rec
 from .items import bare, block_name
+from .sightline import STATION_EYE_REACH, can_reach_block, eye_to_block_dist
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,7 @@ RECIPES: dict[str, Recipe] = {
 _BAMBOO_STICK = Recipe((("bamboo", 2),), requires_table=False)
 _TABLE_RADIUS = 16
 _TABLE_LIMIT = 5
-_TABLE_REACH = 3.5
+_TABLE_REACH = STATION_EYE_REACH
 _MAX_BATCHES = 64
 
 
@@ -107,15 +107,21 @@ def _craft_capacity(recipe: Recipe, counts: dict[str, int]) -> int:
     )
 
 
-def _at_table(ex: Executor, state: State, pos: list[int]) -> bool:
-    if math.dist(state.pos, pos) > _TABLE_REACH:
-        return False
+def _is_table_block(ex: Executor, pos: list[int]) -> bool:
     try:
         return block_name(ex, pos) == "crafting_table"
     except ApiError as exc:
         if exc.code != "not_loaded":
             raise
         return False
+
+
+def _at_table(ex: Executor, state: State, pos: list[int]) -> bool:
+    if eye_to_block_dist(state.st, pos) > _TABLE_REACH:
+        return False
+    if not _is_table_block(ex, pos):
+        return False
+    return can_reach_block(ex, state.st, pos, reach=_TABLE_REACH)
 
 
 def _table_position(ex: Executor, state: State) -> Generator[dict, None, list[int]]:
@@ -125,10 +131,10 @@ def _table_position(ex: Executor, state: State) -> Generator[dict, None, list[in
         block["pos"] for block in (observed.get("blocks") or [])[:_TABLE_LIMIT]
         if isinstance(block.get("pos"), list) and len(block["pos"]) == 3
     ]
-    for pos in sorted(candidates, key=lambda pos: math.dist(state.pos, pos)):
+    for pos in sorted(candidates, key=lambda pos: eye_to_block_dist(state.st, pos)):
         if _at_table(ex, state, pos):
             return pos
-        if math.dist(state.pos, pos) <= _TABLE_REACH:
+        if eye_to_block_dist(state.st, pos) <= _TABLE_REACH and not _is_table_block(ex, pos):
             continue
         dimension = state.snapshot().get("dimension")
         try:

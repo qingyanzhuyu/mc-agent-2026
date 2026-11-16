@@ -9,6 +9,7 @@ from .base import failure, rec
 from .field import _bounded, _cell, _grounded, _observed_block, _position, _standable_cell, scan_entities
 from .items import AIR, bare
 from .observations import completed_advancements
+from .sightline import eye_pos, voxel_line_cells
 
 
 _ARROWS = ("arrow", "spectral_arrow", "tipped_arrow")
@@ -17,22 +18,7 @@ _AMMO = (*_ARROWS, "firework_rocket")
 
 def _line_cells(start, end):
     """枚举直线经过的格子，包括两个端点；同一时刻跨多个格界时一并前进。"""
-    cell, target = list(_cell(start)), _cell(end)
-    delta = [b - a for a, b in zip(start, end)]
-    step = [(d > 0) - (d < 0) for d in delta]
-    stride = [abs(1 / d) if d else math.inf for d in delta]
-    crossing = [
-        (cell[i] + (step[i] > 0) - start[i]) / delta[i] if cell[i] != target[i] else math.inf
-        for i in range(3)
-    ]
-    yield tuple(cell)
-    while tuple(cell) != target:
-        first = min(crossing)
-        for i in range(3):
-            if math.isclose(crossing[i], first, abs_tol=1e-10, rel_tol=0):
-                cell[i] += step[i]
-                crossing[i] = crossing[i] + stride[i] if cell[i] != target[i] else math.inf
-        yield tuple(cell)
+    return voxel_line_cells(start, end)
 
 
 def _retreat_clear(ex, start, retreat_pos):
@@ -64,7 +50,7 @@ def verify_shot_lane(ex, state, pos, *, retreat_pos, min_horizontal=0, max_dista
     st = state.refresh_status(ex.client, max_age_s=0)
     start = _position(st.get("pos"))
     # 眼高用于保守近似，服务端仍负责实体瞄准和弧线解算。
-    eye = (start[0], start[1] + (1.27 if st.get("sneaking") else 1.62), start[2])
+    eye = eye_pos(st)
     horizontal = math.hypot(pos[0] - eye[0], pos[2] - eye[2])
     distance = math.dist(eye, pos)
     evidence = {"distance": distance, "horizontal_dist": horizontal, "origin": list(start),

@@ -15,6 +15,7 @@ from .mining import MineStepUnsafe, mine_step
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
+from .sightline import STATION_EYE_REACH
 from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 _ARMOR = ("diamond_boots", "diamond_chestplate", "diamond_helmet", "diamond_leggings")
@@ -80,7 +81,7 @@ def _nearby_loot(ex, state, names, goal_qty: int, status):
     for pos in _nearby(ex, state, CONTAINERS, radius=4, limit=3):
         dimension = bare(status.get("dimension"))
         current = _safe_status(ex, state, dimension or None)
-        if not _in_reach(ex, current["pos"], pos, reach=3):
+        if not _in_reach(ex, current, pos, reach=3):
             continue
         block = _dry_name(_block(ex, pos))
         if block not in CONTAINERS:
@@ -96,7 +97,7 @@ def _nearby_loot(ex, state, names, goal_qty: int, status):
             raise
         current = _safe_status(ex, state, dimension or None)
         if (not is_storage_window(view, block) or _cell(current["pos"]) != _cell(status["pos"])
-                or not _in_reach(ex, current["pos"], pos, reach=3)):
+                or not _in_reach(ex, current, pos, reach=3)):
             continue
         for item in names:
             available = window_amount(view, "container", item)
@@ -177,7 +178,7 @@ class MineDiamond(Skill):
                     tried_ores.add(ore)
                     yield from _hand_pick(ex, state, 1)
                     stand = _safe_status(ex, state, "overworld")
-                    if (not _in_reach(ex, stand["pos"], ore, reach=5)
+                    if (not _in_reach(ex, stand, ore, reach=5)
                             or not _safe_excavation(ex, _cell(stand["pos"]), (ore,), path)):
                         raise Replan("换镐后钻矿的安全站位或可采性已经变化，请重新观察")
                     try:
@@ -260,7 +261,7 @@ class MineDiamond(Skill):
                 # The callback can pause the movement before the next cell is dug.
                 ores = _nearby(ex, state, DIAMOND_ORES, radius=5, limit=6)
                 yield from ()
-                return any(_in_reach(ex, status["pos"], ore, reach=4)
+                return any(_in_reach(ex, status, ore, reach=4)
                            and _safe_excavation(ex, origin, (ore,), path)
                            for ore in ores) or None
 
@@ -325,8 +326,7 @@ class CraftDiamondGear(Skill):
                 raise Replan(f"合成 {item} 缺材料：需要 {count} 个 {ingredient}，请先补足")
         current = _safe_status(ex, state, bare(status.get("dimension")) or None)
         tables = _nearby(ex, state, ("crafting_table",), radius=4, limit=5)
-        if not any(math.dist(current["pos"], cell) <= 3.5
-                   and _in_reach(ex, current["pos"], cell, reach=3.5) for cell in tables):
+        if not any(_in_reach(ex, current, cell, reach=STATION_EYE_REACH) for cell in tables):
             x, y, z = _cell(current["pos"])
             sites = [(x + dx, y, z + dz) for dx, dz in CARDINALS
                      if _standing(ex, (x + dx, y, z + dz))]

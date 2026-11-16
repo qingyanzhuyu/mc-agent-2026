@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-from itertools import product
 
 from ..client import ApiError
 from ..runtime import Replan
@@ -10,6 +9,7 @@ from .field import move_local, scan_blocks
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .mining import SOLID_SUPPORT, safe_mine_column
 from .observations import observe_block as _block
+from .sightline import can_reach_block
 
 Cell = tuple[int, int, int]
 CARDINALS = ((1, 0), (0, 1), (-1, 0), (0, -1))
@@ -60,31 +60,15 @@ def _safe_status(ex, state, dimension: str | None = None) -> dict:
 
 def _in_reach(ex, stand, target: Cell, *, reach: float) -> bool:
     """Conservative straight sight line within the local interaction budget."""
-    eye = (stand[0], stand[1] + 1.62, stand[2])
-    center = tuple(axis + 0.5 for axis in target)
-    if math.dist(eye, center) > reach:
-        return False
-    cell = _cell(eye)
-    delta = tuple(b - a for a, b in zip(eye, center))
-    sign = tuple(1 if value > 0 else -1 for value in delta)
-    while cell != target:
-        if _dry_name(_block(ex, cell)) not in AIR:
-            return False
-        crossings = tuple(
-            ((cell[i] + (sign[i] > 0)) - eye[i]) / d if cell[i] != target[i] else math.inf
-            for i, d in enumerate(delta)
-        )
-        first = min(crossings)
-        hit = tuple(math.isclose(t, first, rel_tol=0, abs_tol=1e-9) for t in crossings)
-        stepped = tuple(v + sign[i] if hit[i] else v for i, v in enumerate(cell))
-        if sum(hit) > 1:
-            # Be conservative when the ray touches a voxel corner or edge exactly.
-            corners = product(*(tuple({a, b}) for a, b in zip(cell, stepped)))
-            if any(_dry_name(_block(ex, corner)) not in AIR
-                   for corner in corners if corner not in (cell, stepped)):
-                return False
-        cell = stepped
-    return True
+    return can_reach_block(
+        ex,
+        stand,
+        target,
+        reach=reach,
+        passable=AIR,
+        reject_waterlogged=True,
+        face_fallback=False,
+    )
 
 
 def _safe_excavation(ex, origin: Cell, cuts, protected, *, landing: Cell | None = None) -> bool:
@@ -126,12 +110,13 @@ def _nearby(ex, state, kinds, *, radius: int, limit: int) -> list[Cell]:
 
 def _approach(ex, state, target: Cell, status, *, dimension: str, protected):
     """Use the current stance or one observed dry cardinal foothold beside it."""
-    if _in_reach(ex, status["pos"], target, reach=4):
+    if _in_reach(ex, status, target, reach=4):
         return status
     x, y, z = _cell(status["pos"])
     for dx, dz in CARDINALS:
         stand = (x + dx, y, z + dz)
-        if (_standing(ex, stand) and _in_reach(ex, _center(stand), target, reach=4)
+        next_stance = {"pos": _center(stand), "sneaking": bool(status.get("sneaking"))}
+        if (_standing(ex, stand) and _in_reach(ex, next_stance, target, reach=4)
                 and _safe_excavation(ex, stand, (target,), protected)):
             after = yield from move_local(ex, state, _center(stand), rng=1, require_move=True)
             checked = _safe_status(ex, state, dimension)

@@ -12,6 +12,7 @@ from .encounter import _line_cells, _retreat_clear, verify_shot_lane
 from .field import _cell, _grounded, _position, _safe_support, _standable_cell, move_local, scan_entities
 from .items import bare
 from .observations import completed_advancements as completed
+from .sightline import eye_pos
 
 KILL_MOB = "minecraft:adventure/kill_a_mob"
 DEFLECT = "minecraft:story/deflect_arrow"
@@ -61,17 +62,20 @@ def _safe_status(ex, state, previous=None, *, stay=False):
 
 
 def _cover(ex, destination, danger):
-    eye = (destination[0], destination[1] + 1.6, destination[2])
+    eye = eye_pos(destination)
     return any(_safe_support(ex, cell) for cell in list(_line_cells(eye, danger))[1:-1])
 
 
 def _retreat(ex, origin, aim):
-    x, y, z = _cell(origin)
+    origin_pos = origin["pos"] if isinstance(origin, dict) else origin
+    sneaking = origin.get("sneaking") if isinstance(origin, dict) else None
+    x, y, z = _cell(origin_pos)
     candidates = [(x + 0.5 + dx * stride, y, z + 0.5 + dz * stride)
                   for stride in (2, 3) for dx, dz in _CARDINAL]
     for dest in sorted(candidates, key=lambda p: math.dist(p, aim), reverse=True):
-        if math.dist(dest, aim) >= math.dist(origin, aim) and _standable_cell(ex, dest) and (
-                _retreat_clear(ex, origin, dest) and _cover(ex, dest, aim)):
+        dest_source = {"pos": dest, "sneaking": sneaking} if sneaking is not None else dest
+        if math.dist(dest, aim) >= math.dist(origin_pos, aim) and _standable_cell(ex, dest) and (
+                _retreat_clear(ex, origin_pos, dest) and _cover(ex, dest_source, aim)):
             return dest
     return None
 
@@ -88,7 +92,7 @@ def _hostiles_near(entities, target_id, origin):
 
 def _other_in_shot(entities, target_id, origin, aim, splash_radius):
     """§3.5 快照中的旁观者门槛。弹道由服务器解算，几何门槛需实测。"""
-    eye = (origin[0], origin[1] + 1.6, origin[2])
+    eye = eye_pos(origin)
     delta = tuple(b - a for a, b in zip(eye, aim))
     length_sq = sum(v * v for v in delta)
     if length_sq <= 0:
@@ -113,7 +117,7 @@ def _clear_shot(ex, state, scene, entities):
                            max_distance=scene.max_distance)
     target_id = scene.target["id"] if scene.target else None
     return lane["status"] == "clear" and not _other_in_shot(
-        entities, target_id, scene.origin["pos"], scene.aim, scene.splash_radius)
+        entities, target_id, scene.origin, scene.aim, scene.splash_radius)
 
 
 def _observe(ex, state, previous=None):
@@ -150,7 +154,7 @@ def select_encounter(ex, state, predicate, *, description, missing, max_distance
         target_id = target["id"] if target else None
         if _hostiles_near(entities, target_id, origin["pos"]):
             continue
-        retreat = _retreat(ex, origin["pos"], aim)
+        retreat = _retreat(ex, origin, aim)
         if retreat is None:
             continue
         scene = Encounter(origin, retreat, target, aim, min_distance, max_distance, splash_radius)
@@ -178,7 +182,7 @@ def refresh_encounter(ex, state, scene, *, aimed=False):
     if not scene.min_distance <= math.dist(origin["pos"], aim) <= scene.max_distance or (
         _hostiles_near(entities, target_id, origin["pos"])
         or not _retreat_clear(ex, origin["pos"], scene.retreat)
-        or not _cover(ex, scene.retreat, aim)
+        or not _cover(ex, {"pos": scene.retreat, "sneaking": origin.get("sneaking")}, aim)
         or (target is None and not _backstop_present(ex, origin, aim))
     ):
         raise Replan("交战距离、旁侧敌对或掩体退路已变化")
@@ -224,11 +228,11 @@ def retreat_after_failure(ex, state, scene):
             state.in_safe_mode or current.get("ready") is not True or not current.get("alive")
             or current.get("dimension") != scene.origin["dimension"]
             or not _grounded(ex, current) or not _retreat_clear(ex, current["pos"], scene.retreat)
-            or not _cover(ex, scene.retreat, scene.aim)
+            or not _cover(ex, {"pos": scene.retreat, "sneaking": current.get("sneaking")}, scene.aim)
         ):
             return
         after = yield from move_local(ex, state, scene.retreat, max_distance=6, require_move=True)
-        if not _cover(ex, after["pos"], scene.aim):
+        if not _cover(ex, after, scene.aim):
             yield rec("combat_retreat_unconfirmed", None, reason="移动后未重新见证掩体")
     except (ApiError, Replan) as exc:
         yield rec("combat_retreat_unconfirmed", None, reason=str(exc))
