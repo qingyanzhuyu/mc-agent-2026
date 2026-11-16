@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import fcntl
 import fnmatch
@@ -120,6 +121,51 @@ def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: s
     if name and name in FIXER_PRESETS:
         return name, FIXER_PRESETS[name]
     return default_name, default_tmpl
+
+
+FIXER_WORKERS_BOUNDS: tuple[int, int] = (1, 6)
+
+
+def _validate_fixer_workers(val: Any) -> int:
+    """校验工位 B 并发修单工人数，必须在 [1, 6] 整数区间内。"""
+    lo, hi = FIXER_WORKERS_BOUNDS
+    if isinstance(val, bool):
+        raise ValueError(f"fixer_workers={val!r} 非法：必须为 [{lo}, {hi}] 整数")
+    if isinstance(val, int):
+        n = val
+    elif isinstance(val, str):
+        s = val.strip()
+        if not re.fullmatch(r"[+-]?\d+", s):
+            raise ValueError(f"fixer_workers={val!r} 非法：必须为 [{lo}, {hi}] 整数")
+        n = int(s)
+    else:
+        raise ValueError(f"fixer_workers={val!r} 非法：必须为 [{lo}, {hi}] 整数")
+    if not (lo <= n <= hi):
+        raise ValueError(f"fixer_workers={n!r} 超出允许区间 [{lo}, {hi}]")
+    return n
+
+
+def _extract_fixer_workers(st: dict[str, Any], default_workers: int = 1) -> int:
+    raw = st.get("fixer_workers")
+    if raw is not None:
+        try:
+            return _validate_fixer_workers(raw)
+        except ValueError:
+            pass
+    try:
+        return _validate_fixer_workers(default_workers)
+    except ValueError:
+        return 1
+
+
+def resolve_fixer_workers(session_dir: Path, default_workers: int = 1) -> int:
+    """取工位 B 并发修单工人数：state.json 里有合法 fixer_workers (1..6) 就用它，否则回落 default_workers。"""
+    try:
+        st = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        st = {}
+    return _extract_fixer_workers(st, default_workers)
+
 
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
 
@@ -546,6 +592,16 @@ def _clean_fixer_worktree(fixer_wt: Path) -> None:
     _git(fixer_wt, "clean", "-fd", check=False)
 
 
+def _remove_worktree_cleanly(repo_root: Path, wt_dir: Path) -> None:
+    """安全卸载临时 worktree 并清理遗留目录及 git worktree 元数据。"""
+    if wt_dir.exists():
+        _clean_fixer_worktree(wt_dir)
+        _git(repo_root, "worktree", "remove", "--force", str(wt_dir), check=False)
+    if wt_dir.exists():
+        shutil.rmtree(wt_dir, ignore_errors=True)
+    _git(repo_root, "worktree", "prune", check=False)
+
+
 def _branch_tip(repo_root: Path, branch: str) -> str:
     return _git(repo_root, "rev-parse", f"refs/heads/{branch}").stdout.strip()
 
@@ -586,6 +642,9 @@ def init_session(
     with locked_fixer_wt(session_dir):
         _clean_fixer_worktree(fixer_wt)
         _git(fixer_wt, "checkout", branch)
+        if wt_root.exists():
+            for stale_worker in sorted(wt_root.glob("worker-*")):
+                _remove_worktree_cleanly(repo_root, stale_worker)
         if tip_sha != base_sha and _git(repo_root, "merge-base", "--is-ancestor", base_sha, tip_sha, check=False).returncode != 0:
             mproc = _git(fixer_wt, "merge", "--no-edit", base_sha, check=False)
             if mproc.returncode != 0:
@@ -629,6 +688,7 @@ def init_session(
             for rec in st.get("incidents", {}).values():
                 if rec.get("status") == "claimed":
                     rec["status"] = "pending"
+                    rec.pop("worker_wt", None)
             if norm_goal:
                 st["target_goal"] = norm_goal
             else:
@@ -1045,9 +1105,14 @@ def ingest_episode_and_check_rollback(
     return ep_meta
 
 
-def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixer_wt: Path) -> str:
+def _render_fixer_prompt(
+    inc_rec: dict[str, Any],
+    inc_json: dict[str, Any],
+    fixer_wt: Path,
+    allow_subagents: bool = True,
+) -> str:
     tape_preview = json.dumps((inc_json.get("http_tape") or [])[-10:], ensure_ascii=False, indent=2)
-    inc_path = inc_rec["incident_path"]
+    inc_path = str(inc_rec.get("incident_path") or "")
     skill_ctx = inc_json.get("skill_context") or {}
     detail = inc_json.get("detail") or {}
     skill_args = inc_json.get("skill_args") if inc_json.get("skill_args") is not None else skill_ctx.get("args", {})
@@ -1066,6 +1131,10 @@ def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixe
         for p in (inc_rec.get("editable_files") or inc_json.get("editable_files") or detail.get("editable_files") or [])
         if p
     ]
+    topic_raw = goal_id or str(inc_rec.get("skill") or "fix")
+    safe_goal_id = re.sub(r"[^A-Za-z0-9_]+", "_", topic_raw.lower()).strip("_") or "goal"
+    safe_inc_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(inc_rec.get("incident_id") or "inc").lower()).strip("_") or "inc"
+    suggested_test_path = f"code/tests/test_soak_{safe_goal_id}_{safe_inc_id}.py"
 
     goal_section = ""
     if is_goal_miss:
@@ -1083,14 +1152,27 @@ def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixe
 
     if is_goal_miss and narrow_files:
         narrow_list_str = "、".join(f"`{f}`" for f in narrow_files)
+        target_skill_started = detail.get("target_skill_started")
+        bottleneck_skill = str(detail.get("bottleneck_skill") or inc_rec.get("skill") or "").strip()
         whitelist_block = f"""2. **目标单收窄文件白名单（Gate 1 动态收窄强校验，越界直接拒绝并丢弃改动）**：
    - **本单只允许修改/新增**：{narrow_list_str} 以及 `code/tests/test_*.py`。
+   - **允许从零创建新技能文件与 `@register` 新 L3 技能**：当前诊断 `target_skill_started={target_skill_started}`，目标/瓶颈技能为 `{bottleneck_skill or goal_id}`；若目标主技能尚未启动（`False`）或该技能尚不在 `code/mcagent/skills/REGISTRY` 中，你**有权修改或直接从零创建**上述精确白名单内的领域文件（{narrow_list_str}），并严格参照 `code/mcagent/skills/__init__.py` 与 `code/mcagent/skills/README.md` 定义且 `@register` 新的 L3 `Skill` 子类（`load_all()` 会自动扫描发现 `skills/` 下所有 `.py` 模块）。**严禁**在 {narrow_list_str} 之外新建不同文件名的技能文件！
+   - **建议单测命名避免并发冲突**：新增单元测试文件请优先命名为 `{suggested_test_path}`（或按主题命名为 `code/tests/test_soak_<topic>.py`），避免多个并行修单工位碰撞测试文件名。
    - **严禁越界触碰其他模块**：修改 `code/mcagent/loop/policy.py`、其他无关 `skills/*.py` 或 `loop/*.py` 将被 Gate 1 直接拒绝！
    - **严禁触碰冻结底座**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{{base,registry,testing}}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
     else:
-        whitelist_block = """2. **文件白名单（严禁越界）**：
+        whitelist_block = f"""2. **文件白名单（严禁越界）**：
    - **只允许修改/新增**：`code/mcagent/loop/*.py`、`code/mcagent/skills/*.py`（不含冻结文件）、`code/tests/test_*.py`。
-   - **严禁触碰**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{base,registry,testing}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
+   - **允许修改已有技能或从零新建技能模块**：除修改已有 `code/mcagent/skills/*.py` 外，你**有权直接新建领域文件** `code/mcagent/skills/<module>.py` 并用 `@register` 注册新 L3 `Skill`（`code/mcagent/skills/__init__.py` 与 `code/mcagent/skills/README.md` 中的 `load_all()` 会自动发现并接入 `REGISTRY`），同时仍须严守下方冻结保护文件清单。
+   - **建议单测命名避免并发冲突**：新增单元测试文件请优先命名为 `{suggested_test_path}`（或按主题命名为 `code/tests/test_soak_<topic>.py`），避免多个并行修单工位碰撞测试文件名。
+   - **严禁触碰**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{{base,registry,testing}}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
+
+    subagent_section = ""
+    if allow_subagents:
+        subagent_section = f"""
+2B. **子代理协作权限（可选）**：
+   - 若你的运行环境提供 `spawn_agent` / 子代理协作工具，你**可以**在 `{fixer_wt}` 内派发 1–2 个职责收敛的辅助子代理并行提速（例如：1 个负责 `--replay` 回放与代码排查，1 个负责单测编写与局部验证；并发写入子代理必须分配严格互不重叠的可写文件，递归深度 `<= 2`）。
+   - 子代理返回后，你本人必须在退出前亲自运行完整 `cd {fixer_wt}/code && uv run python -m unittest discover -s tests` 最终全量回归验证。"""
 
     return f"""# 自动修单任务：{inc_rec['incident_id']} (`{inc_rec['code']}`)
 
@@ -1112,48 +1194,246 @@ def _render_fixer_prompt(inc_rec: dict[str, Any], inc_json: dict[str, Any], fixe
 
 ## 3. 修复步骤与硬性红线（机器门禁将逐项核查，违规直接丢弃改动）
 1. **复现与定位**：可在 `{fixer_wt}/code` 下运行 `uv run python -m mcagent.loop --replay {shlex.quote(inc_path)}` 查看确定性回放，并阅读相关技能与规划代码。
-{whitelist_block}
-3. **补充离线回归单测**：在 `code/tests/` 中针对该根因补充至少 1 条确定性单测，确保 `cd {fixer_wt}/code && uv run python -m unittest discover -s tests` 全部通过。
+{whitelist_block}{subagent_section}
+3. **补充离线回归单测**：在 `code/tests/` 中针对该根因补充至少 1 条确定性单测（新建文件建议命名为 `{suggested_test_path}`），确保 `cd {fixer_wt}/code && uv run python -m unittest discover -s tests` 全部通过。
 4. **不要自己执行 `git commit`**：保留工作区修改即可，外层 `soak_ctl.py verify-and-promote` 会独立运行四道门禁并统一提交到待审分支。
 """
+
+
+def _incident_edit_scope(inc_rec: dict[str, Any]) -> frozenset[str]:
+    """返回异常单的可写作用域集合；非收窄 GOAL_MISS 或空列表返回通配 `{'*'}`。"""
+    if inc_rec.get("code") == "GOAL_MISS":
+        raw_files = inc_rec.get("editable_files") or []
+        normed = frozenset(
+            str(p).strip().lstrip("./").replace("\\", "/")
+            for p in raw_files
+            if str(p).strip()
+        )
+        if normed:
+            return normed
+    return frozenset({"*"})
+
+
+def _scopes_conflict(a: frozenset[str], b: frozenset[str]) -> bool:
+    return "*" in a or "*" in b or bool(a & b)
+
+
+def _allocate_attempt_no(session_dir: Path, st: dict[str, Any]) -> int:
+    from_history = sum(len(r.get("gate_history", [])) for r in st.get("incidents", {}).values()) + 1
+    from_state = int(st.get("next_attempt_no", 1) or 1)
+    from_dirs = 0
+    runs_dir = session_dir / "fixer_runs"
+    if runs_dir.exists():
+        for p in runs_dir.iterdir():
+            m = re.fullmatch(r"attempt-(\d+)", p.name)
+            if m:
+                from_dirs = max(from_dirs, int(m.group(1)))
+    attempt_no = max(from_history, from_state, from_dirs + 1)
+    st["next_attempt_no"] = attempt_no + 1
+    return attempt_no
+
+
+def _collect_pending_candidates(
+    st: dict[str, Any],
+) -> list[tuple[tuple[int, int, int], str, dict[str, Any]]]:
+    candidates: list[tuple[tuple[int, int, int], str, dict[str, Any]]] = []
+    for fp, rec in st.get("incidents", {}).items():
+        if rec.get("status") != "pending":
+            continue
+        max_att = _max_attempts_for(st, rec)
+        if int(rec.get("attempts", 0)) >= max_att:
+            rec["status"] = "escalated_human"
+            continue
+        rank = (
+            SEVERITY_RANK.get(str(rec.get("severity", "P2")), 9),
+            CATEGORY_RANK.get(str(rec.get("category", "strategy")), 9),
+            int(rec.get("attempts", 0)),
+        )
+        candidates.append((rank, fp, rec))
+    candidates.sort(key=lambda item: item[0])
+    return candidates
+
+
+def _finalize_incident_claim(
+    session_dir: Path,
+    st: dict[str, Any],
+    chosen: dict[str, Any],
+    wt_dir: Path,
+    *,
+    attempt_no: Optional[int] = None,
+    worker_wt: Optional[Path] = None,
+) -> dict[str, Any]:
+    chosen["status"] = "claimed"
+    chosen["claimed_at"] = _utc_now()
+    if attempt_no is None:
+        attempt_no = _allocate_attempt_no(session_dir, st)
+    attempt_dir = session_dir / "fixer_runs" / f"attempt-{attempt_no:04d}"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+
+    inc_path_raw = str(chosen.get("incident_path") or "")
+    inc_path = Path(inc_path_raw) if inc_path_raw else None
+    inc_json = (
+        json.loads(inc_path.read_text(encoding="utf-8"))
+        if inc_path is not None and inc_path.is_file()
+        else {}
+    )
+    prompt_file = attempt_dir / "prompt.md"
+    prompt_file.write_text(_render_fixer_prompt(chosen, inc_json, wt_dir), encoding="utf-8")
+    chosen["active_attempt_dir"] = str(attempt_dir)
+    chosen["prompt_file"] = str(prompt_file)
+    if worker_wt is not None:
+        chosen["worker_wt"] = str(worker_wt)
+    else:
+        chosen.pop("worker_wt", None)
+    return json.loads(json.dumps(chosen))
 
 
 def claim_next_incident(session_dir: Path) -> Optional[dict[str, Any]]:
     with locked_state(session_dir) as st:
         fixer_wt = Path(st["fixer_wt"])
-        candidates = []
-        for fp, rec in st.get("incidents", {}).items():
-            if rec.get("status") != "pending":
-                continue
-            max_att = _max_attempts_for(st, rec)
-            if int(rec.get("attempts", 0)) >= max_att:
-                rec["status"] = "escalated_human"
-                continue
-            rank = (
-                SEVERITY_RANK.get(str(rec.get("severity", "P2")), 9),
-                CATEGORY_RANK.get(str(rec.get("category", "strategy")), 9),
-                int(rec.get("attempts", 0)),
-            )
-            candidates.append((rank, fp, rec))
-
+        candidates = _collect_pending_candidates(st)
         if not candidates:
             return None
-        candidates.sort(key=lambda item: item[0])
         _, fp, chosen = candidates[0]
-        chosen["status"] = "claimed"
-        chosen["claimed_at"] = _utc_now()
+        return _finalize_incident_claim(session_dir, st, chosen, fixer_wt)
 
-        attempt_no = sum(len(r.get("gate_history", [])) for r in st["incidents"].values()) + 1
-        attempt_dir = session_dir / "fixer_runs" / f"attempt-{attempt_no:04d}"
-        attempt_dir.mkdir(parents=True, exist_ok=True)
 
-        inc_path = Path(chosen["incident_path"])
-        inc_json = json.loads(inc_path.read_text(encoding="utf-8")) if inc_path.exists() else {}
-        prompt_file = attempt_dir / "prompt.md"
-        prompt_file.write_text(_render_fixer_prompt(chosen, inc_json, fixer_wt), encoding="utf-8")
-        chosen["active_attempt_dir"] = str(attempt_dir)
-        chosen["prompt_file"] = str(prompt_file)
-        return json.loads(json.dumps(chosen))
+def claim_parallel_incidents(
+    session_dir: Path,
+    *,
+    max_workers: int = 1,
+    base_ref: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """在独立临时 worktree 上批量认领互不冲突的待修异常单。"""
+    if int(max_workers) < 1:
+        return []
+    with locked_fixer_wt(session_dir):
+        with locked_state(session_dir) as st:
+            repo_root = Path(st["repo_root"])
+            fixer_wt = Path(st["fixer_wt"])
+            branch = st["target_branch"]
+            if base_ref:
+                base_sha = _git(repo_root, "rev-parse", base_ref).stdout.strip()
+            else:
+                base_sha = _branch_tip(repo_root, branch)
+
+            _clean_fixer_worktree(fixer_wt)
+            _git(fixer_wt, "checkout", branch)
+
+            candidates = _collect_pending_candidates(st)
+            if not candidates:
+                return []
+
+            chosen_items: list[dict[str, Any]] = []
+            selected_scopes: list[frozenset[str]] = []
+            for _, fp, rec in candidates:
+                if len(chosen_items) >= int(max_workers):
+                    break
+                scope = _incident_edit_scope(rec)
+                if any(_scopes_conflict(scope, prev) for prev in selected_scopes):
+                    continue
+                selected_scopes.append(scope)
+                chosen_items.append(rec)
+
+            claimed_out: list[dict[str, Any]] = []
+            for chosen in chosen_items:
+                attempt_no = _allocate_attempt_no(session_dir, st)
+                worker_wt = session_dir / "worktrees" / f"worker-{attempt_no:04d}"
+                _remove_worktree_cleanly(repo_root, worker_wt)
+                worker_wt.parent.mkdir(parents=True, exist_ok=True)
+                _git(repo_root, "worktree", "add", "--detach", str(worker_wt), base_sha)
+                _wire_worktree_env(repo_root, worker_wt)
+                claimed_out.append(
+                    _finalize_incident_claim(
+                        session_dir,
+                        st,
+                        chosen,
+                        worker_wt,
+                        attempt_no=attempt_no,
+                        worker_wt=worker_wt,
+                    )
+                )
+            return claimed_out
+
+
+def _collect_worktree_changes(wt_dir: Path) -> list[str]:
+    """解析 worktree 中修改、删除、重命名与未跟踪文件路径列表。"""
+    porcelain = _git(wt_dir, "status", "--porcelain", "-uall").stdout.splitlines()
+    changed_files: list[str] = []
+    for line in porcelain:
+        if len(line) < 4:
+            continue
+        raw = line[3:].strip()
+        if " -> " in raw:
+            raw = raw.split(" -> ", 1)[1].strip()
+        rel = raw.strip('"')
+        if rel and rel not in changed_files:
+            changed_files.append(rel)
+    return changed_files
+
+
+def _check_gate1_in_worktree(
+    wt_dir: Path, inc_rec: dict[str, Any]
+) -> tuple[list[str], Optional[tuple[str, str]]]:
+    """在指定 worktree 内独立校验 Gate 1（非空改动、路径白名单、密钥泄露扫描）。"""
+    changed_files = _collect_worktree_changes(wt_dir)
+    if not changed_files:
+        return [], ("gate1_whitelist", "fixer 工位没有任何文件改动")
+
+    narrow_files = (
+        inc_rec.get("editable_files")
+        if inc_rec.get("code") == "GOAL_MISS" and inc_rec.get("editable_files")
+        else None
+    )
+    for rel in changed_files:
+        ok, why = is_allowed_edit_path(rel, narrow_files=narrow_files)
+        if not ok:
+            return changed_files, ("gate1_whitelist", why)
+
+    diff_txt = _git(wt_dir, "diff", "HEAD", check=False).stdout
+    untracked_raw = _git(
+        wt_dir, "ls-files", "--others", "--exclude-standard", check=False
+    ).stdout.splitlines()
+    for rel in untracked_raw:
+        p = wt_dir / rel.strip().strip('"')
+        if p.is_file():
+            diff_txt += "\n+" + "\n+".join(p.read_text(encoding="utf-8", errors="ignore").splitlines())
+    secret_hits = scan_diff_for_secrets(diff_txt)
+    if secret_hits:
+        return changed_files, ("gate1_secrets", f"检测到疑似敏感凭据片段: {secret_hits}")
+    return changed_files, None
+
+
+def _apply_worker_patch_to_fixer_wt(
+    fixer_wt: Path,
+    worker_wt: Path,
+    changed_files: list[str],
+    commit_msg: str,
+) -> tuple[bool, str]:
+    """将 worker_wt 的工作区改动临时提交后以 cherry-pick --no-commit 合入 fixer_wt，并还原为未暂存改动。"""
+    if not changed_files:
+        return False, "worker 工位没有任何文件改动"
+    add_proc = _git(worker_wt, "add", "--", *changed_files, check=False)
+    if add_proc.returncode != 0:
+        return False, (add_proc.stderr or add_proc.stdout).strip()
+    cmt_proc = _git(
+        worker_wt,
+        "-c", "user.name=soak-autofix",
+        "-c", "user.email=soak-autofix@local",
+        "commit", "-m", commit_msg,
+        check=False,
+    )
+    if cmt_proc.returncode != 0:
+        return False, (cmt_proc.stderr or cmt_proc.stdout).strip()
+    worker_sha = _git(worker_wt, "rev-parse", "HEAD").stdout.strip()
+
+    cp_proc = _git(fixer_wt, "cherry-pick", "--no-commit", worker_sha, check=False)
+    if cp_proc.returncode != 0:
+        _git(fixer_wt, "cherry-pick", "--abort", check=False)
+        _clean_fixer_worktree(fixer_wt)
+        return False, (cp_proc.stderr or cp_proc.stdout).strip()
+    _git(fixer_wt, "reset", "HEAD", "--", ".", check=False)
+    return True, ""
 
 
 def verify_and_promote(
@@ -1191,37 +1471,9 @@ def verify_and_promote(
         return {"ok": False, "failed_gate": gate, "detail": detail}
 
     # ---------------- Gate 1: 修改文件白名单 + 密钥泄露扫描 ----------------
-    porcelain = _git(fixer_wt, "status", "--porcelain").stdout.splitlines()
-    changed_files: list[str] = []
-    for line in porcelain:
-        if len(line) < 4:
-            continue
-        raw = line[3:].strip()
-        if " -> " in raw:
-            raw = raw.split(" -> ", 1)[1].strip()
-        changed_files.append(raw.strip('"'))
-
-    if not changed_files:
-        return _fail("gate1_whitelist", "fixer 工位没有任何文件改动")
-
-    narrow_files = (
-        inc_rec.get("editable_files")
-        if inc_rec.get("code") == "GOAL_MISS" and inc_rec.get("editable_files")
-        else None
-    )
-    for rel in changed_files:
-        ok, why = is_allowed_edit_path(rel, narrow_files=narrow_files)
-        if not ok:
-            return _fail("gate1_whitelist", why)
-
-    diff_txt = _git(fixer_wt, "diff").stdout
-    for untracked in changed_files:
-        p = fixer_wt / untracked
-        if p.is_file():
-            diff_txt += "\n+" + "\n+".join(p.read_text(encoding="utf-8", errors="ignore").splitlines())
-    secret_hits = scan_diff_for_secrets(diff_txt)
-    if secret_hits:
-        return _fail("gate1_secrets", f"检测到疑似敏感凭据片段: {secret_hits}")
+    changed_files, gate1_err = _check_gate1_in_worktree(fixer_wt, inc_rec)
+    if gate1_err is not None:
+        return _fail(gate1_err[0], gate1_err[1])
 
     # ---------------- Gate 2: 离线语法编译 + 全量单测 + 干跑契约 ----------------
     code_dir = fixer_wt / "code"
@@ -1529,6 +1781,169 @@ def run_fixer_once(
         return res
 
 
+def run_fixer_batch(
+    session_dir: Path,
+    *,
+    fixer_cmd_template: str,
+    max_workers: int = 3,
+    fixer_timeout_s: int = 600,
+    live_canary: bool = True,
+    fixer_bot_user: str = DEFAULT_FIXER_USER,
+    fixer_preset_name: str = "",
+) -> list[dict[str, Any]]:
+    """并行认领互不冲突的待修单并在各自临时 worktree 并发修复，由协调器串行合入与过四道门禁。"""
+    batch = claim_parallel_incidents(session_dir, max_workers=max_workers)
+    if not batch:
+        return []
+
+    if fixer_preset_name:
+        with locked_state(session_dir) as st_rec:
+            for item in batch:
+                rec = st_rec.get("incidents", {}).get(item["fingerprint"])
+                if rec is not None:
+                    rec["last_fixer_preset"] = fixer_preset_name
+
+    st_snap = read_state(session_dir)
+    repo_root = Path(st_snap["repo_root"])
+    main_fixer_wt = Path(st_snap["fixer_wt"])
+    processed_fps: set[str] = set()
+    results: list[dict[str, Any]] = []
+
+    def _run_worker(item: dict[str, Any]) -> tuple[dict[str, Any], bool, str]:
+        worker_wt = Path(item["worker_wt"])
+        attempt_dir = Path(item.get("active_attempt_dir") or (session_dir / "fixer_runs" / "manual"))
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        cmd_str = fixer_cmd_template.format(
+            fixer_wt=shlex.quote(str(worker_wt)),
+            prompt_file=shlex.quote(str(item["prompt_file"])),
+            incident_file=shlex.quote(str(item.get("incident_path", ""))),
+            skill=shlex.quote(str(item.get("skill", ""))),
+        )
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", cmd_str],
+                cwd=str(worker_wt),
+                env=_uv_env(worker_wt),
+                capture_output=True,
+                text=True,
+                timeout=fixer_timeout_s,
+            )
+            (attempt_dir / "fixer_agent.log").write_text(
+                (proc.stdout or "") + "\n" + (proc.stderr or ""),
+                encoding="utf-8",
+            )
+            return item, False, ""
+        except subprocess.TimeoutExpired as exc:
+            out_s = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err_s = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            (attempt_dir / "fixer_agent.log").write_text(
+                f"[fixer] worker timeout after {fixer_timeout_s}s\n{out_s}\n{err_s}",
+                encoding="utf-8",
+            )
+            _clean_fixer_worktree(worker_wt)
+            return item, True, f"fixer worker timeout after {fixer_timeout_s}s"
+
+    try:
+        print(
+            f"[fixer-batch] 并行认领 {len(batch)} 单："
+            + ", ".join(f"{it['incident_id']}({it['fingerprint']})" for it in batch)
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            futures = [pool.submit(_run_worker, item) for item in batch]
+            for fut in concurrent.futures.as_completed(futures):
+                item, timed_out, timeout_note = fut.result()
+                fp = item["fingerprint"]
+                worker_wt = Path(item["worker_wt"])
+                with locked_fixer_wt(session_dir):
+                    st_cur = read_state(session_dir)
+                    fixer_wt = Path(st_cur["fixer_wt"])
+                    branch = st_cur["target_branch"]
+                    _clean_fixer_worktree(fixer_wt)
+                    _git(fixer_wt, "checkout", branch)
+
+                    changed_files, gate1_err = _check_gate1_in_worktree(worker_wt, item)
+                    if gate1_err is not None:
+                        res = verify_and_promote(
+                            session_dir,
+                            fp,
+                            live_canary=live_canary,
+                            fixer_bot_user=fixer_bot_user,
+                        )
+                        eff_gate, eff_detail = gate1_err
+                        if timed_out and eff_gate == "gate1_whitelist":
+                            eff_detail = timeout_note
+                        if (
+                            not res.get("ok")
+                            and res.get("failed_gate") == "gate1_whitelist"
+                            and res.get("detail") == "fixer 工位没有任何文件改动"
+                            and (eff_gate, eff_detail) != ("gate1_whitelist", "fixer 工位没有任何文件改动")
+                        ):
+                            res["failed_gate"] = eff_gate
+                            res["detail"] = eff_detail
+                            with locked_state(session_dir) as st_mut:
+                                gh = st_mut.get("incidents", {}).get(fp, {}).get("gate_history") or []
+                                if gh:
+                                    gh[-1]["failed_gate"] = eff_gate
+                                    gh[-1]["detail"] = eff_detail[:1000]
+                            write_review_report(session_dir)
+                    else:
+                        skill_name = str(item.get("skill") or "").strip()
+                        goal_id = str(item.get("goal_id") or "").strip()
+                        commit_msg = (
+                            f"fix(soak-autofix): {skill_name or goal_id or 'loop'} "
+                            f"resolve {item.get('incident_id')} [{item.get('code')}]"
+                        )
+                        applied, conflict_detail = _apply_worker_patch_to_fixer_wt(
+                            fixer_wt, worker_wt, changed_files, commit_msg
+                        )
+                        if not applied:
+                            with locked_state(session_dir) as st_mut:
+                                rec = st_mut["incidents"][fp]
+                                rec["status"] = "pending"
+                                rec.setdefault("gate_history", []).append({
+                                    "at": _utc_now(),
+                                    "ok": False,
+                                    "failed_gate": "merge_conflict_requeue",
+                                    "event": "merge_conflict_requeue",
+                                    "detail": (conflict_detail or "merge conflict during parallel cherry-pick")[:1000],
+                                })
+                            write_review_report(session_dir)
+                            res = {
+                                "ok": False,
+                                "requeued": True,
+                                "failed_gate": "merge_conflict_requeue",
+                                "detail": conflict_detail,
+                            }
+                        else:
+                            res = verify_and_promote(
+                                session_dir,
+                                fp,
+                                live_canary=live_canary,
+                                fixer_bot_user=fixer_bot_user,
+                            )
+                res.setdefault("fingerprint", fp)
+                res.setdefault("incident_id", item.get("incident_id"))
+                processed_fps.add(fp)
+                results.append(res)
+                print(f"[fixer-batch] 门禁结果 ({item.get('incident_id')}): {res}")
+    finally:
+        for item in batch:
+            w_str = item.get("worker_wt")
+            if w_str:
+                w_path = Path(w_str)
+                if w_path.resolve() != main_fixer_wt.resolve():
+                    _remove_worktree_cleanly(repo_root, w_path)
+        with locked_state(session_dir) as st_cleanup:
+            for item in batch:
+                b_fp = item["fingerprint"]
+                rec = st_cleanup.get("incidents", {}).get(b_fp)
+                if rec is not None:
+                    rec.pop("worker_wt", None)
+                    if b_fp not in processed_fps and rec.get("status") == "claimed":
+                        rec["status"] = "pending"
+    return results
+
+
 def _rollback_branch_in_fixer_wt(fixer_wt: Path, branch: str, prev_tip: str) -> None:
     """无 git reset --hard 回退 fixer_wt 上的待审分支到 prev_tip。"""
     _clean_fixer_worktree(fixer_wt)
@@ -1548,6 +1963,7 @@ def inject_and_set_goal(
     episode_steps: Optional[int] = None,
     clear_episode_budget: bool = False,
     fixer_preset: Optional[str] = None,
+    fixer_workers: Optional[int] = None,
     focus_mode: Optional[str] = None,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
@@ -1560,6 +1976,12 @@ def inject_and_set_goal(
         return {"ok": False, "failed_step": "invalid_focus_mode", "detail": f"未知聚焦模式 {focus_mode!r}"}
     if fixer_preset is not None and fixer_preset not in FIXER_PRESETS:
         return {"ok": False, "failed_step": "invalid_fixer_preset", "detail": f"未知修单预设 {fixer_preset!r}"}
+    norm_workers: Optional[int] = None
+    if fixer_workers is not None:
+        try:
+            norm_workers = _validate_fixer_workers(fixer_workers)
+        except ValueError as exc:
+            return {"ok": False, "failed_step": "invalid_fixer_workers", "detail": str(exc)}
     budget_err = validate_episode_budget(episode_seconds, episode_steps)
     if budget_err:
         return {"ok": False, "failed_step": "invalid_episode_budget", "detail": budget_err}
@@ -1663,6 +2085,8 @@ def inject_and_set_goal(
                 st["episode_steps"] = int(episode_steps)
             if fixer_preset is not None:
                 st["fixer_preset"] = fixer_preset
+            if norm_workers is not None:
+                st["fixer_workers"] = norm_workers
             if merged_sha:
                 st["commits"].append({
                     "sha": merged_sha,
@@ -1683,6 +2107,7 @@ def inject_and_set_goal(
                 "episode_steps": st.get("episode_steps"),
             }
             final_fixer = st.get("fixer_preset", "")
+            final_workers = _extract_fixer_workers(st, 1)
             final_mode = st.get("focus_mode", "together")
 
         write_review_report(session_dir)
@@ -1692,6 +2117,7 @@ def inject_and_set_goal(
             "target_goal": final_goal,
             "episode_budget_override": final_budget,
             "fixer_preset": final_fixer,
+            "fixer_workers": final_workers,
             "focus_mode": final_mode,
             "previous_tip": prev_tip,
             "current_tip": final_tip,
@@ -1708,6 +2134,7 @@ def write_review_report(session_dir: Path) -> Path:
     tot_in = sum(int(e.get("prompt_tokens", 0) or 0) for e in st["episodes"])
     tot_out = sum(int(e.get("completion_tokens", 0) or 0) for e in st["episodes"])
     tot_elapsed = sum(float(e.get("elapsed_s", 0.0) or 0.0) for e in st["episodes"])
+    workers_n = _extract_fixer_workers(st, 1)
 
     lines = [
         f"# 双工位挂机自愈待审报告（分支 `{branch}`）",
@@ -1720,6 +2147,7 @@ def write_review_report(session_dir: Path) -> Path:
         f"- **玩家操控模型（工位 A）**：`{'AIA 官方代理（LLM_PROFILE=official）' if (st.get('server_target') == 'official' and st.get('official_llm') == 'official') else (st.get('player_model') or '沿用 .env')}`"
         + ("（比赛服赛前训练，自备 key）" if (st.get("server_target") == "official" and st.get("official_llm", "custom") == "custom") else ""),
         f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
+        f"- **修单并发工人数（工位 B）**：`{workers_n}`（`fixer_workers={workers_n}`）",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
     if st.get("target_goal"):
@@ -1876,6 +2304,10 @@ def teardown_session(session_dir: Path) -> Path:
         if wt.exists():
             _clean_fixer_worktree(wt)
             _git(repo_root, "worktree", "remove", "--force", str(wt), check=False)
+    wt_root = session_dir / "worktrees"
+    if wt_root.exists():
+        for worker_wt in sorted(wt_root.glob("worker-*")):
+            _remove_worktree_cleanly(repo_root, worker_wt)
     _git(repo_root, "worktree", "prune", check=False)
     return write_review_report(session_dir)
 
@@ -1942,6 +2374,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_fix.add_argument("--skip-live-canary", action="store_true")
     p_fix.add_argument("--fixer-user", default=DEFAULT_FIXER_USER)
     p_fix.add_argument("--fixer-timeout", type=int, default=600)
+    p_fix.add_argument(
+        "--fixer-workers",
+        type=int,
+        default=None,
+        help=f"工位 B 并发修单工人数（{FIXER_WORKERS_BOUNDS[0]}–{FIXER_WORKERS_BOUNDS[1]}，默认读取 state.json 或 1）",
+    )
 
     p_dual = sub.add_parser("run", help="一键并行启动 Runner + Fixer 双工位守护")
     p_dual.add_argument("--session-dir", required=True)
@@ -2004,6 +2442,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dual.add_argument("--fixer-cmd", default="")
     p_dual.add_argument("--fixer-timeout", type=int, default=600, help="单次 AI 修单命令超时秒数（默认 600s）")
+    p_dual.add_argument(
+        "--fixer-workers",
+        type=int,
+        default=1,
+        help=f"工位 B 并发修单工人数（{FIXER_WORKERS_BOUNDS[0]}–{FIXER_WORKERS_BOUNDS[1]}，默认 1）",
+    )
     p_dual.add_argument("--skip-live-canary", action="store_true")
     p_dual.add_argument("--min-verified", choices=("", "offline", "live"), default="",
                         help="可选覆盖技能验证门槛（默认空=比赛服仅 live，自建服含 offline）")
@@ -2031,6 +2475,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(FIXER_PRESETS),
         default=None,
         help="可选热切换工位 B 修单模型（下一单起生效），如 codex:gpt-6-astra:high、agy:gemini-4-carbon-medium",
+    )
+    p_set.add_argument(
+        "--fixer-workers",
+        type=int,
+        default=None,
+        help=f"可选热切换工位 B 并发修单工人数（{FIXER_WORKERS_BOUNDS[0]}–{FIXER_WORKERS_BOUNDS[1]}）",
     )
     p_set.add_argument(
         "--clear-episode-budget",
@@ -2120,6 +2570,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0 if res.get("ok") else 1
 
     if args.cmd == "fixer-loop":
+        if args.fixer_workers is not None:
+            try:
+                _validate_fixer_workers(args.fixer_workers)
+            except ValueError as exc:
+                print(f"[fixer-loop] {exc}", file=sys.stderr)
+                return 2
         tmpl = args.fixer_cmd or (FIXER_PRESETS[args.fixer_preset] if args.fixer_preset else "")
         if not tmpl:
             print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
@@ -2127,23 +2583,46 @@ def main(argv: Optional[list[str]] = None) -> int:
         default_name = "custom" if args.fixer_cmd else args.fixer_preset
         while not (session_dir / "STOP").exists():
             cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
-            res = run_fixer_once(
-                session_dir,
-                fixer_cmd_template=cur_tmpl,
-                fixer_timeout_s=args.fixer_timeout,
-                live_canary=not args.skip_live_canary,
-                fixer_bot_user=args.fixer_user,
-                fixer_preset_name=cur_name,
+            workers = (
+                _validate_fixer_workers(args.fixer_workers)
+                if args.fixer_workers is not None
+                else resolve_fixer_workers(session_dir, 1)
             )
-            if args.once:
-                return 0 if (res is None or res.get("ok")) else 1
-            if res is None:
-                time.sleep(max(0.5, args.poll_s))
+            if workers <= 1:
+                res = run_fixer_once(
+                    session_dir,
+                    fixer_cmd_template=cur_tmpl,
+                    fixer_timeout_s=args.fixer_timeout,
+                    live_canary=not args.skip_live_canary,
+                    fixer_bot_user=args.fixer_user,
+                    fixer_preset_name=cur_name,
+                )
+                if args.once:
+                    return 0 if (res is None or res.get("ok")) else 1
+                if res is None:
+                    time.sleep(max(0.5, args.poll_s))
+            else:
+                batch = run_fixer_batch(
+                    session_dir,
+                    fixer_cmd_template=cur_tmpl,
+                    max_workers=workers,
+                    fixer_timeout_s=args.fixer_timeout,
+                    live_canary=not args.skip_live_canary,
+                    fixer_bot_user=args.fixer_user,
+                    fixer_preset_name=cur_name,
+                )
+                if args.once:
+                    if not batch:
+                        return 0
+                    return 0 if any(r.get("ok") for r in batch) else 1
+                if not batch:
+                    time.sleep(max(0.5, args.poll_s))
         return 0
 
     if args.cmd == "run":
         try:
             bot_user = validate_bot_user(args.bot_user)
+            fixer_workers = _validate_fixer_workers(args.fixer_workers)
         except ValueError as exc:
             print(f"[run] {exc}", file=sys.stderr)
             return 2
@@ -2173,6 +2652,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 st_fx.pop("server_base", None)
             st_fx["focus_mode"] = args.focus_mode
             st_fx["official_llm"] = args.official_llm
+            st_fx["fixer_workers"] = fixer_workers
             if args.fixer_cmd:
                 st_fx.pop("fixer_preset", None)
             else:
@@ -2206,6 +2686,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--fixer-cmd", tmpl,
             "--fixer-timeout", str(args.fixer_timeout),
         ]
+        if fixer_workers != 1:
+            fixer_cmd.extend(["--fixer-workers", str(fixer_workers)])
         if args.skip_live_canary:
             fixer_cmd.append("--skip-live-canary")
 
@@ -2238,6 +2720,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             episode_steps=args.episode_steps,
             clear_episode_budget=args.clear_episode_budget,
             fixer_preset=args.fixer_preset,
+            fixer_workers=args.fixer_workers,
             focus_mode=args.focus_mode,
             skip_offline_gate=args.skip_offline_gate,
         )
@@ -2252,6 +2735,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "target_goal": st.get("target_goal", ""),
             "player_model": st.get("player_model", ""),
             "fixer_preset": st.get("fixer_preset", ""),
+            "fixer_workers": _extract_fixer_workers(st, 1),
             "focus_mode": st.get("focus_mode", "together"),
             "server_target": st.get("server_target", "local"),
             "server_base": st.get("server_base", ""),
