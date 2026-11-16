@@ -503,7 +503,7 @@ class SoakObserver:
         # 常见单次环境波动：记入波动计数，只有短时间反复撞同一目标才升级为震荡问题单
         variance_key = f"{skill.name}:{error_code or outcome}"
         self.env_variance_counts[variance_key] = self.env_variance_counts.get(variance_key, 0) + 1
-        if environment_recovery and skill.name == "scout_island" and error_code == "path_not_found":
+        if environment_recovery and skill.name == "scout_island" and error_code in ("path_not_found", "stalled"):
             self._goal_failures.pop(skill.goal, None)
             return
         now_m = time.monotonic()

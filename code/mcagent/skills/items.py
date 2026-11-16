@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Optional
 
 from ..runtime import Replan
@@ -13,6 +14,28 @@ if TYPE_CHECKING:
     from ..runtime import Executor, State
 
 AIR = frozenset({"air", "cave_air", "void_air"})
+
+#: 寻路常见失败状态码
+NAV_FAIL_CODES: tuple[str, ...] = ("path_not_found", "unreachable", "move_timeout", "stalled")
+
+#: 常见无害、不阻挡通行的地被植物与覆盖物（25种）
+PASSABLE_COVER: frozenset[str] = frozenset({
+    "short_grass", "tall_grass", "fern", "large_fern",
+    "short_dry_grass", "tall_dry_grass", "dead_bush", "bush",
+    "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet",
+    "oxeye_daisy", "cornflower", "lily_of_the_valley", "leaf_litter",
+    "pink_petals", "wildflowers", "moss_carpet", "pale_moss_carpet",
+    "brown_mushroom", "red_mushroom", "glow_lichen", "vine",
+})
+
+#: 危险或非实体液体/伤害性方块（不可作为安全立足地面）
+_UNSAFE_FLOOR_BLOCKS: frozenset[str] = frozenset({
+    "water", "lava", "flowing_water", "flowing_lava", "bubble_column",
+    "powder_snow", "cactus", "magma_block", "sweet_berry_bush",
+    "fire", "soul_fire", "campfire", "soul_campfire",
+    "wither_rose", "cobweb", "seagrass", "tall_seagrass",
+    "kelp", "kelp_plant",
+})
 
 #: 可以拿来垫脚/铺桥的常见整块方块
 PLACEABLE_BLOCKS: tuple[str, ...] = (
@@ -39,6 +62,50 @@ def bare(name: object) -> str:
 def block_name(ex: "Executor", pos) -> str:
     """观察一格方块的名字（不占动作锁）。"""
     return bare(ex.client.get_block(pos).get("name", ""))
+
+
+def _extract_block_name(block: object) -> str:
+    """从方块字典或名称字符串提取规整后的无前缀方块名。"""
+    if isinstance(block, str):
+        raw_name = block
+    elif isinstance(block, Mapping):
+        raw_name = block.get("name")
+    else:
+        return ""
+    return bare(raw_name).strip()
+
+
+def is_clear_space(block: object) -> bool:
+    """判断方块是否为可通行的空旷空间（空气、地被植物或 <=2 层的顶层雪）。"""
+    name = _extract_block_name(block)
+    if not name:
+        return False
+
+    if name in AIR or name in PASSABLE_COVER:
+        return True
+
+    if name == "snow":
+        props = block.get("properties") if isinstance(block, Mapping) else None
+        raw_layers = props.get("layers", 1) if isinstance(props, Mapping) else 1
+        if isinstance(raw_layers, bool):
+            return False
+        if isinstance(raw_layers, int):
+            layers = raw_layers
+        elif isinstance(raw_layers, str) and raw_layers.strip().isdigit():
+            layers = int(raw_layers.strip())
+        else:
+            return False
+        return 1 <= layers <= 2
+
+    return False
+
+
+def is_safe_solid_floor(block: object) -> bool:
+    """判断方块是否为可安全踩踏的实体地面（排除空气、地被、液体与伤害性方块）。"""
+    name = _extract_block_name(block)
+    if not name or is_clear_space(block):
+        return False
+    return name not in _UNSAFE_FLOOR_BLOCKS
 
 
 def best_pickaxe(state: "State") -> Optional[str]:
