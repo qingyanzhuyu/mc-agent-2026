@@ -88,7 +88,7 @@ assert [s["op"] for s in steps] == ["equip", "dig"]
 
 | 模块及签名 | 前置、返回与后验 | 失败 | 端点、规范与待实测 |
 |---|---|---|---|
-| `recipes.craft_recipe(ex, state, item, count=1)` | `count` 是最终持有量下限。核对该配方原料和所需工作台，最多调用 64 次合成。持有足额直接返回。每批核对成品增量。返回 `{item,before,after,gained,consumed}`，`consumed` 记录背包实物净减。调用方负责检查与结算预留 | R 缺料、未知配方、预算用尽或后验不足。E 找不到可达工作台 | `/inventory /status /find_blocks /get_block /move_to /craft` §3.1–3.4、§4.1、§4.8。待测 `count=1`、选配方、混用标签原料和工作台实际触达距离 |
+| `recipes.craft_recipe(ex, state, item, *, goal_qty=1)` | `goal_qty` 是最终持有量下限，只能按关键字传入。核对该配方原料和所需工作台，最多调用 64 次合成。持有足额直接返回。每批核对成品增量。返回 `{item,before,after,gained,consumed}`，`consumed` 记录背包实物净减。调用方负责检查与结算预留 | R 缺料、未知配方、预算用尽或后验不足。E 找不到可达工作台 | `/inventory /status /find_blocks /get_block /move_to /craft` §3.1–3.4、§4.1、§4.8。待测 `POST /craft` 的 `count=1`、选配方、混用标签原料和工作台实际触达距离 |
 | `field.scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None)` | 有界搜索，并逐个复核方块。返回 `{status,blocks,origin,dimension,radius,observed_at}`，`status` 为 `found/unknown`，观察时刻为本机单调时钟 | R 无效参数。空回执、过滤后为空或候选未加载时为 `unknown` | `/status /find_blocks /get_block` §3.1、§3.3–3.4。待测性质键值、负搜索覆盖和暴露面范围 |
 | `field.scan_entities(ex, state, types=None, *, radius=32, limit=40)` | 返回 `{status,entities,origin,dimension,radius,observed_at}`；只返回有整型 ID 和坐标的观察记录 | R 无效参数。空回执为 `unknown` | `/status /get_entities` §3.1、§3.5。待复核 ready 后可见实体与字段 |
 | `field.move_local(ex, state, pos, *, rng=1, max_distance=16, require_move=False)` | 只走近处已观测落脚格。检查整格支撑和两格净空，移动后重读同维度落地状态与距离，返回状态快照。足够近且已稳时可跳过，`require_move=True` 强制发出尝试 | R 无落脚证据、超限、偏离目标、掉线/切维度后无法核对 | `/status /get_block /move_to` §3.1、§3.4、§4.1。待测单格、台阶、贴边与实际到点精度 |
