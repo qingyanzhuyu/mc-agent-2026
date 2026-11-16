@@ -21,38 +21,13 @@ import subprocess
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from ..runtime import State, _inv_fingerprint
+from ..runtime import EnvBlocked, State, _inv_fingerprint
 from ..skills.items import AIR, bare
+from .draft_scores import ADVANCEMENT_SCORES_V2
 from .goals import GOALS, GoalSpec, diagnose_goal_gap, is_goal_achieved, normalize_goal_ids
 from .tape import TapeRecorder
-
-# RULES v2 草案常见 T1/T2 计分表映射（用于计算进度分曲线）
-ADVANCEMENT_SCORES_V2: dict[str, int] = {
-    "minecraft:story/mine_stone": 5,
-    "minecraft:story/upgrade_tools": 5,
-    "minecraft:story/smelt_iron": 5,
-    "minecraft:story/iron_tools": 5,
-    "minecraft:story/obtain_armor": 5,
-    "minecraft:story/lava_bucket": 15,
-    "minecraft:story/deflect_arrow": 15,
-    "minecraft:story/form_obsidian": 15,
-    "minecraft:story/mine_diamond": 15,
-    "minecraft:story/enchant_item": 30,
-    "minecraft:story/enter_the_nether": 30,
-    "minecraft:story/shiny_gear": 60,
-    "minecraft:story/follow_ender_eye": 60,
-    "minecraft:adventure/kill_a_mob": 5,
-    "minecraft:adventure/shoot_arrow": 5,
-    "minecraft:adventure/sleep_in_bed": 5,
-    "minecraft:adventure/ol_betsy": 15,
-    "minecraft:adventure/bullseye": 15,
-    "minecraft:adventure/use_lodestone": 15,
-    "minecraft:husbandry/plant_seed": 5,
-    "minecraft:husbandry/breed_an_animal": 5,
-    "minecraft:husbandry/fishy_business": 15,
-}
 
 # 本地靶场 /advancements 返回 0 时的背包里程碑代理判据（与服务端真实进度分列展示，绝不混同）
 _ITEM_MILESTONES: tuple[tuple[str, tuple[str, ...], int], ...] = (
@@ -232,6 +207,7 @@ class SoakObserver:
 
         self.skill_stats: dict[str, dict[str, int]] = {}
         self.env_variance_counts: dict[str, int] = {}
+        self.environment_blocked_goals: dict[str, dict[str, str]] = {}
         self.decision_sources: dict[str, int] = {}
         self.step_sources: dict[str, int] = {}
         self.llm_latencies_ms: list[float] = []
@@ -409,6 +385,8 @@ class SoakObserver:
         error_code: str = "",
         error_msg: str = "",
         died_or_disconnected: bool = False,
+        environment: Optional[EnvBlocked] = None,
+        environment_recovery: bool = False,
     ) -> None:
         tape_slice = self.tape.end_skill_slice() if self.tape is not None else []
         ctx = self._skill_ctx or {"skill": skill.name, "args": dict(skill.args), "before_counts": {}}
@@ -442,6 +420,10 @@ class SoakObserver:
         elif outcome == "budget_stopped":
             # 外层运行预算只说明未继续执行，不能判定技能失败；保留流水与姿态核对。
             stat["budget_stopped"] += 1
+        elif environment is not None:
+            key = f"{skill.name}:env_blocked"
+            self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
+            self._goal_failures.pop(skill.goal, None)
         else:
             stat["replan"] += 1
             if outcome == "replan":
@@ -452,7 +434,10 @@ class SoakObserver:
                     "error_msg": error_msg[:200],
                     "elapsed_s": self._elapsed_s(),
                 }
-            self._classify_skill_failure(skill, outcome, error_code, error_msg, state, ctx, tape_slice)
+            self._classify_skill_failure(
+                skill, outcome, error_code, error_msg, state, ctx, tape_slice,
+                environment_recovery=environment_recovery,
+            )
 
         self._last_skill_snapshots[skill.name] = (copy.deepcopy(ctx), copy.deepcopy(tape_slice))
 
@@ -482,6 +467,8 @@ class SoakObserver:
             "error_code": error_code,
             "error_msg": error_msg[:200],
             "postcondition_error": post_err,
+            **({"environment": environment.evidence()} if environment is not None else {}),
+            **({"environment_recovery": True} if environment_recovery else {}),
         })
         self._skill_ctx = None
         self.write_summary()
@@ -495,6 +482,8 @@ class SoakObserver:
         state: State,
         ctx: dict,
         tape_slice: list[dict],
+        *,
+        environment_recovery: bool = False,
     ) -> None:
         if outcome in ("fatal", "unexpected_exception") or error_code in ("bad_args", "unknown_api"):
             self._report_incident(
@@ -514,6 +503,9 @@ class SoakObserver:
         # 常见单次环境波动：记入波动计数，只有短时间反复撞同一目标才升级为震荡问题单
         variance_key = f"{skill.name}:{error_code or outcome}"
         self.env_variance_counts[variance_key] = self.env_variance_counts.get(variance_key, 0) + 1
+        if environment_recovery and skill.name == "scout_island" and error_code == "path_not_found":
+            self._goal_failures.pop(skill.goal, None)
+            return
         now_m = time.monotonic()
         q = self._goal_failures.setdefault(skill.goal, deque(maxlen=10))
         q.append(now_m)
@@ -663,15 +655,22 @@ class SoakObserver:
         self._append_jsonl(self.curve_path, point)
         return point
 
-    def on_run_end(self, state: State, client=None, *, stop_reason: str = "") -> None:
+    def on_run_end(
+        self, state: State, client=None, *, stop_reason: str = "",
+        environment_blocked: Optional[Mapping[str, EnvBlocked]] = None,
+    ) -> None:
         self.on_progress_tick(state, client=client, force=True)
         self.update_goals_reached(state)
         reached_map = {gid: gid in self.goals_reached for gid in self.target_goals}
         target_reached = bool(self.target_goals) and all(reached_map.values())
+        self.environment_blocked_goals = {
+            gid: block.evidence() for gid, block in (environment_blocked or {}).items()
+            if gid in reached_map and not reached_map[gid]
+        }
 
         if stop_reason != "keyboard_interrupt":
             for gid in self.target_goals:
-                if not reached_map[gid]:
+                if not reached_map[gid] and gid not in self.environment_blocked_goals:
                     self._report_goal_miss(gid, state, stop_reason)
 
         self._append_jsonl(self.timeline_path, {
@@ -683,6 +682,7 @@ class SoakObserver:
             "target_goal": self.target_goal,
             "target_goals": list(self.target_goals),
             "target_goals_reached": reached_map,
+            "environment_blocked_goals": self.environment_blocked_goals,
             "target_goal_reached": target_reached,
             "target_goal_elapsed_s": (
                 max(self.goals_reached[g] for g in self.target_goals) if target_reached else None
@@ -879,6 +879,9 @@ class SoakObserver:
             label = "本轮聚焦目标" if len(self.target_goals) == 1 else f"本轮聚焦目标（同轮 {len(self.target_goals)} 个）"
             if gid in self.goals_reached:
                 lines.append(f"- 🎯 **{label}**：`{gid}` -> ✅ 已达成 (`{self.goals_reached[gid]}s`)")
+            elif gid in self.environment_blocked_goals:
+                block = self.environment_blocked_goals[gid]
+                lines.append(f"- 🎯 **{label}**：`{gid}` -> 环境挂起（{block['message']}；恢复条件 `{block['wake_on']}`）")
             else:
                 lines.append(f"- 🎯 **{label}**：`{gid}` -> ❌ 未达成")
         base_pt = self._load_baseline_last_point()

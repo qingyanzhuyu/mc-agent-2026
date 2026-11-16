@@ -23,17 +23,18 @@ if TYPE_CHECKING:
 
 ALL_LOGS: tuple[str, ...] = (
     "oak_log", "birch_log", "spruce_log", "jungle_log",
-    "acacia_log", "dark_oak_log", "cherry_log", "mangrove_log",
+    "acacia_log", "dark_oak_log", "cherry_log", "mangrove_log", "pale_oak_log",
 )
 ALL_PLANKS: tuple[str, ...] = (
     "oak_planks", "birch_planks", "spruce_planks", "jungle_planks",
-    "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks",
+    "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks", "pale_oak_planks",
 )
 AXE_ORDER: tuple[str, ...] = (
-    "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "golden_axe", "wooden_axe",
+    "netherite_axe", "diamond_axe", "iron_axe", "copper_axe",
+    "stone_axe", "golden_axe", "wooden_axe",
 )
 STONE_Targets: tuple[str, ...] = ("stone", "cobblestone", "deepslate", "cobbled_deepslate")
-PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol")
+PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter")
 SAFE_GROUND: tuple[str, ...] = (
     "grass_block", "dirt", "coarse_dirt", "stone", "cobblestone",
     "sand", "sandstone", "gravel", "andesite", "diorite", "granite", "oak_planks",
@@ -543,7 +544,8 @@ class MineStone(Skill):
     @staticmethod
     def _safe_stair_column(ex: "Executor", x: int, y: int, z: int) -> bool:
         floor = bare(ex.client.get_block([x, y - 1, z]).get("name", ""))
-        if not floor or floor in AIR or floor in ("lava", "water"):
+        # 树冠的叶片和树干可能仍在地表上方，不能把它们当作采石地层。
+        if not floor or floor in AIR or floor in ("lava", "water") or floor.endswith(("_leaves", "_log", "_wood")):
             return False
         # 三格净空上方若是落沙/砾石，挖开后会重新填入槽内；底板实心仍不足以安全下行。
         roof = bare(ex.client.get_block([x, y + 3, z]).get("name", ""))
@@ -575,12 +577,7 @@ class MineStone(Skill):
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.refresh_status(ex.client, max_age_s=0)
-        state.refresh_inventory(ex.client)
-        pick = best_pickaxe(state)
-        if not pick:
-            raise Replan("背包没有镐")
-        if bare((state.st.get("held") or {}).get("name")) != pick:
-            yield rec("equip", ex.equip(pick, "hand"), item=pick)
+        yield from self._prepare_pickaxe(ex, state)
 
         start_cobble = total_cobble(state)
         want = int(self.args["count"])
@@ -610,7 +607,7 @@ class MineStone(Skill):
             target = cands[0] if cands else None
 
             if target is None:
-                # 地表无平层裸露石头：从脚边安全方向向下开凿阶梯式探槽（每步先核对底板非空气/岩浆/水，防挖穿虚空，且人物随阶梯下行贴身拾取）
+                # 地表无平层裸露石头：从脚边安全方向开凿探槽，核对每列的底板，再沿阶梯下行贴身拾取。
                 if stair_origin is None and stair_steps_taken < 6:
                     ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                     stair_columns.add((ix, iz))
@@ -646,7 +643,8 @@ class MineStone(Skill):
                                     stair_origin = None
                                     reobserve_stair = True
                                     break
-                                dug_res = ex.dig([sx, clear_y, sz], collect=True)
+                                # 拾取表土可能让角色提前踩进还未清完的阶梯列。
+                                dug_res = ex.dig([sx, clear_y, sz], collect=bname not in PEEL_SURFACE)
                                 yield rec("dig", dug_res, pos=[sx, clear_y, sz])
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:

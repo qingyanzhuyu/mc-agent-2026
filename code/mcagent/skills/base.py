@@ -187,8 +187,9 @@ class Skill:
         until = _COOLDOWN.get(self._fail_key(), 0.0)
         return time.time() < until
 
-    def mark_failed(self) -> None:
-        _COOLDOWN[self._fail_key()] = time.time() + self.cooldown_s
+    def mark_failed(self, *, cooldown_s: Optional[float] = None) -> None:
+        delay = self.cooldown_s if cooldown_s is None else cooldown_s
+        _COOLDOWN[self._fail_key()] = time.time() + delay
 
     def __str__(self) -> str:
         return f"<{self.name}:{self.goal}>"

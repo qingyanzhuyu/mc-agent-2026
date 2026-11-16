@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..client import ApiError, Client
-from ..runtime import Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
+from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
 from ..skills.base import Skill, failure
 from .auditor import SoakObserver
 from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
@@ -70,6 +70,7 @@ class MainLoop:
         self.safety = safety or Safety(state.config)
         self.log = log
         self.recent_failures: deque[str] = deque(maxlen=12)
+        self._path_failures: dict[str, int] = {}
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
 
@@ -321,6 +322,7 @@ class MainLoop:
                         if done:
                             skill_dt = max(0.0, time.monotonic() - skill_t0)
                             finished_name = active_skill.name
+                            self._path_failures.pop(active_skill.goal, None)
                             if self.observer is not None and self.observer.tape is not None:
                                 self.observer.tape.end_skill_slice()
                             self._refresh_world_state()
@@ -377,8 +379,6 @@ class MainLoop:
                             or extra.get("interrupted_by") == "death"
                             or self._is_dead_now()
                         )
-                        active_skill.mark_failed()
-                        skills_replan += 1
                         self.recent_failures.append(f"{active_skill.name}: {e}")
                         self.log(f"[loop] 技能中断 {active_skill}: {e}")
                         if not is_death_err:
@@ -386,16 +386,34 @@ class MainLoop:
                                 self.state.refresh_status(self.client, max_age_s=0)
                             except ApiError:
                                 is_death_err = True
+                        environment = e if isinstance(e, EnvBlocked) and not is_death_err else None
+                        if environment is not None:
+                            self._path_failures.pop(active_skill.goal, None)
+                            self.planner.record_environment_block(active_skill, environment, self.state)
+                        else:
+                            skills_replan += 1
+                            if code == "path_not_found" and not is_death_err:
+                                streak = self._path_failures.get(active_skill.goal, 0) + 1
+                                self._path_failures[active_skill.goal] = streak
+                            else:
+                                streak = 0
+                                self._path_failures.pop(active_skill.goal, None)
+                            if streak >= 3:
+                                active_skill.mark_failed(cooldown_s=3 * active_skill.cooldown_s)
+                            else:
+                                active_skill.mark_failed()
                         if self.observer is not None:
                             self.observer.on_skill_end(
                                 active_skill,
-                                "replan",
+                                "env_blocked" if environment is not None else "replan",
                                 self.state,
-                                error_code=code,
+                                error_code="env_blocked" if environment is not None else code,
                                 error_msg=str(e),
                                 died_or_disconnected=is_death_err,
+                                **({"environment": environment} if environment is not None else {}),
+                                **({"environment_recovery": True} if decision.environment_recovery and not is_death_err else {}),
                             )
-                        if hasattr(self.planner, "record_skill_outcome"):
+                        if environment is None and hasattr(self.planner, "record_skill_outcome"):
                             self.planner.record_skill_outcome(
                                 failed_name,
                                 ok=False,
@@ -436,7 +454,12 @@ class MainLoop:
             if monitor is not None:
                 monitor.close()
             if self.observer is not None:
-                self.observer.on_run_end(self.state, client=self.client, stop_reason=stop_reason)
+                # 外迁最后一步可能耗尽预算。还未进入下一规划拍时，保留挂起证据。
+                blocked = self.planner.blocked_targets(self.state, self.observer.target_goals, refresh=False)
+                self.observer.on_run_end(
+                    self.state, client=self.client, stop_reason=stop_reason,
+                    **({"environment_blocked": blocked} if blocked else {}),
+                )
             if self.config.disconnect_on_exit:
                 try:
                     self.client.disconnect()

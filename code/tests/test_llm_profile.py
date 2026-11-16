@@ -252,6 +252,9 @@ class LoopGuardTests(unittest.TestCase):
         env = dict(CUSTOM_ENV, MC_API_BASE="https://apiin.nmo.net.cn/api/v1", MC_USER="bot", MC_PASS="p")
         code, err = self.run_main(env, ["--llm", "--local-target"])
         self.assertEqual(code, 2)
+        self.assertIn("显式加 --live", err)
+        code, err = self.run_main(env, ["--llm", "--live"])
+        self.assertEqual(code, 2)
         self.assertIn("LLM_PROFILE=official", err)
 
     def test_bad_profile_refused(self):
