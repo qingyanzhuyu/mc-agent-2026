@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ..runtime import EnvBlocked, Replan
-from .base import Skill, rec
+from .base import Skill, failure, rec
 from .field import collect_drops, place_block, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
@@ -18,6 +18,26 @@ from .survival import (
 _BEDS = tuple(item for item in RECIPES if item.endswith("_bed"))
 _WOOLS = tuple(item.removesuffix("_bed") + "_wool" for item in _BEDS)
 _BED_RADIUS = 12
+_EARLY_NIGHT_START = 12542
+_NIGHT_END = 23459
+
+
+def _can_sleep_now(status):
+    """§4.4 / §8 1.3.4：原版早夜 12542 起（早于 is_day 翻转的 13000）及雷暴均可入睡并返回 slept: true。"""
+    if status.get("thundering") is True:
+        return True
+    tod = status.get("time_of_day")
+    if isinstance(tod, (int, float)) and not isinstance(tod, bool):
+        if _EARLY_NIGHT_START <= int(tod) % 24000 <= _NIGHT_END:
+            return True
+        if status.get("is_day") is False:
+            return True
+        return False
+    if status.get("is_day") is False:
+        return True
+    if status.get("is_day") is True:
+        return False
+    return None
 
 
 def _sleep_window(status):
@@ -25,10 +45,11 @@ def _sleep_window(status):
         raise Replan("世界加载尚未就绪或角色未存活（not_ready），请等 ready=true 后再睡")
     if bare(status.get("dimension")) != "overworld":
         raise Replan("只有确认在主世界才能点床睡觉，请先返回主世界")
-    if status.get("is_day") is True:
+    can_sleep = _can_sleep_now(status)
+    if can_sleep is False:
         raise EnvBlocked("现在是白天，等到夜晚再尝试睡觉", missing_predicate="sleep_at_night",
                          searched_volume="当前主世界 /status 昼夜快照", wake_on="night")
-    if status.get("is_day") is not False:
+    if can_sleep is None:
         raise Replan("缺少当前主世界的昼夜信息，请刷新状态")
     if not _on_ground(status):
         raise Replan("睡前未确认安全站立，先离开液体或恢复安全站位")
@@ -120,15 +141,48 @@ def _shear_for_wool(ex, state, reserved_wool):
     return None
 
 
+def wake_from_bed(ex, state, pos):
+    """§4.4 / §8 1.3.4：睡着时再点床触发起床，woke=true 表示服务端已确认下床，2s 未下床报 cannot_sleep。"""
+    try:
+        evidence = yield from use_item_on(ex, state, pos)
+    except Replan as exc:
+        if failure(exc)[0] == "cannot_sleep":
+            raise Replan("点击床起床失败：2 秒内服务端未确认下床（cannot_sleep）") from exc
+        raise
+    after = evidence["after"]["status"]
+    if evidence["receipt"].get("woke") is not True or after.get("is_sleeping") is True:
+        raise Replan("点床起床后未确认 woke=true 且脱离 is_sleeping 状态")
+    return evidence
+
+
+def _click_bed(ex, state, pos):
+    try:
+        return (yield from use_item_on(ex, state, pos))
+    except Replan as exc:
+        if failure(exc)[0] == "cannot_sleep":
+            raise Replan("点床或下床未被服务端确认（cannot_sleep），请检查周围敌对或床位状态") from exc
+        raise
+
+
 def _sleep_confirmed(ex, evidence, since):
+    receipt = evidence["receipt"]
     after = evidence["after"]["status"]
     if bare(after.get("dimension")) != "overworld" or after.get("alive") is not True:
         raise Replan("点床后未确认角色仍活着且处于主世界")
+    if receipt.get("slept") is False:
+        if receipt.get("daytime") is True and _can_sleep_now(after) is False:
+            raise EnvBlocked(
+                "现在是白天（daytime=true），点床仅绑定重生点未入睡",
+                missing_predicate="sleep_at_night",
+                searched_volume="当前主世界 /status 昼夜快照",
+                wake_on="night",
+            )
+        raise Replan("点床返回 slept=false，服务端拒绝入睡，请检查昼夜时间或床边环境")
     if _has_progress(ex, _SLEEP_PROGRESS):
         return {"advancement_confirmed": True}
     if after.get("is_sleeping") is True:
         return {"observed_sleeping": True, "advancement_confirmed": False}
-    if since is not None and evidence["receipt"].get("slept") is True:
+    if since is not None and receipt.get("slept") is True:
         after_events = ex.client.events(since=since, limit=30).get("events") or ()
         if any(event.get("type") == "sleep" and event.get("seq", -1) > since for event in after_events):
             return {"observed_sleep_event": True, "advancement_confirmed": False}
@@ -212,5 +266,18 @@ class SleepInBed(Skill):
             return
         event_snapshot = ex.client.events(since=state.last_seq, limit=30)
         since = None if event_snapshot.get("has_more") else event_snapshot.get("last_seq", state.last_seq)
-        evidence = yield from use_item_on(ex, state, pos)
+        evidence = yield from _click_bed(ex, state, pos)
+        if evidence["receipt"].get("woke") is True:
+            after_wake = evidence["after"]["status"]
+            if after_wake.get("is_sleeping") is True:
+                raise Replan("点床返回 woke=true，但角色状态仍为睡眠中")
+            if _has_progress(ex, _SLEEP_PROGRESS):
+                yield rec("verify_sleep", {"advancement_confirmed": True, "woke": True})
+                return
+            _sleep_window(after_wake)
+            if not _bed_observed(ex, pos, bed):
+                raise Replan("下床后复读未确认两格床体、承重与上方净空")
+            event_snapshot = ex.client.events(since=state.last_seq, limit=30)
+            since = None if event_snapshot.get("has_more") else event_snapshot.get("last_seq", state.last_seq)
+            evidence = yield from _click_bed(ex, state, pos)
         yield rec("verify_sleep", _sleep_confirmed(ex, evidence, since))

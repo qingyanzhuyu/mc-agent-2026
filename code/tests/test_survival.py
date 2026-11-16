@@ -5,7 +5,7 @@ from mcagent.client import ApiError
 from mcagent.runtime import EnvBlocked, Replan
 from mcagent.skills import make
 from mcagent.skills.scripted_world import ScriptedWorld
-from mcagent.skills.survival_camp import SleepInBed
+from mcagent.skills.survival_camp import SleepInBed, wake_from_bed
 from mcagent.skills.survival_farm import BreedAnimal, PlantSeed
 from mcagent.skills.survival_fish import CatchFish
 from mcagent.skills.testing import drive
@@ -291,6 +291,50 @@ class SurvivalTests(unittest.TestCase):
         world.queue("interact", {"slept": True})
         with self.assertRaisesRegex(Replan, "未复核到睡眠"):
             self.run_skill(world, "sleep_in_bed")
+
+    def test_sleep_early_night_12542_woke_reentry_daytime_receipt_and_cannot_sleep(self):
+        early = SurvivalWorld(is_day=True, time_of_day=12600, extra={BED: "white_bed", (3, 64, 0): "white_bed"})
+        early.queue("advancements", progress(), progress(SLEEP))
+        early.queue("find_blocks", blocks((BED, "white_bed")))
+        early.queue("interact", sleep)
+        actions, steps = self.run_skill(early, "sleep_in_bed")
+        self.assertEqual(actions, ["interact"])
+        self.assertTrue(steps[-1]["result"]["advancement_confirmed"])
+
+        woke_world = self.bed_world()
+        woke_world.queue("advancements", progress(), progress(), progress(SLEEP))
+        woke_world.queue("interact", {"woke": True}, sleep)
+        actions2, steps2 = self.run_skill(woke_world, "sleep_in_bed")
+        self.assertEqual(actions2, ["interact", "interact"])
+        self.assertTrue(steps2[-1]["result"]["advancement_confirmed"])
+
+        daytime_race = self.bed_world()
+        daytime_race.queue("advancements", progress())
+
+        def turned_day(w, **_):
+            w.st.update(is_day=True, time_of_day=100)
+            return {"slept": False, "interacted": True, "daytime": True}
+
+        daytime_race.queue("interact", turned_day)
+        self.assert_blocked(daytime_race, "sleep_in_bed", "sleep_at_night", "当前主世界 /status 昼夜快照", "night")
+
+        cannot_world = self.bed_world()
+        cannot_world.queue("advancements", progress())
+        cannot_world.queue("interact", ApiError("cannot_sleep", "did not leave bed within 2s"))
+        with self.assertRaisesRegex(Replan, "cannot_sleep"):
+            self.run_skill(cannot_world, "sleep_in_bed")
+
+        wake_ok = SurvivalWorld(is_sleeping=True, extra={BED: "white_bed", (3, 64, 0): "white_bed"})
+
+        def leave_bed(w, **_):
+            w.st["is_sleeping"] = False
+            return {"woke": True}
+
+        wake_ok.queue("interact", leave_bed)
+        ex, state = wake_ok.session()
+        drive(wake_from_bed(ex, state, BED), ex)
+        self.assertFalse(state.st["is_sleeping"])
+        wake_ok.assert_exhausted()
 
     def test_abort_sleep_after_place_preserves_bed_and_does_not_interact(self):
         world = SurvivalWorld({"red_bed": 1})
