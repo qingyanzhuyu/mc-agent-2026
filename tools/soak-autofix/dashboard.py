@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import json
 import os
@@ -24,10 +25,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 HERE = Path(__file__).resolve().parent
 SOAK_CTL_PATH = HERE / "soak_ctl.py"
@@ -166,11 +169,33 @@ def _event_text(ev: dict[str, Any]) -> str:
     if kind == "skill_start":
         return f"开始技能 {ev.get('skill')} {json.dumps(ev.get('args') or {}, ensure_ascii=False)}（{ev.get('source', '')}）"
     if kind == "skill_end":
+        out = ev.get("outcome")
+        if out == "env_blocked":
+            env_info = ev.get("environment") or {}
+            msg = env_info.get("message") or ev.get("error_msg") or ""
+            wake = env_info.get("wake_on") or ""
+            return f"环境挂起 {ev.get('skill')}" + (f"：{msg[:140]}" if msg else "") + (f"（恢复：{wake}）" if wake else "")
+        if out == "budget_stopped":
+            return f"预算中止 {ev.get('skill')}"
         msg = ev.get("error_msg") or ev.get("postcondition_error") or ""
-        return f"技能结束 {ev.get('skill')} → {ev.get('outcome')}" + (f"：{msg[:160]}" if msg else "")
+        return f"技能结束 {ev.get('skill')} → {out}" + (f"：{msg[:160]}" if msg else "")
     if kind == "llm_call":
         state = "成功" if ev.get("ok") else "失败"
-        return f"LLM {state} {float(ev.get('ms') or 0) / 1000:.1f}s → {ev.get('skill') or '-'}"
+        tok = int(ev.get("total_tokens") or 0)
+        tok_s = f" [{tok}tok]" if tok > 0 else ""
+        return f"LLM {state} {float(ev.get('ms') or 0) / 1000:.1f}s → {ev.get('skill') or '-'}{tok_s}"
+    if kind == "objective_decision":
+        src = ev.get("source") or "rule"
+        trig = ev.get("trigger") or ""
+        adopted = "采纳" if ev.get("adopted") else "沿用"
+        return f"战略目标 {ev.get('goal_id') or '-'}（{src}/{trig}/{adopted}）"
+    if kind == "death_recovered":
+        cause = ev.get("cause") or "原因未知"
+        ms = ev.get("respawn_ms")
+        ms_s = f"，{float(ms):.0f}ms" if ms is not None else ""
+        return f"死亡重生 #{ev.get('deaths_total') or '?'}（{cause}{ms_s}）"
+    if kind == "goal_reached":
+        return f"达成目标 {ev.get('goal_id')}"
     if kind == "step":
         rec = ev.get("record") or {}
         err = rec.get("error_code") or ""
@@ -180,6 +205,20 @@ def _event_text(ev: dict[str, Any]) -> str:
     if kind == "run_start":
         return "本轮开始"
     return str(kind)
+
+
+def _event_kind(ev: dict[str, Any]) -> str:
+    ev_type = str(ev.get("event") or "")
+    if ev_type == "skill_end":
+        out = ev.get("outcome")
+        if out == "completed":
+            return "skill_end"
+        if out == "env_blocked":
+            return "env_blocked"
+        if out == "budget_stopped":
+            return "budget_stopped"
+        return "skill_fail"
+    return ev_type
 
 
 def summarize_live_episode(ep_dir: Path, now: Optional[float] = None) -> Optional[dict[str, Any]]:
@@ -202,6 +241,8 @@ def summarize_live_episode(ep_dir: Path, now: Optional[float] = None) -> Optiona
     steps = [e for e in events if e.get("event") == "step"]
     llm = [e for e in events if e.get("event") == "llm_call"]
     ends = [e for e in events if e.get("event") == "skill_end"]
+    skill_starts = [e for e in events if e.get("event") == "skill_start"]
+    obj_decisions = [e for e in events if e.get("event") == "objective_decision"]
     current_skill = None
     for e in events:
         if e.get("event") == "skill_start":
@@ -221,15 +262,43 @@ def summarize_live_episode(ep_dir: Path, now: Optional[float] = None) -> Optiona
         elapsed = max(0.0, now - float(t0))
     else:
         elapsed = float(events[-1].get("elapsed_s") or 0.0) if events else 0.0
+    prompt_tokens = int(llm[-1].get("cumulative_prompt_tokens") or 0) if llm else 0
+    completion_tokens = int(llm[-1].get("cumulative_completion_tokens") or 0) if llm else 0
     tokens = int(llm[-1].get("cumulative_total_tokens") or 0) if llm else 0
     if run_end is not None:
+        prompt_tokens = int(run_end.get("prompt_tokens") or prompt_tokens)
+        completion_tokens = int(run_end.get("completion_tokens") or completion_tokens)
         tokens = int(run_end.get("total_tokens") or tokens)
+    elif obj_decisions:
+        last_obj = obj_decisions[-1]
+        prompt_tokens = max(prompt_tokens, int(last_obj.get("cumulative_prompt_tokens") or 0))
+        completion_tokens = max(completion_tokens, int(last_obj.get("cumulative_completion_tokens") or 0))
+        tokens = max(tokens, int(last_obj.get("cumulative_total_tokens") or 0))
+
+    decision_sources: dict[str, int] = {}
+    if run_end is not None and isinstance(run_end.get("decision_sources"), dict):
+        decision_sources = {str(k): int(v or 0) for k, v in run_end["decision_sources"].items()}
+    else:
+        for e in skill_starts:
+            src = str(e.get("source") or "rule")
+            decision_sources[src] = decision_sources.get(src, 0) + 1
+
+    current_objective = None
+    for od in reversed(obj_decisions):
+        if od.get("adopted") or current_objective is None:
+            current_objective = od.get("goal_id")
+            if od.get("adopted"):
+                break
+
     return {
         "ep_id": ep_dir.name,
         "finished": run_end is not None,
         "stop_reason": (run_end or {}).get("stop_reason"),
+        "source": head.get("source") or (run_end or {}).get("source") or "",
         "bot_user": meta.get("bot_user"),
         "model": meta.get("llm_model") if meta.get("use_llm") else "规则",
+        "strategy": meta.get("strategy") or "",
+        "min_verified": meta.get("min_verified") or "",
         "base": meta.get("base") or "",
         "target_goal": meta.get("target_goal") or "",
         "commit": ((head.get("git") or {}).get("commit") or "")[:7],
@@ -237,24 +306,35 @@ def summarize_live_episode(ep_dir: Path, now: Optional[float] = None) -> Optiona
         "max_steps": meta.get("max_steps"),
         "elapsed_s": round(elapsed, 1),
         "steps": len(steps),
+        "pos": last_step.get("pos") or head.get("pos"),
         "current_skill": current_skill,
+        "current_objective": current_objective,
         "skills_completed": sum(1 for e in ends if e.get("outcome") == "completed"),
-        "skills_failed": sum(1 for e in ends if e.get("outcome") not in ("completed", None)),
+        "skills_env_blocked": sum(1 for e in ends if e.get("outcome") == "env_blocked"),
+        "skills_budget_stopped": sum(1 for e in ends if e.get("outcome") == "budget_stopped"),
+        "skills_failed": sum(
+            1 for e in ends if e.get("outcome") not in ("completed", "env_blocked", "budget_stopped", None)
+        ),
         "llm_calls": len(llm),
         "llm_fail": sum(1 for e in llm if not e.get("ok")),
         "llm_p50_ms": round(llm_ms[len(llm_ms) // 2]) if llm_ms else None,
         "llm_last_ms": round(float(llm[-1].get("ms") or 0)) if llm else None,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         "tokens": tokens,
+        "decision_sources": decision_sources,
         "hp": last_step.get("hp"),
         "food": last_step.get("food"),
         "deaths": last_curve.get("deaths", 0),
+        "server_advancements": last_curve.get("server_advancements", 0),
         "goals_reached": last_curve.get("goals_reached") or list(((run_end or {}).get("goals_reached") or {}).keys()),
+        "environment_blocked_goals": dict(((run_end or {}).get("environment_blocked_goals") or {})),
         "server_score": last_curve.get("server_score_v2", 0),
         "inferred_score": last_curve.get("inferred_score_v2", 0),
         "recent": [
             {
                 "t": e.get("elapsed_s"),
-                "kind": "skill_fail" if e.get("event") == "skill_end" and e.get("outcome") != "completed" else e.get("event"),
+                "kind": _event_kind(e),
                 "text": _event_text(e),
             }
             for e in events[-18:]
@@ -269,7 +349,11 @@ _GOAL_FIELD_RES = {
     "score": re.compile(r"\bscore=(\d+)"),
     "skill": re.compile(r'\bskill="([^"]+)"'),
     "stage": re.compile(r'\bstage="([^"]+)"'),
+    "budget_s": re.compile(r"\bbudget_s=(\d+(?:\.\d+)?)"),
 }
+_PREREQ_RE = re.compile(r"\bprereq_goals=\(([^)]*)\)", re.S)
+_STOP_LOSS_RE = re.compile(r"\bstop_loss=True\b")
+_STR_LIT_RE = re.compile(r'"([^"]+)"')
 
 
 def parse_ledger(text: str) -> list[dict[str, Any]]:
@@ -281,11 +365,120 @@ def parse_ledger(text: str) -> list[dict[str, Any]]:
         for key, rx in _GOAL_FIELD_RES.items():
             m = rx.search(chunk)
             if m:
-                row[key] = int(m.group(1)) if key == "score" else m.group(1)
+                if key == "score":
+                    row[key] = int(m.group(1))
+                elif key == "budget_s":
+                    row[key] = float(m.group(1))
+                else:
+                    row[key] = m.group(1)
+        pm = _PREREQ_RE.search(chunk)
+        row["prereq_goals"] = _STR_LIT_RE.findall(pm.group(1)) if pm else []
+        row["stop_loss"] = bool(_STOP_LOSS_RE.search(chunk))
         if row.get("id"):
             row.setdefault("stage", "draft")
             goals.append(row)
     return goals
+
+
+def _is_register_decorator(dec: ast.expr) -> bool:
+    return (
+        (isinstance(dec, ast.Name) and dec.id == "register")
+        or (isinstance(dec, ast.Attribute) and dec.attr == "register")
+    )
+
+
+def _extract_class_str_attr(node: ast.ClassDef, attr: str) -> Optional[str]:
+    for stmt in node.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            t = stmt.targets[0]
+            if isinstance(t, ast.Name) and t.id == attr and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                return stmt.value.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == attr:
+            if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                return stmt.value.value
+    return None
+
+
+def parse_skills_from_sources(file_contents: dict[str, str]) -> dict[str, Any]:
+    """用 AST 静态抽取各模块中 @register 技能的 name 与 verified 等级（不执行模块代码）。"""
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for rel_path, src in sorted(file_contents.items()):
+        if not src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if not any(_is_register_decorator(d) for d in node.decorator_list):
+                continue
+            name = _extract_class_str_attr(node, "name")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            verified = _extract_class_str_attr(node, "verified") or "offline"
+            items.append({
+                "name": name,
+                "verified": verified,
+                "file": rel_path,
+            })
+    items.sort(key=lambda x: x["name"])
+    live_n = sum(1 for x in items if x["verified"] == "live")
+    return {
+        "total": len(items),
+        "live": live_n,
+        "offline": len(items) - live_n,
+        "items": items,
+    }
+
+
+def _read_env_snapshot(repo_root: Path) -> dict[str, str]:
+    """读取 code/mcagent/.env 与进程环境，供展示非密钥配置与自检（严禁向前端透出密钥值）。"""
+    vals: dict[str, str] = {}
+    env_path = repo_root / "code" / "mcagent" / ".env"
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for k in (
+        "MC_API_BASE", "MC_LOCAL_API_BASE", "MC_OFFICIAL_API_BASE",
+        "MC_USER", "MC_PASS", "MC_OXYGEN_WARN",
+        "LLM_PROFILE", "LLM_BASE", "LLM_KEY", "LLM_MODEL", "LLM_MAX_CONCURRENCY", "LLM_TOKEN_BUDGET",
+        "LLM_CUSTOM_BASE", "LLM_CUSTOM_KEY", "LLM_CUSTOM_MODEL",
+        "MCAGENT_TRAIN_ON_OFFICIAL",
+    ):
+        if os.environ.get(k):
+            vals[k] = os.environ[k]
+    return vals
+
+
+def _probe_local_bridge(local_base: str) -> dict[str, Any]:
+    """非阻塞检查本地联调网关 /healthz，仅用于控制台自检按钮。"""
+    parts = urlsplit(local_base)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return {"reachable": False, "url": local_base, "error": "本地网关地址无效"}
+    health_url = f"{parts.scheme}://{parts.netloc}/healthz"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(health_url, timeout=0.6) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return {
+            "reachable": True,
+            "url": health_url,
+            "mc_target": data.get("mc_target"),
+            "mc_version": data.get("mc_version"),
+            "active_bots": data.get("active_bots") or [],
+        }
+    except Exception as exc:
+        return {"reachable": False, "url": health_url, "error": str(exc)}
 
 
 def _fixer_group(key: str) -> str:
@@ -306,10 +499,12 @@ class Console:
     def __init__(self, repo_root: Path, session_dir: Path):
         self.repo_root = repo_root
         self.session_dir = session_dir
+        self._initial_session_dir = session_dir.resolve()
         self._lock = threading.Lock()
         self._child: Optional[subprocess.Popen] = None
         self._job: dict[str, Any] = {}
         self._ledger_cache: tuple[str, list[dict[str, Any]]] = ("", [])
+        self._skills_cache: tuple[str, dict[str, Any]] = ("", {"total": 0, "live": 0, "offline": 0, "items": []})
         self._budget_feature_ct: Optional[float] = self._git_feature_time("EPISODE_SECONDS_BOUNDS")
         self._fixer_hot_ct: Optional[float] = self._git_feature_time("def resolve_fixer_template")
 
@@ -323,6 +518,18 @@ class Console:
         out = self._git("log", "-1", "--format=%ct", "-S", marker, "--", "tools/soak-autofix/soak_ctl.py")
         return float(out) if out.isdigit() else None
 
+    def _list_branches(self) -> list[str]:
+        out = self._git("for-each-ref", "--format=%(refname:short)", "refs/heads")
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    def _main_ahead_count(self, branch: str) -> Optional[int]:
+        if not branch or branch == "main":
+            return 0 if branch == "main" else None
+        if not self._git("rev-parse", "--verify", "refs/heads/main") or not self._git("rev-parse", "--verify", branch):
+            return None
+        out = self._git("rev-list", "--count", f"{branch}..main")
+        return int(out) if out.isdigit() else None
+
     def ledger(self, branch: str) -> list[dict[str, Any]]:
         tip = self._git("rev-parse", branch) if branch else ""
         key = tip or "worktree"
@@ -335,6 +542,81 @@ class Console:
         goals = parse_ledger(text)
         self._ledger_cache = (key, goals)
         return goals
+
+    def skills_summary(self, branch: str) -> dict[str, Any]:
+        tip = self._git("rev-parse", branch) if branch else ""
+        key = tip or "worktree"
+        if self._skills_cache[0] == key:
+            return self._skills_cache[1]
+        sources: dict[str, str] = {}
+        rel_paths: list[str] = ["code/mcagent/loop/starter_skills.py"]
+        if tip:
+            tree = self._git("ls-tree", "-r", "--name-only", tip, "code/mcagent/skills")
+            for ln in tree.splitlines():
+                ln = ln.strip()
+                if ln.endswith(".py"):
+                    rel_paths.append(ln)
+            for rel in rel_paths:
+                txt = self._git("show", f"{tip}:{rel}")
+                if txt:
+                    sources[rel] = txt
+        else:
+            skills_dir = self.repo_root / "code" / "mcagent" / "skills"
+            if skills_dir.is_dir():
+                for p in sorted(skills_dir.rglob("*.py")):
+                    rel_paths.append(str(p.relative_to(self.repo_root)))
+            for rel in rel_paths:
+                p = self.repo_root / rel
+                if p.is_file():
+                    try:
+                        sources[rel] = p.read_text(encoding="utf-8")
+                    except OSError:
+                        pass
+        summary = parse_skills_from_sources(sources)
+        self._skills_cache = (key, summary)
+        return summary
+
+    def _discover_sessions(self) -> list[dict[str, Any]]:
+        logs_root = self.repo_root / "code" / "mcagent" / "logs"
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        if logs_root.is_dir():
+            for child in sorted(logs_root.iterdir()):
+                if child.is_dir() and (child / "state.json").is_file():
+                    rp = child.resolve()
+                    candidates.append(rp)
+                    seen.add(rp)
+        cur = self.session_dir.resolve()
+        if cur not in seen:
+            candidates.insert(0, cur)
+        out: list[dict[str, Any]] = []
+        for d in candidates:
+            st = read_state_nolock(d)
+            out.append({
+                "id": d.name,
+                "path": str(d),
+                "target_branch": st.get("target_branch") or "",
+                "episodes": len(st.get("episodes") or []),
+                "active": d == cur,
+            })
+        return out
+
+    def switch_session(self, target_path: str) -> dict[str, Any]:
+        raw = (target_path or "").strip()
+        if not raw:
+            raise ValueError("会话路径不能为空")
+        cand = Path(raw).resolve()
+        logs_root = (self.repo_root / "code" / "mcagent" / "logs").resolve()
+        allowed = cand == self._initial_session_dir or (
+            logs_root.is_dir() and cand.parent == logs_root and cand.is_dir()
+        )
+        if not allowed:
+            raise ValueError("只能切换到 code/mcagent/logs 下的已知会话目录或初始会话")
+        with self._lock:
+            if self._job.get("status") == "running":
+                raise ValueError("后台任务进行中，暂不能切换会话")
+            self.session_dir = cand
+        return self.snapshot()
 
     # ---- 读 ----
     def _reap_child(self) -> None:
@@ -358,6 +640,8 @@ class Console:
             "rotate_user": False,
             "server": "official",
             "official_llm": "custom",
+            "official_api_base": "",
+            "min_verified": "",
             "account_reserved": False,
         }
         p = self.session_dir / LAST_START_NAME
@@ -403,17 +687,60 @@ class Console:
                 live["running"] = bool("runner-loop" in roles and not live["finished"])
 
         branch = st.get("target_branch") or self.last_start_params()["branch"]
-        telemetry = {}
-        tpath = self.session_dir / "goal_telemetry.local-target.json"
+        telemetry_by_source: dict[str, dict[str, Any]] = {}
+        telemetry_rows: list[dict[str, Any]] = []
+        for tf in sorted(self.session_dir.glob("goal_telemetry.*.json")):
+            try:
+                tdata = json.loads(tf.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            src = str(tdata.get("source") or tf.stem.removeprefix("goal_telemetry."))
+            goals_obj = tdata.get("goals") or {}
+            if isinstance(goals_obj, dict):
+                telemetry_by_source[src] = goals_obj
+                for gid, gstat in goals_obj.items():
+                    if isinstance(gstat, dict):
+                        telemetry_rows.append({"goal_id": str(gid), "source": src, **gstat})
+        preferred_src = "official" if st.get("server_target") == "official" else "local-target"
+        telemetry = (
+            telemetry_by_source.get(preferred_src)
+            or telemetry_by_source.get("local-target")
+            or (next(iter(telemetry_by_source.values())) if telemetry_by_source else {})
+        )
+
+        env_cfg = _read_env_snapshot(self.repo_root)
+        local_base = soak_ctl.local_mc_base(self.repo_root)
+        official_base = ""
+        official_base_error = ""
         try:
-            telemetry = json.loads(tpath.read_text(encoding="utf-8")).get("goals", {})
-        except (OSError, json.JSONDecodeError):
-            pass
+            official_base = soak_ctl.official_mc_base(self.repo_root)
+        except ValueError as exc:
+            official_base_error = str(exc)
+
+        def _inc_summary(r: dict[str, Any]) -> dict[str, Any]:
+            gh = r.get("gate_history") or []
+            last_g = gh[-1] if gh else {}
+            row = {k: r.get(k) for k in (
+                "incident_id", "fingerprint", "code", "severity", "category", "skill", "goal_id",
+                "status", "attempts", "last_seen_ep", "fix_commit", "last_fixer_preset", "revert_reason",
+            )}
+            row["editable_files"] = list(r.get("editable_files") or [])
+            row["gate_count"] = len(gh)
+            row["last_gate_ok"] = last_g.get("ok") if gh else None
+            row["last_failed_gate"] = last_g.get("failed_gate") if gh else None
+            return row
+
+        tot_in = sum(int(e.get("prompt_tokens", 0) or 0) for e in episodes)
+        tot_out = sum(int(e.get("completion_tokens", 0) or 0) for e in episodes)
+        tot_elapsed = sum(float(e.get("elapsed_s", 0.0) or 0.0) for e in episodes)
 
         return {
             "now": time.time(),
             "session_dir": str(self.session_dir),
             "session_exists": bool(st),
+            "sessions": self._discover_sessions(),
+            "branches": self._list_branches(),
+            "main_ahead_commits": self._main_ahead_count(branch),
             "daemon": daemon,
             "processes": procs,
             "managed_pid": managed_pid,
@@ -431,31 +758,32 @@ class Console:
                 "server_target": st.get("server_target", "local"),
                 "server_base": st.get("server_base", ""),
                 "official_llm": st.get("official_llm", "custom"),
+                "min_verified": st.get("min_verified", ""),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
                 "episode_seconds": st.get("episode_seconds"),
                 "episode_steps": st.get("episode_steps"),
                 "commits": len(st.get("commits") or []),
+                "total_prompt_tokens": tot_in,
+                "total_completion_tokens": tot_out,
+                "total_elapsed_s": round(tot_elapsed, 1),
             },
             "live": live,
             "episodes": [
                 {k: e.get(k) for k in (
-                    "ep_id", "at", "commit", "bot_user", "elapsed_s", "stop_reason", "skills_completed",
+                    "ep_id", "at", "commit", "bot_user", "source", "elapsed_s", "stop_reason",
+                    "skills_completed", "skills_env_blocked", "skills_budget_stopped",
                     "bugs_count", "p0_bugs", "server_score", "inferred_score", "deaths", "target_goal",
                     "target_goal_reached", "target_goal_elapsed_s", "goals_reached", "prompt_tokens",
-                    "target_goals_reached",
-                    "completion_tokens", "rolled_back",
+                    "target_goals_reached", "environment_blocked_goals", "decision_sources",
+                    "completion_tokens", "rolled_back", "revert_reason",
                 )}
                 for e in reversed(episodes[-60:])
             ],
-            "incidents": [
-                {k: r.get(k) for k in (
-                    "incident_id", "fingerprint", "code", "severity", "category", "skill", "goal_id",
-                    "status", "attempts", "last_seen_ep", "fix_commit", "last_fixer_preset",
-                )}
-                for r in (st.get("incidents") or {}).values()
-            ],
+            "incidents": [_inc_summary(r) for r in (st.get("incidents") or {}).values()],
             "telemetry": telemetry,
+            "telemetry_rows": telemetry_rows,
             "ledger": self.ledger(branch),
+            "skills_summary": self.skills_summary(branch),
             "start_defaults": self.last_start_params(),
             "fixer_presets": list(soak_ctl.FIXER_PRESETS),
             "fixer_catalog": [
@@ -465,7 +793,41 @@ class Console:
             "player_models": [{"name": k, "note": v} for k, v in soak_ctl.PLAYER_MODEL_CHOICES.items()],
             "servers": [{"key": k, "label": v} for k, v in soak_ctl.SERVER_TARGETS.items()],
             "official_llm_sources": [{"key": k, "label": v} for k, v in soak_ctl.OFFICIAL_LLM_SOURCES.items()],
+            "official_endpoints": [
+                {
+                    "key": "",
+                    "label": f"沿用 .env（当前：{(urlsplit(official_base).hostname if official_base else '未配置/无效')}）",
+                },
+                {"key": soak_ctl.CAMPUS_MC_BASE, "label": "校园网直连 apiin.nmo.net.cn（校内 ≈5ms）"},
+                {"key": soak_ctl.OFFICIAL_MC_BASE, "label": "公网隧道 mc-api.windywindie.top（任意网络 ≈1305ms）"},
+            ],
+            "official_base": official_base,
+            "official_base_error": official_base_error,
+            "local_base": local_base,
+            "min_verified_choices": [
+                {"key": k, "label": v} for k, v in soak_ctl.MIN_VERIFIED_CHOICES.items()
+            ],
             "focus_modes": [{"key": k, "label": v} for k, v in soak_ctl.FOCUS_MODES.items()],
+            "quota": {
+                "input_tokens": soak_ctl.QUOTA_INPUT_TOKENS,
+                "output_tokens": soak_ctl.QUOTA_OUTPUT_TOKENS,
+                "match_duration_s": soak_ctl.MATCH_DURATION_S,
+            },
+            "env_summary": {
+                "mc_api_host": urlsplit(env_cfg.get("MC_API_BASE") or "").hostname or "",
+                "local_base": local_base,
+                "official_base": official_base,
+                "official_base_error": official_base_error,
+                "llm_profile": (env_cfg.get("LLM_PROFILE") or "official").strip().lower(),
+                "llm_model": env_cfg.get("LLM_MODEL") or "default",
+                "llm_max_concurrency": env_cfg.get("LLM_MAX_CONCURRENCY") or "",
+                "llm_token_budget": env_cfg.get("LLM_TOKEN_BUDGET") or "0",
+                "mc_oxygen_warn": env_cfg.get("MC_OXYGEN_WARN") or "",
+                "train_on_official_flag": env_cfg.get("MCAGENT_TRAIN_ON_OFFICIAL", "").strip() not in ("", "0"),
+                "has_mc_account": bool(env_cfg.get("MC_USER") and env_cfg.get("MC_PASS")),
+                "has_llm_key": bool(env_cfg.get("LLM_KEY")),
+                "has_custom_llm": bool(env_cfg.get("LLM_CUSTOM_BASE") and env_cfg.get("LLM_CUSTOM_KEY")),
+            },
             # 比赛服前置检查（占位确认另算），页面据此提前提示；只给「缺什么」，不含任何值
             "official_checks": {
                 "custom": soak_ctl.check_server_target(self.repo_root, "official", use_llm=True,
@@ -495,6 +857,84 @@ class Console:
             "incidents": sorted(p.name for p in inc_dir.glob("*.json")) if inc_dir.is_dir() else [],
             "live": summarize_live_episode(ep_dir),
         }
+
+    def incident_detail(self, fp: str) -> dict[str, Any]:
+        fp = (fp or "").strip()
+        if not fp:
+            raise ValueError("缺少异常指纹")
+        st = read_state_nolock(self.session_dir)
+        rec = (st.get("incidents") or {}).get(fp)
+        if not isinstance(rec, dict):
+            raise ValueError(f"未找到异常单 {fp}")
+        sess_root = self.session_dir.resolve()
+        inc_json: dict[str, Any] = {}
+        inc_path_raw = rec.get("incident_path")
+        if inc_path_raw:
+            try:
+                p = Path(str(inc_path_raw)).resolve()
+                if sess_root in p.parents and p.is_file():
+                    inc_json = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        prompt_preview = ""
+        prompt_raw = rec.get("prompt_file")
+        if prompt_raw:
+            try:
+                pp = Path(str(prompt_raw)).resolve()
+                if sess_root in pp.parents and pp.is_file():
+                    prompt_preview = pp.read_text(encoding="utf-8", errors="replace")[:8000]
+            except OSError:
+                pass
+        return {
+            "record": {
+                k: rec.get(k) for k in (
+                    "incident_id", "fingerprint", "code", "severity", "category", "skill", "goal_id",
+                    "editable_files", "status", "attempts", "first_seen_ep", "last_seen_ep",
+                    "fix_commit", "last_failed_fix_commit", "last_fixer_preset", "revert_reason",
+                    "goal_achieved_ep", "gate_history",
+                )
+            },
+            "title": inc_json.get("title") or "",
+            "detail": inc_json.get("detail") or inc_json.get("last_detail") or {},
+            "skill_context": {
+                k: (inc_json.get("skill_context") or {}).get(k)
+                for k in ("skill", "args", "outcome")
+            } if inc_json.get("skill_context") else {},
+            "http_tape_count": len(inc_json.get("http_tape") or []),
+            "prompt_preview": prompt_preview,
+        }
+
+    def probe_env(self) -> dict[str, Any]:
+        local_base = soak_ctl.local_mc_base(self.repo_root)
+        bridge = _probe_local_bridge(local_base)
+        env = _read_env_snapshot(self.repo_root)
+        base = env.get("MC_API_BASE", "")
+        host = (urlsplit(base).hostname or "").lower() if base else ""
+        profile = (env.get("LLM_PROFILE") or "official").strip().lower()
+        try:
+            conc = int(env.get("LLM_MAX_CONCURRENCY") or "")
+        except ValueError:
+            conc = -1
+        checks = [
+            {"name": "MC_API_BASE 非本机", "ok": bool(base) and host not in ("127.0.0.1", "localhost", "0.0.0.0"),
+             "detail": host or "(空)"},
+            {"name": "MC_API_BASE 为官方入口", "ok": host in soak_ctl.OFFICIAL_MC_HOSTS,
+             "detail": host or "(空)"},
+            {"name": "正式账号已填", "ok": bool(env.get("MC_USER") and env.get("MC_PASS")),
+             "detail": "已设置" if (env.get("MC_USER") and env.get("MC_PASS")) else "未设置"},
+            {"name": "AIA 官方 LLM_KEY 已填", "ok": bool(env.get("LLM_KEY")) and not env.get("LLM_KEY", "").startswith("sk-mRbe"),
+             "detail": "已设置" if env.get("LLM_KEY") else "未设置"},
+            {"name": "LLM_PROFILE == official", "ok": profile == "official", "detail": profile},
+            {"name": "LLM_MODEL == default", "ok": (env.get("LLM_MODEL") or "default") == "default",
+             "detail": env.get("LLM_MODEL") or "default"},
+            {"name": "LLM_MAX_CONCURRENCY <= 2", "ok": 0 < conc <= 2,
+             "detail": env.get("LLM_MAX_CONCURRENCY") or "(未设)"},
+            {"name": "未开 MCAGENT_TRAIN_ON_OFFICIAL", "ok": env.get("MCAGENT_TRAIN_ON_OFFICIAL", "").strip() in ("", "0"),
+             "detail": env.get("MCAGENT_TRAIN_ON_OFFICIAL") or "(未设)"},
+            {"name": "本地联调网关已停", "ok": not bridge["reachable"],
+             "detail": "监听中" if bridge["reachable"] else "未运行"},
+        ]
+        return {"bridge": bridge, "preflight_checks": checks}
 
     def log_tail(self, lines: int = 200) -> str:
         p = self.session_dir / RUN_LOG_NAME
@@ -543,10 +983,21 @@ class Console:
             if not 1 <= n <= 20:
                 raise ValueError("最大尝试轮数需在 1–20")
             changes["max_goal_attempts"] = n
+        clear_min_ver = False
+        if "min_verified" in payload and payload["min_verified"] is not None:
+            mv = str(payload["min_verified"]).strip()
+            if mv not in soak_ctl.MIN_VERIFIED_CHOICES:
+                raise ValueError(f"未知验证门槛 {mv!r}")
+            if mv:
+                changes["min_verified"] = mv
+            else:
+                clear_min_ver = True
         with soak_ctl.locked_state(self.session_dir) as st:
             if clear:
                 st.pop("episode_seconds", None)
                 st.pop("episode_steps", None)
+            if clear_min_ver:
+                st.pop("min_verified", None)
             if sec is not None:
                 st["episode_seconds"] = sec
             if steps is not None:
@@ -559,6 +1010,7 @@ class Console:
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
                 "focus_mode": st.get("focus_mode", "together"),
+                "min_verified": st.get("min_verified", ""),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
             }
         try:
@@ -605,11 +1057,23 @@ class Console:
         p["rotate_user"] = bool(p["rotate_user"])
         p["server"] = str(p["server"] or "official")
         p["official_llm"] = str(p["official_llm"] or "custom")
+        p["official_api_base"] = str(p.get("official_api_base") or "").strip()
+        if p["official_api_base"]:
+            parts = urlsplit(p["official_api_base"])
+            if parts.scheme != "https" or parts.hostname not in soak_ctl.OFFICIAL_MC_HOSTS:
+                raise ValueError(
+                    f"official_api_base={p['official_api_base']!r} 不是官方入口"
+                )
+        p["min_verified"] = str(p.get("min_verified") or "").strip()
+        if p["min_verified"] not in soak_ctl.MIN_VERIFIED_CHOICES:
+            raise ValueError(f"未知验证门槛 {p['min_verified']!r}")
         p["account_reserved"] = bool(p["account_reserved"])
         errs = soak_ctl.check_server_target(
             self.repo_root, p["server"], use_llm=p["llm"], account_reserved=p["account_reserved"],
             official_llm=p["official_llm"],
         )
+        if p["official_api_base"]:
+            errs = [e for e in errs if not e.startswith("MC_OFFICIAL_API_BASE=")]
         if errs:
             raise ValueError("；".join(errs))
         return p
@@ -636,6 +1100,8 @@ class Console:
         if p["goal"]:
             cmd.extend(["--goal", p["goal"]])
         cmd.extend(["--focus-mode", p["focus_mode"]])
+        if p.get("min_verified") in ("offline", "live"):
+            cmd.extend(["--min-verified", p["min_verified"]])
         if p["skip_live_canary"]:
             cmd.append("--skip-live-canary")
         return cmd
@@ -658,6 +1124,8 @@ class Console:
         log.write(f"\n===== [dashboard] {time.strftime('%Y-%m-%d %H:%M:%S')} 启动: {' '.join(cmd)}\n".encode("utf-8"))
         log.flush()
         env = dict(os.environ, PYTHONUNBUFFERED="1")
+        if p.get("official_api_base"):
+            env["MC_OFFICIAL_API_BASE"] = p["official_api_base"]
         self._child = subprocess.Popen(
             cmd, cwd=str(self.repo_root), stdout=log, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, env=env, start_new_session=True,
@@ -778,6 +1246,16 @@ def make_handler(console: Console, port: int):
                     return self._json(200, console.snapshot())
                 if url.path == "/api/episode":
                     return self._json(200, console.episode_detail((qs.get("id") or [""])[0]))
+                if url.path == "/api/incident":
+                    return self._json(200, console.incident_detail((qs.get("fp") or [""])[0]))
+                if url.path == "/api/ledger":
+                    br = (qs.get("branch") or [""])[0].strip()
+                    if br and not re.match(r"^[A-Za-z0-9._/\-]+$", br):
+                        raise ValueError("非法分支名")
+                    return self._json(200, {"branch": br, "ledger": console.ledger(br),
+                                            "skills_summary": console.skills_summary(br)})
+                if url.path == "/api/probe_env":
+                    return self._json(200, console.probe_env())
                 if url.path == "/api/log":
                     n = int((qs.get("lines") or ["200"])[0])
                     return self._json(200, {"log": console.log_tail(n)})
@@ -801,6 +1279,8 @@ def make_handler(console: Console, port: int):
                 path = urlparse(self.path).path
                 if path == "/api/settings":
                     return self._json(200, {"ok": True, "result": console.apply_settings(payload)})
+                if path == "/api/session":
+                    return self._json(200, {"ok": True, "snapshot": console.switch_session(str(payload.get("path") or ""))})
                 if path == "/api/start":
                     return self._json(200, {"ok": True, "result": console.start(payload)})
                 if path == "/api/stop":

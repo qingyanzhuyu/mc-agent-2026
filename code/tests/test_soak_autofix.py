@@ -1380,5 +1380,58 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertTrue((self.session / "STOP").exists())
         soak_ctl.teardown_session(self.session)
 
+    def test_env_blocked_summary_isolated_official_telemetry_and_min_verified(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/env-iso", target_goal="smelt_iron")
+        ep1 = self.session / "episodes" / "ep-0001"
+        (ep1 / "incidents").mkdir(parents=True)
+        (ep1 / "timeline.jsonl").write_text(
+            json.dumps({"event": "run_start", "source": "official", "target_goal": "smelt_iron"}) + "\n"
+            + json.dumps({"event": "skill_end", "skill": "smelt_iron", "outcome": "env_blocked"}) + "\n"
+            + json.dumps({
+                "event": "run_end",
+                "elapsed_s": 40.0,
+                "stop_reason": "max_seconds_reached",
+                "source": "official",
+                "target_goal": "smelt_iron",
+                "environment_blocked_goals": {"smelt_iron": {"message": "无铁矿", "wake_on": "chunk_moved"}},
+                "decision_sources": {"rule": 1},
+            }) + "\n",
+            encoding="utf-8",
+        )
+        ep1_meta = soak_ctl.ingest_episode_and_check_rollback(self.session, "ep-0001", ep1, "a" * 40, "official-account")
+        self.assertEqual(ep1_meta["skills_env_blocked"], 1)
+        self.assertIn("smelt_iron", ep1_meta["environment_blocked_goals"])
+        report = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("⏸ `smelt_iron` (环境挂起)", report)
+
+        # local-target 遥测存在时，official 跑法绝不能加载 local-target 文件
+        (self.session / "goal_telemetry.local-target.json").write_text(json.dumps({"goals": {}}), encoding="utf-8")
+        seen_cmds: list[list[str]] = []
+        real_run = subprocess.run
+
+        def mock_runner(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                seen_cmds.append(list(cmd))
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_end", "elapsed_s": 5.0, "source": "official"}) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_runner):
+            soak_ctl.run_runner_loop(
+                self.session, episodes=1, use_llm=False, server="official", min_verified="offline"
+            )
+        cmd = seen_cmds[0]
+        self.assertEqual(cmd[cmd.index("--min-verified") + 1], "offline")
+        self.assertEqual(
+            cmd[cmd.index("--goal-telemetry") + 1],
+            str(self.session / "goal_telemetry.official.json"),
+        )
+        soak_ctl.teardown_session(self.session)
+
 if __name__ == "__main__":
     unittest.main()

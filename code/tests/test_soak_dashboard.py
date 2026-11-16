@@ -369,6 +369,146 @@ class DashboardTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_live_episode_env_blocked_budget_stopped_death_and_objective(self):
+        ep = self.session / "episodes" / "ep-0002"
+        rows = [
+            {"event": "run_start", "t": 2000.0, "source": "official", "git": {"commit": "1234567"},
+             "meta": {"use_llm": True, "llm_model": "default", "strategy": "llm", "min_verified": "offline",
+                      "max_steps": 50, "max_seconds": 300.0, "bot_user": "team_bot", "target_goal": "smelt_iron"}},
+            {"event": "objective_decision", "elapsed_s": 1.0, "trigger": "init", "source": "llm",
+             "goal_id": "smelt_iron", "adopted": True, "cumulative_prompt_tokens": 300,
+             "cumulative_completion_tokens": 40, "cumulative_total_tokens": 340},
+            {"event": "skill_start", "elapsed_s": 1.2, "skill": "smelt_iron", "args": {"count": 1}, "source": "rule"},
+            {"event": "skill_end", "elapsed_s": 4.0, "skill": "smelt_iron", "outcome": "env_blocked",
+             "environment": {"reason": "no_ore", "message": "半径 32 内无暴露铁矿", "wake_on": "chunk_moved"}},
+            {"event": "death_recovered", "elapsed_s": 8.0, "deaths_total": 1, "cause": "fell", "respawn_ms": 500},
+            {"event": "skill_start", "elapsed_s": 9.0, "skill": "scout_island", "args": {}, "source": "rule"},
+            {"event": "skill_end", "elapsed_s": 10.0, "skill": "scout_island", "outcome": "budget_stopped"},
+            {"event": "run_end", "elapsed_s": 10.0, "stop_reason": "max_seconds_reached", "source": "official",
+             "environment_blocked_goals": {"smelt_iron": {"message": "缺铁矿", "wake_on": "chunk_moved"}},
+             "decision_sources": {"rule": 2}, "prompt_tokens": 300, "completion_tokens": 40, "total_tokens": 340},
+        ]
+        _write_jsonl(ep / "timeline.jsonl", rows)
+        live = dash.summarize_live_episode(ep, now=2020.0)
+        self.assertEqual((live["source"], live["strategy"], live["min_verified"]), ("official", "llm", "offline"))
+        self.assertEqual(live["current_objective"], "smelt_iron")
+        self.assertEqual((live["skills_completed"], live["skills_env_blocked"], live["skills_budget_stopped"], live["skills_failed"]),
+                         (0, 1, 1, 0))
+        self.assertEqual((live["prompt_tokens"], live["completion_tokens"], live["tokens"]), (300, 40, 340))
+        self.assertIn("smelt_iron", live["environment_blocked_goals"])
+        texts = "\n".join(x["text"] for x in live["recent"])
+        self.assertIn("环境挂起", texts)
+        self.assertIn("chunk_moved", texts)
+        self.assertIn("死亡重生 #1", texts)
+        self.assertIn("战略目标 smelt_iron", texts)
+        kinds = [x["kind"] for x in live["recent"]]
+        self.assertIn("env_blocked", kinds)
+        self.assertIn("budget_stopped", kinds)
+        self.assertNotIn("skill_fail", kinds)
+
+    def test_multi_source_telemetry_and_skills_ast_scan(self):
+        (self.session / "goal_telemetry.local-target.json").write_text(json.dumps({
+            "source": "local-target",
+            "goals": {"prep_wood": {"episodes": 4, "hits": 3, "hit_rate": 0.75, "p50_elapsed_s": 25.0,
+                                    "p50_tokens": 1000, "total_deaths": 0}},
+        }), encoding="utf-8")
+        (self.session / "goal_telemetry.official.json").write_text(json.dumps({
+            "source": "official",
+            "goals": {"prep_wood": {"episodes": 2, "hits": 2, "hit_rate": 1.0, "p50_elapsed_s": 40.0,
+                                    "p50_tokens": 1500, "total_deaths": 1}},
+        }), encoding="utf-8")
+        self._init_state(server_target="official")
+        snap = self.console.snapshot()
+        rows = {(r["source"], r["goal_id"]): r for r in snap["telemetry_rows"]}
+        self.assertIn(("local-target", "prep_wood"), rows)
+        self.assertIn(("official", "prep_wood"), rows)
+        self.assertEqual(rows[("official", "prep_wood")]["p50_elapsed_s"], 40.0)
+        self.assertEqual(snap["telemetry"]["prep_wood"]["p50_elapsed_s"], 40.0)
+
+        sk = dash.parse_skills_from_sources({
+            "code/mcagent/loop/starter_skills.py": (
+                "@register\nclass A(Skill):\n    name = 'a'\n\n"
+                "@register\nclass B(Skill):\n    name = 'b'\n    verified = 'live'\n"
+            ),
+        })
+        self.assertEqual((sk["total"], sk["live"], sk["offline"]), (2, 1, 1))
+        real_sk = dash.parse_skills_from_sources({
+            "code/mcagent/loop/starter_skills.py": (
+                REPO_ROOT / "code" / "mcagent" / "loop" / "starter_skills.py"
+            ).read_text(encoding="utf-8"),
+        })
+        self.assertGreaterEqual(real_sk["total"], 5)
+
+    def test_official_endpoint_min_verified_incident_detail_and_session_guard(self):
+        self._init_state()
+        with patch.object(self.console, "ledger", return_value=[]):
+            with self.assertRaises(ValueError):
+                self.console._validate_start({"official_api_base": "https://evil.example/api/v1"})
+            with self.assertRaises(ValueError):
+                self.console._validate_start({"min_verified": "magic"})
+            p = self.console._validate_start({
+                "official_api_base": dash.soak_ctl.CAMPUS_MC_BASE,
+                "min_verified": "offline",
+            })
+            cmd = self.console.build_run_cmd(p)
+            self.assertEqual(cmd[cmd.index("--min-verified") + 1], "offline")
+            res = self.console.apply_settings({"min_verified": "live"})
+            self.assertEqual(res["min_verified"], "live")
+            self.assertEqual(self.console.apply_settings({"min_verified": ""})["min_verified"], "")
+
+        inc_file = self.session / "episodes" / "ep-0001" / "incidents" / "INC-001.json"
+        inc_file.parent.mkdir(parents=True)
+        inc_file.write_text(json.dumps({"title": "缺铁矿", "detail": {"goal_id": "smelt_iron"}, "http_tape": [1, 2]}),
+                            encoding="utf-8")
+        prompt_file = self.session / "fixer_runs" / "attempt-0001" / "prompt.md"
+        prompt_file.parent.mkdir(parents=True)
+        prompt_file.write_text("# prompt body", encoding="utf-8")
+        with dash.soak_ctl.locked_state(self.session) as st:
+            st["incidents"]["GOAL_MISS:smelt_iron"] = {
+                "incident_id": "INC-001", "fingerprint": "GOAL_MISS:smelt_iron", "code": "GOAL_MISS",
+                "severity": "P1", "category": "strategy", "skill": "smelt_iron", "goal_id": "smelt_iron",
+                "status": "pending", "attempts": 1, "incident_path": str(inc_file),
+                "prompt_file": str(prompt_file), "gate_history": [{"ok": False, "failed_gate": "gate2_unittest"}],
+            }
+        det = self.console.incident_detail("GOAL_MISS:smelt_iron")
+        self.assertEqual(det["title"], "缺铁矿")
+        self.assertEqual(det["http_tape_count"], 2)
+        self.assertIn("# prompt body", det["prompt_preview"])
+        with self.assertRaises(ValueError):
+            self.console.incident_detail("no_such")
+        with self.assertRaises(ValueError):
+            self.console.switch_session("/etc")
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        httpd = dash.ThreadingHTTPServer(("127.0.0.1", port), dash.make_handler(self.console, port))
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("GET", "/api/incident?fp=GOAL_MISS%3Asmelt_iron")
+            r1 = conn.getresponse()
+            self.assertEqual(r1.status, 200)
+            self.assertEqual(json.loads(r1.read())["record"]["incident_id"], "INC-001")
+            with patch.object(dash, "_probe_local_bridge", return_value={"reachable": False, "url": "x"}):
+                conn.request("GET", "/api/probe_env")
+                r2 = conn.getresponse()
+                self.assertEqual(r2.status, 200)
+                self.assertIn("preflight_checks", json.loads(r2.read()))
+            conn.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_dashboard_html_script_ids_match_dom(self):
+        import re
+        html = (REPO_ROOT / "tools" / "soak-autofix" / "dashboard.html").read_text(encoding="utf-8")
+        head_html, js_tail = html.split("<script>", 1)
+        dom_ids = set(re.findall(r'id="([^"]+)"', head_html))
+        used_ids = set(re.findall(r'\$\("([^"]+)"\)', js_tail))
+        self.assertEqual(used_ids - dom_ids, set())
+
 
 if __name__ == "__main__":
     unittest.main()
