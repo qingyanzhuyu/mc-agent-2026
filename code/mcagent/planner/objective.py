@@ -9,10 +9,9 @@
 """
 from __future__ import annotations
 
-import copy
+from dataclasses import dataclass, field
 import math
 import time
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional, Sequence
 
 from ..runtime import State
@@ -20,6 +19,7 @@ from .llm import LLMClient, LLMError
 
 if TYPE_CHECKING:
     from ..loop.goals import GoalSpec
+    from ..loop.reserve import ReservationBook
 
 OBJECTIVE_SOURCES: tuple[str, ...] = ("rule", "llm")
 MIN_BUDGET_S: float = 60.0
@@ -70,11 +70,8 @@ class Objective:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "goal_id": self.goal_id,
-            "budget_s": self.budget_s,
-            "why": self.why,
-            "source": self.source,
-            "started_at": self.started_at,
+            "goal_id": self.goal_id, "budget_s": self.budget_s,
+            "why": self.why, "source": self.source, "started_at": self.started_at,
         }
 
 
@@ -110,8 +107,7 @@ def _loop_modules():
 
 
 def effective_include_stages(
-    min_verified: str = "offline",
-    include_stages: Optional[Collection[str]] = None,
+    min_verified: str = "offline", include_stages: Optional[Collection[str]] = None
 ) -> tuple[str, ...]:
     goals_mod, _ = _loop_modules()
     if include_stages is not None:
@@ -120,12 +116,8 @@ def effective_include_stages(
 
 
 def compute_remaining_cost_and_prereqs(
-    goal: "GoalSpec",
-    state: State,
-    ledger_map: Mapping[str, "GoalSpec"],
-    *,
-    completed_advs: Collection[str] = (),
-    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    goal: "GoalSpec", state: State, ledger_map: Mapping[str, "GoalSpec"], *,
+    completed_advs: Collection[str] = (), telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> tuple[float, bool, tuple[str, ...]]:
     """计算目标剩余链路预计成本（秒）、直接/传递前置是否全部满足及缺失前置列表。"""
     goals_mod, _ = _loop_modules()
@@ -152,31 +144,21 @@ def compute_remaining_cost_and_prereqs(
 
     _walk(goal, True)
     items_ok = all(goals_mod.check_item_expr(state, expr) for expr in goal.prereq_items)
-    prereqs_met = (len(missing_prereqs) == 0) and items_ok
-    return round(max(1.0, remaining_cost), 1), prereqs_met, tuple(missing_prereqs)
+    return round(max(1.0, remaining_cost), 1), (not missing_prereqs and items_ok), tuple(missing_prereqs)
 
 
 def _make_probe_planner(
-    target_goal: str,
-    *,
-    ledger: tuple["GoalSpec", ...],
-    registry: Optional[dict],
-    min_verified: str,
-    include_stages: tuple[str, ...],
-    completed_advs: Collection[str],
-    ep_goal_fails: Optional[Mapping[str, int]],
-    ep_goal_elapsed: Optional[Mapping[str, float]],
-    telemetry: Optional[Mapping[str, Mapping[str, Any]]],
-    environment_blocks: Optional[Mapping[str, Any]],
+    target_goal: str, *, ledger: tuple["GoalSpec", ...], registry: Optional[dict],
+    min_verified: str, include_stages: tuple[str, ...], completed_advs: Collection[str],
+    ep_goal_fails: Optional[Mapping[str, int]], ep_goal_elapsed: Optional[Mapping[str, float]],
+    telemetry: Optional[Mapping[str, Mapping[str, Any]]], environment_blocks: Optional[Mapping[str, Any]],
+    reservation_book: Optional[ReservationBook],
 ):
     _, RulePlanner = _loop_modules()
     probe = RulePlanner(
-        registry=registry,
-        ledger=ledger,
-        include_stages=include_stages,
-        target_goal=target_goal,
-        telemetry=telemetry,
-        min_verified=min_verified,
+        registry=registry, ledger=ledger, include_stages=include_stages,
+        target_goal=target_goal, telemetry=telemetry, min_verified=min_verified,
+        reservations=reservation_book,
     )
     probe.completed_advancements = set(completed_advs)
     probe.ep_goal_fails = dict(ep_goal_fails or {})
@@ -189,18 +171,12 @@ def _make_probe_planner(
 
 
 def collect_objective_candidates(
-    state: State,
-    *,
-    ledger: Optional[Sequence["GoalSpec"]] = None,
-    registry: Optional[dict] = None,
-    min_verified: str = "offline",
-    include_stages: Optional[Collection[str]] = None,
-    focus_goals: Any = None,
-    completed_advs: Collection[str] = (),
-    ep_goal_fails: Optional[Mapping[str, int]] = None,
-    ep_goal_elapsed: Optional[Mapping[str, float]] = None,
-    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
-    environment_blocks: Optional[Mapping[str, Any]] = None,
+    state: State, *, ledger: Optional[Sequence["GoalSpec"]] = None, registry: Optional[dict] = None,
+    min_verified: str = "offline", include_stages: Optional[Collection[str]] = None,
+    focus_goals: Any = None, completed_advs: Collection[str] = (),
+    ep_goal_fails: Optional[Mapping[str, int]] = None, ep_goal_elapsed: Optional[Mapping[str, float]] = None,
+    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None, environment_blocks: Optional[Mapping[str, Any]] = None,
+    reservation_book: Optional[ReservationBook] = None,
 ) -> tuple[list[ObjectiveCandidate], list[SuspendedGoalInfo]]:
     """按台账静态声明顺序收集「可选且未达成目标」与「被环境挂起目标」（不透传规则性价比排序）。"""
     goals_mod, _ = _loop_modules()
@@ -208,80 +184,48 @@ def collect_objective_candidates(
     ledger_map = {g.id: g for g in all_goals}
     eff_stages = effective_include_stages(min_verified, include_stages)
     allowed_stage_set = set(eff_stages)
-
-    focus_closure_ids: Optional[set[str]] = None
-    if focus_goals:
-        focus_closure = goals_mod.resolve_active_goals(all_goals, include_stages=eff_stages, target_goal=focus_goals)
-        focus_closure_ids = {g.id for g in focus_closure}
+    focus_ids = (
+        {g.id for g in goals_mod.resolve_active_goals(all_goals, include_stages=eff_stages, target_goal=focus_goals)}
+        if focus_goals else None
+    )
 
     eligible: list[ObjectiveCandidate] = []
     suspended: list[SuspendedGoalInfo] = []
-
     for g in all_goals:
-        if focus_closure_ids is not None:
-            if g.id not in focus_closure_ids:
+        if focus_ids is not None:
+            if g.id not in focus_ids:
                 continue
         elif g.stage not in allowed_stage_set:
             continue
-
         if goals_mod.is_goal_achieved(g, state, completed_advs):
             continue
 
         probe = _make_probe_planner(
-            g.id,
-            ledger=all_goals,
-            registry=registry,
-            min_verified=min_verified,
-            include_stages=eff_stages,
-            completed_advs=completed_advs,
-            ep_goal_fails=ep_goal_fails,
-            ep_goal_elapsed=ep_goal_elapsed,
-            telemetry=telemetry,
-            environment_blocks=environment_blocks,
+            g.id, ledger=all_goals, registry=registry, min_verified=min_verified,
+            include_stages=eff_stages, completed_advs=completed_advs, ep_goal_fails=ep_goal_fails,
+            ep_goal_elapsed=ep_goal_elapsed, telemetry=telemetry, environment_blocks=environment_blocks,
+            reservation_book=reservation_book,
         )
         probe.refresh_environment_blocks(state)
         blocked_map = probe.blocked_targets(state, g.id, refresh=False)
         if g.id in blocked_map:
             err = blocked_map[g.id]
-            suspended.append(
-                SuspendedGoalInfo(
-                    goal_id=g.id,
-                    title=g.title,
-                    score=g.score,
-                    wake_on=err.wake_on,
-                    missing_predicate=err.missing_predicate,
-                    message=str(err),
-                )
-            )
+            suspended.append(SuspendedGoalInfo(g.id, g.title, g.score, err.wake_on, err.missing_predicate, str(err)))
             continue
-
         if goals_mod.is_goal_stopped_out(g, ep_goal_fails, ep_goal_elapsed):
             continue
-
-        skill, _ = probe.expand_objective_skill(state)
-        if skill is None:
+        if probe.expand_objective_skill(state)[0] is None:
             continue
 
         rem_cost, prereqs_met, missing = compute_remaining_cost_and_prereqs(
             g, state, ledger_map, completed_advs=completed_advs, telemetry=telemetry
         )
-        eligible.append(
-            ObjectiveCandidate(
-                goal_id=g.id,
-                title=g.title,
-                score=g.score,
-                est_remaining_cost_s=rem_cost,
-                prereqs_met=prereqs_met,
-                missing_prereqs=missing,
-                default_budget_s=clamp_budget(g.budget_s),
-            )
-        )
+        eligible.append(ObjectiveCandidate(g.id, g.title, g.score, rem_cost, prereqs_met, missing, clamp_budget(g.budget_s)))
     return eligible, suspended
 
 
 def render_objective_menu(
-    eligible: Sequence[ObjectiveCandidate],
-    suspended: Sequence[SuspendedGoalInfo] = (),
+    eligible: Sequence[ObjectiveCandidate], suspended: Sequence[SuspendedGoalInfo] = ()
 ) -> str:
     """渲染紧凑目标菜单（不含规则排名提示、不含坐标或实体 id）。"""
     lines = ["可选目标（只能从这里选 goal_id）："]
@@ -304,30 +248,22 @@ def render_objective_menu(
     if suspended:
         lines.append("被挂起目标（等待唤醒条件，当前不可选）：")
         for s in suspended:
-            lines.append(
-                f"- {s.goal_id}: {s.title} | {s.score}分 | 缺失={s.missing_predicate} | 唤醒={s.wake_on}"
-            )
+            lines.append(f"- {s.goal_id}: {s.title} | {s.score}分 | 缺失={s.missing_predicate} | 唤醒={s.wake_on}")
     else:
         lines.append("被挂起目标：无")
     return "\n".join(lines)
 
 
 def resolve_objective(
-    obj: Any,
-    state: State,
-    *,
-    ledger: Optional[Sequence["GoalSpec"]] = None,
-    registry: Optional[dict] = None,
-    min_verified: str = "offline",
-    include_stages: Optional[Collection[str]] = None,
-    focus_goals: Any = None,
-    completed_advs: Collection[str] = (),
-    ep_goal_fails: Optional[Mapping[str, int]] = None,
+    obj: Any, state: State, *, ledger: Optional[Sequence["GoalSpec"]] = None,
+    registry: Optional[dict] = None, min_verified: str = "offline",
+    include_stages: Optional[Collection[str]] = None, focus_goals: Any = None,
+    completed_advs: Collection[str] = (), ep_goal_fails: Optional[Mapping[str, int]] = None,
     ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     environment_blocks: Optional[Mapping[str, Any]] = None,
-    source: str = "llm",
-    now: Optional[float] = None,
+    reservation_book: Optional[ReservationBook] = None,
+    source: str = "llm", now: Optional[float] = None,
 ) -> tuple[Optional[Objective], list[str]]:
     """校验候选字典并构造 `Objective`；不合法返回 `(None, 错误原文列表)`。"""
     if not isinstance(obj, dict):
@@ -337,18 +273,14 @@ def resolve_objective(
     forbidden = sorted(set(obj) & _FORBIDDEN_KEYS)
     if forbidden:
         errs.append(f"战略目标不允许包含坐标或实体字段: {forbidden}")
-
     goal_id = obj.get("goal_id")
     if not isinstance(goal_id, str) or not goal_id.strip():
         errs.append("goal_id 必须是非空字符串")
-
     if "why" in obj and obj["why"] is not None and not isinstance(obj["why"], str):
         errs.append("why 必须是字符串")
-
     raw_budget = obj.get("budget_s")
     if raw_budget is not None and not _is_finite_number(raw_budget):
         errs.append("budget_s 必须是有限数字")
-
     if errs:
         return None, errs
 
@@ -358,49 +290,27 @@ def resolve_objective(
     all_goals: tuple["GoalSpec", ...] = tuple(goals_mod.GOALS if ledger is None else ledger)
     ledger_map = {g.id: g for g in all_goals}
     eff_stages = effective_include_stages(min_verified, include_stages)
+    common_kw = dict(
+        ledger=all_goals, registry=registry, min_verified=min_verified, include_stages=eff_stages,
+        completed_advs=completed_advs, ep_goal_fails=ep_goal_fails, ep_goal_elapsed=ep_goal_elapsed,
+        telemetry=telemetry, environment_blocks=environment_blocks, reservation_book=reservation_book,
+    )
 
     goal = ledger_map.get(goal_id)
     if goal is None:
-        eligible, _ = collect_objective_candidates(
-            state,
-            ledger=all_goals,
-            registry=registry,
-            min_verified=min_verified,
-            include_stages=eff_stages,
-            focus_goals=focus_goals,
-            completed_advs=completed_advs,
-            ep_goal_fails=ep_goal_fails,
-            ep_goal_elapsed=ep_goal_elapsed,
-            telemetry=telemetry,
-            environment_blocks=environment_blocks,
-        )
+        eligible, _ = collect_objective_candidates(state, focus_goals=focus_goals, **common_kw)
         valid_ids = ", ".join(c.goal_id for c in eligible) or "（无）"
         return None, [f"目标 {goal_id!r} 不在目标台账内；当前可选目标: {valid_ids}"]
-
     if focus_goals:
         focus_closure = goals_mod.resolve_active_goals(all_goals, include_stages=eff_stages, target_goal=focus_goals)
         if goal_id not in {g.id for g in focus_closure}:
             return None, [f"目标 {goal_id} 不在本轮聚焦目标 {focus_goals!r} 的依赖闭包内"]
     if goal.stage not in set(eff_stages) and not focus_goals:
-        return None, [
-            f"目标 {goal_id} 的 stage={goal.stage!r} 不在当前允许阶段 {list(eff_stages)} 内（min_verified={min_verified}）"
-        ]
-
+        return None, [f"目标 {goal_id} 的 stage={goal.stage!r} 不在当前允许阶段 {list(eff_stages)} 内（min_verified={min_verified}）"]
     if goals_mod.is_goal_achieved(goal, state, completed_advs):
         return None, [f"目标 {goal_id}（{goal.title}）在本局已达成，请换未达成的目标"]
 
-    probe = _make_probe_planner(
-        goal_id,
-        ledger=all_goals,
-        registry=registry,
-        min_verified=min_verified,
-        include_stages=eff_stages,
-        completed_advs=completed_advs,
-        ep_goal_fails=ep_goal_fails,
-        ep_goal_elapsed=ep_goal_elapsed,
-        telemetry=telemetry,
-        environment_blocks=environment_blocks,
-    )
+    probe = _make_probe_planner(goal_id, **common_kw)
     probe.refresh_environment_blocks(state)
     blocked_map = probe.blocked_targets(state, goal_id, refresh=False)
     if goal_id in blocked_map:
@@ -412,126 +322,32 @@ def resolve_objective(
         return None, [f"目标 {goal_id} 无法展开出可启动技能：{expand_reason}"]
 
     budget = clamp_budget(raw_budget, default_budget_s=goal.budget_s)
-    why = str(obj.get("why") or "").strip()
     started = time.monotonic() if now is None else float(now)
-    return Objective(
-        goal_id=goal_id,
-        budget_s=budget,
-        why=why,
-        source=source,
-        started_at=started,
-    ), []
+    return Objective(goal_id=goal_id, budget_s=budget, why=str(obj.get("why") or "").strip(), source=source, started_at=started), []
 
 
-def validate_objective(
-    obj: Any,
-    state: State,
-    *,
-    ledger: Optional[Sequence["GoalSpec"]] = None,
-    registry: Optional[dict] = None,
-    min_verified: str = "offline",
-    include_stages: Optional[Collection[str]] = None,
-    focus_goals: Any = None,
-    completed_advs: Collection[str] = (),
-    ep_goal_fails: Optional[Mapping[str, int]] = None,
-    ep_goal_elapsed: Optional[Mapping[str, float]] = None,
-    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
-    environment_blocks: Optional[Mapping[str, Any]] = None,
-) -> tuple[bool, list[str]]:
+def validate_objective(obj: Any, state: State, **kwargs: Any) -> tuple[bool, list[str]]:
     """校验模型的目标选择。返回 `(是否合法, 错误列表)`；错误原文可直接回喂重问。"""
-    resolved, errs = resolve_objective(
-        obj,
-        state,
-        ledger=ledger,
-        registry=registry,
-        min_verified=min_verified,
-        include_stages=include_stages,
-        focus_goals=focus_goals,
-        completed_advs=completed_advs,
-        ep_goal_fails=ep_goal_fails,
-        ep_goal_elapsed=ep_goal_elapsed,
-        telemetry=telemetry,
-        environment_blocks=environment_blocks,
-        source="llm",
-    )
+    resolved, errs = resolve_objective(obj, state, source="llm", **kwargs)
     return resolved is not None, errs
 
 
-def from_objective_choice(
-    obj: Any,
-    state: State,
-    *,
-    ledger: Optional[Sequence["GoalSpec"]] = None,
-    registry: Optional[dict] = None,
-    min_verified: str = "offline",
-    include_stages: Optional[Collection[str]] = None,
-    focus_goals: Any = None,
-    completed_advs: Collection[str] = (),
-    ep_goal_fails: Optional[Mapping[str, int]] = None,
-    ep_goal_elapsed: Optional[Mapping[str, float]] = None,
-    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
-    environment_blocks: Optional[Mapping[str, Any]] = None,
-    source: str = "llm",
-    now: Optional[float] = None,
-) -> Objective:
+def from_objective_choice(obj: Any, state: State, *, source: str = "llm", now: Optional[float] = None, **kwargs: Any) -> Objective:
     """校验通过后返回 `Objective`；不通过抛 `ValueError`。"""
-    resolved, errs = resolve_objective(
-        obj,
-        state,
-        ledger=ledger,
-        registry=registry,
-        min_verified=min_verified,
-        include_stages=include_stages,
-        focus_goals=focus_goals,
-        completed_advs=completed_advs,
-        ep_goal_fails=ep_goal_fails,
-        ep_goal_elapsed=ep_goal_elapsed,
-        telemetry=telemetry,
-        environment_blocks=environment_blocks,
-        source=source,
-        now=now,
-    )
+    resolved, errs = resolve_objective(obj, state, source=source, now=now, **kwargs)
     if resolved is None:
         raise ValueError("目标选择不合法: " + " | ".join(errs))
     return resolved
 
 
 def choose_objective(
-    llm: LLMClient,
-    decision_context: str,
-    state: State,
-    *,
-    menu_text: Optional[str] = None,
-    ledger: Optional[Sequence["GoalSpec"]] = None,
-    registry: Optional[dict] = None,
-    min_verified: str = "offline",
-    include_stages: Optional[Collection[str]] = None,
-    focus_goals: Any = None,
-    completed_advs: Collection[str] = (),
-    ep_goal_fails: Optional[Mapping[str, int]] = None,
-    ep_goal_elapsed: Optional[Mapping[str, float]] = None,
-    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
-    environment_blocks: Optional[Mapping[str, Any]] = None,
-    attempts: int = 2,
-    thinking: bool = False,
-    total_timeout: Optional[float] = None,
-    usage_out: Optional[dict[str, int]] = None,
-    fallback: Optional[Callable[[], Optional[Objective]]] = None,
-    now: Optional[float] = None,
+    llm: LLMClient, decision_context: str, state: State, *,
+    menu_text: Optional[str] = None, attempts: int = 2, thinking: bool = False,
+    total_timeout: Optional[float] = None, usage_out: Optional[dict[str, int]] = None,
+    fallback: Optional[Callable[[], Optional[Objective]]] = None, now: Optional[float] = None,
+    **check_kwargs: Any,
 ) -> tuple[Optional[Objective], list[str], int]:
     """让模型根据决策上下文选一个战略 `Objective`（非法时回喂错误重问一次，仍非法回退 `fallback`）。"""
-    check_kwargs: dict[str, Any] = {
-        "ledger": ledger,
-        "registry": registry,
-        "min_verified": min_verified,
-        "include_stages": include_stages,
-        "focus_goals": focus_goals,
-        "completed_advs": completed_advs,
-        "ep_goal_fails": ep_goal_fails,
-        "ep_goal_elapsed": ep_goal_elapsed,
-        "telemetry": telemetry,
-        "environment_blocks": environment_blocks,
-    }
     user = decision_context.strip()
     if menu_text is not None and menu_text.strip() and "可选目标" not in user:
         user = f"{user}\n\n{menu_text.strip()}"
@@ -544,17 +360,11 @@ def choose_objective(
     raw_obj: Optional[dict] = None
     try:
         raw_obj, errors, used = llm.ask_json(
-            OBJECTIVE_SYSTEM_PROMPT,
-            user,
-            lambda o: validate_objective(o, state, **check_kwargs),
-            attempts=attempts,
-            thinking=thinking,
-            total_timeout=total_timeout,
-            usage_out=usage_out,
+            OBJECTIVE_SYSTEM_PROMPT, user, lambda o: validate_objective(o, state, **check_kwargs),
+            attempts=attempts, thinking=thinking, total_timeout=total_timeout, usage_out=usage_out,
         )
     except LLMError as exc:
-        errors = [f"LLMError: {exc}"]
-        used = max(1, used)
+        errors, used = [f"LLMError: {exc}"], max(1, used)
 
     if raw_obj is not None:
         resolved, final_errs = resolve_objective(raw_obj, state, source="llm", now=now, **check_kwargs)
@@ -562,6 +372,4 @@ def choose_objective(
             return resolved, [], used
         errors = final_errs
 
-    if fallback is not None:
-        return fallback(), errors, used
-    return None, errors, used
+    return (fallback(), errors, used) if fallback is not None else (None, errors, used)

@@ -91,7 +91,8 @@ class ReservationIntegrationTests(unittest.TestCase):
     def test_iron_tools_and_armor_compete_on_same_book_without_partial_claim(self):
         pick, boots = (make_goal(gid) for gid in ("iron_tools", "obtain_armor"))
         stock(self.state, iron_ingot=6, stick=2)
-        self.assertIs(self.planner.rules.reservations, self.planner._make_tactical_planner("iron_tools").reservations)
+        self.assertIs(self.planner.rules.reservations,
+                      self.planner._strategy.make_tactical_planner("iron_tools").reservations)
         self.assertTrue(self.book.reserve_plan(self.state, "pick", plan(pick, self.state)))
         before = self.book.entries
         self.assertFalse(self.book.reserve_plan(self.state, "boots", plan(boots, self.state)))

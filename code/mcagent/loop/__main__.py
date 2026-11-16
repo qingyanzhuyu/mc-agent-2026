@@ -54,13 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="聚焦推进并验收目标台账中的 goal_id；多个用逗号分隔表示同一轮一起追（如 smelt_iron,kill_a_mob）")
     p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
     p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
-    p.add_argument("--strategy", choices=("rule", "llm"), default="rule",
-                   help="战略层目标选择实现：rule=性价比排序（默认），llm=事件驱动异步模型选目标")
+    p.add_argument("--strategy", choices=("legacy", "rule", "llm"), default="rule",
+                   help="战略层目标选择实现：rule=性价比排序（默认），llm=事件驱动异步模型选目标，legacy=直调当前 RulePlanner.choose")
     p.add_argument("--strategy-review-s", type=float, default=None,
                    help="战略层例行复核目标的间隔秒数（默认 600s，可由 MC_STRATEGY_REVIEW_S 覆盖）")
     p.add_argument("--require-iron", action="store_true", default=None,
                    help="铁器（smelt_iron）达成前不调用战略层模型（默认关闭）")
-    p.add_argument("--llm", action="store_true", help="开启技能级 LLM 菜单选择（--strategy llm 下仅在战术层无技能时兜底）")
+    p.add_argument("--llm", action="store_true", help="开启 rule 的技能级 LLM 菜单选择（legacy 直接走规则，llm 战略自带异步兜底）")
     p.add_argument("--soak", action="store_true", help="挂载 SoakObserver（落盘 timeline/http_tape/progress_curve/异常包）")
     p.add_argument("--run-dir", type=Path, default=None, help="指定运行日志目录（默认 mcagent/logs/soak-YYYYmmdd-HHMMSS）")
     p.add_argument("--baseline", type=Path, default=None, help="对比上一版运行目录的 progress_curve.jsonl")
@@ -100,6 +100,9 @@ def _run_dry(cfg: Config, *, min_verified: str = "offline", strategy: str = "rul
     d = planner.choose(st)
     print(f"[dry] 空包规则首拍决策 -> {d.skill} ({d.reason})")
     cp = CampaignPlanner(mode="campaign", strategy=strategy, min_verified=min_verified)
+    if strategy != "llm" and cp.select(st, []).skill is None:
+        print(f"[dry] strategy={strategy} 空包首拍未产出技能")
+        return 1
     ctx = cp.build_context(st)
     rendered = ctx.render()
     if len(rendered) > 2000:
@@ -161,8 +164,9 @@ def main(argv: list[str] | None = None) -> int:
         print("缺少 MC_USER / MC_PASS（见 mcagent/.env.example 或传 --user）", file=sys.stderr)
         return 2
 
+    use_llm = args.llm and args.strategy != "legacy"
     llm_meta: dict = {}
-    if args.llm or args.strategy == "llm":
+    if use_llm or args.strategy == "llm":
         try:
             prof = resolve_profile()
         except ValueError as e:
@@ -226,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 "skill": args.skill,
                 "target_goal": args.goal,
                 "stop_on_goal": stop_on_goal,
-                "use_llm": args.llm,
+                "use_llm": use_llm,
                 **llm_meta,
                 "min_verified": min_ver,
                 "max_steps": args.max_steps,
@@ -241,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         strategy=args.strategy,
         focus_skill=args.skill,
         focus_args=focus_args,
-        use_llm=args.llm,
+        use_llm=use_llm,
         min_verified=min_ver,
         on_llm_telemetry=observer.on_llm_call if observer else None,
         on_objective_telemetry=observer.on_objective_decision if observer else None,

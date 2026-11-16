@@ -4,14 +4,13 @@
 1. 必须包含：有资格且未达成目标（id、标题、分值、预计剩余成本、前置是否满足）、被挂起目标及唤醒条件、
    背包摘要、剩余比赛时间与昼夜、最近 5 个目标的结果与失败分类、当前 Objective 及已用时间。
 2. 严禁包含：`RulePlanner.current_goal_hint()`、写死的科技顺序、任何三维/区块坐标、实体 id。
-3. 预留可选扩展字段 `subgoal_predicates` 与 `reservations`，供后续接入 `loop/subgoals.py` 与 `loop/reserve.py`；
-   本模块零导入依赖那两个尚未合入的文件。
+3. 支持 `subgoal_predicates` 和 `reservations` 摘要，菜单使用调度器的物资预留条件。
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Collection, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Collection, Mapping, Optional, Sequence
 
 from ..planner.objective import (
     Objective,
@@ -24,6 +23,9 @@ from ..runtime import State, _inv_fingerprint
 from ..skills.items import best_pickaxe
 from .goals import GOALS, GoalSpec
 from .starter_skills import best_axe, best_food, total_cobble, total_logs, total_planks
+
+if TYPE_CHECKING:
+    from .reserve import ReservationBook
 
 DEFAULT_MATCH_SECONDS: float = 8 * 3600.0
 MAX_CONTEXT_CHARS: int = 2000
@@ -238,6 +240,7 @@ def build_decision_context(
     max_match_seconds: float = 0.0,
     subgoal_predicates: Optional[Mapping[str, Any]] = None,
     reservations: Optional[Any] = None,
+    reservation_book: Optional[ReservationBook] = None,
     extra_fields: Optional[Mapping[str, Any]] = None,
 ) -> DecisionContext:
     """由 harness 客观组装战略决策上下文（不含 current_goal_hint、科技硬编码、坐标与实体 id）。"""
@@ -257,6 +260,7 @@ def build_decision_context(
         ep_goal_elapsed=ep_goal_elapsed,
         telemetry=telemetry,
         environment_blocks=environment_blocks,
+        reservation_book=reservation_book,
     )
 
     cleaned_suspended = tuple(
