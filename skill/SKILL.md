@@ -22,7 +22,7 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 | 报名/材料截止 | **11/18** |
 | 决赛 | 12/6，双赛道同场 |
 | 计分 | 游戏表现 60（advancement）+ 工程评审 40 |
-| 接口 | `https://mc-api.windywindie.top/api/v1`，规范 v1.3.1 |
+| 接口 | `https://mc-api.windywindie.top/api/v1`，以上游 v1.3.11 为规范参考，比赛服部署版本待核（`docs/04` B18） |
 
 ## 开工必读（按顺序）
 

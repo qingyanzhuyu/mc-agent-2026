@@ -13,7 +13,7 @@
 
 - 赛道：自建 harness 控制一个 Minecraft bot 自主生存 8 小时，按原版 advancement 计分（60）+ 工程评审（40）。
 - 模型：公告写"统一 DeepSeek V4.1 Flash"，群里已改口为 **qwen3.6-35b-a3b 无限额度**，d4.1f 额度有限，正式用哪个**还未定**（代码层统一按环境变量配置化，见 J13）。
-- 接口：`https://mc-api.windywindie.top/api/v1`，规范 v1.3.1，高层语义动作（"走到坐标""挖这个方块"）。
+- 接口：`https://mc-api.windywindie.top/api/v1`，以上游 [v1.3.11 规范](docs/99-原始记录/api-spec-v1.3.11.md)为协议参考。比赛服实际部署版本见 [待确认 B18](docs/04-待确认.md)。
 
 ## 我们目前最重要的五条判断
 
