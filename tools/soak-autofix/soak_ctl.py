@@ -77,8 +77,11 @@ _AGY_FIXER_TMPL = (
 )
 CODEX_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "gpt-6.1-sol": ("GPT-6.1-Sol", "codex", ("low", "medium", "high", "xhigh", "max")),
+    "gpt-6.1-terra": ("GPT-6.1-Terra", "codex", ("low", "medium", "high", "xhigh", "max")),
     "gpt-6-astra": ("GPT-6-Astra", "codex", ("low", "medium", "high", "xhigh", "max")),
 }
+DEFAULT_FIXER_SUBAGENT_MODEL = "gpt-6.1-terra"
+DEFAULT_FIXER_SUBAGENT_EFFORT = "xhigh"
 AGY_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "gemini-4-hydrogen": ("Gemini 4 Hydrogen", "agy", ("low", "medium", "high", "xhigh")),
     "gemini-4-carbon": ("Gemini 4 Carbon", "agy", ("low", "medium", "high")),
@@ -1110,6 +1113,8 @@ def _render_fixer_prompt(
     inc_json: dict[str, Any],
     fixer_wt: Path,
     allow_subagents: bool = True,
+    subagent_model: str = DEFAULT_FIXER_SUBAGENT_MODEL,
+    subagent_effort: str = DEFAULT_FIXER_SUBAGENT_EFFORT,
 ) -> str:
     tape_preview = json.dumps((inc_json.get("http_tape") or [])[-10:], ensure_ascii=False, indent=2)
     inc_path = str(inc_rec.get("incident_path") or "")
@@ -1170,8 +1175,9 @@ def _render_fixer_prompt(
     subagent_section = ""
     if allow_subagents:
         subagent_section = f"""
-2B. **子代理协作权限（可选）**：
-   - 若你的运行环境提供 `spawn_agent` / 子代理协作工具，你**可以**在 `{fixer_wt}` 内派发 1–2 个职责收敛的辅助子代理并行提速（例如：1 个负责 `--replay` 回放与代码排查，1 个负责单测编写与局部验证；并发写入子代理必须分配严格互不重叠的可写文件，递归深度 `<= 2`）。
+2B. **子代理协作权限与模型配置（可选）**：
+   - 若你的运行环境提供 `spawn_agent` / 子代理协作工具，你**可以**在 `{fixer_wt}` 内派发辅助子代理并行提速（注意每个工单会话共 **4 个并发槽位**，含你自身 `/root` 占 `1` 槽、**同时活跃的子代理最多 `3` 个**，先完成后关闭可顺序继续派发；建议 1 个负责 `--replay` 回放与代码排查，1–2 个负责分文件实现/单测验证；并发写入子代理必须分配严格互不重叠的可写文件，递归深度 `<= 2`）。
+   - **子代理统一模型配置**：调用 `spawn_agent` 创建辅助子代理时，**请显式传入 `model="{subagent_model}"`、`reasoning_effort="{subagent_effort}"`，并必须同时设置 `fork_turns="none"`**（因为继承历史 `fork_turns="all"` 不允许覆盖模型/推理档位，因此务必在 `message` 中写明工作目录 `{fixer_wt}`、异常包路径 `{inc_path}`、允许文件白名单与复现命令）。
    - 子代理返回后，你本人必须在退出前亲自运行完整 `cd {fixer_wt}/code && uv run python -m unittest discover -s tests` 最终全量回归验证。"""
 
     return f"""# 自动修单任务：{inc_rec['incident_id']} (`{inc_rec['code']}`)
