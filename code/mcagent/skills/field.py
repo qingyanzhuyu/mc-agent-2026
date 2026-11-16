@@ -10,6 +10,7 @@ from ..runtime import EnvBlocked, Replan
 from .base import failure, rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .observations import observe_block as _observed_block
+from .sightline import API_DIG_EYE_REACH, can_reach_block
 
 
 _UNSAFE_SUPPORT = AIR | {"water", "lava", "bubble_column", "fire", "soul_fire",
@@ -224,7 +225,7 @@ def equip_item(ex, state, item, slot="hand", *, min_durability=None):
     return entry
 
 
-_MINE_EYE_REACH = 5.0
+_MINE_EYE_REACH = API_DIG_EYE_REACH
 
 
 def _has_silk_touch(entry) -> bool:
@@ -236,10 +237,11 @@ def _has_silk_touch(entry) -> bool:
 
 
 def _local_mine_target(ex, state, pos, names):
-    cur = _position(state.refresh_status(ex.client, max_age_s=0).get("pos"))
-    center = tuple(v + 0.5 for v in pos)
-    eye = (cur[0], cur[1] + 1.62, cur[2])
-    if math.dist(eye, center) > _MINE_EYE_REACH or (_cell(cur)[::2] == pos[::2] and pos[1] < cur[1]):
+    status = state.refresh_status(ex.client, max_age_s=0)
+    cur = _position(status.get("pos"))
+    if _cell(cur)[::2] == pos[::2] and pos[1] < cur[1]:
+        return {}
+    if not can_reach_block(ex, status, pos, reach=_MINE_EYE_REACH, face_fallback=True):
         return {}
     block = _observed_block(ex, pos)
     return block if _block_matches(block, names) else {}

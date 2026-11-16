@@ -11,8 +11,9 @@ from .interaction import use_item_on
 from .items import AIR, bare
 from .recipes import craft_recipe
 from .registry import register
+from .sightline import ENTITY_EYE_REACH, block_center
 from .survival import (
-    _BREED_PROGRESS, _PLANT_PROGRESS, _above, _approach, _block, _can_reach, _center,
+    _BREED_PROGRESS, _PLANT_PROGRESS, _above, _approach, _block, _can_reach,
     _fresh_inventory, _has_progress, _plank_plan, _require_ready, _site_missing, _stand_for,
 )
 
@@ -58,10 +59,11 @@ def _gather_wheat(ex, state, goal_qty):
         _fresh_inventory(ex, state)
         if state.count(_WHEAT) >= goal_qty:
             return
-        stand = _stand_for(ex, status, _center(pos))
+        target = block_center(pos)
+        stand = _stand_for(ex, status, target, block_pos=pos)
         if stand is None:
             continue
-        yield from _approach(ex, state, status, stand, _center(pos))
+        yield from _approach(ex, state, status, stand, target, block_pos=pos)
         if _block(ex, pos) not in _GRASS:
             continue
         try:
@@ -104,7 +106,7 @@ def _planting_site(ex, state, seed):
     for row in candidates:
         pos = tuple(row["pos"])
         if _block(ex, _above(pos)) in AIR:
-            stand = _stand_for(ex, status, _center(pos))
+            stand = _stand_for(ex, status, block_center(pos), block_pos=pos)
             if stand is not None:
                 return base, pos, stand, status
     raise _site_missing("未观察到上方净空并且有安全站位的播种地块",
@@ -152,7 +154,7 @@ class PlantSeed(Skill):
                 base, pos, stand, status = _planting_site(ex, state, seed)
         else:
             hoe = None
-        yield from _approach(ex, state, status, stand, _center(pos))
+        yield from _approach(ex, state, status, stand, block_center(pos), block_pos=pos)
         if _block(ex, _above(pos)) not in AIR:
             raise Replan("播种前目标上方净空已变化，请换地块")
         current = _block(ex, pos)
@@ -290,7 +292,7 @@ class BreedAnimal(Skill):
             status = yield from _approach(ex, state, status, stand, target)
             pair, seen = _recheck_pair(ex, state, species, ids)
             baseline.update(row["id"] for row in seen)
-            if not _can_reach(status, pair[parent_id]["pos"], 4):
+            if not _can_reach(status, pair[parent_id]["pos"], ENTITY_EYE_REACH):
                 raise _pair_missing(species)
             _fresh_inventory(ex, state)
             before = state.count(food)

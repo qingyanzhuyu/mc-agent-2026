@@ -225,7 +225,7 @@ def build_pattern(ex, state, frame, *, stand):
     for op, pos in order:
         status = state.refresh_status(ex.client, max_age_s=0)
         if (_dimension(status) != "overworld" or _cell(_pos(status)) != stand
-                or not _standing(ex, status) or not _near(_pos(status), pos, radius=4.25)):
+                or not _standing(ex, status) or not _near(status, pos, radius=4.25)):
             raise Replan("补框时施工站位或维度已变化")
         if op == "remove":
             if _name(ex, pos) != support:

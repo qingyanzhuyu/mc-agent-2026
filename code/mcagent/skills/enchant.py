@@ -7,11 +7,12 @@ from dataclasses import dataclass
 
 from ..runtime import EnvBlocked, Replan
 from .base import Skill, failure, rec
-from .encounter import _completed, _line_cells, _retreat_clear
+from .encounter import _completed, _retreat_clear
 from .field import _cell, _grounded, _observed_block, _standable_cell, move_local, place_block, scan_blocks
-from .items import AIR, bare
+from .items import bare
 from .recipes import RECIPES, craft_recipe
 from .registry import register
+from .sightline import STATION_EYE_REACH, can_reach_block
 from .windows import (
     _receipt_inventory_full, apply_window_ops, take_container_item, window_section, window_view,
 )
@@ -22,7 +23,7 @@ _STATION = "enchanting_table"
 _ADJACENT = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _NEAR_RADIUS = 8
 _NEAR_LIMIT = 5
-_REACH = 3.5
+_REACH = STATION_EYE_REACH
 _ENCHANTABLE = frozenset({"bow", "crossbow", "fishing_rod", "trident", "mace"})
 _GEAR_SUFFIXES = ("_sword", "_pickaxe", "_axe", "_shovel", "_hoe", "_helmet", "_chestplate", "_leggings", "_boots")
 
@@ -80,12 +81,8 @@ def _site_state(ex, state):
     return status
 
 
-def _face_reachable(ex, feet, pos):
-    eye = (feet[0], feet[1] + 1.62, feet[2])
-    center = tuple(n + 0.5 for n in pos)
-    return math.dist(eye, center) <= _REACH and all(
-        bare(_observed_block(ex, cell).get("name")) in AIR for cell in list(_line_cells(eye, center))[1:-1]
-    )
+def _face_reachable(ex, source, pos):
+    return can_reach_block(ex, source, pos, reach=_REACH, face_fallback=False)
 
 
 def _nearby_blocks(ex, state, names):
@@ -98,13 +95,14 @@ def _nearby_blocks(ex, state, names):
     direct, nearby = [], []
     for block in candidates["blocks"]:
         pos = tuple(block["pos"])
-        if _face_reachable(ex, status["pos"], pos):
+        if _face_reachable(ex, status, pos):
             direct.append((pos, block["name"], None))
             continue
         for dx, dz in _ADJACENT:
             stand = (pos[0] + dx, here[1], pos[2] + dz)
             feet = (stand[0] + 0.5, stand[1], stand[2] + 0.5)
-            if _face_reachable(ex, feet, pos) and _retreat_clear(ex, status["pos"], feet):
+            candidate_source = {"pos": feet, "sneaking": status.get("sneaking")}
+            if _face_reachable(ex, candidate_source, pos) and _retreat_clear(ex, status["pos"], feet):
                 nearby.append((pos, block["name"], feet))
                 break
     return direct + nearby
@@ -115,7 +113,7 @@ def _approach_block(ex, state, candidate):
     if stand is not None:
         yield from move_local(ex, state, stand, max_distance=6)
     status = _site_state(ex, state)
-    if bare(_observed_block(ex, pos).get("name")) != name or not _face_reachable(ex, status["pos"], pos):
+    if bare(_observed_block(ex, pos).get("name")) != name or not _face_reachable(ex, status, pos):
         raise Replan(f"到场后未复核到可触达的 {name}，请换一处安全站位")
     return list(pos)
 
