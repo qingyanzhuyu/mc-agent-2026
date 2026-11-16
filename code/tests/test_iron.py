@@ -6,9 +6,10 @@ import unittest
 from unittest.mock import patch
 
 from mcagent.client import ApiError
+from mcagent.loop.starter_skills import MINE_TRAILS, ScoutIsland, reset_world_memo
 from mcagent.runtime import EnvBlocked, Replan
 from mcagent.skills import REGISTRY
-from mcagent.skills.iron import SmeltIron
+from mcagent.skills.iron import SmeltIron, reset_iron_memo
 from mcagent.skills.testing import GridWorld, drive
 
 
@@ -34,8 +35,25 @@ class IronWorld(GridWorld):
 
     def find_blocks(self, types=None, radius=16, limit=20):
         self.calls.append(("find_blocks", {"types": types, "radius": radius}))
+        if types is None:
+            return {"radius": radius, "blocks": {}}
         return {"blocks": [{"pos": list(p), "name": n} for p, n in self.blocks.items()
                            if n in types and sum((a-b)**2 for a, b in zip(p, self.st["pos"])) <= radius**2][:limit]}
+
+    def craft(self, item, count=1, *, stop_on=None):
+        self.calls.append(("craft", {"item": item, "count": count}))
+        if item == "raw_iron":
+            self._need("raw_iron_block")
+            self.items["raw_iron_block"] -= count
+            self.items["raw_iron"] = self.items.get("raw_iron", 0) + 9 * count
+        elif item.endswith("_planks"):
+            log = item.removesuffix("_planks") + "_log"
+            self._need(log)
+            self.items[log] -= count
+            self.items[item] = self.items.get(item, 0) + 4 * count
+        else:
+            raise ApiError("missing_item", f"不支持夹具配方 {item}")
+        return {"crafted": item, "count": count}
 
     def dig(self, pos, collect=True, *, stop_on=None):
         result = super().dig(pos, collect=collect, stop_on=stop_on)
@@ -424,6 +442,117 @@ class SmeltIronTests(unittest.TestCase):
                 self.assertFalse(world.st["sneaking"])
                 self.assertFalse(world.st.get("blocking", False))
                 self.assertFalse(any(c[0] == "posture" for c in world.calls))
+
+    def test_unreachable_ores_cached_across_retries_and_scout_climbs_mine_trail(self):
+        reset_iron_memo()
+        reset_world_memo()
+        self.addCleanup(reset_iron_memo)
+        self.addCleanup(reset_world_memo)
+        deep_ores = [(x, 35, 1) for x in range(2, 5)]
+        stair_blocks = {(x, y, 0): "stone" for x in range(1, 5) for y in range(63 - x, 64)}
+        surface_far = {(20, 63, 0): "grass_block"}
+        world = IronWorld(blocks={**dict.fromkeys(deep_ores, "iron_ore"), **stair_blocks, **surface_far})
+        move = world.move_to
+        rejected = []
+
+        def reject_deep(*args, **kwargs):
+            target = tuple(kwargs["pos"])
+            if target in deep_ores:
+                rejected.append(target)
+                raise ApiError("path_not_found", "No path")
+            return move(*args, **kwargs)
+
+        world.move_to = reject_deep
+        ex, state = world.session()
+        with self.assertRaises(EnvBlocked):
+            drive(SmeltIron(count=1), ex, state)
+        self.assertEqual(rejected, deep_ores)
+        self.assertEqual(int(state.pos[1]), 62)
+        self.assertEqual(len(MINE_TRAILS), 1)
+
+        # 同一区块再次进入 SmeltIron：不再对已知死洞的 3 个铁矿重复发 move_to。
+        rejected.clear()
+        with self.assertRaises(EnvBlocked):
+            drive(SmeltIron(count=1), ex, state)
+        self.assertEqual(rejected, [])
+
+        # ScoutIsland 在井底 Y=60 沿记录阶梯先退回井口 Y=64，再外迁至新区块 x=20.5。
+        drive(ScoutIsland(radius=36), ex, state)
+        self.assertGreaterEqual(state.pos[0], 20.0)
+        self.assertEqual(int(state.pos[1]), 64)
+
+    def test_prospect_turns_around_mid_stair_water_and_places_furnace_on_upper_step(self):
+        # 复现 ep-0003：向 +x 下探一级到 (1, 63, 0) 后，继续挖 (2, 64, 0) 时暴露上方地下水 (2, 65, 0)；
+        # 技能应停止进入 (2, 62, 0)，改为向 +z 侧向转向 (1, 62, 1) 挖出铁矿，并转身把炉放在上一级台阶 (0, 63, 0)。
+        blocks = {
+            (0, 62, 0): "stone",
+            (1, 62, 0): "stone", (1, 63, 0): "stone", (1, 64, 0): "stone",
+            (2, 61, 0): "stone", (2, 62, 0): "stone", (2, 63, 0): "stone", (2, 64, 0): "granite",
+            (1, 61, 1): "stone", (1, 62, 1): "stone", (1, 63, 1): "stone", (1, 64, 1): "stone",
+            (1, 62, 2): "iron_ore", (1, 61, 2): "stone",
+            # 井底四周同高度格皆为实心岩壁，迫使 _furnace 使用上一级台阶 py=y+1 放置熔炉
+            (2, 62, 1): "stone", (0, 62, 1): "stone", (1, 62, 3): "stone",
+        }
+        world = ProspectingWorld(
+            blocks=blocks,
+            exposed_after={(1, 62, 2): (1, 62, 1)},
+            views=[view(), view(output=1), view()],
+        )
+        orig_dig = world.dig
+
+        def flood_on_granite(pos, collect=True, *, stop_on=None):
+            res = orig_dig(pos, collect=collect, stop_on=stop_on)
+            if list(pos) == [2, 64, 0]:
+                world.blocks[(2, 65, 0)] = "water"
+            return res
+
+        world.dig = flood_on_granite
+        _, _, state = self.run_skill(world, count=1)
+        self.assertEqual(state.count("iron_ingot"), 1)
+        # 未挖穿渗水列下层 (2, 63, 0)，也未踩进 (2, 62, 0)；站在 y=63 转身把熔炉放在上一级台阶 [0, 64, 0]
+        self.assertEqual(world.blocks[(2, 63, 0)], "stone")
+        placed = [args["pos"] for op, args in world.calls if op == "place"]
+        self.assertEqual(placed, [[0, 64, 0]])
+
+    def test_converts_log_to_planks_and_uses_retired_wooden_pickaxe_fuel(self):
+        with self.subTest("log_to_4_planks"):
+            world = IronWorld(items={"raw_iron": 3, "pale_oak_log": 1, "furnace": 1},
+                              views=[view(), view(output=3), view()])
+            _, _, state = self.run_skill(world, count=3)
+            self.assertEqual(state.count("iron_ingot"), 3)
+            self.assertEqual(state.count("pale_oak_planks"), 2)
+
+        with self.subTest("post_furnace_cold_start_inventory"):
+            world = IronWorld(
+                items={"raw_iron": 3, "stone_pickaxe": 1, "wooden_pickaxe": 1,
+                       "oak_planks": 1, "stick": 3, "furnace": 1},
+                views=[view(), view(output=1), view(), view(output=1), view(), view(output=1), view()],
+            )
+            _, _, state = self.run_skill(world, count=3)
+            self.assertEqual(state.count("iron_ingot"), 3)
+            self.assertEqual(state.count("stone_pickaxe"), 1)
+            self.assertEqual(state.count("stick"), 1)
+
+    def test_unpacks_raw_iron_block_and_recovers_interrupted_placed_furnace(self):
+        with self.subTest("raw_iron_block"):
+            world = IronWorld(
+                items={"stone_pickaxe": 1, "coal": 1, "furnace": 1},
+                blocks={(2, 64, 0): "raw_iron_block"},
+                views=[view(), view(output=3), view()],
+            )
+            _, _, state = self.run_skill(world, count=3)
+            self.assertEqual(state.count("iron_ingot"), 3)
+            self.assertEqual(state.count("raw_iron"), 6)
+
+        with self.subTest("recover_placed_furnace_output"):
+            world = IronWorld(
+                items={"stone_pickaxe": 1},
+                blocks={(2, 64, 0): "furnace"},
+                views=[view(output=3)],
+            )
+            _, _, state = self.run_skill(world, count=3)
+            self.assertEqual(state.count("iron_ingot"), 3)
+            self.assertFalse(any(op == "dig" for op, _ in world.calls))
 
 
 if __name__ == "__main__":

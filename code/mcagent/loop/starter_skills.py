@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 from ..client import ApiError
 from ..runtime import Replan
 from ..skills.base import Param, Skill, failure, rec
-from ..skills.items import AIR, bare, best_pickaxe
+from ..skills.items import AIR, MINE_TRAILS, bare, best_pickaxe
 from ..skills.registry import register
 
 if TYPE_CHECKING:
@@ -37,7 +37,8 @@ STONE_Targets: tuple[str, ...] = ("stone", "cobblestone", "deepslate", "cobbled_
 PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter")
 SAFE_GROUND: tuple[str, ...] = (
     "grass_block", "dirt", "coarse_dirt", "stone", "cobblestone",
-    "sand", "sandstone", "gravel", "andesite", "diorite", "granite", "oak_planks",
+    "sand", "sandstone", "gravel", "andesite", "diorite", "granite",
+    "tuff", "oak_planks", "pale_oak_planks",
 )
 EDIBLE_FOODS: tuple[str, ...] = (
     "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod",
@@ -61,6 +62,7 @@ def reset_world_memo() -> None:
     PROTECTED_ZONES.clear()
     VISITED_ANCHORS.clear()
     KNOWN_TABLES.clear()
+    MINE_TRAILS.clear()
 
 
 def _record_known_table(pos) -> None:
@@ -235,28 +237,61 @@ class ScoutIsland(Skill):
             if any(b in blocks_map for b in names)
         }
 
+        # 若角色刚在探矿阶梯井底受阻（当前位置紧邻最近一条下探轨迹末端），先分段沿阶梯退回井口地表再外迁。
+        if MINE_TRAILS:
+            trail = MINE_TRAILS[-1]
+            tail = trail[-1]
+            if math.dist(cur, tail) <= 5.0 and trail[0][1] > cur[1] + 2.0:
+                MINE_TRAILS.pop()
+                # 每隔约 10 级取一个中继路点，最后回到井口起点，避免深井单次长距寻路超时。
+                indices = list(range(len(trail) - 1, -1, -10))
+                if indices[-1] != 0:
+                    indices.append(0)
+                for idx in indices:
+                    if idx == len(trail) - 1:
+                        continue
+                    wp = list(trail[idx])
+                    try:
+                        moved_up = ex.move_to(pos=wp, rng=2)
+                    except Replan as e:
+                        code, _ = failure(e)
+                        if code not in ("path_not_found", "unreachable", "move_timeout"):
+                            raise
+                        yield rec("move_to", pos=wp, fingerprints=hits, error_code=code)
+                        break
+                    yield rec("move_to", moved_up, pos=wp, fingerprints=hits)
+                st = state.refresh_status(ex.client, max_age_s=0)
+                cur = st.get("pos") or state.pos
+
         # limit 取 250 以覆盖近处 5 格地表之外的远端陆地（limit=40 在普通森林地形会被脚边草方块占满）
         land = ex.client.find_blocks(types=list(SAFE_GROUND), radius=min(r, 28), limit=250)
         cands = []
+        climb_cands = []
         for b in (land.get("blocks") or []):
             p = b.get("pos")
             if not (isinstance(p, list) and len(p) == 3):
                 continue
             dist = math.hypot(p[0] - cur[0], p[2] - cur[2])
-            if dist < 5.0 or abs(p[1] - cur[1]) > 10.0 or _is_protected(p, radius=8.0):
+            if _is_protected(p, radius=8.0):
                 continue
             visited_pen = sum(1 for vx, vz in VISITED_ANCHORS[-6:] if math.hypot(p[0] - vx, p[2] - vz) < 8.0)
-            cands.append((visited_pen, -dist, p))
+            if dist >= 5.0 and abs(p[1] - cur[1]) <= 10.0:
+                cands.append((0, visited_pen, -dist, p))
+            elif dist >= 3.0 and 10.0 < (p[1] - cur[1]) <= 28.0:
+                # 地下浅井或河谷受困兜底：允许向高处有两格空气的开放陆地爬升脱困。
+                climb_cands.append((1, visited_pen, p[1] - cur[1], p))
 
-        if not cands:
+        if not cands and not climb_cands:
             raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
-        # 落水时先找最近的干燥落脚点；在陆地上仍优先未访问过的远端区域。
-        cands.sort(key=(lambda item: (-item[1], item[0])) if st.get("in_water")
-                   else (lambda item: (item[0], item[1])))
+        # 落水时先找最近的干燥落脚点；在陆地上仍优先未访问过的远端区域；平层无点时才试爬回地表。
+        cands.sort(key=(lambda item: (-item[2], item[1])) if st.get("in_water")
+                   else (lambda item: (item[1], item[2])))
+        climb_cands.sort(key=lambda item: (item[1], item[2]))
+        all_cands = cands + climb_cands
         checked: list[list] = []
         attempts = 0
         last_nav_err: Optional[Replan] = None
-        for _, _, chosen in cands:
+        for _, _, _, chosen in all_cands:
             dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
             # 相邻方块通常属于同一片地形，失败后换一片；同时限制额外观察与动作预算。
             if any(math.dist(dest, old) < 3.0 for old in checked):
