@@ -8,9 +8,10 @@ from .interaction import use_item_on
 from .items import AIR, bare
 from .recipes import RECIPES, craft_recipe
 from .registry import register
+from .sightline import ENTITY_EYE_REACH, block_center
 from .survival import (
     _SLEEP_PROGRESS, _SUPPORT, _above, _approach, _block, _can_reach, _cell,
-    _center, _fresh_inventory, _has_progress, _neighbors, _on_ground, _plank_plan,
+    _fresh_inventory, _has_progress, _neighbors, _on_ground, _plank_plan,
     _site_missing, _stand_for, _standable,
 )
 
@@ -92,7 +93,7 @@ def _existing_bed(ex, state):
     status = state.refresh_status(ex.client, max_age_s=0)
     for row in candidates:
         pos = tuple(row["pos"])
-        if _bed_observed(ex, pos, row["name"]) and _stand_for(ex, status, _center(pos)) is not None:
+        if _bed_observed(ex, pos, row["name"]) and _stand_for(ex, status, block_center(pos), block_pos=pos) is not None:
             return pos, row["name"]
     return None
 
@@ -122,7 +123,7 @@ def _shear_for_wool(ex, state, reserved_wool):
         fresh = yield from _approach(ex, state, status, stand, animal["pos"])
         current = next((row for row in scan_entities(ex, state, "sheep", radius=8)["entities"]
                         if row["id"] == animal["id"]), None)
-        if current is None or not _can_reach(fresh, current["pos"], 4):
+        if current is None or not _can_reach(fresh, current["pos"], ENTITY_EYE_REACH):
             continue
         evidence = yield from use_item_on(ex, state, animal["id"], "shears")
         _fresh_inventory(ex, state)
@@ -255,10 +256,11 @@ class SleepInBed(Skill):
                 raise Replan("摆床后未确认消耗一张床")
         status = state.refresh_status(ex.client, max_age_s=0)
         _sleep_window(status)
-        stand = _stand_for(ex, status, _center(pos))
+        bed_target = block_center(pos)
+        stand = _stand_for(ex, status, bed_target, block_pos=pos)
         if stand is None:
             raise _site_missing("未复核到床边可达安全站位", "reachable_bed", _BED_RADIUS, 8)
-        fresh = yield from _approach(ex, state, status, stand, _center(pos))
+        fresh = yield from _approach(ex, state, status, stand, bed_target, block_pos=pos)
         _sleep_window(fresh)
         if not _bed_observed(ex, pos, bed):
             raise Replan("点床前未确认两格床体、承重与上方净空")

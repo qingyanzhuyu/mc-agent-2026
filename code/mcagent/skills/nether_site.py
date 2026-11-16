@@ -1,12 +1,13 @@
 """Conservative geometry from live block and status snapshots for the Nether line."""
 from __future__ import annotations
 
-from math import dist, floor, isfinite
+from math import floor, isfinite
 
 from ..runtime import Replan
 from .base import rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .observations import observe_block
+from .sightline import eye_to_block_dist
 
 CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
 PORTAL = "nether_portal"
@@ -93,9 +94,9 @@ def _standing(ex, status, *, through_portal=False):
             and _standable(ex, _cell(_pos(status)), through_portal=through_portal))
 
 
-def _near(pos, target, radius=4):
-    """Conservative block-center reach from a standing player's eye. Endpoint threshold awaits P8."""
-    return dist((pos[0], pos[1] + 1.62, pos[2]), tuple(v + 0.5 for v in target)) <= radius
+def _near(source, target, radius=4):
+    """Conservative block-center reach from the player's eye. Endpoint threshold awaits P8."""
+    return eye_to_block_dist(source, target) <= radius
 
 
 def _approach(ex, start, dest):

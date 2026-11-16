@@ -179,7 +179,7 @@ J16（虚空防坠）、J17（模型会编坐标和实体 id），这里不重�
 
 **"用了 `@register`" 就等于"模型能选到"。** 所以 L2 永远不注册；想让模型用一个原语，就写一个 L3 技能包住它。
 
-### 9.2 七条硬规则（括号里是谁在替你检查）
+### 9.2 八条硬规则（括号里是谁在替你检查）
 
 1. **每发一个阻塞动作就 `yield` 一次**。Safety 只能在动作之间抢占；一步里连发两个动作，中间掉血没人知道。
    （`skills.testing.drive()`：一步内发两个动作直接断言失败。`posture` 和所有观察不占动作锁，不算。）
@@ -197,6 +197,7 @@ J16（虚空防坠）、J17（模型会编坐标和实体 id），这里不重�
 7. **`verified` 如实标**。技能类默认 `verified = "offline"`；真机跑通、`docs/06` 留了日志路径之后才改成 `"live"`。
    赛中菜单默认只收 `"live"`（联调时传 `min_verified="offline"`）。这是 §2A.6 在代码里的落点，不是它的替代品：
    没上过真机的技能仍然不进 `main`。
+8. **距离与视线统一走 `skills.sightline`，禁止拿脚底直接算方块角点**。`/status` 返回的 `pos` 是玩家脚底坐标（站立眼高 `+1.62`、潜行 `+1.27`），`/find_blocks` 与 `/get_block` 的 `pos` 是整数格角点 `[bx, by, bz]`（几何中心 `[bx+0.5, by+0.5, bz+0.5]`）。所有挖掘、工作站交互、瞄准距离与 3D 视线遮挡判定一律调用 `skills.sightline`（`eye_pos`、`block_center`、`eye_to_block_dist`、`can_see_block`、`can_reach_block` 等），**严禁手写 `math.dist(state.pos, block_pos)`**。（`code/tests/test_sightline.py` 与人工评审；规范 §3.1、§3.3–3.4、§4.2。）
 
 ### 9.3 一文件一职责
 
@@ -207,6 +208,7 @@ code/mcagent/
   skills/base.py        Skill 基类、Param 声明、rec()、failure()
   skills/registry.py    @register、REGISTRY、make()、契约检查、自动发现
   skills/items.py       只读选择器：最好的镐、垫块、空气判断
+  skills/sightline.py   只读视线几何：眼高、方块中心/碰撞箱眼距与 3D 体素视线遮挡
   skills/nav.py         L2 原语（真机验过的三段手动兜底序列）
   skills/testing.py     离线夹具：GridWorld 替身 + drive()
   skills/<领域>.py       L3 技能：wood / stone_iron / survival / explore ……（待写，一个领域一个文件）
@@ -232,6 +234,7 @@ from . import nav
 from .base import Param, Skill, rec
 from .items import best_pickaxe
 from .registry import register
+from .sightline import can_reach_block
 
 @register
 class MineOre(Skill):
@@ -248,17 +251,19 @@ class MineOre(Skill):
         return "" if best_pickaxe(state) else "背包没有镐"
 
     def run(self, ex, state):
+        st = state.refresh_status(ex.client, max_age_s=0)
         found = ex.client.find_blocks(types=[self.args["target"]], radius=32, limit=4)   # 观察，不用 yield
         if not found.get("blocks"):
             raise Replan(f"半径 32 内没有裸露的 {self.args['target']}")                    # 这句话会回喂给模型
-        pos = found["blocks"][0]["pos"]
-        yield rec("move_to", ex.move_to(pos=pos, rng=3), pos=pos)                        # 一个动作，一个 yield
+        pos = found["blocks"][0]["pos"]                                                  # 整数格角点，禁止 math.dist(state.pos, pos)
+        if not can_reach_block(ex, st, pos):                                             # 统一调 sightline 判眼距与视线遮挡
+            yield rec("move_to", ex.move_to(pos=pos, rng=3), pos=pos)                    # 一个动作，一个 yield
         yield from nav.breach_1x2(ex, state, [pos])                                      # 组合 L2 原语
 ```
 
 上面是**写法示例，不是已验证的技能**（仓库里目前没有任何 L3 技能）。步骤：
 
-1. 选对文件（按领域），照上面的形状写；先想清楚失败时抛什么 `Replan` 文案——那是模型下一轮唯一能看到的线索。
+1. 选对文件（按领域），照上面的形状写；先想清楚失败时抛什么 `Replan` 文案——那是模型下一轮唯一能看到的线索。注意 `/status.pos` 为脚底坐标、方块 `pos` 为整数角点，所有挖掘/交互/瞄准距离与视线遮挡判定统一调 `skills.sightline`，严禁手写 `math.dist(state.pos, block_pos)`。
 2. 在 `code/tests/` 里用 `GridWorld` + `drive()` 写离线单测：发了哪些动作、顺序对不对、被 `abort()` 后有没有收尾。
 3. 跑 §5 的自检。此时是 `verified: offline`，留在分支上。
 4. 占账号上真机跑通，把日志路径写进 `docs/06`，`verified` 改成 `"live"`，再合 `main`。

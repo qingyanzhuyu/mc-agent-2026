@@ -9,6 +9,7 @@ from .items import AIR, PLACEABLE_BLOCKS, bare
 from .observations import completed_advancements, observe_block
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES
+from .sightline import block_center, can_see_block, eye_to_point_dist
 
 
 _SUPPORT = frozenset(PLACEABLE_BLOCKS) | {
@@ -75,36 +76,53 @@ def _standable(ex, pos):
             and _block(ex, _above(pos)) in AIR)
 
 
-def _can_reach(status, target, reach):
-    eye = _above(status["pos"], 1.62)
-    return math.dist(eye, target) <= reach
+def _can_reach(source, target, reach):
+    return eye_to_point_dist(source, target) <= reach
 
 
-def _stand_for(ex, status, target, reach=4, clear=None):
+def _stand_for(ex, status, target=None, reach=4, clear=None, *, block_pos=None):
     """仅使用目标周围已复核的整格站位。实际交互触达阈值待实测。"""
     if not _on_ground(status):
         return None
+    aim = block_center(block_pos) if block_pos is not None else target
     current = status["pos"]
-    if (_can_reach(status, target, reach) and _standable(ex, _cell(current))
-            and (clear is None or clear(current))):
+    if (
+        _can_reach(status, aim, reach)
+        and _standable(ex, _cell(current))
+        and (block_pos is None or can_see_block(ex, status, block_pos))
+        and (clear is None or clear(current))
+    ):
         return tuple(current)
-    cell = _cell(target)
+    cell = _cell(block_pos if block_pos is not None else aim)
+    sneaking = status.get("sneaking")
     candidates = [_above(p, dy) for p in _neighbors(cell) for dy in (0, 1)]
     candidates.sort(key=lambda pos: math.dist(current, _center(pos)))
     for pos in candidates:
         spot = _center(pos)
-        if (math.dist(current, spot) <= 16 and math.dist(_above(spot, 1.62), target) <= reach
-                and _standable(ex, pos) and (clear is None or clear(spot))):
+        candidate = {"pos": spot, "sneaking": sneaking}
+        if (
+            math.dist(current, spot) <= 16
+            and _can_reach(candidate, aim, reach)
+            and _standable(ex, pos)
+            and (block_pos is None or can_see_block(ex, candidate, block_pos))
+            and (clear is None or clear(spot))
+        ):
             return spot
     return None
 
 
-def _approach(ex, state, status, stand, target, reach=4):
+def _approach(ex, state, status, stand, target=None, reach=4, *, block_pos=None):
+    aim = block_center(block_pos) if block_pos is not None else target
     if tuple(status["pos"]) != tuple(stand):
         status = yield from move_local(ex, state, stand, require_move=True)
     fresh = state.refresh_status(ex.client, max_age_s=0)
-    if (fresh.get("dimension") != status.get("dimension") or not _on_ground(fresh)
-            or not _can_reach(fresh, target, reach) or not _standable(ex, _cell(fresh["pos"]))):
+    if (
+        fresh.get("dimension") != status.get("dimension")
+        or not _on_ground(fresh)
+        or not _can_reach(fresh, aim, reach)
+        or not _standable(ex, _cell(fresh["pos"]))
+        or (block_pos is not None and not can_see_block(ex, fresh, block_pos))
+    ):
         raise Replan("到点后未确认脚下支撑和交互距离，请换可达位置")
     return fresh
 

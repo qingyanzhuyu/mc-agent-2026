@@ -7,6 +7,7 @@
 base.py       Skill 基类 / Param 参数声明 / rec() / failure()
 registry.py   @register、REGISTRY、make()、契约检查、自动发现
 items.py      只读选择器：最好的镐、垫块、空气判断
+sightline.py  只读视线几何：眼高、方块中心/碰撞箱眼距与 3D 体素视线遮挡
 nav.py        L2 战术原语：breach_1x2 / sneak_bridge / step_up_1x2
 testing.py    离线夹具：GridWorld 替身 + drive()
 <领域>.py      L3 意图技能
@@ -88,6 +89,7 @@ assert [s["op"] for s in steps] == ["equip", "dig"]
 
 | 模块及签名 | 前置、返回与后验 | 失败 | 端点、规范与待实测 |
 |---|---|---|---|
+| `sightline.eye_pos(source, *, sneaking=None)`、`block_center(pos)`、`eye_to_block_dist(source, block_pos, ...)`、`eye_to_aabb_dist(source, block_pos, ...)`、`eye_to_point_dist(source, target_point, ...)`、`voxel_line_cells(start, end)`、`ray_clear_to_point(...)`、`can_see_block(ex, source, block_pos, ...)`、`can_reach_block(ex, source, block_pos, *, reach=DIG_EYE_REACH, ...)` | 统一将 `/status.pos` 脚底坐标换算为站立/潜行眼睛坐标（`EYE_HEIGHT_STANDING=1.62`、`EYE_HEIGHT_SNEAKING=1.27`），将整数角点换算为方块中心 `(bx+0.5, by+0.5, bz+0.5)`；导出触达常量 `DIG_EYE_REACH=4.5`、`API_DIG_EYE_REACH=5.0`、`STATION_EYE_REACH=3.5`、`ENTITY_EYE_REACH=4.0`，并提供两段式零请求眼距粗筛 + 3D 体素视线遮挡复核（单次调用内缓存 `get_block`，拦截对角双石夹缝） | R 坐标缺失、布尔值或非有限数。`not_loaded` / `not_ready` 视为不可穿透；上送其余 `ApiError` | 纯计算或 `/get_block` §3.1、§3.3–3.4、§4.2、§8 1.3.10 ①。不发阻塞动作 |
 | `recipes.craft_recipe(ex, state, item, *, goal_qty=1)` | `goal_qty` 是最终持有量下限，只能按关键字传入。核对该配方原料和所需工作台，最多调用 64 次合成。持有足额直接返回。每批核对成品增量。返回 `{item,before,after,gained,consumed}`，`consumed` 记录背包实物净减。调用方负责检查与结算预留 | R 缺料、未知配方、预算用尽、`inventory_full`、`no_window` 或后验不足。E 找不到可达工作台（含跳过 `stalled`） | `/inventory /status /find_blocks /get_block /move_to /craft` §3.1–3.4、§4.1、§4.8、§5。待测 `POST /craft` 的 `count=1`、选配方、混用标签原料和工作台实际触达距离 |
 | `field.scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None)` | 有界搜索，并逐个复核方块。返回 `{status,blocks,ready,origin,dimension,radius,observed_at}`，`status` 为 `found/unknown`，`ready=False` 表示世界正在加载区块 | R 无效参数。`not_ready`/空回执/过滤后为空或候选未加载时为 `unknown` | `/status /find_blocks /get_block` §3.1、§3.3–3.4、§5。待测性质键值、负搜索覆盖和暴露面范围 |
 | `field.scan_entities(ex, state, types=None, *, radius=32, limit=40)` | 返回 `{status,entities,ready,origin,dimension,radius,observed_at}`；`ready=True` 后区块和实体已到齐，只返回有整型 ID 和坐标的观察记录 | R 无效参数。`not_ready` 或空回执为 `unknown` | `/status /get_entities` §3.1、§3.5、§5。待复核实体筛选边界与年龄/羊毛专项字段 |
