@@ -17,7 +17,7 @@ from typing import Any, Collection, Mapping, Optional
 
 from ..runtime import State
 from ..skills import REGISTRY, bind_args
-from ..skills.items import best_pickaxe
+from ..skills.items import STONE_OR_BETTER_PICKS, best_pickaxe
 from .starter_skills import (
     can_afford_gear,
     has_known_table,
@@ -31,9 +31,6 @@ DEFAULT_CAMPAIGN_STAGES: tuple[str, ...] = ("candidate", "graduated", "live")
 OFFICIAL_CAMPAIGN_STAGES: tuple[str, ...] = ("graduated", "live")
 GOAL_TIERS: tuple[str, ...] = ("T0_PREP", "T1", "T2", "T3")
 
-STONE_OR_BETTER_PICKS: frozenset[str] = frozenset({
-    "stone_pickaxe", "copper_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
-})
 IRON_OR_BETTER_PICKS: frozenset[str] = frozenset({
     "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
 })
