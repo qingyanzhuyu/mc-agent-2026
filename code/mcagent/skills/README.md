@@ -105,6 +105,9 @@ assert [s["op"] for s in steps] == ["equip", "dig"]
 | `windows.select_window_option(ex, state, target, option, *, times=1, verify)` | 一次 `select`，重读窗口和背包。调用方必须提供最终后验 `verify(before_view, after_view, state)`。返回 `{receipt,view}` | R 次数非法、选项拒绝或后验不足 | `/window/view /window/act /inventory` §4.9、§3.2。待测不同窗口的选项索引和附魔的槽位/等级变化 |
 | `windows.take_container_item(ex, state, target, section, item, count, *, view=None)` | 从已观察到的分区取指定物品，核对入包后重读窗口。返回 `{receipt,view,count}` | R 数量、视图或实际入包不足 | `/window/view /window/act /inventory` §4.9、§3.2。待测窗口重开与取出延迟 |
 | `windows.window_section(view, section)` 与 `window_amount(view, section, item, *, slot=None)` | 纯读取，分别返回槽位列表及匹配物品数量。指定槽位只计有对应整数 `slot` 的条目 | 视图由调用者预先校验 | 无。按 §4.9 快照结构读取 |
+| `observations.observe_block(ex, pos)` | 按现场坐标读取方块快照，未加载返回 `{}` | 上送其余 `ApiError` | `/get_block` §3.4 |
+| `observations.refresh_inventory(ex, state)` | 强制刷新背包并返回快照，供材料和事后对账 | 上送 `ApiError` | `/inventory` §3.2 |
+| `observations.completed_advancements(ex, *, require_ready=True)` | 返回可见、明确完成的进度 ID 集合，返回值去掉 `minecraft:` 前缀。默认要求 `ready=True`，未就绪返回空 | 上送 `not_ready` 以外的 `ApiError` | `/advancements` §3.7。进度传播延迟与 `ready` 时序待实测 |
 | `furnace.inspect_furnace(ex, target)` | 读取一次普通炉窗口，返回含 `sections` 的快照 | R 非普通炉或视图字段不可用 | `/window/view` §4.9。待测燃烧状态、进度与燃料字段 |
 | `furnace.load_furnace(ex, state, target, *, raw_item=None, raw_count=0, fuel_item, fuel_count, view=None, replace_fuel=False, output_item=None)` | 原料与燃料足额，投新批时输入槽为空，输出不能被指定产物以外的物品占用。可复用已核实窗口；换燃料先验取回，随后每笔投放验扣包。返回动作回执列表，续用炉面前再次读取 | R 缺料、旧槽位冲突、换料/投放后验不足 | `/window/view /window/act /inventory` §4.9、§3.2。待测燃烧导致的槽位即时变更与烟熏炉/高炉 |
 | `furnace.collect_furnace(ex, state, target, *, item, count=None, section="output", view=None, inspect_after=True, require_empty=False)` | 单个普通炉已观测的 `output/fuel` 槽有物料；默认取该物品目前全部。返回 `{receipt,view,count}`。按实收判定，`require_empty` 时再核对槽为空 | R 槽位或入包不合 | `/window/view /window/act /inventory` §4.9、§3.2。待测空桶退回与产物入包 |
@@ -127,9 +130,12 @@ assert [s["op"] for s in steps] == ["equip", "dig"]
 | `loop.subgoals.safe_encounter(state, entity, entity_type, *, dimension, retreat_safe, min_health, min_distance=0, max_distance=24, ammo=None)` | 用当场实体快照核对类型、距离和血量，同时检查状态、短退路、异常状态与可选弹药 `(item,count)`。安全模式以状态快照时刻判定 | 缺证据返回假。纯计算 |
 | `loop.subgoals.active_portal(state, portal, source_dimension, destination)` | 本维度已观察到匹配维度方向的激活门方块才为真。落地安全需另验 | 缺证据返回假。纯计算 |
 | `loop.reserve.ReservationBook(safety_floor=None)` | 单调度循环负责一本账，`entries` 为 `Reservation(consumer,item,count,mode)` 序列，模式为 `consume/borrow/in_transit` | 非法安全底线抛 `ValueError`。无端点 |
+| `book.can_reserve_plan(state, consumer, requirements)` / `book.reserve_plan(state, consumer, requirements)` | 计算整份 `(item,count,mode)` 同时可用的条件，合并同种需求。`reserve_plan` 成功后替换该消费者的库存预留，保留已经登记的容器在途项。 | 库存陈旧或未足额时返回假，保持已有账项。格式无效抛 `ValueError` |
 | `book.observe(state)`、`book.reset(state)` | 检查死亡/换维度，识别后整账 `stale` 并返回假；调用方复查状态、背包、窗口后用 `reset` 清旧账重建 | 数据陈旧期间不可分配。无端点 |
 | `book.available(state, item, consumer=None)`、`book.reserve(state, consumer, item, count, *, mode="consume")` | 返回库存扣其他占用和底线所得件数；预留更新指定键并返回是否成功。在途已离开背包，同一桶体的变体共享占用 | 不够或陈旧返回 0/假，非法键/数量抛 `ValueError` |
 | `book.move_to_container(state, consumer, item, count, *, from_mode="consume")`、`book.release(consumer, item=None, *, mode=None)` | 凭实际扣包与炉面确认将库存预留转为在途，返回是否结转；实收、取消或消耗后释放匹配预留 | 陈旧或无足额旧预留时转移返回假，非法数量抛 `ValueError` |
 | `scripted_world.ScriptedWorld(*args, **kwargs)`、`world.queue(method, *responses)`、`world.assert_exhausted()` | 按方法排列快照、异常或 `callback(world, **request)`，测试显式模拟相应副作用。用 `testing.drive()` 驱动生成器并核对回执消费 | 需要安排的回执缺失或未消费时报 `AssertionError`。纯离线 |
 
 扫描结果的 `dimension`、`observed_at` 在外层。调用方将已观察维度与可达证据并入候选，再交给子目标谓词；切维度、死亡或地标陈旧后重新观察。
+
+`CampaignPlanner` 持有一本 `ReservationBook`。规则和战术展开先核对需求，最终派发时用技能的可选 `material_plan(args, state)` 进行原子预留。技能结束、重规划、环境挂起或主循环退出时释放当前账项，下一拍基于刷新后的背包重算。模型策略读取同一账本的摘要，现场工作站、地标、遭遇和门在缺少现场快照时保持待观察。
