@@ -278,6 +278,48 @@ class ObsidianTests(unittest.TestCase):
                     self.assertNotIn("dig", [op for op, _ in world.calls])
                 world.assert_exhausted()
 
+    def test_cooling_fetches_from_water_cauldron_and_pours_to_air_cell_when_anchor_not_lower(self):
+        cauldron = (1, 64, -1)
+        ore = (3, 65, 1)
+        world = NetherWorld(
+            items={_PICK: 1, "bucket": 1},
+            extra={
+                cauldron: "water_cauldron",
+                ore: "obsidian",
+                (3, 64, 1): "lava",
+                (3, 63, 1): "stone",
+                (2, 64, 1): "stone",
+                (4, 65, 1): "stone",
+                (3, 65, 2): "stone",
+                (3, 65, 0): "stone",
+            },
+            observed=(ore, cauldron),
+        )
+        world.properties[cauldron] = {"level": "3"}
+
+        def scoop_cauldron(w, *, pos, item, **kwargs):
+            self.assertEqual((pos, item), (list(cauldron), "bucket"))
+            w.blocks[cauldron] = "cauldron"
+            w.properties.pop(cauldron, None)
+            w.items.update(bucket=0, water_bucket=1)
+            return {"block": "water_cauldron", "changed": True}
+
+        def pour_air_cell(w, *, pos, item, **kwargs):
+            # Bot stands at y=64 while anchor (2, 64, 1) is also y=64: must pass target air cell [2, 65, 1]!
+            self.assertEqual((pos, item), ([2, 65, 1], "water_bucket"))
+            w.items.update(water_bucket=0, bucket=1)
+            w.blocks[(2, 65, 1)] = "water"
+            w.blocks[(3, 64, 1)] = "obsidian"
+            return {"target": [2, 65, 1], "changed": True}
+
+        world.queue("interact", scoop_cauldron, pour_air_cell)
+        world.queue("equip", _equip)
+        world.queue("dig", _dig)
+        _, _, state = self.run_skill(world)
+        self.assertEqual(state.count("obsidian"), 1)
+        self.assertEqual(state.count("bucket"), 1)
+        world.assert_exhausted()
+
     def test_false_dig_success_without_inventory_or_block_change(self):
         ore = (2, 64, 0)
         world = NetherWorld(items={_PICK: 1}, extra={ore: "obsidian"}, observed=(ore,))

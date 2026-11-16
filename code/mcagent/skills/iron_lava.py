@@ -5,7 +5,7 @@ import math
 from itertools import pairwise
 
 from ..runtime import EnvBlocked, Replan
-from .base import Skill, rec
+from .base import Skill, failure, rec
 from .field import move_local, scan_blocks
 from .interaction import use_item_on
 from .items import AIR, PLACEABLE_BLOCKS, bare
@@ -26,9 +26,12 @@ def _observe(ex, pos):
 
 
 def _lava_source(block):
-    """§3.4 exposes properties. The lava level encoding is pending a target probe."""
+    """§3.4、§4.4：空桶装岩浆支持 level=0 岩浆源本身，或直接右键 lava_cauldron 本身。"""
+    name = bare(block.get("name"))
+    if name == "lava_cauldron":
+        return True
     level = (block.get("properties") or {}).get("level")
-    return bare(block.get("name")) == "lava" and str(level) == "0"
+    return name == "lava" and str(level) == "0"
 
 
 def _dry_stance(ex, cell):
@@ -48,9 +51,11 @@ def _grounded_cell(ex, status):
 
 
 def _approach_safe(ex, source, stance, direction):
-    """The source stays two cells away with one observed dry retreat cell behind us."""
+    """The source stays two cells away with one observed dry retreat cell and unobstructed §4.4 sightline."""
     dx, dz = direction
     x, y, z = stance
+    if y > source[1] and bare(_observe(ex, (source[0], source[1] + 1, source[2])).get("name")) not in AIR:
+        return False
     return (_dry_stance(ex, stance)
             and _dry_stance(ex, (x + dx, y, z + dz))
             and all(bare(_observe(ex, (x - dx, y + dy, z - dz)).get("name")) in AIR
@@ -109,7 +114,9 @@ class FillLavaBucket(Skill):
         if reason := self.blocked(state):
             raise Replan(reason)
 
-        scan = scan_blocks(ex, state, "lava", radius=_RADIUS, limit=_LIMIT)
+        scan = scan_blocks(ex, state, ("lava", "lava_cauldron"), radius=_RADIUS, limit=_LIMIT)
+        if scan.get("ready") is False:
+            raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描岩浆源")
         sources = [tuple(block["pos"]) for block in scan["blocks"] if _lava_source(block)]
         if not sources:
             raise _blocked("lava_source")
@@ -144,8 +151,14 @@ class FillLavaBucket(Skill):
         lava_before, empty_before = state.count("lava_bucket"), state.count("bucket")
         if lava_before:
             return
-        yield from use_item_on(ex, state, source, "bucket")
-        if state.count("lava_bucket") <= lava_before or state.count("bucket") >= empty_before:
+        try:
+            evidence = yield from use_item_on(ex, state, source, "bucket")
+        except Replan as exc:
+            if failure(exc)[0] == "cannot_interact":
+                raise Replan("装岩浆桶被服务端拒绝（cannot_interact），请确认对着源格/炼药锅本身且视线无遮挡") from exc
+            raise
+        if (evidence["receipt"].get("changed") is False
+                or state.count("lava_bucket") <= lava_before or state.count("bucket") >= empty_before):
             raise Replan("装桶后背包未确认空桶转为岩浆桶")
         yield rec("lava_bucket_evidence", inventory_confirmed=True,
                   advancement_confirmed="story/lava_bucket" in completed_advancements(ex))

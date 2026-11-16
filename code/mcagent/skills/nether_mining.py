@@ -131,22 +131,34 @@ def _ore_environment(ex, pos):
     return "wet" if "water" in names.values() else "dry"
 
 
+def _water_source(block) -> bool:
+    """§4.4 / §8 1.3.10 ③：支持水源格(level=0)本身或满水炼药锅(water_cauldron, level=3)本身。"""
+    name = bare(block.get("name"))
+    level = str((block.get("properties") or {}).get("level"))
+    return (name == "water" and level == "0") or (name == "water_cauldron" and level == "3")
+
+
 def _fetch_water(ex, state, dimension):
     if state.count("water_bucket"):
         return True
     if not state.count("bucket"):
         return False
-    found = scan_blocks(ex, state, "water", radius=8, limit=6)
+    found = scan_blocks(ex, state, ("water", "water_cauldron"), radius=8, limit=6)
     for block in found["blocks"]:
         pos = tuple(block["pos"])
-        if (str((block.get("properties") or {}).get("level")) != "0"
-                or not _at_work_site(ex, state, dimension, pos)):
+        if not _water_source(block) or not _at_work_site(ex, state, dimension, pos):
             continue
-        # Bucket source level and its actual conversion are endpoint probes.
         old_empty, old_full = state.count("bucket"), state.count("water_bucket")
-        yield from use_item_on(ex, state, list(pos), "bucket")
+        try:
+            evidence = yield from use_item_on(ex, state, list(pos), "bucket")
+        except Replan as exc:
+            if failure(exc)[0] == "cannot_interact":
+                yield rec("interact", pos=list(pos), item="bucket", error_code="cannot_interact")
+                continue
+            raise
         state.refresh_inventory(ex.client)
-        if state.count("bucket") != old_empty - 1 or state.count("water_bucket") != old_full + 1:
+        if (evidence["receipt"].get("changed") is False
+                or state.count("bucket") != old_empty - 1 or state.count("water_bucket") != old_full + 1):
             raise Replan("舀水后未确认空桶变为水桶")
         return True
     return False
@@ -166,13 +178,19 @@ def _cool_ore(ex, state, pos, dimension):
         return False
     water = targets[0]
     anchor = _ground(water)
+    status = state.refresh_status(ex.client, max_age_s=0)
+    current = _cell(_pos(status))
     if (not _at_work_site(ex, state, dimension, anchor)
+            or not _line_clear(ex, _pos(status), water)
             or _name(ex, water) not in AIR or not _stable(ex, anchor)):
         return False
+    # §4.4：bot 站得比承载格高时传承载格即倒在顶面；平齐或更低时传目标空气格，避免倒在侧面。
+    pour_pos = list(anchor) if current[1] > anchor[1] else list(water)
     old_empty, old_full = state.count("bucket"), state.count("water_bucket")
-    yield from use_item_on(ex, state, list(anchor), "water_bucket")
+    evidence = yield from use_item_on(ex, state, pour_pos, "water_bucket")
     state.refresh_inventory(ex.client)
-    if state.count("bucket") != old_empty + 1 or state.count("water_bucket") != old_full - 1:
+    if (evidence["receipt"].get("changed") is False
+            or state.count("bucket") != old_empty + 1 or state.count("water_bucket") != old_full - 1):
         raise Replan("放水后未确认水桶变为空桶")
     if not _at_work_site(ex, state, dimension, pos, wet=True):
         raise Replan("放水后作业站位被水流影响，停止采掘")

@@ -803,6 +803,42 @@ class FillLavaBucketTests(unittest.TestCase):
         self.assertFalse(steps[-1]["advancement_confirmed"])
         world.assert_exhausted()
 
+    def test_lava_cauldron_overhang_raycast_and_cannot_interact(self):
+        overhang = LavaFixture(source=(2, 63, 0))
+        overhang.blocks[(2, 64, 0)] = "stone"
+        ex, state = overhang.session()
+        with self.assertRaises(EnvBlocked) as blocked:
+            drive(FillLavaBucket(), ex, state)
+        self.assertEqual(blocked.exception.missing_predicate, "safe_lava_access")
+        overhang.assert_exhausted()
+
+        cauldron_world = ScriptedWorld(
+            blocks={(x, 63, 0): "stone" for x in range(-2, 3)} | {(2, 64, 0): "lava_cauldron"},
+            items={"bucket": 1},
+        )
+        cauldron_world.st["dimension"] = "overworld"
+        cauldron_world.queue("find_blocks", {"blocks": [{"name": "lava_cauldron", "pos": [2, 64, 0]}]})
+
+        def take_cauldron(w, **req):
+            self.assertEqual(req["pos"], [2, 64, 0])
+            w.blocks[(2, 64, 0)] = "cauldron"
+            w.items.update(bucket=0, lava_bucket=1)
+            return {"block": "lava_cauldron", "changed": True, "gained": {"lava_bucket": 1}}
+
+        cauldron_world.queue("interact", take_cauldron)
+        cauldron_world.queue("advancements", {"ready": True, "advancements": []})
+        ex2, state2 = cauldron_world.session()
+        drive(FillLavaBucket(), ex2, state2)
+        self.assertEqual(state2.count("lava_bucket"), 1)
+        cauldron_world.assert_exhausted()
+
+        reject_world = LavaFixture()
+        reject_world.queue("interact", ApiError("cannot_interact", "hit solid block"))
+        ex3, state3 = reject_world.session()
+        with self.assertRaisesRegex(Replan, "cannot_interact"):
+            drive(FillLavaBucket(), ex3, state3)
+        reject_world.assert_exhausted()
+
 
 if __name__ == "__main__":
     unittest.main()
