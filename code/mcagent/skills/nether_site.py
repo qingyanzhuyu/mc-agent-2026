@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from math import dist, floor, isfinite
 
-from ..client import ApiError
 from ..runtime import Replan
 from .base import rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
+from .observations import observe_block
 
 CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
 PORTAL = "nether_portal"
@@ -23,12 +23,7 @@ SCAFFOLDS = frozenset(PLACEABLE_BLOCKS) - GRAVITY
 
 
 def _block(ex, pos):
-    try:
-        return ex.client.get_block(list(pos))
-    except ApiError as exc:
-        if exc.code != "not_loaded":
-            raise
-        return {}
+    return observe_block(ex, list(pos))
 
 
 def _name(ex, pos):

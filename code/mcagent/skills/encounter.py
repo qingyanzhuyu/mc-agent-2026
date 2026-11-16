@@ -4,11 +4,11 @@ from __future__ import annotations
 import math
 import time
 
-from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import rec
 from .field import _bounded, _cell, _grounded, _observed_block, _position, _standable_cell, scan_entities
 from .items import AIR, bare
+from .observations import completed_advancements
 
 
 _ARROWS = ("arrow", "spectral_arrow", "tipped_arrow")
@@ -104,18 +104,7 @@ def _current_entity(ex, state, entity, radius, *, required):
 
 
 def _completed(ex, advancement):
-    if advancement is None:
-        return False
-    try:
-        snapshot = ex.client.advancements(status="completed", include_recipes=False)
-    except ApiError as exc:
-        if exc.code == "not_ready":
-            return False
-        raise
-    return snapshot.get("ready") is True and any(
-        bare(row.get("id")) == bare(advancement) and row.get("status") == "completed"
-        for row in snapshot.get("advancements", ())
-    )
+    return advancement is not None and bare(advancement) in completed_advancements(ex)
 
 
 def _verify_advancement(ex, advancement, polls):

@@ -4,13 +4,13 @@ from __future__ import annotations
 import math
 from itertools import pairwise
 
-from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import Skill, rec
 from .field import move_local, scan_blocks
 from .interaction import use_item_on
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .mining import SOLID_SUPPORT
+from .observations import completed_advancements, observe_block
 from .registry import register
 
 
@@ -22,12 +22,7 @@ _SUPPORT = SOLID_SUPPORT | set(PLACEABLE_BLOCKS) | {"bedrock", "obsidian", "blac
 
 
 def _observe(ex, pos):
-    try:
-        return ex.client.get_block(list(pos))
-    except ApiError as exc:
-        if exc.code != "not_loaded":
-            raise
-        return {}
+    return observe_block(ex, list(pos))
 
 
 def _lava_source(block):
@@ -88,19 +83,6 @@ def _blocked(missing):
         missing_predicate=missing,
         searched_volume=f"当前视点半径 {_RADIUS} 格内最多 {_LIMIT} 个暴露岩浆候选",
         wake_on="chunk_moved",
-    )
-
-
-def _completed_lava_advancement(ex):
-    try:
-        result = ex.client.advancements(status="completed", include_recipes=False)
-    except ApiError as exc:
-        if exc.code != "not_ready":
-            raise
-        return False
-    return result.get("ready") is True and any(
-        bare(row.get("id")) == "story/lava_bucket" and row.get("status") == "completed"
-        for row in result.get("advancements", ())
     )
 
 
@@ -166,7 +148,7 @@ class FillLavaBucket(Skill):
         if state.count("lava_bucket") <= lava_before or state.count("bucket") >= empty_before:
             raise Replan("装桶后背包未确认空桶转为岩浆桶")
         yield rec("lava_bucket_evidence", inventory_confirmed=True,
-                  advancement_confirmed=_completed_lava_advancement(ex))
+                  advancement_confirmed="story/lava_bucket" in completed_advancements(ex))
 
     def verify_done(self, state, before_counts):
         return "" if state.count("lava_bucket") else "背包未确认岩浆桶"

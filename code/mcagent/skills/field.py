@@ -5,10 +5,10 @@ import math
 import time
 from itertools import islice
 
-from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
+from .observations import observe_block as _observed_block
 
 
 _UNSAFE_SUPPORT = AIR | {"water", "lava", "bubble_column", "fire", "soul_fire",
@@ -35,15 +35,6 @@ def _position(value):
 
 def _cell(value):
     return tuple(map(math.floor, _position(value)))
-
-
-def _observed_block(ex, pos):
-    try:
-        return ex.client.get_block(pos)
-    except ApiError as exc:
-        if exc.code == "not_loaded":
-            return {}
-        raise
 
 
 def _block_matches(block, names, properties=None, mature=None):

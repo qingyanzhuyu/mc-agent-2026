@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import math
 
-from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .field import move_local
 from .items import AIR, PLACEABLE_BLOCKS, bare
+from .observations import completed_advancements, observe_block
+from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES
 
 
@@ -22,22 +23,8 @@ _SLEEP_PROGRESS = "adventure/sleep_in_bed"
 _FISH_PROGRESS = "husbandry/fishy_business"
 
 
-def _fresh_inventory(ex, state):
-    state.invalidate_inventory()
-    return state.refresh_inventory(ex.client)
-
-
 def _has_progress(ex, advancement):
-    try:
-        snapshot = ex.client.advancements(status="completed", include_recipes=False)
-    except ApiError as exc:
-        if exc.code == "not_ready":
-            return False
-        raise
-    return snapshot.get("ready") is True and any(
-        bare(row.get("id")) == advancement and row.get("status") == "completed"
-        for row in (snapshot.get("advancements") or ())
-    )
+    return advancement in completed_advancements(ex)
 
 
 def _plank_plan(state, count):
@@ -53,12 +40,7 @@ def _plank_plan(state, count):
 
 
 def _block(ex, pos):
-    try:
-        return bare(ex.client.get_block(pos).get("name"))
-    except ApiError as exc:
-        if exc.code == "not_loaded":
-            return ""
-        raise
+    return bare(observe_block(ex, pos).get("name"))
 
 
 def _cell(pos):

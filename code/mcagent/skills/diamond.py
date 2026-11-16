@@ -12,6 +12,7 @@ from .diamond_site import (
 from .field import equip_item, mine_block_batch, place_block, scan_blocks
 from .items import AIR, PICKAXE_ORDER, bare, record_mine_trail
 from .mining import MineStepUnsafe, mine_step
+from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
 from .windows import take_container_item, window_amount, window_view
@@ -23,11 +24,6 @@ _MAX_DESCENT = 24
 _MAX_ORES = 16
 _MIN_Y = -54
 _SCAN_RADIUS = 16
-
-
-def _fresh_inventory(ex, state) -> dict:
-    state.invalidate_inventory()
-    return state.refresh_inventory(ex.client)
 
 
 def _world_block(state) -> str:
@@ -272,7 +268,10 @@ class CraftDiamondGear(Skill):
         item = args["item"]
         if _already_has_gear(item, state):
             return ()
-        return tuple((ingredient, count, "consume") for ingredient, count in RECIPES[item].ingredients)
+        ingredients = RECIPES[item].ingredients
+        if any(state.count(ingredient) < count for ingredient, count in ingredients):
+            return ()  # 背包无法自制，这一拍仍可观察容器成品。
+        return tuple((ingredient, count, "consume") for ingredient, count in ingredients)
 
     def run(self, ex, state):
         item = self.args["item"]

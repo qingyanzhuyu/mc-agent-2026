@@ -11,6 +11,7 @@ from .base import rec
 from .encounter import _line_cells, _retreat_clear, verify_shot_lane
 from .field import _cell, _grounded, _position, _safe_support, _standable_cell, move_local, scan_entities
 from .items import bare
+from .observations import completed_advancements as completed
 
 KILL_MOB = "minecraft:adventure/kill_a_mob"
 DEFLECT = "minecraft:story/deflect_arrow"
@@ -30,20 +31,6 @@ class Encounter:
     min_distance: int
     max_distance: int
     splash_radius: int
-
-
-def completed(ex):
-    """§3.7 只读取当前会话下发且明确完成的计分结果。"""
-    try:
-        observed = ex.client.advancements(status="completed", include_recipes=False)
-    except ApiError as exc:
-        if exc.code == "not_ready":
-            return set()
-        raise
-    if observed.get("ready") is not True:
-        return set()
-    return {bare(entry["id"]) for entry in observed.get("advancements") or ()
-            if entry.get("id") and entry.get("status") == "completed"}
 
 
 def gate_reason(state, status):

@@ -9,6 +9,7 @@ from ..runtime import Replan
 from .field import move_local, scan_blocks
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .mining import SOLID_SUPPORT, safe_mine_column
+from .observations import observe_block as _block
 
 Cell = tuple[int, int, int]
 CARDINALS = ((1, 0), (0, 1), (-1, 0), (0, -1))
@@ -30,15 +31,6 @@ def _center(cell: Cell) -> tuple[float, float, float]:
 def _above(cell: Cell, dy: int) -> Cell:
     x, y, z = cell
     return x, y + dy, z
-
-
-def _block(ex, cell: Cell) -> dict:
-    try:
-        return ex.client.get_block(cell)
-    except ApiError as exc:
-        if exc.code != "not_loaded":
-            raise
-        return {}
 
 
 def _dry_name(block: dict) -> str:

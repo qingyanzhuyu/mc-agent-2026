@@ -451,6 +451,9 @@ class MainLoop:
         finally:
             if active_skill is not None:
                 active_skill.abort()
+            release_materials = getattr(self.planner, "release_skill_materials", None)
+            if release_materials is not None:
+                release_materials()
             if monitor is not None:
                 monitor.close()
             if self.observer is not None:

@@ -17,7 +17,7 @@ from collections import deque
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Collection, Mapping, Optional
 
 from ..planner import objective, skill_choice
@@ -49,6 +49,7 @@ from .goals import (
     rank_actionable_goals,
     resolve_active_goals,
 )
+from .reserve import ReservationBook
 from .starter_skills import (
     PROTECTED_ZONES,
     can_afford_gear,
@@ -56,6 +57,7 @@ from .starter_skills import (
     total_logs,
     total_planks,
 )
+from .subgoals import item_available, tool_ready
 
 DEFAULT_STRATEGY_REVIEW_S: float = 600.0
 
@@ -101,6 +103,19 @@ class PlanDecision:
     objective: Optional[Objective] = None
     objective_source: Optional[str] = None
     objective_trigger: Optional[str] = None
+
+
+def _material_plan(skill: Skill, state: State):
+    plan = getattr(type(skill), "material_plan", None)
+    return plan(skill.args, state) if callable(plan) else ()
+
+
+def _supplies(goal: GoalSpec, state: State):
+    for requirement, name, args in goal.gather_fallbacks:
+        if not check_item_expr(state, requirement):
+            yield requirement, name, dict(args)
+            if not goal.gather_when_blocked:
+                return
 
 
 @dataclass
@@ -162,9 +177,11 @@ class RulePlanner:
         target_goal: Optional[str] = None,
         telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
         min_verified: str = "offline",
+        reservations: Optional[ReservationBook] = None,
     ):
         self.registry = REGISTRY if registry is None else registry
         self.min_verified = min_verified
+        self.reservations = reservations
         self.ledger: tuple[GoalSpec, ...] = tuple(ledger)
         self.ledger_map: dict[str, GoalSpec] = {g.id: g for g in self.ledger}
         default_stages = OFFICIAL_CAMPAIGN_STAGES if min_verified == "live" else DEFAULT_CAMPAIGN_STAGES
@@ -242,9 +259,15 @@ class RulePlanner:
         if cls is None or not skill_choice.meets_verification(cls, self.min_verified) or cls.blocked(state):
             return None
         inst = cls(**(args or {}))
-        if self.environment_block(inst.goal) or inst.is_cooling() or not inst.can_start(state):
+        if (self.environment_block(inst.goal) or inst.is_cooling() or not inst.can_start(state)
+                or not self._materials_ready(inst, state)):
             return None
         return inst
+
+    def _materials_ready(self, inst: Skill, state: State) -> bool:
+        return self.reservations is None or self.reservations.can_reserve_plan(
+            state, f"candidate:{inst.goal}", _material_plan(inst, state),
+        )
 
     def _diagnose_skill(self, name: str, args: Optional[dict], state: State) -> tuple[Optional[Skill], str, bool]:
         """检查单个技能在当拍是否可启动，返回 `(实例或 None, 失败原因, 是否仅因冷却受阻)`。"""
@@ -267,6 +290,8 @@ class RulePlanner:
             return None, f"技能 {name}({bound}) 当前不可启动（can_start=False）", False
         if inst.is_cooling():
             return None, f"技能 {name}（{inst.goal}）处于失败冷却期", True
+        if not self._materials_ready(inst, state):
+            return None, f"技能 {name} 的物资被预留、数量不足或库存待刷新", False
         return inst, "", False
 
     def expand_objective_skill(self, state: State) -> tuple[Optional[Skill], str]:
@@ -291,7 +316,8 @@ class RulePlanner:
         cooling_step_id: Optional[str] = None
         for step in ranked:
             g = step.step_goal
-            if all(check_item_expr(state, expr) for expr in g.prereq_items):
+            ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
+            if ready:
                 inst, why_not, cooling_only = self._diagnose_skill(g.skill, g.args_dict, state)
                 if inst is not None:
                     self._last_selected_goal_id = g.id
@@ -299,20 +325,18 @@ class RulePlanner:
                 reasons.append(f"{g.id}: {why_not}")
                 if cooling_only and cooling_step_id is None:
                     cooling_step_id = g.id
-            else:
+            if not ready or g.gather_when_blocked:
                 matched_fb = False
-                for req_expr, fb_skill, fb_args in g.gather_fallbacks:
-                    if not check_item_expr(state, req_expr):
-                        matched_fb = True
-                        inst, why_not, cooling_only = self._diagnose_skill(fb_skill, dict(fb_args), state)
-                        if inst is not None:
-                            self._last_selected_goal_id = g.id
-                            return inst, f"为目标 {g.id} 补齐前置材料（{req_expr}）"
-                        reasons.append(f"{g.id}({req_expr}): {why_not}")
-                        if cooling_only and cooling_step_id is None:
-                            cooling_step_id = g.id
-                        break
-                if not matched_fb:
+                for req_expr, fb_skill, fb_args in _supplies(g, state):
+                    matched_fb = True
+                    inst, why_not, cooling_only = self._diagnose_skill(fb_skill, fb_args, state)
+                    if inst is not None:
+                        self._last_selected_goal_id = g.id
+                        return inst, f"为目标 {g.id} 补齐前置材料（{req_expr}）"
+                    reasons.append(f"{g.id}({req_expr}): {why_not}")
+                    if cooling_only and cooling_step_id is None:
+                        cooling_step_id = g.id
+                if not ready and not matched_fb:
                     unmet = [expr for expr in g.prereq_items if not check_item_expr(state, expr)]
                     reasons.append(f"{g.id}: 缺少前置物资 {unmet} 且无补料技能")
 
@@ -438,20 +462,18 @@ class RulePlanner:
         if ranked:
             for step in ranked:
                 g = step.step_goal
-                if all(check_item_expr(state, expr) for expr in g.prereq_items):
+                ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
+                if ready:
                     inst = self._try_make(g.skill, g.args_dict, state)
                     if inst is not None:
                         self._last_selected_goal_id = g.id
                         return PlanDecision(inst, "rule", f"推进目标 {g.id}（{g.title}）")
-                else:
-                    # 仅尝试首个未满足前置表达式对应的补料技能（避免缺圆石且采石冷却时盲目去砍树）
-                    for req_expr, fb_skill, fb_args in g.gather_fallbacks:
-                        if not check_item_expr(state, req_expr):
-                            inst = self._try_make(fb_skill, dict(fb_args), state)
-                            if inst is not None:
-                                self._last_selected_goal_id = g.id
-                                return PlanDecision(inst, "rule", f"为目标 {g.id} 补齐前置材料（{req_expr}）")
-                            break
+                if not ready or g.gather_when_blocked:
+                    for req_expr, fb_skill, fb_args in _supplies(g, state):
+                        inst = self._try_make(fb_skill, fb_args, state)
+                        if inst is not None:
+                            self._last_selected_goal_id = g.id
+                            return PlanDecision(inst, "rule", f"为目标 {g.id} 补齐前置材料（{req_expr}）")
 
             sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
             sc = self._try_make("scout_island", {"radius": sc_radius}, state)
@@ -528,6 +550,8 @@ class CampaignPlanner:
         self.min_verified = min_verified
         self.registry = REGISTRY if registry is None else registry
         self.target_goal = target_goal
+        self.reservations = ReservationBook()
+        self._active_material_consumer: Optional[str] = None
         self.rules = RulePlanner(
             self.registry,
             ledger=ledger,
@@ -535,6 +559,7 @@ class CampaignPlanner:
             target_goal=target_goal,
             telemetry=telemetry,
             min_verified=min_verified,
+            reservations=self.reservations,
         )
         self.on_llm_telemetry = on_llm_telemetry
         self.on_objective_telemetry = on_objective_telemetry
@@ -612,6 +637,7 @@ class CampaignPlanner:
             target_goal=goal_id,
             telemetry=self.rules.telemetry,
             min_verified=self.min_verified,
+            reservations=self.reservations,
         )
         tp.completed_advancements = self.rules.completed_advancements
         tp.ep_goal_fails = self.rules.ep_goal_fails
@@ -674,8 +700,8 @@ class CampaignPlanner:
             if current_objective_elapsed_s is None
             else float(current_objective_elapsed_s)
         )
-        subgoals = self.subgoal_provider(state) if self.subgoal_provider is not None else None
-        reserves = self.reserve_provider(state) if self.reserve_provider is not None else None
+        subgoals = self.subgoal_provider(state) if self.subgoal_provider is not None else self._subgoal_snapshot(state)
+        reserves = self.reserve_provider(state) if self.reserve_provider is not None else self._reservation_snapshot(state)
         return build_decision_context(
             state,
             ledger=self.rules.ledger,
@@ -696,6 +722,27 @@ class CampaignPlanner:
             subgoal_predicates=subgoals,
             reservations=reserves,
         )
+
+    def _subgoal_snapshot(self, state: State) -> dict[str, Any]:
+        return {
+            "item_available": {
+                item: item_available(state, item, count, allocatable=self.reservations.available(state, item))
+                for item, count in (("iron_ingot", 3), ("diamond", 4), ("wheat_seeds", 3))
+            },
+            "tool_ready": {tier: tool_ready(state, "pickaxe", tier, 1) for tier in ("iron", "diamond")},
+            **dict.fromkeys(("station_ready", "landmark_reachable", "safe_encounter", "active_portal"), "待现场观察"),
+        }
+
+    def _reservation_snapshot(self, state: State) -> dict[str, Any]:
+        return {
+            "有效": self.reservations.observe(state) and not state.inventory_dirty,
+            "账项": [f"{r.item}×{r.count}({r.mode})" for r in self.reservations.entries],
+        }
+
+    def release_skill_materials(self) -> None:
+        if self._active_material_consumer is not None:
+            self.reservations.release(self._active_material_consumer)
+            self._active_material_consumer = None
 
     def _emit_objective_telemetry(
         self,
@@ -750,6 +797,7 @@ class CampaignPlanner:
             )
 
     def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
+        self.release_skill_materials()
         self.rules.record_environment_block(skill, error, state)
         self._last_selected_goal_id = None
 
@@ -764,6 +812,7 @@ class CampaignPlanner:
         elapsed_s: float = 0.0,
         completed_advs: Collection[str] = (),
     ) -> None:
+        self.release_skill_materials()
         self._sync_external_objective_assignment()
         if self._last_selected_goal_id and self.rules._last_selected_goal_id is None:
             self.rules._last_selected_goal_id = self._last_selected_goal_id
@@ -1297,6 +1346,19 @@ class CampaignPlanner:
         )
 
     def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
+        self.release_skill_materials()
+        if not self.reservations.observe(state) and not state.inventory_dirty:
+            self.reservations.reset(state)
+        choice = self._select_skill(state, recent_failures)
+        if choice.skill is None or not (plan := _material_plan(choice.skill, state)):
+            return choice
+        consumer = f"{self._last_selected_goal_id or 'skill'}:{choice.skill.goal}"
+        if not self.reservations.reserve_plan(state, consumer, plan):
+            return replace(choice, skill=None, source="idle", reason="技能所需物资不足、已被预留或库存待刷新")
+        self._active_material_consumer = consumer
+        return choice
+
+    def _select_skill(self, state: State, recent_failures: list[str]) -> PlanDecision:
         if self.mode == "focus":
             assert self.focus_skill is not None
             self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None

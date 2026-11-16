@@ -16,6 +16,7 @@ from ..client import ApiError
 from ..runtime import Replan
 from ..skills.base import Param, Skill, failure, rec
 from ..skills.items import AIR, MINE_TRAILS, bare, best_pickaxe
+from ..skills.recipes import craft_recipe
 from ..skills.registry import register
 
 if TYPE_CHECKING:
@@ -136,6 +137,8 @@ _GEAR_NEEDS: dict[str, tuple[int, int, int]] = {
 
 
 def can_afford_gear(state: "State", item: str, *, assume_no_table: bool = True) -> bool:
+    if item == "stick":
+        return total_planks(state) + 4 * total_logs(state) >= 2 or state.count("bamboo") >= 2
     if item not in _GEAR_NEEDS:
         return False
     p_need, s_need, c_need = _GEAR_NEEDS[item]
@@ -444,7 +447,7 @@ class CraftGear(Skill):
         "item": Param(
             str,
             "要合成的物品",
-            choices=("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace"),
+            choices=("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace", "stick"),
             default="wooden_pickaxe",
         ),
     }
@@ -454,7 +457,8 @@ class CraftGear(Skill):
 
     @classmethod
     def blocked(cls, state: "State") -> str:
-        if total_logs(state) + total_planks(state) + total_cobble(state) < 2:
+        if (total_logs(state) + total_planks(state) + total_cobble(state) < 2
+                and not can_afford_gear(state, "stick")):
             return "缺少原木、木板或圆石原料"
         return ""
 
@@ -463,6 +467,13 @@ class CraftGear(Skill):
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         target = str(self.args["item"])
+        if target == "stick":
+            state.invalidate_inventory()
+            state.refresh_inventory(ex.client)
+            if total_planks(state) < 2 and state.count("bamboo") < 2:
+                yield from _prepare_recipe_planks(ex, state, 2, "stick")
+            yield from craft_recipe(ex, state, "stick", goal_qty=state.count("stick") + 1)
+            return
         p_need, s_need, c_need = _GEAR_NEEDS[target]
         state.refresh_status(ex.client, max_age_s=0)
         state.refresh_inventory(ex.client)

@@ -1,11 +1,9 @@
 """T1 obsidian acquisition and Nether portal entry."""
 from __future__ import annotations
 
-from ..client import ApiError
 from ..runtime import Replan
 from .base import Param, Skill, rec
 from .interaction import use_item_on
-from .items import bare
 from .nether_mining import _durable_pick, _gather_flint, _harvest_obsidian, _take_available
 from .nether_portal import (
     Entry, _choose_build_plan, _find_activated_portal, _material_scaffold, build_pattern,
@@ -14,6 +12,8 @@ from .nether_portal import (
 from .nether_site import (
     OBSIDIAN, PORTAL, _cell, _dimension, _ground, _name, _near, _pos, _standing, _walk,
 )
+from .observations import completed_advancements
+from .observations import refresh_inventory as _inventory
 from .registry import register
 
 
@@ -25,22 +25,6 @@ def cast_obsidian_cell(ex, state, pos):
 def _ignite_with_lava(ex, state, pos):
     """Reserved for P8 coverage of ignition by lava."""
     raise Replan("岩浆引燃门框等待靶场验证")
-
-
-def _completed(ex, advancement):
-    try:
-        view = ex.client.advancements(status="completed", include_recipes=False)
-    except ApiError as exc:
-        if exc.code == "not_ready":
-            return False
-        raise
-    return any(bare(row.get("id")) == advancement and row.get("status") == "completed"
-               for row in view.get("advancements") or ())
-
-
-def _inventory(ex, state):
-    state.invalidate_inventory()
-    state.refresh_inventory(ex.client)
 
 
 @register
@@ -135,7 +119,7 @@ class BuildAndEnterPortal(Skill):
             entry = yield from self._prepare_portal(ex, state, start)
         landing = yield from traverse_portal(ex, state, entry)
         yield rec("portal_landing", landing, source_dimension="overworld", source_portal=list(entry.foot),
-                  advancement_confirmed=_completed(ex, "story/enter_the_nether"))
+                  advancement_confirmed="story/enter_the_nether" in completed_advancements(ex, require_ready=False))
 
     def _prepare_portal(self, ex, state, start):
         if self.args["allow_casting"]:

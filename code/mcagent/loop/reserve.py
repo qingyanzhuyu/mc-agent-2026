@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -105,6 +105,43 @@ class ReservationBook:
         if self._available(state, item, other) < count:
             return False
         self._entries[key] = Reservation(consumer, item, count, mode)
+        return True
+
+    def _plan_entries(self, state: State, consumer: str, requirements: Iterable[tuple[str, int, StockMode]]
+                      ) -> dict[tuple[str, str, ReservationMode], Reservation] | None:
+        amounts: dict[tuple[str, StockMode], int] = {}
+        for item, count, mode in requirements:
+            item = bare(item)
+            if not item or type(count) is not int or count < 1 or mode not in ("consume", "borrow"):
+                raise ValueError("物资计划需要物品、正整数数量与有效模式")
+            key = (item, mode)
+            amounts[key] = amounts.get(key, 0) + count
+        if not consumer:
+            raise ValueError("物资计划需要消费者")
+        if amounts and (not self.observe(state) or state.inventory_dirty):
+            return None
+        held = [entry for entry in self.entries if entry.consumer != consumer and entry.mode != "in_transit"]
+        planned = {}
+        for (item, mode), count in amounts.items():
+            if self._available(state, item, tuple(held)) < count:
+                return None
+            entry = Reservation(consumer, item, count, mode)
+            planned[(consumer, item, mode)] = entry
+            held.append(entry)
+        return planned
+
+    def can_reserve_plan(self, state: State, consumer: str, requirements: Iterable[tuple[str, int, StockMode]]) -> bool:
+        """Check the whole plan against other consumers and its own combined requests."""
+        return self._plan_entries(state, consumer, requirements) is not None
+
+    def reserve_plan(self, state: State, consumer: str, requirements: Iterable[tuple[str, int, StockMode]]) -> bool:
+        """Atomically replace this consumer's stock plan, keeping existing container entries."""
+        planned = self._plan_entries(state, consumer, requirements)
+        if planned is None:
+            return False
+        self.release(consumer, mode="consume")
+        self.release(consumer, mode="borrow")
+        self._entries.update(planned)
         return True
 
     def move_to_container(

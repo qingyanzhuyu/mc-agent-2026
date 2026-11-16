@@ -18,6 +18,7 @@ from .combat_scene import (
 from .encounter import combat_melee, shoot_projectile
 from .field import collect_drops, equip_item, scan_blocks
 from .items import bare
+from .observations import refresh_inventory as _fresh_inventory
 from .registry import register
 
 _CRITERIA = Path(__file__).resolve().parents[3] / "docs" / "99-原始记录" / "criteria-1.21.11.json"
@@ -52,11 +53,6 @@ def _hostile(entity):
 
 def _shield_source(entity):
     return _hostile(entity) and bare(entity.get("name")) in SKELETONS
-
-
-def _fresh_inventory(ex, state):
-    state.invalidate_inventory()
-    state.refresh_inventory(ex.client)
 
 
 @register
