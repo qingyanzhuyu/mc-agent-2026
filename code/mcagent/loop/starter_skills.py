@@ -13,7 +13,7 @@ import math
 from typing import TYPE_CHECKING, Iterator, Optional
 
 from ..client import ApiError
-from ..runtime import Replan
+from ..runtime import EnvBlocked, Replan
 from ..skills.base import Param, Skill, failure, rec
 from ..skills.items import AIR, bare, best_pickaxe
 from ..skills.registry import register
@@ -25,6 +25,7 @@ from ..skills.sightline import (
     can_reach_block,
     eye_to_block_dist,
 )
+from ..skills.world_memo import WorldResourceMemo, memo_for, reset_all_world_memos
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -69,6 +70,7 @@ def reset_world_memo() -> None:
     PROTECTED_ZONES.clear()
     VISITED_ANCHORS.clear()
     KNOWN_TABLES.clear()
+    reset_all_world_memos()
 
 
 def _record_known_table(pos) -> None:
@@ -112,6 +114,99 @@ def _refresh_stance(ex: "Executor", state: "State") -> tuple[dict, list[float]]:
     if not st.get("pos"):
         st = {**st, "pos": cur}
     return st, cur
+
+
+def _dim_of(st: dict) -> str:
+    return str(st.get("dimension") or "overworld")
+
+
+def _probe_block_name(ex: "Executor", pos: list) -> Optional[str]:
+    """只读查询目标格方块名；未加载或未就绪时返回 None。"""
+    try:
+        return bare(ex.client.get_block(pos).get("name"))
+    except ApiError as e:
+        if e.code in ("not_loaded", "not_ready"):
+            return None
+        raise
+
+
+def _scout_hits(summary: object) -> dict[str, list[str]]:
+    blocks_map = (summary.get("blocks") or {}) if isinstance(summary, dict) else {}
+    if isinstance(blocks_map, list):
+        seen = {bare(b.get("name", "")) for b in blocks_map if isinstance(b, dict)}
+        return {
+            tag: [b for b in names if b in seen]
+            for tag, names in STRUCTURE_FINGERPRINTS.items()
+            if any(b in seen for b in names)
+        }
+    if not isinstance(blocks_map, dict):
+        return {}
+    return {
+        tag: [b for b in names if b in blocks_map]
+        for tag, names in STRUCTURE_FINGERPRINTS.items()
+        if any(b in blocks_map for b in names)
+    }
+
+
+def _is_high_canopy(
+    ex: "Executor",
+    st: dict,
+    cur: list[float],
+    pt: tuple[int, int, int],
+) -> bool:
+    """判断是否为头顶悬空或被遮挡且高差>4格的不可达树冠原木。"""
+    same_col = pt[0] == math.floor(cur[0]) and pt[2] == math.floor(cur[2])
+    cx, _, cz = block_center(pt)
+    return (
+        math.hypot(cx - cur[0], cz - cur[2]) < 3.0
+        and (pt[1] - cur[1]) > 4.0
+        and not (same_col and can_reach_block(ex, st, pt, reach=DIG_EYE_REACH))
+    )
+
+
+def _no_wood_blocked() -> EnvBlocked:
+    return EnvBlocked(
+        "半径 64 内及已知原木台账均没有可砍的裸露原木（或均在保护区/不可达处）",
+        missing_predicate="exposed_log",
+        searched_volume="半径 64 + 共享原木台账",
+        wake_on="chunk_moved",
+    )
+
+
+def _collect_live_woods(
+    ex: "Executor",
+    st: dict,
+    cur: list[float],
+    dim: str,
+    memo: WorldResourceMemo,
+    bad_positions: set[tuple[int, int, int]],
+    blocks: list,
+) -> tuple[list[dict], set[tuple[int, int, int]]]:
+    cands: list[dict] = []
+    live_keys: set[tuple[int, int, int]] = set()
+    for b in blocks:
+        p = b.get("pos") if isinstance(b, dict) else None
+        if not (isinstance(p, list) and len(p) == 3):
+            continue
+        pt = (int(p[0]), int(p[1]), int(p[2]))
+        live_keys.add(pt)
+        if (
+            pt in bad_positions
+            or memo.is_blocked(pt, dimension=dim, category="wood")
+            or _is_under_feet(cur, p)
+            or _is_protected(p)
+        ):
+            continue
+        if _is_high_canopy(ex, st, cur, pt):
+            bad_positions.add(pt)
+            continue
+        cands.append({
+            "pos": [pt[0], pt[1], pt[2]],
+            "name": bare(b.get("name", "")),
+            "from_memo": False,
+            "memo_status": "live",
+        })
+    return cands, live_keys
 
 
 def total_logs(state: "State") -> int:
@@ -240,19 +335,31 @@ class ScoutIsland(Skill):
     verified = "offline"
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
-        st = state.refresh_status(ex.client, max_age_s=0)
-        cur = st.get("pos") or state.pos
+        st, cur = _refresh_stance(ex, state)
+        dim = _dim_of(st)
+        memo = memo_for(state)
         r = int(self.args["radius"])
         summary = ex.client.find_blocks(radius=r, limit=40)
-        blocks_map = (summary.get("blocks") or {}) if isinstance(summary, dict) else {}
-        hits = {
-            tag: [b for b in names if b in blocks_map]
-            for tag, names in STRUCTURE_FINGERPRINTS.items()
-            if any(b in blocks_map for b in names)
-        }
+        memo.ingest_find_blocks(summary, dimension=dim, origin=st)
+        hits = _scout_hits(summary)
 
-        # limit 取 250 以覆盖近处 5 格地表之外的远端陆地（limit=40 在普通森林地形会被脚边草方块占满）
-        land = ex.client.find_blocks(types=list(SAFE_GROUND), radius=min(r, 28), limit=250)
+        target_wood = None
+        cur_wood_dist = 0.0
+        if total_logs(state) == 0:
+            woods = [
+                entry for entry in memo.query("wood", dimension=dim, origin=st)
+                if entry.status in ("untested", "reachable") and not _is_protected(entry.pos)
+            ]
+            if woods:
+                cand_dist = eye_to_block_dist(st, woods[0].pos)
+                if cand_dist > 28.0:
+                    target_wood = woods[0]
+                    cur_wood_dist = cand_dist
+
+        # limit 适度放大至 250~350 以覆盖近处地表之外的远端陆地（bot_session.js 上限 500）
+        land_limit = min(350, max(250, r * 7))
+        land = ex.client.find_blocks(types=list(SAFE_GROUND), radius=min(r, 28), limit=land_limit)
+        recent_anchors = VISITED_ANCHORS[-24:]
         cands = []
         for b in (land.get("blocks") or []):
             p = b.get("pos")
@@ -261,18 +368,37 @@ class ScoutIsland(Skill):
             dist = math.hypot(p[0] - cur[0], p[2] - cur[2])
             if dist < 5.0 or abs(p[1] - cur[1]) > 10.0 or _is_protected(p, radius=8.0):
                 continue
-            visited_pen = sum(1 for vx, vz in VISITED_ANCHORS[-6:] if math.hypot(p[0] - vx, p[2] - vz) < 8.0)
-            cands.append((visited_pen, -dist, p))
+            visited_pen = 0
+            for vx, vz in recent_anchors:
+                d_anchor = math.hypot(p[0] - vx, p[2] - vz)
+                if d_anchor < 8.0:
+                    visited_pen += 2
+                elif d_anchor < 14.0:
+                    visited_pen += 1
+            if target_wood is not None:
+                cand_wood_dist = eye_to_block_dist(
+                    {"pos": [p[0] + 0.5, p[1] + 1.0, p[2] + 0.5], "sneaking": st.get("sneaking")},
+                    target_wood.pos,
+                )
+                closer_to_wood = 0 if cand_wood_dist < cur_wood_dist - 8.0 else 1
+                wood_order = cand_wood_dist if closer_to_wood == 0 else -dist
+            else:
+                closer_to_wood = 1
+                wood_order = -dist
+            cands.append((visited_pen, -dist, closer_to_wood, wood_order, p))
 
         if not cands:
             raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
-        # 落水时先找最近的干燥落脚点；在陆地上仍优先未访问过的远端区域。
-        cands.sort(key=(lambda item: (-item[1], item[0])) if st.get("in_water")
-                   else (lambda item: (item[0], item[1])))
+        # 落水时先找最近的干燥落脚点；在陆地上优先低惩罚组，缺木时同组优先靠近已知远木，否则优先未访问远端。
+        cands.sort(
+            key=(lambda item: (-item[1], item[0]))
+            if st.get("in_water")
+            else (lambda item: (item[0], item[2], item[3], item[1]))
+        )
         checked: list[list] = []
         attempts = 0
         last_nav_err: Optional[Replan] = None
-        for _, _, chosen in cands:
+        for _, _, _, _, chosen in cands:
             dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
             # 相邻方块通常属于同一片地形，失败后换一片；同时限制额外观察与动作预算。
             if any(math.dist(dest, old) < 3.0 for old in checked):
@@ -329,6 +455,7 @@ class GatherWood(Skill):
         state.refresh_inventory(ex.client)
         start_logs = total_logs(state)
         want = int(self.args["count"])
+        memo = memo_for(state)
 
         axe = best_axe(state)
         if axe and bare((state.st.get("held") or {}).get("name")) != axe:
@@ -340,42 +467,55 @@ class GatherWood(Skill):
         bad_positions: set[tuple[int, int, int]] = set()
         last_nav_err: Optional[Replan] = None
         attempts = 0
-        while total_logs(state) - start_logs < want and attempts < want + 6:
-            attempts += 1
+        stale_memo_skips = 0
+        while total_logs(state) - start_logs < want and attempts < want + 6 and stale_memo_skips < 32:
             st, cur = _refresh_stance(ex, state)
+            dim = _dim_of(st)
+
             found = ex.client.find_blocks(types=list(ALL_LOGS), radius=32, limit=32)
-            cands = []
-            for b in (found.get("blocks") or []):
-                p = b.get("pos")
-                if not (isinstance(p, list) and len(p) == 3):
-                    continue
-                pt = (int(p[0]), int(p[1]), int(p[2]))
-                if pt in bad_positions or _is_under_feet(cur, p) or _is_protected(p):
-                    continue
-                same_col = pt[0] == math.floor(cur[0]) and pt[2] == math.floor(cur[2])
-                # 跳过头顶侧上方悬空或被树叶挡住的高树冠原木（水平 <3 格且高于脚底 >4 格时地面寻路必报 path_not_found）；
-                # 仅放行正头顶同列且当前视线无遮挡、眼距可达的树干顶节（如 [0, 69, 0]）直接原地挖掘。
-                cx, _, cz = block_center(p)
-                if (
-                    math.hypot(cx - cur[0], cz - cur[2]) < 3.0
-                    and (p[1] - cur[1]) > 4.0
-                    and not (same_col and can_reach_block(ex, st, p, reach=DIG_EYE_REACH))
-                ):
-                    bad_positions.add(pt)
-                    continue
-                cands.append(b)
+            memo.ingest_find_blocks(found, dimension=dim, origin=st, category="wood")
+            cands, live_keys = _collect_live_woods(
+                ex, st, cur, dim, memo, bad_positions, found.get("blocks") or []
+            )
+
+            if not cands:
+                found64 = ex.client.find_blocks(types=list(ALL_LOGS), radius=64, limit=64)
+                memo.ingest_find_blocks(found64, dimension=dim, origin=st, category="wood")
+                cands, live_keys = _collect_live_woods(
+                    ex, st, cur, dim, memo, bad_positions, found64.get("blocks") or []
+                )
+                for entry in memo.query("wood", dimension=dim, origin=st):
+                    pt = entry.pos
+                    if (
+                        pt in live_keys
+                        or pt in bad_positions
+                        or _is_under_feet(cur, pt)
+                        or _is_protected(pt)
+                    ):
+                        continue
+                    if _is_high_canopy(ex, st, cur, pt):
+                        bad_positions.add(pt)
+                        continue
+                    cands.append({
+                        "pos": [pt[0], pt[1], pt[2]],
+                        "name": entry.block,
+                        "from_memo": True,
+                        "memo_status": entry.status,
+                    })
 
             if not cands:
                 if total_logs(state) > start_logs:
                     return
                 if last_nav_err is not None:
                     raise last_nav_err
-                raise Replan("半径 32 内没有可砍的裸露原木（或均在保护区/不可达处）")
+                raise _no_wood_blocked()
 
             if preferred_species is None:
                 preferred_species = bare(cands[0].get("name", "")) or None
             cands.sort(
                 key=lambda b: (
+                    0 if not b["from_memo"] else 1,
+                    0 if b["memo_status"] in ("live", "reachable", "untested") else 1,
                     # 先试当前高度附近或原地眼距可达的树干，避免远端高树冠耗尽尝试预算；山坡高树仍可后备尝试。
                     float(b["pos"][1]) > cur[1] + 4.0 and eye_to_block_dist(st, b["pos"]) > DIG_EYE_REACH,
                     0
@@ -387,18 +527,47 @@ class GatherWood(Skill):
                     else 1,
                     0 if eye_to_block_dist(st, b["pos"]) <= DIG_EYE_REACH else 1,
                     round(math.hypot(block_center(b["pos"])[0] - cur[0], block_center(b["pos"])[2] - cur[2]), 3),
+                    0 if b["memo_status"] == "reachable" else 1,
                     float(b["pos"][1]),
                 )
             )
-            target = cands[0]["pos"]
+            chosen = cands[0]
+            target = chosen["pos"]
             t_key = (int(target[0]), int(target[1]), int(target[2]))
-            if not can_reach_block(ex, st, target, reach=DIG_EYE_REACH):
+            from_memo = bool(chosen["from_memo"])
+
+            if from_memo and eye_to_block_dist(st, target) <= 36.0:
+                probed = _probe_block_name(ex, target)
+                if probed is not None and probed not in ALL_LOGS:
+                    memo.mark_depleted(t_key, dimension=dim, category="wood")
+                    bad_positions.add(t_key)
+                    stale_memo_skips += 1
+                    continue
+                if probed is None and eye_to_block_dist(st, target) <= DIG_EYE_REACH:
+                    bad_positions.add(t_key)
+                    stale_memo_skips += 1
+                    continue
+
+            attempts += 1
+            moved_for_target = False
+            need_move = (
+                (from_memo and eye_to_block_dist(st, target) > 36.0)
+                or not can_reach_block(ex, st, target, reach=DIG_EYE_REACH)
+            )
+            if need_move:
                 try:
                     yield rec("move_to", ex.move_to(pos=target, rng=3), pos=target)
                 except Replan as e:
                     code, _ = failure(e)
                     if code in ("path_not_found", "unreachable", "move_timeout"):
                         bad_positions.add(t_key)
+                        memo.mark_unreachable(
+                            t_key,
+                            dimension=dim,
+                            category="wood",
+                            error_code=code,
+                            block=chosen["name"],
+                        )
                         if target[1] > cur[1] + 3:
                             for dy in range(0, 5):
                                 bad_positions.add((t_key[0], t_key[1] + dy, t_key[2]))
@@ -406,23 +575,51 @@ class GatherWood(Skill):
                         yield rec("move_to", pos=target, error_code=code)
                         continue
                     raise
+                moved_for_target = True
+
+            if from_memo and moved_for_target:
+                st, cur = _refresh_stance(ex, state)
+                probed = _probe_block_name(ex, target)
+                if probed is not None and probed not in ALL_LOGS:
+                    memo.mark_depleted(t_key, dimension=dim, category="wood")
+                    bad_positions.add(t_key)
+                    continue
+                if probed is None:
+                    bad_positions.add(t_key)
+                    continue
+
             try:
-                yield rec("dig", ex.dig(target, collect=True), pos=target)
+                dug_res = ex.dig(target, collect=True)
+                memo.mark_reachable(t_key, dimension=dim, category="wood", block=chosen["name"])
+                after_name = _probe_block_name(ex, target)
+                if after_name is not None and after_name not in ALL_LOGS:
+                    memo.mark_depleted(t_key, dimension=dim, category="wood")
+                yield rec("dig", dug_res, pos=target)
             except Replan as e:
                 code, _ = failure(e)
                 if code == "protected_region":
                     _mark_protected(target)
+                    memo.mark_protected(t_key, dimension=dim, category="wood", block=chosen["name"])
                     raise Replan(f"原木 {target} 位于出生点保护区，已标记外迁") from e
                 if code in ("unreachable", "dig_timeout", "path_not_found"):
                     bad_positions.add(t_key)
+                    memo.mark_unreachable(
+                        t_key,
+                        dimension=dim,
+                        category="wood",
+                        error_code=code,
+                        block=chosen["name"],
+                    )
                     last_nav_err = e
                     yield rec("dig", pos=target, error_code=code)
                     continue
                 raise
             state.refresh_inventory(ex.client)
 
-        if total_logs(state) <= start_logs and last_nav_err is not None:
-            raise last_nav_err
+        if total_logs(state) <= start_logs:
+            if last_nav_err is not None:
+                raise last_nav_err
+            raise _no_wood_blocked()
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         before = sum(before_counts.get(k, 0) for k in ALL_LOGS)
@@ -460,18 +657,46 @@ class CraftGear(Skill):
         target = str(self.args["item"])
         p_need, s_need, c_need = _GEAR_NEEDS[target]
         st, _ = _refresh_stance(ex, state)
+        dim = _dim_of(st)
+        memo = memo_for(state)
         state.refresh_inventory(ex.client)
 
         if total_cobble(state) < c_need:
             raise Replan(f"合成 {target} 圆石不足：需 {c_need}，现 {total_cobble(state)}")
 
-        nearby_tables = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5).get("blocks") or []
-        valid_tables = [b for b in nearby_tables if isinstance(b.get("pos"), list)
-                        and len(b["pos"]) == 3 and not _is_protected(b["pos"])]
+        nearby_resp = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5)
+        memo.ingest_find_blocks(nearby_resp, dimension=dim, origin=st, category="station")
+        nearby_tables = nearby_resp.get("blocks") or []
+        valid_tables = [
+            {"name": bare(b.get("name") or "crafting_table"), "pos": b["pos"], "from_memo": False}
+            for b in nearby_tables
+            if isinstance(b.get("pos"), list)
+            and len(b["pos"]) == 3
+            and not _is_protected(b["pos"])
+            and not memo.is_blocked(b["pos"], dimension=dim, category="station")
+        ]
         valid_tables.sort(key=lambda b: eye_to_block_dist(st, b["pos"]))
+        if not valid_tables:
+            valid_tables = [
+                {"name": entry.block, "pos": list(entry.pos), "from_memo": True}
+                for entry in memo.query("station", dimension=dim, origin=st)
+                if entry.block == "crafting_table"
+                and entry.status in ("untested", "reachable")
+                and eye_to_block_dist(st, entry.pos) <= 48.0
+                and not _is_protected(entry.pos)
+            ]
         table_ready = False
         for tb in valid_tables:
             tpos = tb["pos"]
+            from_memo = bool(tb.get("from_memo"))
+            if from_memo and eye_to_block_dist(st, tpos) <= 36.0:
+                probed = _probe_block_name(ex, tpos)
+                if probed is not None and probed != "crafting_table":
+                    _forget_known_table(tpos)
+                    memo.mark_depleted(tpos, dimension=dim, category="station")
+                    continue
+                if probed is None and eye_to_block_dist(st, tpos) <= STATION_EYE_REACH:
+                    continue
             if not can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
                 try:
                     moved = ex.move_to(pos=tpos, rng=2)
@@ -480,17 +705,39 @@ class CraftGear(Skill):
                     if code not in ("path_not_found", "unreachable", "move_timeout"):
                         raise
                     _forget_known_table(tpos)
+                    memo.mark_unreachable(
+                        tpos,
+                        dimension=dim,
+                        category="station",
+                        error_code=code,
+                        block="crafting_table",
+                    )
                     # 失败动作也必须让出一步，给 Safety 抢占与状态刷新留出边界。
                     yield rec("move_to", pos=tpos, error_code=code)
                     st, _ = _refresh_stance(ex, state)
                     continue
                 yield rec("move_to", moved, pos=tpos)
                 st, _ = _refresh_stance(ex, state)
+                if from_memo:
+                    probed = _probe_block_name(ex, tpos)
+                    if probed != "crafting_table":
+                        _forget_known_table(tpos)
+                        if probed is not None:
+                            memo.mark_depleted(tpos, dimension=dim, category="station")
+                        continue
                 if not can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
                     # 成功响应也要核对实际到达后的眼距与视线遮挡，不能把仍够不到或隔墙的台当作可用锚点。
                     _forget_known_table(tpos)
+                    memo.mark_unreachable(
+                        tpos,
+                        dimension=dim,
+                        category="station",
+                        error_code="unreachable",
+                        block="crafting_table",
+                    )
                     continue
             _record_known_table(tpos)
+            memo.mark_reachable(tpos, dimension=dim, category="station", block="crafting_table")
             table_ready = True
             break
         need_table = not table_ready and state.count("crafting_table") < 1
@@ -513,15 +760,24 @@ class CraftGear(Skill):
                 state.refresh_inventory(ex.client)
             try:
                 placed = ex.place("crafting_table")
-                if isinstance(placed, dict) and isinstance(placed.get("pos"), list):
-                    _record_known_table(placed["pos"])
-                else:
-                    _record_known_table(state.pos)
+                placed_pos = (
+                    placed["pos"]
+                    if isinstance(placed, dict) and isinstance(placed.get("pos"), list)
+                    else state.pos
+                )
+                _record_known_table(placed_pos)
+                memo.mark_reachable(
+                    placed_pos,
+                    dimension=dim,
+                    category="station",
+                    block="crafting_table",
+                )
                 yield rec("place", placed, item="crafting_table")
             except Replan as e:
                 code, _ = failure(e)
                 if code == "protected_region":
                     _mark_protected(state.pos)
+                    memo.mark_protected(state.pos, dimension=dim)
                     raise Replan("当前位置处于出生点保护区，无法放置工作台") from e
                 raise
         yield from _prepare_recipe_planks(ex, state, p_need, target)
@@ -613,6 +869,7 @@ class MineStone(Skill):
         start_cobble = total_cobble(state)
         want = int(self.args["count"])
         budget = want + 18
+        memo = memo_for(state)
         bad_positions: set[tuple[int, int, int]] = set()
         stair_origin: Optional[tuple[int, int, int, int, int]] = None
         stair_step = 0
@@ -625,6 +882,7 @@ class MineStone(Skill):
             if total_cobble(state) - start_cobble >= want:
                 return
             st, cur = _refresh_stance(ex, state)
+            dim = _dim_of(st)
             stones = ex.client.find_blocks(types=list(STONE_Targets), radius=16, limit=24).get("blocks") or []
             # 下界保持 cur[1] - 1.5 防深坑掉物，上界放宽至头顶眼距可达层（cur[1] + 4.0 且眼距合理，或原地眼距可达）
             cands = [
@@ -639,6 +897,7 @@ class MineStone(Skill):
                 )
                 and not _is_under_feet(cur, b["pos"])
                 and not _is_protected(b["pos"])
+                and not memo.is_blocked(b["pos"], dimension=dim)
             ]
             cands.sort(key=lambda p: eye_to_block_dist(st, p))
             target = cands[0] if cands else None
@@ -650,7 +909,11 @@ class MineStone(Skill):
                     stair_columns.add((ix, iz))
                     for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         sx1, sz1 = ix + dx, iz + dz
-                        if (sx1, sz1) in stair_columns or _is_protected([sx1, fy - 1, sz1]):
+                        if (
+                            (sx1, sz1) in stair_columns
+                            or _is_protected([sx1, fy - 1, sz1])
+                            or memo.is_blocked([sx1, fy - 1, sz1], dimension=dim)
+                        ):
                             continue
                         head1 = bare(ex.client.get_block([sx1, fy, sz1]).get("name", ""))
                         if head1 == "crafting_table":
@@ -749,6 +1012,7 @@ class MineStone(Skill):
                 code, _ = failure(e)
                 if code == "protected_region":
                     _mark_protected(target)
+                    memo.mark_protected(target, dimension=dim)
                     raise Replan(f"方块 {target} 位于出生点保护区，已标记外迁") from e
                 if code in ("unreachable", "dig_timeout", "path_not_found"):
                     bad_positions.add(t_key)

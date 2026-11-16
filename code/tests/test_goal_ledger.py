@@ -602,8 +602,10 @@ class SingleGoalLifecycleAndIncidentTests(unittest.TestCase):
 
     def test_goal_miss_when_blocked_at_prereq_reports_bottleneck_and_last_replan(self):
         with tempfile.TemporaryDirectory() as tmp:
-            # 空岛无任何树木与陆地，目标 upgrade_tools 卡在首个前置 prep_wood
-            world = RichGridWorld(blocks={}, items={})
+            # 前置树木位于保护区且周边无陆地外迁时，prep_wood 以常规 Replan 受阻而非环境缺树挂起，
+            # 从而准确落盘 GOAL_MISS:upgrade_tools 并记录瓶颈归因与 last_replan。
+            world = RichGridWorld(blocks={(2, 64, 0): "oak_log"}, items={})
+            world.protected_blocks.add((2, 64, 0))
             state = State()
             ex = CountingExecutor(world, state)
             obs = SoakObserver(tmp, target_goal="upgrade_tools")
