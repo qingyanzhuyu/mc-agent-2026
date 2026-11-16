@@ -1112,10 +1112,10 @@ class TestWorkerBoundsAndCli(unittest.TestCase):
         self.assertEqual(rc_bad, 2)
 
     def test_codex_fixer_presets_and_default_timeout(self):
-        self.assertEqual(soak_ctl.DEFAULT_FIXER_TIMEOUT_S, 1200)
+        self.assertEqual(soak_ctl.DEFAULT_FIXER_TIMEOUT_S, 1000)
         parser = soak_ctl.build_parser()
-        self.assertEqual(parser.parse_args(["fixer-loop", "--session-dir", "/tmp/s"]).fixer_timeout, 1200)
-        self.assertEqual(parser.parse_args(["run", "--session-dir", "/tmp/s"]).fixer_timeout, 1200)
+        self.assertEqual(parser.parse_args(["fixer-loop", "--session-dir", "/tmp/s"]).fixer_timeout, 1000)
+        self.assertEqual(parser.parse_args(["run", "--session-dir", "/tmp/s"]).fixer_timeout, 1000)
 
         for preset_name, tmpl in soak_ctl.FIXER_PRESETS.items():
             if not (preset_name == "codex" or preset_name.startswith("codex:")):

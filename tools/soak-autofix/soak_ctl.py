@@ -128,7 +128,7 @@ def resolve_fixer_template(session_dir: Path, default_name: str, default_tmpl: s
 
 
 FIXER_WORKERS_BOUNDS: tuple[int, int] = (1, 6)
-DEFAULT_FIXER_TIMEOUT_S: int = 1200
+DEFAULT_FIXER_TIMEOUT_S: int = 1000
 
 
 def _validate_fixer_workers(val: Any) -> int:
@@ -2680,6 +2680,17 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _enable_line_buffering() -> None:
+    """长驻守护子命令切为行缓冲，避免重定向到日志文件时延迟刷盘。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if callable(reconf):
+            try:
+                reconf(line_buffering=True)
+            except Exception:
+                pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     session_dir = Path(args.session_dir).resolve()
@@ -2708,6 +2719,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "runner-loop":
+        _enable_line_buffering()
         run_runner_loop(
             session_dir,
             episodes=args.episodes,
@@ -2740,6 +2752,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0 if res.get("ok") else 1
 
     if args.cmd == "fixer-loop":
+        _enable_line_buffering()
         if args.fixer_workers is not None:
             try:
                 _validate_fixer_workers(args.fixer_workers)
@@ -2751,6 +2764,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
             return 2
         default_name = "custom" if args.fixer_cmd else args.fixer_preset
+        if not args.once:
+            print(
+                f"[fixer-loop] 启动工位 B：preset={default_name} timeout={args.fixer_timeout}s poll={args.poll_s}s",
+                flush=True,
+            )
         while not (session_dir / "STOP").exists():
             cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
             workers = (
