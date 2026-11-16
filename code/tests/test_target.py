@@ -186,3 +186,20 @@ class TargetTests(unittest.TestCase):
         with self.assertRaisesRegex(Replan, "落箭路线待实测"):
             drive(HitBullseye(), ex, state)
         self.assertEqual(ex.acts, [])
+
+    def test_not_ready_or_jumping_replans_without_false_env_blocked(self):
+        world = TargetWorld()
+        world.st["ready"] = False
+        world.queue("advancements", _progress())
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "not_ready"):
+            drive(HitBullseye(), ex, state)
+        world.assert_exhausted()
+
+        jumping = TargetWorld()
+        jumping.st["jumping"] = True
+        jumping.queue("advancements", _progress())
+        ex2, state2 = jumping.session()
+        with self.assertRaisesRegex(Replan, "落脚"):
+            drive(HitBullseye(), ex2, state2)
+        jumping.assert_exhausted()

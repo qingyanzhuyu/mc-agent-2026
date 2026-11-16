@@ -98,6 +98,8 @@ def _walk_plan(ex, origin, target):
 def _prepare_lane(ex, state, *, allow_place):
     origin = _site_state(ex, state)["pos"]
     observed = scan_blocks(ex, state, _TARGET, radius=_SCAN_RADIUS, limit=_LIMIT)
+    if observed.get("ready") is False:
+        raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描标靶射道")
     for block in observed["blocks"]:
         pos = tuple(block["pos"])
         aim = _face_center(origin, pos)

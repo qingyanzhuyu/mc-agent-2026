@@ -73,8 +73,10 @@ def _craft_plan(state, product_counts, craftable):
 
 def _site_state(ex, state):
     status = state.refresh_status(ex.client, max_age_s=0)
-    if not status.get("dimension") or not _grounded(ex, status):
-        raise Replan("当前维度或干燥落脚没有确认，请先回到安全站位")
+    if status.get("ready") is False:
+        raise Replan("世界区块和实体加载尚未就绪（not_ready），请等 ready=true 后再试")
+    if status.get("jumping") is True or not status.get("dimension") or not _grounded(ex, status):
+        raise Replan("当前维度或干燥静止落脚没有确认，请先回到安全站位")
     return status
 
 
@@ -91,6 +93,8 @@ def _nearby_blocks(ex, state, names):
     status = _site_state(ex, state)
     here = _cell(status["pos"])
     candidates = scan_blocks(ex, state, names, radius=_NEAR_RADIUS, limit=_NEAR_LIMIT)
+    if candidates.get("ready") is False:
+        raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描近场工作站")
     direct, nearby = [], []
     for block in candidates["blocks"]:
         pos = tuple(block["pos"])
