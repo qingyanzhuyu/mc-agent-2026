@@ -30,6 +30,7 @@
 | `docs/07-评审材料.md` | 工程评审负责人汇总，其他人只提建议 |
 | `code/mcagent/client.py` `runtime.py` | 接口负责人 |
 | `code/mcagent/planner/` `skills/` | 策略负责人（见 §2A.6 分级验证要求、§9 框架规则） |
+| `code/mcagent/loop/` | 策略负责人（主循环、规划、目标台账、审计）；改 `engine.py` 的控制流须附回归单测并在 `docs/06` 写明原因 |
 | `code/mcagent/skills/nav.py` `items.py` | 策略负责人；**改了动作顺序或常量必须重跑 `probe --pathfinding --manual-only`**（§9.2 第 6 条） |
 | `code/tests/` | 接口负责人 / 策略负责人（各自模块的离线单测，必须无网可跑） |
 | `pyproject.toml` `uv.lock` | 接口负责人（改依赖必须同步更新 `uv.lock`） |
