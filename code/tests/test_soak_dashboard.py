@@ -501,6 +501,23 @@ class DashboardTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_bridge_env_target_and_snapshot_probe(self):
+        self._init_state()
+        bridge_dir = self.root / "tools" / "local-api-bridge"
+        bridge_dir.mkdir(parents=True)
+        (bridge_dir / ".env.example").write_text("MC_HOST=frp-net.com\nMC_PORT=64463\n", encoding="utf-8")
+        (bridge_dir / ".env").write_text("BRIDGE_HOST=127.0.0.1\nBRIDGE_PORT=8787\nMC_HOST=10.6.17.10\nMC_PORT=25565\nMC_VERSION=1.21.11\n", encoding="utf-8")
+        be = dash._read_bridge_env_target(self.root)
+        self.assertEqual(be["mc_target"], "10.6.17.10:25565")
+        self.assertEqual(be["source_file"], ".env")
+        with patch.object(dash, "_probe_local_bridge",
+                          return_value={"reachable": True, "url": "http://127.0.0.1:8787/healthz",
+                                        "mc_target": "10.6.17.10:25565", "mc_version": "1.21.11", "active_bots": []}):
+            snap = self.console.snapshot()
+        self.assertTrue(snap["bridge"]["reachable"])
+        self.assertEqual(snap["bridge"]["mc_target"], "10.6.17.10:25565")
+        self.assertEqual(snap["bridge_env"]["mc_target"], "10.6.17.10:25565")
+
     def test_dashboard_html_script_ids_match_dom(self):
         import re
         html = (REPO_ROOT / "tools" / "soak-autofix" / "dashboard.html").read_text(encoding="utf-8")
