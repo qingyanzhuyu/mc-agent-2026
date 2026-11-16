@@ -694,10 +694,16 @@ class Executor:
                     if e.kind == FATAL:
                         raise Fatal(str(e)) from e
 
-                    # 超时 / 网络断流：先止动 /stop，再核对非幂等动作是否已在服务端生效
-                    if e.code == "timeout" and name in STOP_ON_TIMEOUT_ACTIONS:
+                    # 超时 / 网络断流：先止动 /stop，再核对非幂等动作是否已在服务端生效。
+                    # 规范 §5：`timeout` =「寻路失败 / 超时」，服务端可能已执行完副作用，
+                    # 故非幂等动作的 timeout 与 network 走同一判重路径（只有确认背包未变才重发）；
+                    # use_item 同时在 STOP_ON_TIMEOUT_ACTIONS 中，判重路径内部仍会先 /stop。
+                    ambiguous = e.code == "network" or (
+                        e.code == "timeout" and name in NON_IDEMPOTENT_ACTIONS
+                    )
+                    if not ambiguous and e.code == "timeout" and name in STOP_ON_TIMEOUT_ACTIONS:
                         self.stop()
-                    elif e.code == "network":
+                    elif ambiguous:
                         status_tag, recovered = self._check_ambiguous_effect(name, before_fp, verify_done)
                         if status_tag == "done" and recovered is not None:
                             self.n_actions += 1
