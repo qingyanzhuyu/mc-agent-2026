@@ -1190,7 +1190,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         (self.root / "att").mkdir()
         with patch.object(soak_ctl, "claim_next_incident", return_value=claimed), \
              patch.object(soak_ctl, "_clean_fixer_worktree"), patch.object(soak_ctl, "_git"), \
-             patch.object(soak_ctl.subprocess, "run",
+             patch.object(soak_ctl, "_run_fixer_command",
                           return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")), \
              patch.object(soak_ctl, "verify_and_promote", return_value={"ok": True}):
             soak_ctl.run_fixer_once(self.session, fixer_cmd_template="echo {prompt_file}",
