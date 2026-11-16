@@ -10,12 +10,13 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Generator, Iterator, Optional
 
 from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
+from ..skills import nav
 from ..skills.base import Param, Skill, failure, rec
-from ..skills.items import AIR, bare, best_pickaxe
+from ..skills.items import AIR, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space
 from ..skills.registry import register
 from ..skills.sightline import (
     API_DIG_EYE_REACH,
@@ -118,6 +119,25 @@ def _refresh_stance(ex: "Executor", state: "State") -> tuple[dict, list[float]]:
 
 def _dim_of(st: dict) -> str:
     return str(st.get("dimension") or "overworld")
+
+
+def _run_nav_recovery(
+    ex: "Executor",
+    state: "State",
+    cur: list[float],
+    *,
+    dest=None,
+    min_displacement: float = 0.8,
+) -> Generator[dict, None, tuple[bool, list[float]]]:
+    """调用 L2 地形脱困原语并复测位移，返回 `(escaped, after_pos)`。"""
+    before_pos = list(cur)
+    try:
+        yield from nav.recover_move(ex, state, dest=dest, protected_fn=_is_protected)
+    except Replan as rec_err:
+        if failure(rec_err)[0] not in NAV_FAIL_CODES:
+            raise
+    _, after = _refresh_stance(ex, state)
+    return math.dist(after, before_pos) >= min_displacement, after
 
 
 def _probe_block_name(ex: "Executor", pos: list) -> Optional[str]:
@@ -387,7 +407,15 @@ class ScoutIsland(Skill):
                 wood_order = -dist
             cands.append((visited_pen, -dist, closer_to_wood, wood_order, p))
 
+        attempted_recovery = False
         if not cands:
+            attempted_recovery = True
+            escaped, arrived = yield from _run_nav_recovery(
+                ex, state, cur, dest=list(target_wood.pos) if target_wood is not None else None
+            )
+            if escaped:
+                VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
+                return
             raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
         # 落水时先找最近的干燥落脚点；在陆地上优先低惩罚组，缺木时同组优先靠近已知远木，否则优先未访问远端。
         cands.sort(
@@ -408,8 +436,10 @@ class ScoutIsland(Skill):
             checked.append(dest)
             # 规范 §3.3 的“暴露”只保证某一面可见，侧露石壁和水底都不是干燥站位。
             try:
-                if any(bare(ex.client.get_block([chosen[0], chosen[1] + dy, chosen[2]]).get("name"))
-                       not in AIR for dy in (1, 2)):
+                if any(
+                    not is_clear_space(ex.client.get_block([chosen[0], chosen[1] + dy, chosen[2]]))
+                    for dy in (1, 2)
+                ):
                     continue
             except ApiError as e:
                 if e.code == "not_loaded":
@@ -420,12 +450,18 @@ class ScoutIsland(Skill):
                 moved = ex.move_to(pos=dest, rng=2)
             except Replan as e:
                 code, _ = failure(e)
-                if code not in ("path_not_found", "unreachable", "move_timeout"):
+                if code not in NAV_FAIL_CODES:
                     raise
                 last_nav_err = e
                 # 失败动作也让出一步，不能在同一个 Safety 边界内直接发下一个动作。
                 yield rec("move_to", pos=dest, fingerprints=hits, error_code=code)
-                state.refresh_status(ex.client, max_age_s=0)
+                st, cur = _refresh_stance(ex, state)
+                if code == "stalled" and not attempted_recovery:
+                    attempted_recovery = True
+                    escaped, arrived = yield from _run_nav_recovery(ex, state, cur, dest=dest)
+                    if escaped:
+                        VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
+                        return
                 if attempts >= 3:
                     break
                 continue
@@ -433,6 +469,13 @@ class ScoutIsland(Skill):
             arrived = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
             VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
             return
+        if not attempted_recovery:
+            attempted_recovery = True
+            fallback_dest = cands[0][4] if cands else (list(target_wood.pos) if target_wood is not None else None)
+            escaped, arrived = yield from _run_nav_recovery(ex, state, cur, dest=fallback_dest)
+            if escaped:
+                VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
+                return
         if last_nav_err is not None:
             raise last_nav_err
         raise Replan("周边未找到有两格空气的安全新陆地站位（防虚空不盲走）")
@@ -466,8 +509,25 @@ class GatherWood(Skill):
         )
         bad_positions: set[tuple[int, int, int]] = set()
         last_nav_err: Optional[Replan] = None
+        used_recovery = False
         attempts = 0
         stale_memo_skips = 0
+
+        def _mark_nav_unreachable(err: Replan, code_str: str) -> None:
+            nonlocal last_nav_err
+            bad_positions.add(t_key)
+            memo.mark_unreachable(
+                t_key,
+                dimension=dim,
+                category="wood",
+                error_code=code_str,
+                block=chosen["name"],
+            )
+            if target[1] > cur[1] + 3:
+                for dy in range(0, 5):
+                    bad_positions.add((t_key[0], t_key[1] + dy, t_key[2]))
+            last_nav_err = err
+
         while total_logs(state) - start_logs < want and attempts < want + 6 and stale_memo_skips < 32:
             st, cur = _refresh_stance(ex, state)
             dim = _dim_of(st)
@@ -507,6 +567,10 @@ class GatherWood(Skill):
                 if total_logs(state) > start_logs:
                     return
                 if last_nav_err is not None:
+                    if not used_recovery and failure(last_nav_err)[0] == "stalled":
+                        used_recovery = True
+                        st, cur = _refresh_stance(ex, state)
+                        yield from _run_nav_recovery(ex, state, cur)
                     raise last_nav_err
                 raise _no_wood_blocked()
 
@@ -559,22 +623,20 @@ class GatherWood(Skill):
                     yield rec("move_to", ex.move_to(pos=target, rng=3), pos=target)
                 except Replan as e:
                     code, _ = failure(e)
-                    if code in ("path_not_found", "unreachable", "move_timeout"):
-                        bad_positions.add(t_key)
-                        memo.mark_unreachable(
-                            t_key,
-                            dimension=dim,
-                            category="wood",
-                            error_code=code,
-                            block=chosen["name"],
-                        )
-                        if target[1] > cur[1] + 3:
-                            for dy in range(0, 5):
-                                bad_positions.add((t_key[0], t_key[1] + dy, t_key[2]))
-                        last_nav_err = e
+                    if code not in NAV_FAIL_CODES:
+                        raise
+                    if code == "stalled" and not used_recovery:
                         yield rec("move_to", pos=target, error_code=code)
+                        used_recovery = True
+                        st, cur = _refresh_stance(ex, state)
+                        escaped, _ = yield from _run_nav_recovery(ex, state, cur, dest=target)
+                        if escaped:
+                            continue
+                        _mark_nav_unreachable(e, code)
                         continue
-                    raise
+                    _mark_nav_unreachable(e, code)
+                    yield rec("move_to", pos=target, error_code=code)
+                    continue
                 moved_for_target = True
 
             if from_memo and moved_for_target:
@@ -618,6 +680,10 @@ class GatherWood(Skill):
 
         if total_logs(state) <= start_logs:
             if last_nav_err is not None:
+                if not used_recovery and failure(last_nav_err)[0] == "stalled":
+                    used_recovery = True
+                    st, cur = _refresh_stance(ex, state)
+                    yield from _run_nav_recovery(ex, state, cur)
                 raise last_nav_err
             raise _no_wood_blocked()
 
@@ -702,7 +768,7 @@ class CraftGear(Skill):
                     moved = ex.move_to(pos=tpos, rng=2)
                 except Replan as e:
                     code, _ = failure(e)
-                    if code not in ("path_not_found", "unreachable", "move_timeout"):
+                    if code not in NAV_FAIL_CODES:
                         raise
                     _forget_known_table(tpos)
                     memo.mark_unreachable(
@@ -959,7 +1025,7 @@ class MineStone(Skill):
                             yield rec("move_to", ex.move_to(pos=[sx + 0.5, sy, sz + 0.5], rng=1), pos=[sx + 0.5, sy, sz + 0.5])
                         except Replan as e:
                             code, _ = failure(e)
-                            if code not in ("path_not_found", "unreachable", "move_timeout"):
+                            if code not in NAV_FAIL_CODES:
                                 raise
                             yield rec("move_to", pos=[sx + 0.5, sy, sz + 0.5], error_code=code)
                         stair_step += 1
@@ -979,7 +1045,7 @@ class MineStone(Skill):
                             moved = ex.move_to(pos=dest, rng=1)
                         except Replan as e:
                             code, _ = failure(e)
-                            if code not in ("path_not_found", "unreachable", "move_timeout"):
+                            if code not in NAV_FAIL_CODES:
                                 raise
                             yield rec("move_to", pos=dest, error_code=code)
                         else:
@@ -994,7 +1060,7 @@ class MineStone(Skill):
                     yield rec("move_to", ex.move_to(pos=target, rng=2), pos=target)
                 except Replan as e:
                     code, _ = failure(e)
-                    if code in ("path_not_found", "unreachable", "move_timeout"):
+                    if code in NAV_FAIL_CODES:
                         bad_positions.add(t_key)
                         yield rec("move_to", pos=target, error_code=code)
                         continue

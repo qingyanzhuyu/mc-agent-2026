@@ -522,7 +522,7 @@ class MainLoop:
                             self.planner.record_environment_block(active_skill, environment, self.state)
                         else:
                             skills_replan += 1
-                            if code == "path_not_found" and not is_death_err:
+                            if code in ("path_not_found", "stalled") and not is_death_err:
                                 streak = self._path_failures.get(active_skill.goal, 0) + 1
                                 self._path_failures[active_skill.goal] = streak
                             else:
