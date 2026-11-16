@@ -486,9 +486,9 @@ NON_IDEMPOTENT_ACTIONS: frozenset[str] = frozenset({
 SNAPSHOT_INVENTORY_ACTIONS: frozenset[str] = frozenset({
     "craft", "window/act", "window_act", "use_item",
 })
-# 超时或网络中断后需主动发 /stop 清理服务端持续寻路/挖掘/追击的动作
+# 超时或网络中断后需主动发 /stop 清理服务端持续寻路/按键/挖掘/追击的动作
 STOP_ON_TIMEOUT_ACTIONS: frozenset[str] = frozenset({
-    "move_to", "dig", "attack", "use_item",
+    "move_to", "control", "dig", "attack", "use_item",
 })
 
 
@@ -778,8 +778,31 @@ class Executor:
             verify_done=lambda before, after: after.get(item, 0) > before.get(item, 0),
         )
 
-    def attack(self, entity_id, timeout_ms=20000, *, stop_on=None) -> dict:
-        return self.act("attack", lambda: self.client.attack(entity_id, timeout_ms, stop_on=stop_on))
+    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
+        # 限次攻击是「砍几下就走」，断流重发会多打，故不重试
+        return self.act(
+            "attack",
+            lambda: self.client.attack(entity_id, timeout_ms, max_hits=max_hits, interval_ms=interval_ms,
+                                       stop_on=stop_on),
+            retries=0 if max_hits is not None else 2,
+        )
+
+    def control(self, **keys) -> dict:
+        """§4.16 底层按键。断流后走过的距离和出手次数都不可知，不重试，交上层重新观察。
+
+        当前部署没有 /control 时抛 Replan（unsupported_api），不会 Fatal。
+        """
+        try:
+            return self.act("control", lambda: self.client.control(**keys), retries=0)
+        finally:
+            if keys.get("hit"):
+                self.state.invalidate_inventory()  # 挥击会掉武器耐久
+
+    def look(self, yaw=None, pitch=None, *, pos=None, entity_id=None) -> dict:
+        """§4.17 转向，不占动作锁。不支持时抛 ApiError(unsupported_api)，kind 为 REPLAN。"""
+        return self._act_without_lock(
+            "look", lambda: self.client.look(yaw=yaw, pitch=pitch, pos=pos, entity_id=entity_id),
+        )
 
     def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100, *, stop_on=None) -> dict:
         return self.act(
@@ -800,11 +823,16 @@ class Executor:
 
     def posture(self, sneak=None, shield=None, *, jump=None) -> dict:
         # 规范 §4.11：/posture 不占动作锁，可在动作阻塞中途调用
-        t0 = time.time()
         jump_opts = {} if jump is None else {"jump": jump}
-        res = self.client.posture(sneak=sneak, shield=shield, **jump_opts)
+        return self._act_without_lock(
+            "posture", lambda: self.client.posture(sneak=sneak, shield=shield, **jump_opts),
+        )
+
+    def _act_without_lock(self, name: str, call: Callable[[], dict]) -> dict:
+        t0 = time.time()
+        res = call()
         self._record({
-            "t": round(t0, 3), "name": "posture", "ms": round((time.time() - t0) * 1000),
+            "t": round(t0, 3), "name": name, "ms": round((time.time() - t0) * 1000),
             "ok": True, "attempt": 1, "result": _shrink(res),
         })
         return res
