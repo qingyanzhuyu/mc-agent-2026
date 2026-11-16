@@ -104,6 +104,28 @@ class GatherWoodSightlineTests(unittest.TestCase):
         self.assertEqual(state2.count("oak_log"), 1)
         self.assertEqual(paired.blocks.get((0, 71, 0)), "oak_log")
 
+    def test_leaf_occluded_or_side_canopy_log_skipped_without_move_to(self):
+        # 同列 [0, 69, 0] 被树叶 (0, 68, 0) 遮挡，以及非同列侧枝 [1, 69, 0] 均不误触发地面 move_to
+        world = SightlineSkillWorld(
+            blocks={
+                (0, 68, 0): "oak_leaves",
+                (0, 69, 0): "oak_log",
+                (1, 69, 0): "oak_log",
+                (6, 64, 0): "oak_log",
+            },
+            move_failures={
+                (0, 69, 0): "path_not_found",
+                (1, 69, 0): "path_not_found",
+            },
+        )
+        ex, state = world.session()
+        steps = drive(make("gather_wood", {"count": 2}), ex, state)
+        self.assertEqual([s["op"] for s in steps], ["move_to", "dig"])
+        self.assertEqual(steps[0]["pos"], [6, 64, 0])
+        self.assertEqual(state.count("oak_log"), 1)
+        self.assertEqual(world.blocks.get((0, 69, 0)), "oak_log")
+        self.assertEqual(world.blocks.get((1, 69, 0)), "oak_log")
+
     def test_wall_occluded_nearby_log_moves_first_instead_of_blind_dig(self):
         # 2 格实心石墙 (1, 64, 0) + (1, 65, 0) 完全阻断视线，[2, 64, 0] 不得原地隔墙盲挖
         world = SightlineSkillWorld(

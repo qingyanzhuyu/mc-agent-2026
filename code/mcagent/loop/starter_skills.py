@@ -352,12 +352,14 @@ class GatherWood(Skill):
                 pt = (int(p[0]), int(p[1]), int(p[2]))
                 if pt in bad_positions or _is_under_feet(cur, p) or _is_protected(p):
                     continue
-                # 跳过头顶超出眼距上限的悬空高树冠原木（水平 <3 格、高于脚底 >4 格且眼距 >4.5 时地面寻路必报 path_not_found）
+                same_col = pt[0] == math.floor(cur[0]) and pt[2] == math.floor(cur[2])
+                # 跳过头顶侧上方悬空或被树叶挡住的高树冠原木（水平 <3 格且高于脚底 >4 格时地面寻路必报 path_not_found）；
+                # 仅放行正头顶同列且当前视线无遮挡、眼距可达的树干顶节（如 [0, 69, 0]）直接原地挖掘。
                 cx, _, cz = block_center(p)
                 if (
                     math.hypot(cx - cur[0], cz - cur[2]) < 3.0
                     and (p[1] - cur[1]) > 4.0
-                    and eye_to_block_dist(st, p) > DIG_EYE_REACH
+                    and not (same_col and can_reach_block(ex, st, p, reach=DIG_EYE_REACH))
                 ):
                     bad_positions.add(pt)
                     continue
@@ -383,7 +385,9 @@ class GatherWood(Skill):
                         and eye_to_block_dist(st, b["pos"]) <= 18.0
                     )
                     else 1,
-                    eye_to_block_dist(st, b["pos"]),
+                    0 if eye_to_block_dist(st, b["pos"]) <= DIG_EYE_REACH else 1,
+                    round(math.hypot(block_center(b["pos"])[0] - cur[0], block_center(b["pos"])[2] - cur[2]), 3),
+                    float(b["pos"][1]),
                 )
             )
             target = cands[0]["pos"]
@@ -464,6 +468,7 @@ class CraftGear(Skill):
         nearby_tables = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5).get("blocks") or []
         valid_tables = [b for b in nearby_tables if isinstance(b.get("pos"), list)
                         and len(b["pos"]) == 3 and not _is_protected(b["pos"])]
+        valid_tables.sort(key=lambda b: eye_to_block_dist(st, b["pos"]))
         table_ready = False
         for tb in valid_tables:
             tpos = tb["pos"]
