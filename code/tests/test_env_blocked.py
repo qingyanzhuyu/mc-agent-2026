@@ -12,12 +12,12 @@ from mcagent.loop.auditor import SoakObserver
 from mcagent.loop.engine import LoopConfig, MainLoop
 from mcagent.loop.goals import GoalSpec
 from mcagent.loop.policy import CampaignPlanner, PlanDecision, RulePlanner
-from mcagent.loop.starter_skills import reset_world_memo
+from mcagent.loop.starter_skills import ScoutIsland, reset_world_memo
 from mcagent.runtime import EnvBlocked, Replan, State
 from mcagent.skills import Param, Skill
 from mcagent.skills import base as skill_base
+from mcagent.skills.base import rec
 from mcagent.skills.testing import CountingExecutor
-from tests.test_iron import IronWorld, view
 from tests.test_loop_soak import RichGridWorld
 
 
@@ -32,7 +32,9 @@ class FindIron(Skill):
     def run(self, ex, state):
         if state.pos[0] < 16:
             raise _no_iron()
-        return iter(())
+        pos = [23, 64, 0]
+        yield rec("dig", ex.dig(pos, collect=True), pos=pos)
+        state.refresh_inventory(ex.client)
 
 
 class FindGem(Skill):
@@ -58,18 +60,19 @@ _OTHER = GoalSpec("shelter", "避难处", "T1", 5, FindShelter.name, stage="grad
 _REGISTRY = {cls.name: cls for cls in (FindIron, FindGem, FindShelter, Scout)}
 
 
-class IronScoutWorld(IronWorld, RichGridWorld):
+class IronScoutWorld(RichGridWorld):
     def __init__(self, navigation_error=None):
         super().__init__(
-            items={"oak_log": 3, "stone_pickaxe": 1, "stone_sword": 1, "furnace": 1, "coal": 1, "cobblestone": 3},
-            views=[view(), view(output=1), view()],
+            blocks={(x, 63, 0): "grass_block" for x in (10, 21, 26)} | {(23, 64, 0): "iron_ore"},
+            items={"stone_pickaxe": 1},
         )
-        self.blocks = {(x, 63, 0): "grass_block" for x in (10, 21, 26)}
-        self.blocks.update({(70, 64, 0): "iron_ore", (71, 64, 0): "furnace"})
         self.navigation_error = navigation_error
 
-    def find_blocks(self, *args, **kwargs):
-        return RichGridWorld.find_blocks(self, *args, **kwargs)
+    def dig(self, pos, collect=True, *, stop_on=None):
+        result = super().dig(pos, collect=collect, stop_on=stop_on)
+        if result.get("dug") == "iron_ore":
+            self.items["iron_ingot"] = self.items.get("iron_ingot", 0) + 1
+        return result
 
     def move_to(self, *args, **kwargs):
         if self.navigation_error:
@@ -184,9 +187,11 @@ class EnvironmentBlockTests(unittest.TestCase):
         reset_world_memo()
         self.addCleanup(reset_world_memo)
         self.state = State()
-        planner = CampaignPlanner(target_goal="smelt_iron")
-        observer = SoakObserver(run_dir, target_goal="smelt_iron")
-        config = LoopConfig(target_goal="smelt_iron", stop_on_goal=True, idle_sleep_s=0,
+        registry = {FindIron.name: FindIron, ScoutIsland.name: ScoutIsland}
+        ledger = (_IRON,)
+        planner = CampaignPlanner(registry=registry, ledger=ledger, target_goal="iron")
+        observer = SoakObserver(run_dir, ledger=ledger, target_goal="iron")
+        config = LoopConfig(target_goal="iron", stop_on_goal=True, idle_sleep_s=0,
                             enable_monitor=False, max_steps=max_steps, max_seconds=2)
         executor = CountingExecutor(world, self.state)
         result = MainLoop(world, self.state, executor, planner, config=config, observer=observer,
@@ -201,13 +206,13 @@ class EnvironmentBlockTests(unittest.TestCase):
             result, rows, tickets = self.run_iron_scout(IronScoutWorld(), 1, run_dir)
             self.assertEqual(result.stop_reason, "max_steps_reached")
             self.assertGreaterEqual(self.state.pos[0], 16)
-            self.assertEqual(rows[-1]["environment_blocked_goals"]["smelt_iron"]["wake_on"], "chunk_moved")
+            self.assertEqual(rows[-1]["environment_blocked_goals"]["iron"]["wake_on"], "chunk_moved")
             self.assertEqual(tickets, [])
 
         with tempfile.TemporaryDirectory() as run_dir:
             result, rows, tickets = self.run_iron_scout(IronScoutWorld(), 100, run_dir)
             starts = [row["skill"] for row in rows if row.get("event") == "skill_start"]
-            self.assertEqual(starts, ["smelt_iron", "scout_island", "smelt_iron"])
+            self.assertEqual(starts, ["find_iron", "scout_island", "find_iron"])
             self.assertEqual(result.stop_reason, "goal_reached")
             self.assertEqual(rows[-1]["environment_blocked_goals"], {})
             self.assertEqual(tickets, [])
@@ -220,7 +225,7 @@ class EnvironmentBlockTests(unittest.TestCase):
                         and row["error_code"] == "path_not_found"]
             self.assertEqual(len(failures), 3)
             self.assertTrue(all(row.get("environment_recovery") for row in failures))
-            self.assertIn("smelt_iron", rows[-1]["environment_blocked_goals"])
+            self.assertIn("iron", rows[-1]["environment_blocked_goals"])
             self.assertEqual(tickets, [])
 
     def test_recovery_scout_contract_bug_still_reports(self):
