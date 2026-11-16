@@ -7,7 +7,7 @@ from collections.abc import Callable, Generator, Iterator, Sequence
 from typing import Any
 
 from ..runtime import Executor, Replan, State
-from .base import rec
+from .base import failure, rec
 from .items import AIR, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, block_name
 
 PEEL_SURFACE = frozenset(("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter"))
@@ -99,11 +99,28 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
             continue
         if name not in solid:
             raise MineStepUnsafe("cut", "探矿阶梯目标方块变化，停止挖掘以保留支撑")
-        result = ex.dig(target, collect=name not in PEEL_SURFACE)
+        try:
+            result = ex.dig(target, collect=name not in PEEL_SURFACE)
+        except Replan as exc:
+            code, _ = failure(exc)
+            after_err = state.refresh_status(ex.client, max_age_s=0)
+            state.refresh_inventory(ex.client)
+            cur_err = after_err.get("pos") or state.pos
+            if (code in {"dig_unconfirmed", "out_of_reach", "protected_region"}
+                    and tuple(map(math.floor, cur_err)) == (cx, cy, cz)
+                    and _same_world(start, after_err)):
+                raise MineStepUnsafe("cut", f"探矿阶梯开凿 {target} 返回 {code}，改试其他方向") from exc
+            raise
         yield rec("dig", result, pos=target)
+        after_dig_status = state.refresh_status(ex.client, max_age_s=0)
         state.refresh_inventory(ex.client)
         if result.get("warning") or _best_allowed_pick(state, allowed_picks) is None:
             raise Replan("探矿工具告警或已无所需镐，停止开凿")
+        if block_name(ex, target) not in AIR:
+            if (tuple(map(math.floor, after_dig_status.get("pos") or state.pos)) == (cx, cy, cz)
+                    and _same_world(start, after_dig_status)):
+                raise MineStepUnsafe("cut", f"探矿阶梯开凿 {target} 后方块未清除，改试其他方向")
+            raise Replan("探矿阶梯开凿后站位或方块状态异常，停止下行")
         if after_dig is not None:
             observation = yield from after_dig()
             if observation is not None:

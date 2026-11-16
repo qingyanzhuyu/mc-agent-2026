@@ -1,6 +1,7 @@
 """Explicit observations for P3. No simulated advancement is inferred from an action."""
 import unittest
 
+from mcagent.client import ApiError
 from mcagent.runtime import EnvBlocked, Replan
 from mcagent.skills import make
 from mcagent.skills.scripted_world import ScriptedWorld
@@ -138,6 +139,28 @@ class SurvivalTests(unittest.TestCase):
         world.queue("advancements", progress())
         world.queue("find_blocks", blocks())
         self.assert_blocked(world, "plant_seed", "reachable_planting_site:farmland", "半径 12 格内最多 10 个候选")
+
+    def test_plant_seed_skips_dig_unconfirmed_grass_candidate(self):
+        g1, g2 = (1, 64, 0), (0, 64, 1)
+        world = SurvivalWorld({}, extra={g1: "short_grass", g2: "short_grass", FIELD: "farmland"})
+        world.queue("advancements", progress(), progress(PLANT))
+        world.queue("find_blocks", blocks((g1, "short_grass"), (g2, "short_grass")), blocks((FIELD, "farmland")))
+
+        def dig_grass(w, *, pos, **_):
+            w.blocks.pop(tuple(pos))
+            w.items["wheat_seeds"] = 1
+            return {"dug": "short_grass", "gained": {"wheat_seeds": 1}}
+
+        world.queue(
+            "dig",
+            ApiError("dig_unconfirmed", "unconfirmed", {"pos": list(g1), "eye_dist": 4.9}),
+            dig_grass,
+        )
+        world.queue("interact", plant)
+        _, steps = self.run_skill(world, "plant_seed")
+        dig_steps = [s for s in steps if s["op"] == "dig"]
+        self.assertEqual([s.get("error_code") for s in dig_steps], ["dig_unconfirmed", None])
+        self.assertTrue(steps[-1]["result"]["advancement_confirmed"])
 
     def test_plant_grass_without_seed_drop_is_not_completion(self):
         grass = (2, 64, 0)

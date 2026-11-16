@@ -39,10 +39,26 @@ def _durable(entry, minimum: int) -> bool:
             and type(durability[0]) is int and durability[0] >= minimum)
 
 
+def _has_silk(entry) -> bool:
+    return any(
+        isinstance(ench, dict) and bare(ench.get("name")) == "silk_touch"
+        and type(ench.get("level")) is int and ench["level"] > 0
+        for ench in ((entry or {}).get("enchantments") or ())
+    )
+
+
 def _pick(inventory, names, minimum: int) -> str | None:
     held = inventory.get("held") or {}
     entries = (held, *(inventory.get("items") or ()))
     held_name = bare(held.get("name"))
+    if held_name in names and _durable(held, minimum) and not _has_silk(held):
+        return held_name
+    non_silk = next((name for name in names if any(
+        bare(entry.get("name")) == name and _durable(entry, minimum) and not _has_silk(entry)
+        for entry in entries
+    )), None)
+    if non_silk is not None:
+        return non_silk
     if held_name in names and _durable(held, minimum):
         return held_name
     return next((name for name in names if any(
@@ -161,11 +177,19 @@ class MineDiamond(Skill):
                     tried_ores.add(ore)
                     yield from _hand_pick(ex, state, 1)
                     stand = _safe_status(ex, state, "overworld")
-                    if (not _in_reach(ex, stand["pos"], ore, reach=4)
+                    if (not _in_reach(ex, stand["pos"], ore, reach=5)
                             or not _safe_excavation(ex, _cell(stand["pos"]), (ore,), path)):
                         raise Replan("换镐后钻矿的安全站位或可采性已经变化，请重新观察")
-                    yield from mine_block_batch(ex, state, (ore,), block_types=DIAMOND_ORES,
-                                                drop="diamond", count=1, max_blocks=1)
+                    try:
+                        yield from mine_block_batch(ex, state, (ore,), block_types=DIAMOND_ORES,
+                                                    drop="diamond", count=1, max_blocks=1)
+                    except Replan as exc:
+                        code, _ = failure(exc)
+                        if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                            _safe_status(ex, state, "overworld")
+                            yield rec("ore_skip", pos=list(ore), error_code=code)
+                            break
+                        raise
                     _safe_status(ex, state, "overworld")
                     if state.count("diamond") >= goal_qty:
                         return

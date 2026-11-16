@@ -219,7 +219,17 @@ def _harvest_obsidian(ex, state, goal_qty, dimension):
             raise Replan("矿面未确认现持钻石级镐可采")
         before = state.count(OBSIDIAN)
         health = state.hp
-        result = ex.dig(list(pos), collect=True, stop_on=("hurt", "death"))
+        try:
+            result = ex.dig(list(pos), collect=True, stop_on=("hurt", "death"))
+        except Replan as exc:
+            code, extra = failure(exc)
+            state.refresh_inventory(ex.client)
+            if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                if not _still_safe(ex, state, dimension, pos, health):
+                    raise Replan("黑曜石挖掘未确认且站位变化，停止采掘") from exc
+                yield rec("dig", item=OBSIDIAN, pos=list(pos), error_code=code, error=extra)
+                continue
+            raise
         yield rec("dig", result, item=OBSIDIAN, pos=list(pos))
         state.refresh_inventory(ex.client)
         if (result.get("warning") or state.count(OBSIDIAN) <= before
@@ -233,6 +243,14 @@ def _harvest_obsidian(ex, state, goal_qty, dimension):
                      missing_predicate="safe_obsidian_source",
                      searched_volume="16 格内最多 16 个露面矿点，最多一次放水",
                      wake_on="chunk_moved")
+
+
+def _has_silk_touch(entry) -> bool:
+    return any(
+        isinstance(ench, dict) and bare(ench.get("name")) == "silk_touch"
+        and type(ench.get("level")) is int and ench["level"] > 0
+        for ench in ((entry or {}).get("enchantments") or ())
+    )
 
 
 def _gather_flint(ex, state, dimension):
@@ -249,8 +267,30 @@ def _gather_flint(ex, state, dimension):
         if (_name(ex, pos) != "gravel" or not _stable(ex, _ground(pos))
                 or any(not name or name in FLUID | GRAVITY | _HAZARDS for name in names)):
             continue
+        inv = state.refresh_inventory(ex.client)
+        if _has_silk_touch(inv.get("held")):
+            alt = next(
+                (bare(row.get("name")) for row in (inv.get("items") or ())
+                 if isinstance(row, dict) and row.get("count", 0) > 0 and not _has_silk_touch(row)),
+                None,
+            )
+            if alt is None:
+                raise Replan("手持工具带有 silk_touch（精准采集），挖砾石不会掉落燧石")
+            yield from equip_item(ex, state, alt)
+            if not _at_work_site(ex, state, dimension, pos) or _name(ex, pos) != "gravel":
+                continue
         health = state.hp
-        result = ex.dig(list(pos), collect=True, stop_on=("hurt", "death"))
+        try:
+            result = ex.dig(list(pos), collect=True, stop_on=("hurt", "death"))
+        except Replan as exc:
+            code, extra = failure(exc)
+            state.refresh_inventory(ex.client)
+            if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                if not _still_safe(ex, state, dimension, pos, health):
+                    raise Replan("挖砾石未确认且站位改变，停止继续挖掘") from exc
+                yield rec("dig", pos=list(pos), purpose="gather_flint", error_code=code, error=extra)
+                continue
+            raise
         yield rec("dig", result, pos=list(pos), purpose="gather_flint")
         state.refresh_inventory(ex.client)
         if not _still_safe(ex, state, dimension, pos, health):

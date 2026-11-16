@@ -328,8 +328,12 @@ class SmeltIron(Skill):
                 code, _ = failure(err)
                 if isinstance(err, _OreRouteUnconfirmed):
                     code = "arrival_unconfirmed"
-                if (in_reach_only and math.dist(state.pos, pos) <= MINING_REACH) or code not in (
-                    "path_not_found", "unreachable", "move_timeout", "arrival_unconfirmed",
+                dig_skip = code in ("dig_unconfirmed", "out_of_reach", "protected_region")
+                route_skip = code in (
+                    "path_not_found", "unreachable", "move_timeout", "stalled", "arrival_unconfirmed",
+                )
+                if not dig_skip and (
+                    (in_reach_only and math.dist(state.pos, pos) <= MINING_REACH) or not route_skip
                 ):
                     raise
                 excluded.add(tuple(pos))
@@ -379,7 +383,10 @@ class SmeltIron(Skill):
                         break
                 except Replan as err:
                     code, _ = failure(err)
-                    if code in ("path_not_found", "unreachable", "move_timeout", "protected_region"):
+                    if code in (
+                        "path_not_found", "unreachable", "move_timeout", "stalled",
+                        "out_of_reach", "dig_unconfirmed", "protected_region",
+                    ):
                         yield rec("fuel_wood_skip", pos=lpos, error_code=code)
                         continue
                     raise

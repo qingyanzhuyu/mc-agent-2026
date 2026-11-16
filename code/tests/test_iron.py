@@ -322,6 +322,28 @@ class SmeltIronTests(unittest.TestCase):
                 if op == "window_act" and a["ops"][0].get("to") == "fuel"]
         self.assertEqual(fuel, ["pale_oak_planks"])
 
+    def test_smelt_iron_skips_dig_unconfirmed_ore_candidate(self):
+        world = IronWorld(
+            items={"stone_pickaxe": 1, "furnace": 1, "coal": 1},
+            blocks={(2, 64, 0): "iron_ore", (3, 64, 0): "iron_ore"},
+            views=[view(), view(output=1), view()],
+        )
+        orig_dig = world.dig
+        failed_once = {"done": False}
+
+        def flaky_dig(pos, collect=True, *, stop_on=None):
+            if list(pos) == [2, 64, 0] and not failed_once["done"]:
+                failed_once["done"] = True
+                world.calls.append(("dig", {"pos": list(pos)}))
+                raise ApiError("dig_unconfirmed", "unconfirmed", {"pos": [2, 64, 0], "eye_dist": 4.8})
+            return orig_dig(pos, collect=collect, stop_on=stop_on)
+
+        world.dig = flaky_dig
+        steps, _, state = self.run_skill(world, count=1)
+        self.assertTrue(any(s["op"] == "ore_route_skip" and s["error_code"] == "dig_unconfirmed" for s in steps))
+        self.assertEqual(state.count("iron_ingot"), 1)
+        self.assertEqual(world.blocks[(2, 64, 0)], "iron_ore")
+
     def test_raw_iron_skips_mining_and_no_pick_needed(self):
         world = IronWorld(items={"raw_iron": 1, "oak_planks": 1, "furnace": 1},
                           views=[view(), view(output=1), view()])

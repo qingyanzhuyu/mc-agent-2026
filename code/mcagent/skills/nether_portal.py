@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from itertools import islice
 
 from ..runtime import EnvBlocked, Replan
-from .base import rec
-from .field import place_block, scan_blocks
-from .items import AIR, PLACEABLE_BLOCKS
+from .base import failure, rec
+from .field import equip_item, place_block, scan_blocks
+from .items import AIR, PLACEABLE_BLOCKS, best_pickaxe
 from .nether_site import (
     OBSIDIAN, PORTAL, SCAFFOLDS, _above, _approach, _cell, _center, _dimension, _ground,
     _hazard, _name, _near, _neighbors, _pos, _stable, _standable, _standing, _walk,
 )
+
+_HAND_SCAFFOLDS = frozenset({"dirt", *(b for b in PLACEABLE_BLOCKS if b.endswith("_planks"))})
 
 _RING = ((1, 0), (2, 0), (0, 1), (3, 1), (0, 2), (3, 2), (0, 3), (3, 3), (1, 4), (2, 4))
 _FRAME_LIMIT = 16
@@ -130,6 +132,14 @@ def _placement_order(ex, frame, stand):
 
 def _material_scaffold(state, missing):
     if missing:
+        if best_pickaxe(state) is None:
+            # §8 1.3.11 ②：无合适工具时直接手持当前物品挖；无镐时优先选徒手可 100% 回收的泥土/木板。
+            hand_ok = next(
+                (item for item in PLACEABLE_BLOCKS if item in _HAND_SCAFFOLDS and item in SCAFFOLDS and state.count(item)),
+                None,
+            )
+            if hand_ok is not None:
+                return hand_ok
         return next((item for item in PLACEABLE_BLOCKS if item in SCAFFOLDS and state.count(item)), None)
     return None
 
@@ -220,8 +230,18 @@ def build_pattern(ex, state, frame, *, stand):
         if op == "remove":
             if _name(ex, pos) != support:
                 raise Replan("无法确认自己放置的临时支撑")
+            if support not in _HAND_SCAFFOLDS and (pick := best_pickaxe(state)) is not None:
+                yield from equip_item(ex, state, pick)
             before = state.count(support)
-            yield rec("dig", ex.dig(list(pos), collect=True), pos=list(pos), purpose="portal_scaffold")
+            try:
+                dug = ex.dig(list(pos), collect=True)
+            except Replan as exc:
+                if failure(exc)[0] == "dig_unconfirmed":
+                    state.refresh_status(ex.client, max_age_s=0)
+                    state.refresh_inventory(ex.client)
+                    raise Replan("临时施工支撑挖掘返回 dig_unconfirmed，方块仍在原处") from exc
+                raise
+            yield rec("dig", dug, pos=list(pos), purpose="portal_scaffold")
             state.refresh_inventory(ex.client)
             if _name(ex, pos) not in AIR or state.count(support) < before + 1:
                 raise Replan("未确认临时施工支撑已拆除并回收")

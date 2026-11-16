@@ -170,6 +170,41 @@ class DiamondTests(unittest.TestCase):
                     drive(MineDiamond(count=1), ex, state)
                 self.assertEqual(ex.acts, [])
 
+    def test_mine_diamond_skips_dig_unconfirmed_and_prefers_non_silk_touch_pick(self):
+        second_ore = (0, -52, 2)
+        world = DiamondWorld(
+            items={"diamond_pickaxe": 1, IRON: 1},
+            picks={"diamond_pickaxe": 100, IRON: 40},
+            blocks={ORE: "diamond_ore", second_ore: "diamond_ore"},
+            exposed=(ORE, second_ore),
+        )
+        orig_inv = world.inventory
+
+        def inv_with_enchants(timeout=10):
+            res = orig_inv(timeout)
+            for entry in res["items"]:
+                if entry["name"] == "diamond_pickaxe":
+                    entry["enchantments"] = [{"name": "silk_touch", "level": 1}]
+                elif entry["name"] == IRON:
+                    entry["enchantments"] = [{"name": "efficiency", "level": 2}]
+            if res.get("held"):
+                res["held"] = next(e for e in res["items"] if e["name"] == res["held"]["name"])
+            return res
+
+        world.inventory = inv_with_enchants
+        world.queue("equip", _equip)
+        world.queue(
+            "dig",
+            ApiError("dig_unconfirmed", "unconfirmed", {"pos": list(ORE), "eye_dist": 4.6}),
+            _dig("diamond"),
+        )
+        ex, state = world.session()
+        steps = drive(MineDiamond(count=1), ex, state)
+        self.assertEqual(world.held, IRON)
+        self.assertIn("ore_skip", [s["op"] for s in steps])
+        self.assertEqual(state.count("diamond"), 1)
+        world.assert_exhausted()
+
     def test_supported_descent_then_rescan_for_exposed_ore(self):
         deep_ore = (2, -54, 0)
         world = DiamondWorld(items={IRON: 1}, held=IRON, picks={IRON: 20},

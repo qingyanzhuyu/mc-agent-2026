@@ -6,7 +6,7 @@ import time
 from itertools import islice
 
 from ..runtime import EnvBlocked, Replan
-from .base import rec
+from .base import failure, rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .observations import observe_block as _observed_block
 
@@ -208,18 +208,29 @@ def equip_item(ex, state, item, slot="hand", *, min_durability=None):
     return entry
 
 
+_MINE_EYE_REACH = 5.0
+
+
+def _has_silk_touch(entry) -> bool:
+    return any(
+        isinstance(ench, dict) and bare(ench.get("name")) == "silk_touch"
+        and type(ench.get("level")) is int and ench["level"] > 0
+        for ench in ((entry or {}).get("enchantments") or ())
+    )
+
+
 def _local_mine_target(ex, state, pos, names):
     cur = _position(state.refresh_status(ex.client, max_age_s=0).get("pos"))
     center = tuple(v + 0.5 for v in pos)
     eye = (cur[0], cur[1] + 1.62, cur[2])
-    if math.dist(eye, center) > 4 or (_cell(cur)[::2] == pos[::2] and pos[1] < cur[1]):
+    if math.dist(eye, center) > _MINE_EYE_REACH or (_cell(cur)[::2] == pos[::2] and pos[1] < cur[1]):
         return {}
     block = _observed_block(ex, pos)
     return block if _block_matches(block, names) else {}
 
 
 def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=None, max_blocks=16):
-    """§3.2、§3.4、§4.2：近处逐格复核，返回实收新增数量。"""
+    """§3.2、§3.4、§4.2：眼睛 5 格内逐格复核，兼容斜下方自动贴近与 dig_unconfirmed，返回实收新增数量。"""
     _bounded(count, 1, 64, "本批采集数量")
     _bounded(max_blocks, 1, 64, "本批采集格数")
     names = {bare(name) for name in ([block_types] if isinstance(block_types, str) else block_types)}
@@ -233,6 +244,7 @@ def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=N
         raise Replan(f"缺少采收工具 {tool}")
     candidates = dict.fromkeys(_cell(pos) for pos in islice(positions, max_blocks))
     equipped = tool is None
+    last_dig_error: Replan | None = None
     for pos in candidates:
         block = _local_mine_target(ex, state, pos, names)
         if not block:
@@ -246,19 +258,38 @@ def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=N
         if block.get("diggable") is False or block.get("harvest_tool_ok") is False:
             raise Replan(f"无法安全采收 {pos} 的 {block['name']}，请换工具或矿点")
         before = state.count(drop)
-        receipt = ex.dig(list(pos), collect=True)
+        try:
+            receipt = ex.dig(list(pos), collect=True)
+        except Replan as exc:
+            # §4.2 / §8 1.3.10 ①：斜下方挖掘可能先走近，失败后也须刷新站位与背包。
+            state.refresh_status(ex.client, max_age_s=0)
+            state.refresh_inventory(ex.client)
+            code, extra = failure(exc)
+            if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                last_dig_error = exc
+                yield rec("dig", pos=list(pos), error_code=code, error=extra)
+                continue
+            raise
         yield rec("dig", receipt, pos=list(pos))
-        state.refresh_inventory(ex.client)
+        state.refresh_status(ex.client, max_age_s=0)
+        inv = state.refresh_inventory(ex.client)
         if receipt.get("warning") or state.count(drop) <= before:
+            if drop not in names and _has_silk_touch(_slot_item(inv, "hand")):
+                raise Replan(f"挖掘后未收到 {drop}：手持工具带有 silk_touch（精准采集），请换无精准采集的工具")
             raise Replan(f"挖掘后背包未确认增加 {drop}，检查工具和掉落位置")
         remaining = bare(_observed_block(ex, pos).get("name"))
         if not remaining or remaining == bare(block.get("name")):
             raise Replan(f"挖掘后未确认目标格 {pos} 已发生改变")
         if state.count(drop) >= initial + count:
             return state.count(drop) - initial
+    if last_dig_error is not None:
+        code, extra = failure(last_dig_error)
+        raise Replan(
+            f"近处矿点挖掘未获服务端确认或不可触达（{code}，eye_dist={extra.get('eye_dist')}）"
+        ) from last_dig_error
     raise EnvBlocked(f"已观察的近处矿点不足以采齐 {count} 个 {drop}",
                      missing_predicate=f"reachable_blocks:{drop}",
-                     searched_volume=f"近处 4 格、至多 {max_blocks} 个观测候选",
+                     searched_volume=f"近处 5 格、至多 {max_blocks} 个观测候选",
                      wake_on="chunk_moved")
 
 

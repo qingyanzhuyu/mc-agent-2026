@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import unittest
 
+from mcagent.client import ApiError
 from mcagent.runtime import EnvBlocked, Replan
-from mcagent.skills.base import Skill
+from mcagent.skills.base import Skill, failure
 from mcagent.skills.encounter import shoot_projectile, verify_shot_lane
-from mcagent.skills.field import collect_drops, place_block, scan_blocks, scan_entities
+from mcagent.skills.field import collect_drops, mine_block_batch, place_block, scan_blocks, scan_entities
 from mcagent.skills.interaction import hold_posture, use_item_on
 from mcagent.skills.scripted_world import ScriptedWorld
 from mcagent.skills.testing import drive
@@ -62,6 +63,86 @@ class FieldTests(unittest.TestCase):
         ex, state = false_positive.session()
         with self.assertRaisesRegex(Replan, "放置后"):
             drive(place_block(ex, state, "obsidian", [1, 64, 0]), ex)
+
+    def test_mine_block_batch_supports_five_block_reach_diagonal_walk_and_dig_unconfirmed(self):
+        first = (3, 62, 2)   # eye dist ~4.77 <= 5.0
+        second = (2, 62, 1)  # diagonal below
+        world = ScriptedWorld(
+            blocks={(0, 63, 0): "stone", (1, 63, 0): "stone", first: "iron_ore", second: "iron_ore"},
+            items={"iron_pickaxe": 1},
+        )
+
+        def inv_with_eff(timeout=10):
+            inv = ScriptedWorld.inventory(world, timeout)
+            for row in inv["items"]:
+                if row["name"] == "iron_pickaxe":
+                    row["durability"] = [200, 250]
+                    row["enchantments"] = [{"name": "efficiency", "level": 3}]
+                    inv["held"] = row
+            return inv
+
+        world.inventory = inv_with_eff
+
+        def dig_walk_and_break(w, *, pos, **kwargs):
+            self.assertEqual(pos, list(second))
+            w.st["pos"] = [1.5, 64.0, 0.5]
+            w.blocks.pop(second)
+            w.items["raw_iron"] = 1
+            return {"dug": "iron_ore", "dig_ms": 210, "tool": "iron_pickaxe", "gained": {"raw_iron": 1}}
+
+        world.queue(
+            "dig",
+            ApiError("dig_unconfirmed", "server did not confirm break", {
+                "pos": list(first), "eye_dist": 4.77, "on_ground": True, "ping_ms": 42,
+            }),
+            dig_walk_and_break,
+        )
+        ex, state = world.session()
+        steps = drive(mine_block_batch(
+            ex, state, [first, second], block_types="iron_ore", drop="raw_iron", tool="iron_pickaxe",
+        ), ex)
+        self.assertEqual([s.get("error_code") for s in steps], ["dig_unconfirmed", None])
+        self.assertEqual(state.pos, [1.5, 64.0, 0.5])
+        self.assertEqual(state.count("raw_iron"), 1)
+        world.assert_exhausted()
+
+        silk_world = ScriptedWorld(blocks={(1, 64, 0): "diamond_ore"}, items={"diamond_pickaxe": 1})
+
+        def inv_with_silk(timeout=10):
+            inv = ScriptedWorld.inventory(silk_world, timeout)
+            for row in inv["items"]:
+                if row["name"] == "diamond_pickaxe":
+                    row["durability"] = [500, 1561]
+                    row["enchantments"] = [{"name": "silk_touch", "level": 1}]
+                    inv["held"] = row
+            return inv
+
+        silk_world.inventory = inv_with_silk
+
+        def silk_dig(w, *, pos, **kwargs):
+            w.blocks.pop((1, 64, 0))
+            w.items["diamond_ore"] = 1
+            return {"dug": "diamond_ore", "gained": {"diamond_ore": 1}}
+
+        silk_world.queue("dig", silk_dig)
+        ex2, state2 = silk_world.session()
+        with self.assertRaisesRegex(Replan, "silk_touch"):
+            drive(mine_block_batch(
+                ex2, state2, [(1, 64, 0)], block_types="diamond_ore", drop="diamond", tool="diamond_pickaxe",
+            ), ex2)
+
+        unconfirmed_only = ScriptedWorld(blocks={(1, 64, 0): "iron_ore"}, items={"iron_pickaxe": 1})
+        unconfirmed_only.inventory = lambda timeout=10: {
+            "items": [{"name": "iron_pickaxe", "count": 1, "slot": 0, "durability": [100, 250]}],
+            "held": {"name": "iron_pickaxe", "count": 1, "slot": 0, "durability": [100, 250]},
+        }
+        unconfirmed_only.queue("dig", ApiError("dig_unconfirmed", "unconfirmed", {"pos": [1, 64, 0], "eye_dist": 4.9}))
+        ex3, state3 = unconfirmed_only.session()
+        with self.assertRaisesRegex(Replan, "dig_unconfirmed") as caught:
+            drive(mine_block_batch(
+                ex3, state3, [(1, 64, 0)], block_types="iron_ore", drop="raw_iron", tool="iron_pickaxe",
+            ), ex3)
+        self.assertEqual(failure(caught.exception)[0], "dig_unconfirmed")
 
 
 class InteractionTests(unittest.TestCase):

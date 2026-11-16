@@ -249,3 +249,27 @@ class MineStepTests(unittest.TestCase):
         with self.assertRaises(MineStepUnsafe):
             drive(mine_step(ex, state, (1, 63, 0)), ex)
         self.assertEqual(ex.acts, [])
+
+    def test_mine_step_dig_unconfirmed_raises_cut_unsafe_unless_moved(self):
+        world = ScriptedWorld(items={"iron_pickaxe": 1}, blocks={(1, y, 0): "stone" for y in range(62, 66)})
+        world.queue("equip", {"equipped": "iron_pickaxe"})
+        world.queue("dig", ApiError("dig_unconfirmed", "unconfirmed", {"pos": [1, 65, 0], "eye_dist": 4.8}))
+        ex, state = world.session()
+        with self.assertRaises(MineStepUnsafe) as caught:
+            drive(mine_step(ex, state, (1, 63, 0)), ex)
+        self.assertEqual(caught.exception.stage, "cut")
+        world.assert_exhausted()
+
+        moved_world = ScriptedWorld(items={"iron_pickaxe": 1}, blocks={(1, y, 0): "stone" for y in range(62, 66)})
+        moved_world.queue("equip", {"equipped": "iron_pickaxe"})
+
+        def walk_and_fail(w, **kwargs):
+            w.st["pos"] = [1.5, 65.0, 0.5]
+            raise ApiError("dig_unconfirmed", "unconfirmed after walk", {"pos": [1, 65, 0]})
+
+        moved_world.queue("dig", walk_and_fail)
+        ex2, state2 = moved_world.session()
+        with self.assertRaises(Replan) as caught2:
+            drive(mine_step(ex2, state2, (1, 63, 0)), ex2)
+        self.assertNotIsInstance(caught2.exception, MineStepUnsafe)
+        moved_world.assert_exhausted()

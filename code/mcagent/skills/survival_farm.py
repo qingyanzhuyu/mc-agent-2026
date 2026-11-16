@@ -5,7 +5,7 @@ import math
 from itertools import combinations
 
 from ..runtime import EnvBlocked, Replan
-from .base import Param, Skill, rec
+from .base import Param, Skill, failure, rec
 from .field import collect_drops, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
@@ -62,7 +62,18 @@ def _gather_wheat(ex, state, goal_qty):
         yield from _approach(ex, state, status, stand, _center(pos))
         if _block(ex, pos) not in _GRASS:
             continue
-        yield rec("dig", ex.dig(pos, collect=True, stop_on=("hurt", "death")), pos=pos)
+        try:
+            dug = ex.dig(pos, collect=True, stop_on=("hurt", "death"))
+        except Replan as exc:
+            code, extra = failure(exc)
+            state.refresh_status(ex.client, max_age_s=0)
+            _fresh_inventory(ex, state)
+            if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                yield rec("dig", pos=pos, error_code=code, error=extra)
+                continue
+            raise
+        yield rec("dig", dug, pos=pos)
+        state.refresh_status(ex.client, max_age_s=0)
         _fresh_inventory(ex, state)
         if _block(ex, pos) not in AIR:
             continue

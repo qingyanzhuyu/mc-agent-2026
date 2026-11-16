@@ -196,6 +196,26 @@ class ObsidianTests(unittest.TestCase):
         self.assertEqual(world.get_block(ore)["name"], "air")
         world.assert_exhausted()
 
+    def test_mine_obsidian_skips_dig_unconfirmed_candidate_and_portal_prefers_hand_scaffold(self):
+        first = (2, 64, 0)
+        second = (0, 64, 2)
+        world = NetherWorld(items={_PICK: 1}, extra={first: "obsidian", second: "obsidian"}, observed=(first, second))
+        world.queue("equip", _equip)
+        world.queue(
+            "dig",
+            ApiError("dig_unconfirmed", "unconfirmed", {"pos": list(first), "eye_dist": 4.5}),
+            _dig,
+        )
+        steps, _, state = self.run_skill(world)
+        self.assertEqual([s.get("error_code") for s in steps if s["op"] == "dig"], ["dig_unconfirmed", None])
+        self.assertEqual(state.count("obsidian"), 1)
+        self.assertEqual(world.get_block(first)["name"], "obsidian")
+        world.assert_exhausted()
+
+        pickless = NetherWorld(items={"obsidian": 4, "cobblestone": 1, "dirt": 1, "flint_and_steel": 1})
+        _, st_pickless = pickless.session()
+        self.assertIn(("dirt", 1, "borrow"), BuildAndEnterPortal.material_plan({}, st_pickless))
+
     def test_ore_present_without_required_pick_replans(self):
         ore = (2, 64, 0)
         world = NetherWorld(extra={ore: "obsidian"}, observed=(ore,))
