@@ -210,6 +210,9 @@ class SoakObserver:
         self.environment_blocked_goals: dict[str, dict[str, str]] = {}
         self.decision_sources: dict[str, int] = {}
         self.step_sources: dict[str, int] = {}
+        self.objective_decisions: list[dict[str, Any]] = []
+        self.objective_sources: dict[str, int] = {}
+        self.objective_llm_latencies_ms: list[float] = []
         self.llm_latencies_ms: list[float] = []
         self.llm_fallbacks = 0
         self.prompt_tokens = 0
@@ -608,6 +611,45 @@ class SoakObserver:
             "cumulative_total_tokens": self.prompt_tokens + self.completion_tokens,
         })
 
+    def on_objective_decision(self, telemetry: dict) -> None:
+        src = str(telemetry.get("source") or "rule")
+        ms = float(telemetry.get("ms", 0.0) or 0.0)
+        p_tok = _nonneg_int(telemetry.get("prompt_tokens"))
+        c_tok = _nonneg_int(telemetry.get("completion_tokens"))
+        errors = [str(e) for e in (telemetry.get("errors") or [])]
+        adopted = bool(telemetry.get("adopted", False))
+        goal_id = telemetry.get("goal_id")
+        replaced_goal_id = telemetry.get("replaced_goal_id")
+        trigger = str(telemetry.get("trigger") or "unknown")
+
+        self.prompt_tokens += p_tok
+        self.completion_tokens += c_tok
+        self.objective_sources[src] = self.objective_sources.get(src, 0) + 1
+        if src in ("llm", "llm_fallback_rule"):
+            self.objective_llm_latencies_ms.append(ms)
+
+        row = {
+            "event": "objective_decision",
+            "elapsed_s": self._elapsed_s(),
+            "trigger": trigger,
+            "source": src,
+            "goal_id": goal_id,
+            "budget_s": telemetry.get("budget_s"),
+            "why": str(telemetry.get("why") or ""),
+            "ms": round(ms, 1),
+            "prompt_tokens": p_tok,
+            "completion_tokens": c_tok,
+            "total_tokens": p_tok + c_tok,
+            "cumulative_prompt_tokens": self.prompt_tokens,
+            "cumulative_completion_tokens": self.completion_tokens,
+            "cumulative_total_tokens": self.prompt_tokens + self.completion_tokens,
+            "errors": errors,
+            "adopted": adopted,
+            "replaced_goal_id": replaced_goal_id,
+        }
+        self.objective_decisions.append(row)
+        self._append_jsonl(self.timeline_path, row)
+
     def update_goals_reached(self, state: State) -> dict[str, float]:
         elapsed = self._elapsed_s()
         for g in self.ledger:
@@ -693,6 +735,8 @@ class SoakObserver:
             "total_tokens": self.prompt_tokens + self.completion_tokens,
             "decision_sources": dict(self.decision_sources),
             "step_sources": dict(self.step_sources),
+            "objective_decisions": len(self.objective_decisions),
+            "objective_sources": dict(self.objective_sources),
             "llm_calls": len(self.llm_latencies_ms),
             "llm_fallbacks": self.llm_fallbacks,
         })
@@ -905,6 +949,10 @@ class SoakObserver:
             lines.append(
                 f"- **决策来源占比**：选技能 {_format_source_breakdown(self.decision_sources, '次')}；"
                 f"动作步 {_format_source_breakdown(self.step_sources, '步')}"
+            )
+        if self.objective_sources:
+            lines.append(
+                f"- **战略目标决策**：{_format_source_breakdown(self.objective_sources, '次')}"
             )
 
         elapsed_now = self._elapsed_s()

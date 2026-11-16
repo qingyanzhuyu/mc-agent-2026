@@ -54,7 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="聚焦推进并验收目标台账中的 goal_id；多个用逗号分隔表示同一轮一起追（如 smelt_iron,kill_a_mob）")
     p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
     p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
-    p.add_argument("--llm", action="store_true", help="开启 LLM 菜单选择（默认关闭，走纯规则队列；失败自动回退规则）")
+    p.add_argument("--strategy", choices=("rule", "llm"), default="rule",
+                   help="战略层目标选择实现：rule=性价比排序（默认），llm=事件驱动异步模型选目标")
+    p.add_argument("--strategy-review-s", type=float, default=None,
+                   help="战略层例行复核目标的间隔秒数（默认 600s，可由 MC_STRATEGY_REVIEW_S 覆盖）")
+    p.add_argument("--require-iron", action="store_true", default=None,
+                   help="铁器（smelt_iron）达成前不调用战略层模型（默认关闭）")
+    p.add_argument("--llm", action="store_true", help="开启技能级 LLM 菜单选择（--strategy llm 下仅在战术层无技能时兜底）")
     p.add_argument("--soak", action="store_true", help="挂载 SoakObserver（落盘 timeline/http_tape/progress_curve/异常包）")
     p.add_argument("--run-dir", type=Path, default=None, help="指定运行日志目录（默认 mcagent/logs/soak-YYYYmmdd-HHMMSS）")
     p.add_argument("--baseline", type=Path, default=None, help="对比上一版运行目录的 progress_curve.jsonl")
@@ -74,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _run_dry(cfg: Config, *, min_verified: str = "offline") -> int:
+def _run_dry(cfg: Config, *, min_verified: str = "offline", strategy: str = "rule") -> int:
     print(f"[dry] 已注册技能 ({len(REGISTRY)}): {', '.join(sorted(REGISTRY))}")
     for name, cls in sorted(REGISTRY.items()):
         errs = contract_errors(cls)
@@ -93,6 +99,17 @@ def _run_dry(cfg: Config, *, min_verified: str = "offline") -> int:
     st.set_inventory({"items": []})
     d = planner.choose(st)
     print(f"[dry] 空包规则首拍决策 -> {d.skill} ({d.reason})")
+    cp = CampaignPlanner(mode="campaign", strategy=strategy, min_verified=min_verified)
+    ctx = cp.build_context(st)
+    rendered = ctx.render()
+    if len(rendered) > 2000:
+        print(f"[dry] 战略决策上下文超长: {len(rendered)} > 2000")
+        return 1
+    rule_obj = cp.rule_objective(st)
+    print(
+        f"[dry] 战略层核验通过 (strategy={strategy}): 上下文 {len(rendered)} 字, "
+        f"可选目标 {len(ctx.eligible_goals)} 项, 规则首选={rule_obj.goal_id if rule_obj else None}"
+    )
     c = Client(cfg)
     code = c.probe()
     print(f"[dry] 端点无凭据探测 ({cfg.base}) -> {code}")
@@ -131,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg.token_file = None  # 临时测试 bot 不污染默认 .token.json
 
     if args.dry:
-        return _run_dry(cfg, min_verified=args.min_verified or "offline")
+        return _run_dry(cfg, min_verified=args.min_verified or "offline", strategy=args.strategy)
 
     official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS
     if official and not args.live:
@@ -145,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     llm_meta: dict = {}
-    if args.llm:
+    if args.llm or args.strategy == "llm":
         try:
             prof = resolve_profile()
         except ValueError as e:
@@ -205,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             target_goal=args.goal,
             run_meta={
                 "mode": args.mode,
+                "strategy": args.strategy,
                 "skill": args.skill,
                 "target_goal": args.goal,
                 "stop_on_goal": stop_on_goal,
@@ -220,13 +238,18 @@ def main(argv: list[str] | None = None) -> int:
 
     planner = CampaignPlanner(
         mode=args.mode,
+        strategy=args.strategy,
         focus_skill=args.skill,
         focus_args=focus_args,
         use_llm=args.llm,
         min_verified=min_ver,
         on_llm_telemetry=observer.on_llm_call if observer else None,
+        on_objective_telemetry=observer.on_objective_decision if observer else None,
         target_goal=args.goal,
         telemetry=telemetry,
+        review_interval_s=args.strategy_review_s,
+        require_iron=True if args.require_iron else None,
+        max_seconds=args.max_seconds,
     )
     loop_cfg = LoopConfig(
         mode=args.mode,
