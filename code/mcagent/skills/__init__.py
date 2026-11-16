@@ -4,6 +4,7 @@
     registry.py   @register、REGISTRY、make()、自动发现
     items.py      选择器：最好的镐、垫块、空气判断（只读）
     sightline.py  眼高（1.62/1.27）、方块中心眼距与 3D 体素视线遮挡检查（只读）
+    world_memo.py 共享世界资源台账（按 State 弱引用隔离与 J17 脱敏摘要）
     nav.py        L2 原语：breach_1x2 / sneak_bridge / step_up_1x2（probe 直接导入验收）
     testing.py    离线夹具：GridWorld 替身 + drive()（强制"一步一动作"）
     <领域>.py      L3 技能，一个文件一个领域，`@register` 即接入
@@ -41,7 +42,7 @@
 - 参数只许标量，不许坐标/实体 id（注册时强制）。
 - **没在真机跑通的技能不要合进 main**（`AGENTS.md` §2A.6）；跑通后把 `verified` 改成 "live"。
 """
-from . import sightline
+from . import sightline, world_memo
 from .base import Param, Skill, bind_args, failure, rec
 from .registry import REGISTRY, all_names, contract_errors, get, load_all, make, register
 
@@ -49,4 +50,4 @@ from .registry import REGISTRY, all_names, contract_errors, get, load_all, make,
 load_all()
 
 __all__ = ["Skill", "Param", "REGISTRY", "register", "get", "all_names", "make",
-           "contract_errors", "bind_args", "load_all", "rec", "failure", "sightline"]
+           "contract_errors", "bind_args", "load_all", "rec", "failure", "sightline", "world_memo"]

@@ -18,6 +18,7 @@ from ..planner.llm import LLMClient, LLMError
 from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills.items import best_pickaxe
+from ..skills.world_memo import format_memo_summary
 from .goals import (
     DEFAULT_CAMPAIGN_STAGES,
     GOALS,
@@ -99,6 +100,9 @@ def build_state_summary(state: State, *, goal_hint: str = "") -> str:
     ]
     if PROTECTED_ZONES:
         lines.append(f"已发现保护区点位数={len(PROTECTED_ZONES)}（需远离）")
+    memo_summary = format_memo_summary(state)
+    if memo_summary:
+        lines.append(f"已知环境资源：{memo_summary}")
     if goal_hint:
         lines.append(f"当前目标指引：{goal_hint}")
     return "\n".join(lines)
