@@ -29,8 +29,17 @@ def _weapon(state):
     return "crossbow" if state.count("crossbow") and not state.count("bow") else "bow"
 
 
+def _arrow_kind(state):
+    return next((name for name in _AMMO if state.count(name)), "arrow")
+
+
+def _ammo_ambiguous(state, weapon):
+    return ((weapon == "crossbow" and state.count("firework_rocket") > 0)
+            or sum(state.count(name) > 0 for name in _AMMO) > 1)
+
+
 def _requirements(state, *, target):
-    arrow = next((name for name in _AMMO if state.count(name)), "arrow")
+    arrow = _arrow_kind(state)
     req = {_weapon(state): 1, arrow: 1}
     if target:
         req[_TARGET] = 1
@@ -141,6 +150,13 @@ def _shoot_center(ex, state, pos, weapon):
         raise Replan("当前位置未确认是距离合格的安全射位")
     if _completed(ex, _ADVANCEMENT):
         return
+    state.invalidate_inventory()
+    state.refresh_inventory(ex.client)
+    if _ammo_ambiguous(state, weapon):
+        raise Replan("射位复核出现多种弹药，无法确认所计划的箭矢")
+    arrow = _arrow_kind(state)
+    if not state.count(arrow):
+        raise Replan("射位复核时已没有预备的箭矢")
     try:
         result = yield from shoot_projectile(ex, state, pos=aim, weapon=weapon, retreat_pos=retreat,
                                              min_horizontal=_MIN_RANGE, max_distance=_MAX_RANGE)
@@ -148,6 +164,8 @@ def _shoot_center(ex, state, pos, weapon):
         _stop_active_draw(ex, weapon)
     yield rec("bullseye_shot_evidence", None, horizontal=result["lane"]["horizontal_dist"],
               ammo_spent=result["ammo_spent"], aim=result["receipt"].get("aim"))
+    if any(item != arrow or qty != 1 for item, qty in result["ammo_spent"].items()):
+        raise Replan("标靶射击实扣与所声明的单箭物资不一致")
     confirmed = yield from _verify_advancement(ex, _ADVANCEMENT, 3)
     yield rec("bullseye_advancement_evidence", None, advancement_confirmed=confirmed)
 
@@ -161,15 +179,17 @@ class HitBullseye(Skill):
 
     @classmethod
     def blocked(cls, state):
+        if _ammo_ambiguous(state, _weapon(state)):
+            return "无法确认弓弩和箭矢的唯一扣减，请只保留一种箭并移除弩的烟花"
         if _craft_plan(state, _requirements(state, target=False), _CRAFTABLE).missing:
             return "缺可用弓弩和箭矢，或缺制作它们的材料"
         return ""
 
     @classmethod
     def material_plan(cls, args, state) -> tuple[tuple[str, int, str], ...]:
-        ready = _craft_plan(state, _requirements(state, target=False), _CRAFTABLE)
-        if ready.missing:
+        if cls.blocked(state):
             return ()
+        ready = _craft_plan(state, _requirements(state, target=False), _CRAFTABLE)
         fallback = _craft_plan(state, _requirements(state, target=True), _CRAFTABLE)
         used = ready if fallback.missing else fallback
         return tuple((item, count, "borrow" if item in ("bow", "crossbow") else mode)

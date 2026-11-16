@@ -82,7 +82,8 @@ class TargetTests(unittest.TestCase):
         world.assert_exhausted()
 
     def test_crossbow_without_compatible_ammo_and_missing_weapon_replan(self):
-        for items in ({"crossbow": 1, "firework_rocket": 1}, {"arrow": 1}):
+        for items in ({"crossbow": 1, "firework_rocket": 1}, {"arrow": 1},
+                      {"bow": 1, "arrow": 1, "spectral_arrow": 1}):
             with self.subTest(items=items):
                 world = TargetWorld(items=items)
                 world.queue("advancements", _progress())
@@ -119,6 +120,22 @@ class TargetTests(unittest.TestCase):
             drive(HitBullseye(), ex, state)
         self.assertEqual(ex.acts, ["shoot"])
         sleep.assert_called()
+        world.assert_exhausted()
+
+    def test_multiple_arrow_debit_stops_before_claiming_progress(self):
+        world = TargetWorld()
+        world.queue("advancements", _progress(), _progress())
+        world.queue("find_blocks", _find(("target", _TARGET)))
+
+        def double_debit(world, **kwargs):
+            world.items["arrow"] -= 2
+            return {"fired": True}
+
+        world.queue("shoot", double_debit)
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "单箭物资不一致"):
+            drive(HitBullseye(), ex, state)
+        self.assertEqual(ex.acts, ["shoot"])
         world.assert_exhausted()
 
     def test_already_recorded_goal_never_shoots_again(self):
