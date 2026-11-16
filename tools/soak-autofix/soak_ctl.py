@@ -37,11 +37,13 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Collection, Iterator, Optional, Sequence
 from urllib.parse import urlsplit
 
+_REAL_SUBPROCESS_RUN = subprocess.run
 PROTECTED_BRANCHES = frozenset({"main", "master", "HEAD"})
 
 # Gate 1 白名单与冻结保护面（严守 AGENTS.md §2A.3 / §5 / docs/05 §3）
@@ -1490,7 +1492,11 @@ def verify_and_promote(
         ("unittest", ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests"]),
         ("loop_dry", ["uv", "run", "python", "-m", "mcagent.loop", "--dry"]),
     ):
-        proc = subprocess.run(cmd, cwd=str(code_dir), env=uv_env, capture_output=True, text=True, timeout=180)
+        try:
+            proc = _run_gate_subprocess(cmd, cwd=code_dir, env=uv_env, timeout_s=180)
+        except subprocess.TimeoutExpired as exc:
+            _write_timeout_log(attempt_dir / f"gate2_{step_name}.log", f"[gate2] {step_name} timeout after 180s", exc)
+            return _fail(f"gate2_{step_name}_timeout", f"{step_name} 离线门禁超时（>180s）")
         (attempt_dir / f"gate2_{step_name}.log").write_text(
             (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
         )
@@ -1533,7 +1539,16 @@ def verify_and_promote(
         canary_env = _uv_env(fixer_wt, player_model=(st_snap.get("player_model") or "").strip())
         canary_env["MC_API_BASE"] = local_mc_base(Path(st_snap["repo_root"]))  # 金丝雀永远在自建测试服，不占比赛账号
         canary_env.pop("MCAGENT_TRAIN_ON_OFFICIAL", None)
-        proc = subprocess.run(cmd, cwd=str(code_dir), env=canary_env, capture_output=True, text=True, timeout=int(canary_max_seconds + 45))
+        canary_timeout_s = int(canary_max_seconds + 75)
+        try:
+            proc = _run_gate_subprocess(cmd, cwd=code_dir, env=canary_env, timeout_s=canary_timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            _write_timeout_log(
+                attempt_dir / "gate3_live_canary.log",
+                f"[gate3] live canary timeout after {canary_timeout_s}s",
+                exc,
+            )
+            return _fail("gate3_live_canary_timeout", f"真机金丝雀验收超时（>{canary_timeout_s}s）")
         (attempt_dir / "gate3_live_canary.log").write_text(
             (proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8"
         )
@@ -1829,24 +1844,32 @@ def _merge_timeout_stream(initial: Any, remainder: Any) -> str:
     return head + tail
 
 
-def _write_timeout_agent_log(
-    attempt_dir: Path,
+def _write_timeout_log(
+    log_path: Path,
     header: str,
     exc: subprocess.TimeoutExpired,
 ) -> None:
     out_s = _decode_subproc_output(exc.stdout)
     err_s = _decode_subproc_output(exc.stderr)
-    (attempt_dir / "fixer_agent.log").write_text(f"{header}\n{out_s}\n{err_s}", encoding="utf-8")
+    log_path.write_text(f"{header}\n{out_s}\n{err_s}", encoding="utf-8")
 
 
-def _run_fixer_command(
-    cmd_str: str,
+def _write_timeout_agent_log(
+    attempt_dir: Path,
+    header: str,
+    exc: subprocess.TimeoutExpired,
+) -> None:
+    _write_timeout_log(attempt_dir / "fixer_agent.log", header, exc)
+
+
+def _run_command_with_tree_kill(
+    argv: Sequence[str],
     *,
     cwd: Path,
     env: dict[str, str],
     timeout_s: int,
 ) -> subprocess.CompletedProcess[str]:
-    """在独立会话中执行 fixer 命令，超时后清理整个进程树（含子进程组/MCP 服务）。"""
+    """在独立会话中执行命令，超时后清理整个进程树（含子进程组/MCP 服务/uv 子进程）。"""
     popen_kw: dict[str, Any] = {
         "cwd": str(cwd),
         "env": env,
@@ -1856,7 +1879,7 @@ def _run_fixer_command(
     }
     if os.name == "posix":
         popen_kw["start_new_session"] = True
-    proc = subprocess.Popen(["bash", "-lc", cmd_str], **popen_kw)
+    proc = subprocess.Popen(list(argv), **popen_kw)
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s)
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout=stdout, stderr=stderr)
@@ -1882,6 +1905,29 @@ def _run_fixer_command(
         out_s = _merge_timeout_stream(exc.stdout, rem_out)
         err_s = _merge_timeout_stream(exc.stderr, rem_err)
         raise subprocess.TimeoutExpired(exc.cmd, exc.timeout, output=out_s, stderr=err_s) from exc
+
+
+def _run_fixer_command(
+    cmd_str: str,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: int,
+) -> subprocess.CompletedProcess[str]:
+    return _run_command_with_tree_kill(["bash", "-lc", cmd_str], cwd=cwd, env=env, timeout_s=timeout_s)
+
+
+def _run_gate_subprocess(
+    cmd: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: int,
+) -> subprocess.CompletedProcess[str]:
+    """执行门禁子命令；测试打桩 subprocess.run 时透传走桩，真实运行时清理整棵子进程树。"""
+    if subprocess.run is not _REAL_SUBPROCESS_RUN:
+        return subprocess.run(list(cmd), cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout_s)
+    return _run_command_with_tree_kill(cmd, cwd=cwd, env=env, timeout_s=timeout_s)
 
 
 def run_fixer_once(
@@ -2009,83 +2055,111 @@ def run_fixer_batch(
             + ", ".join(f"{it['incident_id']}({it['fingerprint']})" for it in batch)
         )
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as pool:
-            futures = [pool.submit(_run_worker, item) for item in batch]
-            for fut in concurrent.futures.as_completed(futures):
-                item, timed_out, timeout_note = fut.result()
-                fp = item["fingerprint"]
-                worker_wt = Path(item["worker_wt"])
-                with locked_fixer_wt(session_dir):
-                    st_cur = read_state(session_dir)
-                    fixer_wt = Path(st_cur["fixer_wt"])
-                    branch = st_cur["target_branch"]
-                    _clean_fixer_worktree(fixer_wt)
-                    _git(fixer_wt, "checkout", branch)
+            future_to_item = {pool.submit(_run_worker, item): item for item in batch}
+            for fut in concurrent.futures.as_completed(future_to_item):
+                orig_item = future_to_item[fut]
+                fp = orig_item["fingerprint"]
+                try:
+                    item, timed_out, timeout_note = fut.result()
+                    worker_wt = Path(item["worker_wt"])
+                    with locked_fixer_wt(session_dir):
+                        st_cur = read_state(session_dir)
+                        fixer_wt = Path(st_cur["fixer_wt"])
+                        branch = st_cur["target_branch"]
+                        _clean_fixer_worktree(fixer_wt)
+                        _git(fixer_wt, "checkout", branch)
 
-                    changed_files, gate1_err = _check_gate1_in_worktree(worker_wt, item)
-                    if gate1_err is not None:
-                        res = verify_and_promote(
-                            session_dir,
-                            fp,
-                            live_canary=live_canary,
-                            fixer_bot_user=fixer_bot_user,
-                        )
-                        eff_gate, eff_detail = gate1_err
-                        if timed_out and eff_gate == "gate1_whitelist":
-                            eff_detail = timeout_note
-                        if (
-                            not res.get("ok")
-                            and res.get("failed_gate") == "gate1_whitelist"
-                            and res.get("detail") == "fixer 工位没有任何文件改动"
-                            and (eff_gate, eff_detail) != ("gate1_whitelist", "fixer 工位没有任何文件改动")
-                        ):
-                            res["failed_gate"] = eff_gate
-                            res["detail"] = eff_detail
-                            with locked_state(session_dir) as st_mut:
-                                gh = st_mut.get("incidents", {}).get(fp, {}).get("gate_history") or []
-                                if gh:
-                                    gh[-1]["failed_gate"] = eff_gate
-                                    gh[-1]["detail"] = eff_detail[:1000]
-                            write_review_report(session_dir)
-                    else:
-                        skill_name = str(item.get("skill") or "").strip()
-                        goal_id = str(item.get("goal_id") or "").strip()
-                        commit_msg = (
-                            f"fix(soak-autofix): {skill_name or goal_id or 'loop'} "
-                            f"resolve {item.get('incident_id')} [{item.get('code')}]"
-                        )
-                        applied, conflict_detail = _apply_worker_patch_to_fixer_wt(
-                            fixer_wt, worker_wt, changed_files, commit_msg
-                        )
-                        if not applied:
-                            with locked_state(session_dir) as st_mut:
-                                rec = st_mut["incidents"][fp]
-                                rec["status"] = "pending"
-                                rec.setdefault("gate_history", []).append({
-                                    "at": _utc_now(),
-                                    "ok": False,
-                                    "failed_gate": "merge_conflict_requeue",
-                                    "event": "merge_conflict_requeue",
-                                    "detail": (conflict_detail or "merge conflict during parallel cherry-pick")[:1000],
-                                })
-                            write_review_report(session_dir)
-                            res = {
-                                "ok": False,
-                                "requeued": True,
-                                "failed_gate": "merge_conflict_requeue",
-                                "detail": conflict_detail,
-                            }
-                        else:
+                        changed_files, gate1_err = _check_gate1_in_worktree(worker_wt, item)
+                        if gate1_err is not None:
                             res = verify_and_promote(
                                 session_dir,
                                 fp,
                                 live_canary=live_canary,
                                 fixer_bot_user=fixer_bot_user,
                             )
+                            eff_gate, eff_detail = gate1_err
+                            if timed_out and eff_gate == "gate1_whitelist":
+                                eff_detail = timeout_note
+                            if (
+                                not res.get("ok")
+                                and res.get("failed_gate") == "gate1_whitelist"
+                                and res.get("detail") == "fixer 工位没有任何文件改动"
+                                and (eff_gate, eff_detail) != ("gate1_whitelist", "fixer 工位没有任何文件改动")
+                            ):
+                                res["failed_gate"] = eff_gate
+                                res["detail"] = eff_detail
+                                with locked_state(session_dir) as st_mut:
+                                    gh = st_mut.get("incidents", {}).get(fp, {}).get("gate_history") or []
+                                    if gh:
+                                        gh[-1]["failed_gate"] = eff_gate
+                                        gh[-1]["detail"] = eff_detail[:1000]
+                                write_review_report(session_dir)
+                        else:
+                            skill_name = str(item.get("skill") or "").strip()
+                            goal_id = str(item.get("goal_id") or "").strip()
+                            commit_msg = (
+                                f"fix(soak-autofix): {skill_name or goal_id or 'loop'} "
+                                f"resolve {item.get('incident_id')} [{item.get('code')}]"
+                            )
+                            applied, conflict_detail = _apply_worker_patch_to_fixer_wt(
+                                fixer_wt, worker_wt, changed_files, commit_msg
+                            )
+                            if not applied:
+                                with locked_state(session_dir) as st_mut:
+                                    rec = st_mut["incidents"][fp]
+                                    rec["status"] = "pending"
+                                    rec.setdefault("gate_history", []).append({
+                                        "at": _utc_now(),
+                                        "ok": False,
+                                        "failed_gate": "merge_conflict_requeue",
+                                        "event": "merge_conflict_requeue",
+                                        "detail": (conflict_detail or "merge conflict during parallel cherry-pick")[:1000],
+                                    })
+                                write_review_report(session_dir)
+                                res = {
+                                    "ok": False,
+                                    "requeued": True,
+                                    "failed_gate": "merge_conflict_requeue",
+                                    "detail": conflict_detail,
+                                }
+                            else:
+                                res = verify_and_promote(
+                                    session_dir,
+                                    fp,
+                                    live_canary=live_canary,
+                                    fixer_bot_user=fixer_bot_user,
+                                )
+                except Exception as exc:
+                    err_detail = f"{type(exc).__name__}: {exc}"
+                    try:
+                        with locked_fixer_wt(session_dir):
+                            st_err = read_state(session_dir)
+                            _clean_fixer_worktree(Path(st_err["fixer_wt"]))
+                    except Exception:
+                        pass
+                    with locked_state(session_dir) as st_mut:
+                        rec = st_mut.get("incidents", {}).get(fp)
+                        if rec is not None and rec.get("status") == "claimed":
+                            rec["status"] = "pending"
+                        if rec is not None:
+                            rec.setdefault("gate_history", []).append({
+                                "at": _utc_now(),
+                                "ok": False,
+                                "failed_gate": "batch_promotion_error",
+                                "detail": err_detail[:1000],
+                            })
+                    write_review_report(session_dir)
+                    res = {
+                        "ok": False,
+                        "requeued": True,
+                        "failed_gate": "batch_promotion_error",
+                        "detail": err_detail,
+                    }
                 res.setdefault("fingerprint", fp)
-                res.setdefault("incident_id", item.get("incident_id"))
+                res.setdefault("incident_id", orig_item.get("incident_id"))
                 processed_fps.add(fp)
                 results.append(res)
-                print(f"[fixer-batch] 门禁结果 ({item.get('incident_id')}): {res}")
+                print(f"[fixer-batch] 门禁结果 ({orig_item.get('incident_id')}): {res}")
     finally:
         for item in batch:
             w_str = item.get("worker_wt")
@@ -2211,9 +2285,15 @@ def inject_and_set_goal(
                         ("unittest", ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests"]),
                         ("loop_dry", ["uv", "run", "python", "-m", "mcagent.loop", "--dry"]),
                     ):
-                        proc = subprocess.run(
-                            cmd, cwd=str(code_dir), env=uv_env, capture_output=True, text=True, timeout=180
-                        )
+                        try:
+                            proc = _run_gate_subprocess(cmd, cwd=code_dir, env=uv_env, timeout_s=180)
+                        except subprocess.TimeoutExpired:
+                            _rollback_branch_in_fixer_wt(fixer_wt, branch, prev_tip)
+                            return {
+                                "ok": False,
+                                "failed_step": f"gate2_{step_name}_timeout",
+                                "detail": f"{step_name} 离线门禁超时（>180s）",
+                            }
                         if proc.returncode != 0:
                             _rollback_branch_in_fixer_wt(fixer_wt, branch, prev_tip)
                             tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-600:]
@@ -2770,41 +2850,52 @@ def main(argv: Optional[list[str]] = None) -> int:
                 flush=True,
             )
         while not (session_dir / "STOP").exists():
-            cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
-            workers = (
-                _validate_fixer_workers(args.fixer_workers)
-                if args.fixer_workers is not None
-                else resolve_fixer_workers(session_dir, 1)
-            )
-            if workers <= 1:
-                res = run_fixer_once(
-                    session_dir,
-                    fixer_cmd_template=cur_tmpl,
-                    fixer_timeout_s=args.fixer_timeout,
-                    live_canary=not args.skip_live_canary,
-                    fixer_bot_user=args.fixer_user,
-                    fixer_preset_name=cur_name,
+            try:
+                cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
+                workers = (
+                    _validate_fixer_workers(args.fixer_workers)
+                    if args.fixer_workers is not None
+                    else resolve_fixer_workers(session_dir, 1)
                 )
-                if args.once:
-                    return 0 if (res is None or res.get("ok")) else 1
-                if res is None:
-                    time.sleep(max(0.5, args.poll_s))
-            else:
-                batch = run_fixer_batch(
-                    session_dir,
-                    fixer_cmd_template=cur_tmpl,
-                    max_workers=workers,
-                    fixer_timeout_s=args.fixer_timeout,
-                    live_canary=not args.skip_live_canary,
-                    fixer_bot_user=args.fixer_user,
-                    fixer_preset_name=cur_name,
-                )
-                if args.once:
+                if workers <= 1:
+                    res = run_fixer_once(
+                        session_dir,
+                        fixer_cmd_template=cur_tmpl,
+                        fixer_timeout_s=args.fixer_timeout,
+                        live_canary=not args.skip_live_canary,
+                        fixer_bot_user=args.fixer_user,
+                        fixer_preset_name=cur_name,
+                    )
+                    if args.once:
+                        return 0 if (res is None or res.get("ok")) else 1
+                    if res is None:
+                        time.sleep(max(0.5, args.poll_s))
+                else:
+                    batch = run_fixer_batch(
+                        session_dir,
+                        fixer_cmd_template=cur_tmpl,
+                        max_workers=workers,
+                        fixer_timeout_s=args.fixer_timeout,
+                        live_canary=not args.skip_live_canary,
+                        fixer_bot_user=args.fixer_user,
+                        fixer_preset_name=cur_name,
+                    )
+                    if args.once:
+                        if not batch:
+                            return 0
+                        return 0 if any(r.get("ok") for r in batch) else 1
                     if not batch:
-                        return 0
-                    return 0 if any(r.get("ok") for r in batch) else 1
-                if not batch:
-                    time.sleep(max(0.5, args.poll_s))
+                        time.sleep(max(0.5, args.poll_s))
+            except Exception as exc:
+                if args.once:
+                    raise
+                print(
+                    f"[fixer-loop] 本轮异常但不退出守护：{type(exc).__name__}: {exc}\n"
+                    f"{traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(max(1.0, args.poll_s))
         return 0
 
     if args.cmd == "run":
