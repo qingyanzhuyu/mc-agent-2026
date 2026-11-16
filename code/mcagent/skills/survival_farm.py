@@ -13,7 +13,7 @@ from .recipes import craft_recipe
 from .registry import register
 from .survival import (
     _BREED_PROGRESS, _PLANT_PROGRESS, _above, _approach, _block, _can_reach, _center,
-    _fresh_inventory, _has_progress, _plank_plan, _site_missing, _stand_for,
+    _fresh_inventory, _has_progress, _plank_plan, _require_ready, _site_missing, _stand_for,
 )
 
 
@@ -50,6 +50,8 @@ def _has_farm_tools(state):
 
 def _gather_wheat(ex, state, goal_qty):
     grass = scan_blocks(ex, state, _GRASS, radius=_BLOCK_RADIUS, limit=8)
+    if grass.get("ready") is False:
+        raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描草丛")
     for row in grass["blocks"]:
         pos = tuple(row["pos"])
         status = state.refresh_status(ex.client, max_age_s=0)
@@ -92,9 +94,13 @@ def _gather_wheat(ex, state, goal_qty):
 def _planting_site(ex, state, seed):
     base = "soul_sand" if seed == "nether_wart" else "farmland"
     types = (base,) if seed == "nether_wart" else (base, *_TILLABLE)
-    candidates = scan_blocks(ex, state, types, radius=_BLOCK_RADIUS, limit=_BLOCK_LIMIT)["blocks"]
+    scan = scan_blocks(ex, state, types, radius=_BLOCK_RADIUS, limit=_BLOCK_LIMIT)
+    if scan.get("ready") is False:
+        raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描播种地块")
+    candidates = scan["blocks"]
     candidates.sort(key=lambda row: row["name"] != base)
     status = state.refresh_status(ex.client, max_age_s=0)
+    _require_ready(status)
     for row in candidates:
         pos = tuple(row["pos"])
         if _block(ex, _above(pos)) in AIR:
@@ -114,6 +120,8 @@ class PlantSeed(Skill):
 
     @classmethod
     def blocked(cls, state):
+        if state.snapshot().get("ready") is False:
+            return "世界正在加载区块和实体（ready=false），请稍候"
         return "" if _find_seed(state) or _has_farm_tools(state) else "先备种子、锄头或木锄原料"
 
     @classmethod
@@ -180,7 +188,10 @@ def _baby(entity):
 
 
 def _animals(ex, state, species):
-    return [entity for entity in scan_entities(ex, state, species, radius=_ANIMAL_RADIUS)["entities"]
+    scan = scan_entities(ex, state, species, radius=_ANIMAL_RADIUS)
+    if scan.get("ready") is False:
+        raise Replan(f"世界实体加载尚未就绪（not_ready），暂无法观察 {species}")
+    return [entity for entity in scan["entities"]
             if entity.get("type") == "animal" and bare(entity.get("name")) == species
             and isinstance(entity.get("health"), (int, float)) and entity["health"] > 0]
 
@@ -193,6 +204,7 @@ def _pair_missing(species):
 def _find_pair(ex, state, species):
     animals = _animals(ex, state, species)
     status = state.refresh_status(ex.client, max_age_s=0)
+    _require_ready(status)
     eligible = {entity["id"]: entity for entity in animals
                 if not _baby(entity) and entity.get("in_love") is not True
                 and _stand_for(ex, status, entity["pos"]) is not None}
@@ -230,6 +242,8 @@ class BreedAnimal(Skill):
 
     @classmethod
     def blocked(cls, state):
+        if state.snapshot().get("ready") is False:
+            return "世界正在加载区块和实体（ready=false），请稍候"
         has_food = state.count(_WHEAT) >= 1 or any(
             state.count(food) >= 2 for foods in _FEEDS.values() for food in foods
         )

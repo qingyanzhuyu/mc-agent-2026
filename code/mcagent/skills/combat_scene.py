@@ -117,6 +117,8 @@ def _clear_shot(ex, state, scene, entities):
 def _observe(ex, state, previous=None):
     origin = _safe_status(ex, state, previous, stay=True)
     observed = scan_entities(ex, state, radius=_SCAN_RADIUS)
+    if observed.get("ready") is False:
+        raise Replan("世界区块或实体加载尚未就绪（not_ready），暂缓战斗选怪")
     echoed = state.snapshot()
     if (
         echoed.get("dimension") != origin["dimension"] or echoed.get("alive") is not True

@@ -5,6 +5,7 @@ import math
 import time
 from itertools import islice
 
+from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import failure, rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
@@ -44,10 +45,11 @@ def _block_matches(block, names, properties=None, mature=None):
             and (mature is None or block.get("mature") is mature))
 
 
-def _scan_result(snapshot, observed_at, radius, key, hits):
+def _scan_result(snapshot, observed_at, radius, key, hits, *, ready=True):
     return {
         "status": "found" if hits else "unknown",
         key: hits,
+        "ready": ready,
         "origin": snapshot.get("pos"),
         "dimension": snapshot.get("dimension"),
         "radius": radius,
@@ -56,14 +58,21 @@ def _scan_result(snapshot, observed_at, radius, key, hits):
 
 
 def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None):
-    """§3.3–3.4：复读最多 limit 个暴露候选。未知不能当作地形不存在。"""
+    """§3.1、§3.3–3.4：ready=true 时复读最多 limit 个暴露候选；加载期间返回 ready=false。"""
     _bounded(radius, 1, 64, "方块搜索半径")
     _bounded(limit, 1, 64, "方块搜索条数")
     names = {bare(name) for name in ([types] if isinstance(types, str) else types or ())}
     snapshot = state.refresh_status(ex.client, max_age_s=0)
     observed_at = time.monotonic()
-    found = ex.client.find_blocks(types=sorted(names) or None, radius=radius,
-                                  limit=limit, properties=properties, mature=mature)
+    if snapshot.get("ready") is False:
+        return _scan_result(snapshot, observed_at, radius, "blocks", [], ready=False)
+    try:
+        found = ex.client.find_blocks(types=sorted(names) or None, radius=radius,
+                                      limit=limit, properties=properties, mature=mature)
+    except ApiError as exc:
+        if exc.code in ("not_ready", "not_loaded"):
+            return _scan_result(snapshot, observed_at, radius, "blocks", [], ready=False)
+        raise
     blocks = found.get("blocks") or []
     if isinstance(blocks, dict):
         summaries = sorted(blocks.items(), key=lambda entry: entry[1].get("dist", math.inf))
@@ -77,23 +86,30 @@ def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, 
         observed = _observed_block(ex, pos)
         if _block_matches(observed, names or {name}, properties, mature):
             hits.append({**candidate, **observed, "pos": list(pos), "name": bare(observed["name"])})
-    return _scan_result(snapshot, observed_at, radius, "blocks", hits)
+    return _scan_result(snapshot, observed_at, radius, "blocks", hits, ready=True)
 
 
 def scan_entities(ex, state, types=None, *, radius=32, limit=40):
-    """§3.5：实体快照批次。空回执只表示本次结果未知。"""
+    """§3.1、§3.5：ready=true 后区块和实体已到齐；重生/切维度期间 ready=false 返回未就绪空快照。"""
     _bounded(radius, 1, 64, "实体搜索半径")
     _bounded(limit, 1, 40, "实体搜索条数")
     names = [bare(types)] if isinstance(types, str) else [bare(name) for name in types or ()]
     snapshot = state.refresh_status(ex.client, max_age_s=0)
     observed_at = time.monotonic()
-    entities = ex.client.get_entities(radius=radius, types=names or None).get("entities") or []
+    if snapshot.get("ready") is False:
+        return _scan_result(snapshot, observed_at, radius, "entities", [], ready=False)
+    try:
+        entities = ex.client.get_entities(radius=radius, types=names or None).get("entities") or []
+    except ApiError as exc:
+        if exc.code == "not_ready":
+            return _scan_result(snapshot, observed_at, radius, "entities", [], ready=False)
+        raise
     hits = [
         entity for entity in entities[:limit]
         if type(entity.get("id")) is int and entity.get("pos")
         and (not names or bare(entity.get("name")) in names or entity.get("type") in names)
     ]
-    return _scan_result(snapshot, observed_at, radius, "entities", hits)
+    return _scan_result(snapshot, observed_at, radius, "entities", hits, ready=True)
 
 
 def _safe_support(ex, pos):
@@ -313,6 +329,8 @@ def collect_drops(ex, state, item, count=1, *, radius=8, max_targets=4):
     attempted = set()
     for _ in range(max_targets):
         scan = scan_entities(ex, state, "item", radius=radius)
+        if scan.get("ready") is False:
+            raise Replan(f"世界加载尚未就绪（not_ready），暂无法扫描 {item} 掉落物")
         target = next((entity for entity in scan["entities"]
                        if entity["id"] not in attempted and _drop_name(entity) == item
                        and _standable_cell(ex, entity["pos"])), None)

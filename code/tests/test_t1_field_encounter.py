@@ -8,6 +8,7 @@ from mcagent.skills.base import Skill, failure
 from mcagent.skills.encounter import shoot_projectile, verify_shot_lane
 from mcagent.skills.field import collect_drops, mine_block_batch, place_block, scan_blocks, scan_entities
 from mcagent.skills.interaction import hold_posture, use_item_on
+from mcagent.skills.observations import observe_block
 from mcagent.skills.scripted_world import ScriptedWorld
 from mcagent.skills.testing import drive
 
@@ -143,6 +144,27 @@ class FieldTests(unittest.TestCase):
                 ex3, state3, [(1, 64, 0)], block_types="iron_ore", drop="raw_iron", tool="iron_pickaxe",
             ), ex3)
         self.assertEqual(failure(caught.exception)[0], "dig_unconfirmed")
+
+    def test_not_ready_scans_and_collect_drops_replan_instead_of_env_blocked(self):
+        world = ScriptedWorld()
+        world.st.update(dimension="overworld", ready=False)
+        ex, state = world.session()
+        blocks = scan_blocks(ex, state, "iron_ore", radius=8)
+        entities = scan_entities(ex, state, "hostile", radius=8)
+        self.assertEqual((blocks["ready"], blocks["blocks"]), (False, []))
+        self.assertEqual((entities["ready"], entities["entities"]), (False, []))
+        with self.assertRaisesRegex(Replan, "not_ready"):
+            drive(collect_drops(ex, state, "arrow", radius=5), ex)
+
+        world2 = ScriptedWorld()
+        world2.st.update(dimension="overworld", ready=True)
+        world2.queue("get_entities", ApiError("not_ready", "world still loading"))
+        world2.get_block = lambda pos: (_ for _ in ()).throw(ApiError("not_ready", "chunks arriving"))
+        ex2, state2 = world2.session()
+        self.assertEqual(observe_block(ex2, [0, 64, 0]), {})
+        with self.assertRaisesRegex(Replan, "not_ready"):
+            drive(collect_drops(ex2, state2, "arrow", radius=5), ex2)
+        world2.assert_exhausted()
 
 
 class InteractionTests(unittest.TestCase):

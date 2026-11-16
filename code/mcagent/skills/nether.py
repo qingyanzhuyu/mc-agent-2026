@@ -80,9 +80,11 @@ class BuildAndEnterPortal(Skill):
 
     @classmethod
     def blocked(cls, state):
+        if not state.ready:
+            return "需先等待世界区块和实体就绪（ready=true）"
         if _dimension(state.st) == "nether":
             return ""
-        if not state.ready or _dimension(state.st) != "overworld":
+        if _dimension(state.st) != "overworld":
             return "需先确认主世界站位，才能查可用下界门"
         return ""
 
@@ -105,6 +107,8 @@ class BuildAndEnterPortal(Skill):
         if self.args["prepare_flint"] and state.count("flint"):
             return
         status = state.refresh_status(ex.client, max_age_s=0)
+        if status.get("ready") is not True:
+            raise Replan("世界加载尚未就绪（ready=false），请等新世界区块和实体到齐后再重试")
         if _dimension(status) == "nether" and not self.args["prepare_flint"]:
             verify_portal_landing(ex, state)
             return

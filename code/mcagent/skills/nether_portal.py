@@ -300,18 +300,31 @@ def traverse_portal(ex, state, entry):
             if _hazard(now) or now.get("health", 20) < status.get("health", 20):
                 raise Replan("穿门时观察到受伤或流体危险，停止移动")
             if _dimension(now) == "nether":
-                break
+                # §3.1 / §8 1.3.8 ②：切维度后 ready 会先变 false 等下界区块与实体到齐，期间动作报 not_ready。
+                if now.get("ready") is True:
+                    break
+                if attempt + 1 < _POLL_LIMIT:
+                    time.sleep(0.5)
+                    yield rec("wait_portal", reason="await_nether_ready")
+                continue
             if now.get("ready") and (_dimension(now) != "overworld" or _cell(_pos(now)) != entry.foot):
                 raise Replan("移动回执未确认站在传送门内，取消继续移动")
             if attempt + 1 < _POLL_LIMIT:
                 time.sleep(0.5)
                 yield rec("wait_portal", reason="await_dimension")
         else:
+            if _dimension(now) == "nether":
+                raise Replan("已进入下界但世界加载尚未就绪（ready=false），等待区块和实体到齐后复核落点")
             raise EnvBlocked("站在活动门内仍未确认维度变化",
                              missing_predicate="nether_transition",
                              searched_volume=f"1 次进门，最多 {_POLL_LIMIT} 次状态读取",
                              wake_on="chunk_moved")
-        ex.stop(raise_on_error=True)
+        try:
+            ex.stop(raise_on_error=True)
+        except Replan as exc:
+            if failure(exc)[0] == "not_ready":
+                raise Replan("下界切维度加载期间动作接口返回 not_ready，请等 ready=true 后复核落点") from exc
+            raise
         stopped = True
         yield rec("stop", purpose="portal_landing")
         return verify_portal_landing(ex, state)

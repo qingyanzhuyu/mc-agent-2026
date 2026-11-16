@@ -21,6 +21,8 @@ _BED_RADIUS = 12
 
 
 def _sleep_window(status):
+    if status.get("ready") is not True or status.get("alive") is not True:
+        raise Replan("世界加载尚未就绪或角色未存活（not_ready），请等 ready=true 后再睡")
     if bare(status.get("dimension")) != "overworld":
         raise Replan("只有确认在主世界才能点床睡觉，请先返回主世界")
     if status.get("is_day") is True:

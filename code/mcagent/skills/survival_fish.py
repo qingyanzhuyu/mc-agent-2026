@@ -12,7 +12,7 @@ from .recipes import craft_recipe
 from .registry import register
 from .survival import (
     _FISH_PROGRESS, _above, _approach, _block, _cell, _center, _fresh_inventory,
-    _has_progress, _on_ground, _site_missing, _stand_for,
+    _has_progress, _on_ground, _require_ready, _site_missing, _stand_for,
 )
 
 
@@ -38,8 +38,12 @@ def _cast_clear(ex, stand, pos):
 
 
 def _cast_site(ex, state):
-    candidates = scan_blocks(ex, state, "water", radius=_WATER_RADIUS, limit=10)["blocks"]
+    scan = scan_blocks(ex, state, "water", radius=_WATER_RADIUS, limit=10)
+    if scan.get("ready") is False:
+        raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描水域")
+    candidates = scan["blocks"]
     status = state.refresh_status(ex.client, max_age_s=0)
+    _require_ready(status)
     for row in candidates:
         pos = tuple(row["pos"])
         if not _open_water_surface(ex, pos):
@@ -79,6 +83,8 @@ class CatchFish(Skill):
 
     @classmethod
     def blocked(cls, state):
+        if state.snapshot().get("ready") is False:
+            return "世界正在加载区块和实体（ready=false），请稍候"
         ready = state.count(_ROD) or (state.count("string") >= 2 and state.count("stick") >= 3)
         return "" if ready else "先备钓竿，或 2 根线和 3 根木棍"
 

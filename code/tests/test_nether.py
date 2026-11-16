@@ -419,6 +419,45 @@ class PortalTests(unittest.TestCase):
         self.assertEqual(steps, [])
         self.assertEqual(ex.acts, [])
 
+    def test_portal_waits_for_nether_ready_before_stop_and_landing_reads(self):
+        world = _active_world()
+        polls = {"count": 0}
+        orig_status = world.status
+
+        def enter_loading(w, *, pos, **kwargs):
+            _arrive()(w, pos=pos)
+            w.st["ready"] = False
+            return {"dimension_changed": {"from": "overworld", "to": "the_nether"}, "pos": w.st["pos"]}
+
+        def status_with_delayed_ready(timeout=10):
+            snap = orig_status(timeout)
+            if "nether" in str(snap.get("dimension")) and not snap.get("ready"):
+                polls["count"] += 1
+                if polls["count"] >= 2:
+                    world.st["ready"] = True
+                    snap["ready"] = True
+            return snap
+
+        world.status = status_with_delayed_ready
+        world.queue("move_to", enter_loading)
+        world.queue("advancements", {"advancements": [
+            {"id": "minecraft:story/enter_the_nether", "status": "completed"},
+        ]})
+        with patch("mcagent.skills.nether_portal.time.sleep") as wait:
+            steps, _, _ = self.run_skill(world)
+        self.assertEqual([s["op"] for s in steps], ["move_to", "wait_portal", "stop", "portal_landing"])
+        self.assertEqual(steps[1]["reason"], "await_nether_ready")
+        self.assertEqual(wait.call_count, 1)
+        world.assert_exhausted()
+
+        loading_nether = NetherWorld()
+        _arrive()(loading_nether, pos=None)
+        loading_nether.st["ready"] = False
+        ex2, state2 = loading_nether.session()
+        self.assertTrue(BuildAndEnterPortal.blocked(state2))
+        with self.assertRaisesRegex(Replan, "ready=false"):
+            drive(BuildAndEnterPortal(), ex2, state2)
+
     def test_flint_preparation_reads_gravel_change_and_pickup(self):
         pos = (2, 64, 1)
         world = NetherWorld(extra={pos: "gravel"}, observed=(pos,))

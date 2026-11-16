@@ -437,3 +437,8 @@ class CombatMaterialTests(CombatTestCase):
     def test_empty_uninitialized_menu_remains_blocked(self):
         for skill in (HuntMob, DeflectSkeletonArrow, FireCrossbow, ShootMob):
             self.assertTrue(skill.blocked(State()))
+
+    def test_combat_scan_not_ready_replans_instead_of_env_blocked(self):
+        world = CombatWorld({"stone_sword": 1}, held="stone_sword")
+        world.queue("get_entities", ApiError("not_ready", "respawn chunks arriving"))
+        self.assert_replan(world, HuntMob(), "not_ready", ())

@@ -371,3 +371,25 @@ class SurvivalTests(unittest.TestCase):
         self.assertEqual(SleepInBed.material_plan({}, state),
                          (("shears", 1, "borrow"), ("red_wool", 2, "consume"), ("oak_planks", 3, "consume")))
         self.assertEqual(world.calls, [])
+
+    def test_not_ready_status_or_scan_replans_for_farm_camp_and_fish(self):
+        for skill_cls, skill_name, items in (
+            (PlantSeed, "plant_seed", {"wheat_seeds": 1}),
+            (BreedAnimal, "breed_animal", {"wheat_seeds": 2}),
+            (SleepInBed, "sleep_in_bed", {"white_bed": 1}),
+            (CatchFish, "catch_fish", {"fishing_rod": 1}),
+        ):
+            with self.subTest(skill=skill_name):
+                world = SurvivalWorld(items, ready=False, is_day=True)
+                world.queue("advancements", progress())
+                ex, state = world.session()
+                self.assertTrue(skill_cls.blocked(state))
+                with self.assertRaisesRegex(Replan, "not_ready|尚未就绪"):
+                    drive(make(skill_name, {}), ex, state)
+                world.assert_exhausted()
+
+        race_world = SurvivalWorld({"wheat_seeds": 2}, ready=True)
+        race_world.queue("advancements", progress())
+        race_world.queue("get_entities", ApiError("not_ready", "dimension transition"))
+        with self.assertRaisesRegex(Replan, "not_ready"):
+            self.run_skill(race_world, "breed_animal")

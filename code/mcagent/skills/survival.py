@@ -65,6 +65,11 @@ def _on_ground(status):
             and not any(status.get(key) for key in ("in_water", "submerged", "in_lava", "on_fire", "in_vehicle")))
 
 
+def _require_ready(status):
+    if status.get("ready") is not True or status.get("alive") is not True:
+        raise Replan("世界区块和实体加载尚未就绪或角色未存活（not_ready），请稍后重试")
+
+
 def _standable(ex, pos):
     return (_block(ex, _above(pos, -1)) in _SUPPORT and _block(ex, pos) in AIR
             and _block(ex, _above(pos)) in AIR)
