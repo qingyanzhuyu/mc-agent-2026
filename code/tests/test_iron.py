@@ -10,6 +10,9 @@ from mcagent.loop.starter_skills import MINE_TRAILS, ScoutIsland, reset_world_me
 from mcagent.runtime import EnvBlocked, Replan
 from mcagent.skills import REGISTRY
 from mcagent.skills.iron import SmeltIron, reset_iron_memo
+from mcagent.skills.iron_gear import CraftIronGear
+from mcagent.skills.iron_lava import FillLavaBucket
+from mcagent.skills.scripted_world import ScriptedWorld
 from mcagent.skills.testing import GridWorld, drive
 
 
@@ -553,6 +556,230 @@ class SmeltIronTests(unittest.TestCase):
             _, _, state = self.run_skill(world, count=3)
             self.assertEqual(state.count("iron_ingot"), 3)
             self.assertFalse(any(op == "dig" for op, _ in world.calls))
+
+    def test_fake_mining_arrival_skips_route_across_retries_until_dimension_changes(self):
+        ore = [6, 64, 0]
+        world = IronWorld(blocks={tuple(ore): "iron_ore"})
+        world.st["dimension"] = "overworld"
+        attempts = []
+
+        def stays_put(*args, **kwargs):
+            pos = kwargs["pos"]
+            attempts.append(pos)
+            return {"pos": pos}
+
+        world.move_to = stays_put
+        ex, state = world.session()
+        for dimension, times in (("overworld", 1), ("overworld", 1), ("the_nether", 2)):
+            world.st["dimension"] = dimension
+            with self.assertRaises(EnvBlocked):
+                drive(SmeltIron(count=1), ex, state)
+            self.assertEqual(attempts, [ore] * times)
+        self.assertNotIn("dig", ex.acts)
+
+    def test_material_plan_counts_transformed_log_once(self):
+        world = IronWorld(items={"pale_oak_log": 1, "raw_iron": 3, "furnace": 1})
+        _, state = world.session()
+        expected = (("raw_iron", 3, "consume"), ("pale_oak_log", 1, "consume"))
+        self.assertEqual(SmeltIron.material_plan({"count": 3}, state), expected)
+
+
+class CraftIronGearTests(unittest.TestCase):
+    def test_registered_and_copper_tool_does_not_replace_explicit_iron_pickaxe(self):
+        self.assertIs(REGISTRY["craft_iron_gear"], CraftIronGear)
+        world = ScriptedWorld(blocks={(1, 64, 0): "crafting_table"},
+                              items={"iron_ingot": 3, "stick": 2, "copper_pickaxe": 1})
+        world.queue("find_blocks", {"blocks": [{"pos": [1, 64, 0], "name": "crafting_table"}]})
+
+        def craft(fixture, item, count, **_):
+            self.assertEqual((item, count), ("iron_pickaxe", 1))
+            fixture.items.update(iron_ingot=0, stick=0, iron_pickaxe=1)
+            return {"crafted": item}
+
+        world.queue("craft", craft)
+        ex, state = world.session()
+        skill = CraftIronGear(item="iron_pickaxe")
+        self.assertEqual([step["op"] for step in drive(skill, ex, state)], ["craft"])
+        self.assertEqual(state.count("iron_pickaxe"), 1)
+        self.assertEqual(skill.verify_done(state, {}), "")
+        world.assert_exhausted()
+
+    def test_missing_ingredients_replan_without_action(self):
+        world = ScriptedWorld(items={"iron_ingot": 2, "stick": 2})
+        ex, state = world.session()
+        skill = CraftIronGear(item="iron_pickaxe")
+        self.assertFalse(skill.can_start(state))
+        self.assertTrue(CraftIronGear(item="shears").can_start(state))
+        with self.assertRaisesRegex(Replan, "缺材料"):
+            drive(skill, ex, state)
+        self.assertEqual(ex.acts, [])
+
+    def test_missing_table_has_bounded_environment_evidence(self):
+        world = ScriptedWorld(items={"iron_ingot": 4})
+        world.queue("find_blocks", {"blocks": []})
+        ex, state = world.session()
+        with self.assertRaises(EnvBlocked) as caught:
+            drive(CraftIronGear(item="iron_boots"), ex, state)
+        self.assertEqual(caught.exception.missing_predicate, "station_ready:crafting_table")
+        self.assertIn("16", caught.exception.searched_volume)
+        self.assertEqual(caught.exception.wake_on, "chunk_moved")
+        self.assertEqual(ex.acts, [])
+        world.assert_exhausted()
+
+    def test_false_craft_receipt_without_inventory_evidence_fails(self):
+        world = ScriptedWorld(items={"iron_ingot": 2})
+        world.queue("craft", {"crafted": "shears"})
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "背包仅增加 0"):
+            drive(CraftIronGear(item="shears"), ex, state)
+        self.assertEqual(ex.acts, ["craft"])
+        world.assert_exhausted()
+
+    def test_existing_product_does_not_spend_materials(self):
+        world = ScriptedWorld(items={"iron_boots": 1, "iron_ingot": 4})
+        ex, state = world.session()
+        self.assertEqual(drive(CraftIronGear(item="iron_boots"), ex, state), [])
+        self.assertEqual(CraftIronGear.material_plan({"item": "iron_boots"}, state), ())
+
+    def test_material_plan_resolves_tag_and_shares_exact_iron_amounts(self):
+        _, state = ScriptedWorld(items={"iron_ingot": 6, "stick": 2,
+                                       "oak_planks": 4, "birch_planks": 2}).session()
+        self.assertEqual(CraftIronGear.material_plan({"item": "iron_pickaxe"}, state),
+                         (("iron_ingot", 3, "consume"), ("stick", 2, "consume")))
+        self.assertEqual(CraftIronGear.material_plan({"item": "iron_boots"}, state),
+                         (("iron_ingot", 4, "consume"),))
+        self.assertEqual(CraftIronGear.material_plan({"item": "shield"}, state),
+                         (("oak_planks", 4, "consume"), ("birch_planks", 2, "consume"),
+                          ("iron_ingot", 1, "consume")))
+
+    def test_abort_after_craft_has_no_additional_action(self):
+        world = ScriptedWorld(items={"iron_ingot": 2})
+        world.queue("craft", {"crafted": "shears"})
+        ex, state = world.session()
+        skill = CraftIronGear(item="shears")
+        self.assertFalse(skill.step(ex, state))
+        skill.abort()
+        self.assertIsNone(skill._flow)
+        self.assertEqual(ex.acts, ["craft"])
+        world.assert_exhausted()
+
+
+class LavaFixture(ScriptedWorld):
+    def __init__(self, *, items=None, source=(2, 64, 0), level=0, support=True):
+        terrain = {(x, 63, 0): "stone" for x in range(-2 if support else 0, 3)}
+        super().__init__(blocks=terrain, items={"bucket": 1} if items is None else items)
+        if source:
+            self.blocks[source] = "lava"
+        self.source = source
+        self.level = level
+        self.st["dimension"] = "overworld"
+        self.queue("find_blocks", {"blocks": [{"name": "lava", "pos": list(source)}] if source else []})
+
+    def get_block(self, pos):
+        data = super().get_block(pos)
+        if data.get("name") == "lava":
+            data["properties"] = {"level": self.level}
+        return data
+
+
+class FillLavaBucketTests(unittest.TestCase):
+    def test_registered_fills_observed_source_and_reads_separate_advancement(self):
+        self.assertIs(REGISTRY["fill_lava_bucket"], FillLavaBucket)
+        world = LavaFixture()
+
+        def collect(fixture, **request):
+            self.assertEqual(request["pos"], [2, 64, 0])
+            self.assertEqual(request["item"], "bucket")
+            fixture.items.update(bucket=0, lava_bucket=1)
+            fixture.blocks.pop(fixture.source)
+            return {"changed": True}
+
+        world.queue("interact", collect)
+        world.queue("advancements", {"ready": True, "advancements": [
+            {"id": "minecraft:story/lava_bucket", "status": "completed"},
+        ]})
+        ex, state = world.session()
+        skill = FillLavaBucket()
+        result = drive(skill, ex, state)
+        self.assertEqual(ex.acts, ["interact"])
+        self.assertEqual([step["op"] for step in result], ["interact", "lava_bucket_evidence"])
+        self.assertTrue(result[-1]["advancement_confirmed"])
+        self.assertEqual(skill.verify_done(state, {}), "")
+        world.assert_exhausted()
+
+    def test_no_bucket_replans_and_owned_product_skips_search(self):
+        for items in ({}, {"lava_bucket": 1}):
+            with self.subTest(items=items):
+                world = ScriptedWorld(items=items)
+                ex, state = world.session()
+                if items:
+                    self.assertEqual(drive(FillLavaBucket(), ex, state), [])
+                    self.assertEqual(FillLavaBucket.material_plan({}, state), ())
+                else:
+                    with self.assertRaisesRegex(Replan, "空桶"):
+                        drive(FillLavaBucket(), ex, state)
+                self.assertEqual(ex.acts, [])
+
+    def test_no_source_flow_unknown_and_no_retreat_are_environment_blocks(self):
+        for fixture, predicate in (
+            (LavaFixture(source=None), "lava_source"),
+            (LavaFixture(level=4), "lava_source"),
+            (LavaFixture(level=None), "lava_source"),
+            (LavaFixture(support=False), "safe_lava_access"),
+        ):
+            with self.subTest(level=fixture.level, predicate=predicate):
+                ex, state = fixture.session()
+                with self.assertRaises(EnvBlocked) as caught:
+                    drive(FillLavaBucket(), ex, state)
+                self.assertEqual(caught.exception.missing_predicate, predicate)
+                self.assertIn("半径 16 格内最多 12", caught.exception.searched_volume)
+                self.assertEqual(caught.exception.wake_on, "chunk_moved")
+                self.assertEqual(ex.acts, [])
+                fixture.assert_exhausted()
+
+    def test_source_is_refreshed_after_approach_and_abort_sends_no_interaction(self):
+        for abort in (True, False):
+            with self.subTest(abort=abort):
+                world = LavaFixture(source=(4, 64, 0))
+                ex, state = world.session()
+                skill = FillLavaBucket()
+                self.assertFalse(skill.step(ex, state))
+                self.assertEqual(ex.acts, ["move_to"])
+                if abort:
+                    skill.abort()
+                    self.assertIsNone(skill._flow)
+                else:
+                    world.level = 1
+                    with self.assertRaises(EnvBlocked) as caught:
+                        drive(skill, ex, state)
+                    self.assertEqual(caught.exception.missing_predicate, "lava_source")
+                self.assertEqual(ex.acts, ["move_to"])
+                world.assert_exhausted()
+
+    def test_receipt_without_new_lava_bucket_fails(self):
+        world = LavaFixture()
+        world.queue("interact", {"changed": True})
+        ex, state = world.session()
+        self.assertEqual(FillLavaBucket.material_plan({}, state), (("bucket", 1, "borrow"),))
+        with self.assertRaisesRegex(Replan, "背包未确认空桶转为岩浆桶"):
+            drive(FillLavaBucket(), ex, state)
+        self.assertEqual(ex.acts, ["interact"])
+        world.assert_exhausted()
+
+    def test_filled_bucket_can_be_verified_before_advancement_arrives(self):
+        world = LavaFixture(level="0")
+
+        def collect(fixture, **_):
+            fixture.items.update(bucket=0, lava_bucket=1)
+            return {}
+
+        world.queue("interact", collect)
+        world.queue("advancements", {"ready": True, "advancements": []})
+        ex, state = world.session()
+        steps = drive(FillLavaBucket(), ex, state)
+        self.assertTrue(steps[-1]["inventory_confirmed"])
+        self.assertFalse(steps[-1]["advancement_confirmed"])
+        world.assert_exhausted()
 
 
 if __name__ == "__main__":

@@ -7,15 +7,18 @@ from __future__ import annotations
 import math
 import time
 from typing import TYPE_CHECKING, Collection, Iterator, Optional
+from weakref import WeakKeyDictionary
 
 from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
+from .field import move_local
 from .furnace import collect_furnace, inspect_furnace, load_furnace
 from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe, record_mine_trail
 from .mining import (
     SOLID_SUPPORT, MineStepUnsafe, mine_step, prepare_mining_pick, safe_mine_column,
     under_feet,
 )
+from .recipes import craft_recipe
 from .registry import register
 from .windows import window_amount, window_section
 
@@ -35,23 +38,22 @@ SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
 MAX_ORE_ROUTE_FAILURES = 3
 POLL_SECONDS = 2.0
-# 按 client 实例隔离的同区块不可达矿点记忆，跨区块后自动失效，避免重入技能时重复撞死胡同洞穴。
-_SESSION_EXCLUDED: dict[int, tuple[tuple[int, int], set[tuple[int, int, int]]]] = {}
+# 同连接、维度、区块和生存阶段共享不可达矿点记忆。
+_SESSION_EXCLUDED = WeakKeyDictionary()
 
 
 def reset_iron_memo() -> None:
     _SESSION_EXCLUDED.clear()
 
 
-def _session_excluded_for(client: object, cur) -> set[tuple[int, int, int]]:
-    chunk = (math.floor(cur[0] / 16), math.floor(cur[2] / 16))
-    key = id(client)
-    entry = _SESSION_EXCLUDED.get(key)
-    if entry is None or entry[0] != chunk:
-        if len(_SESSION_EXCLUDED) >= 8:
-            _SESSION_EXCLUDED.clear()
+def _session_excluded_for(client: object, state: "State", status: dict) -> set[tuple[int, int, int]]:
+    cur = status.get("pos") or state.pos
+    deaths = tuple(state.deaths)
+    scope = (status.get("dimension"), math.floor(cur[0] / 16), math.floor(cur[2] / 16), deaths[-1:])
+    entry = _SESSION_EXCLUDED.get(client)
+    if entry is None or entry[0] != scope:
         fresh: set[tuple[int, int, int]] = set()
-        _SESSION_EXCLUDED[key] = (chunk, fresh)
+        _SESSION_EXCLUDED[client] = (scope, fresh)
         return fresh
     return entry[1]
 
@@ -64,6 +66,33 @@ def _fuels_for(state: "State") -> tuple[tuple[str, int], ...]:
     return BASE_FUELS + tuple(extra)
 
 
+class _OreRouteUnconfirmed(Replan):
+    pass
+
+
+def _log_for_fuel(stock, fuels, count: int) -> Optional[str]:
+    non_log = sum(stock(n) * u // 2 for n, u in fuels if not n.endswith("_log"))
+    direct = sum(stock(n) * u // 2 for n, u in fuels)
+    if non_log >= count or (direct >= count and count < 3):
+        return None
+    return next((w for w in WOODS if stock(f"{w}_log") > 0), None)
+
+
+def _fuel_batches(stock, fuels, remaining: int) -> tuple[list[tuple[str, int, int]], int]:
+    plan = []
+    for item, units in fuels:
+        available = stock(item)
+        if item == "stick" and available > 2 and remaining * 2 <= (available - 2) * units:
+            available -= 2
+        batch = min(remaining, available * units // 2)
+        if batch:
+            plan.append((item, math.ceil(batch * 2 / units), batch))
+            remaining -= batch
+        if not remaining:
+            break
+    return plan, remaining
+
+
 @register
 class SmeltIron(Skill):
     name = "smelt_iron"
@@ -71,6 +100,28 @@ class SmeltIron(Skill):
     params = {"count": Param(int, "期望新增铁锭数（粗铁用完即止）", default=3, min=1, max=16)}
     goal = "acq:iron_ingot"
     verified = "offline"
+
+    @classmethod
+    def material_plan(cls, args: dict, state: "State") -> tuple[tuple[str, int, str], ...]:
+        """Declare the current stock the planned batch can use; mined inputs enter later."""
+        count = args.get("count", 3)
+        raw = min(count, state.count("raw_iron"))
+        blocks = min(state.count("raw_iron_block"), math.ceil((count - raw) / 9))
+        fuels = _fuels_for(state)
+        stock = {item: state.count(item) for item, _ in fuels}
+        materials = {"raw_iron": raw, "raw_iron_block": blocks}
+        batch = min(count, raw + 9 * blocks) or count
+        for _ in range(batch):
+            wood = _log_for_fuel(stock.__getitem__, fuels, batch)
+            if wood is None:
+                break
+            log, plank = f"{wood}_log", f"{wood}_planks"
+            materials[log] = materials.get(log, 0) + 1
+            stock[log] -= 1
+            stock[plank] += 4
+        for item, qty, _ in _fuel_batches(stock.__getitem__, fuels, batch)[0]:
+            materials[item] = materials.get(item, 0) + min(qty, state.count(item))
+        return tuple((item, qty, "consume") for item, qty in materials.items() if qty)
 
     @classmethod
     def blocked(cls, state: "State") -> str:
@@ -82,7 +133,8 @@ class SmeltIron(Skill):
         return ""
 
     def _unpack_raw_iron_blocks(self, ex: "Executor", state: "State") -> Iterator[dict]:
-        while state.count("raw_iron_block") >= 1:
+        deficit = max(0, self.args["count"] - state.count("raw_iron"))
+        for _ in range(min(state.count("raw_iron_block"), math.ceil(deficit / 9))):
             before = state.count("raw_iron")
             yield rec("craft", ex.craft("raw_iron", 1), item="raw_iron")
             state.refresh_inventory(ex.client)
@@ -90,19 +142,30 @@ class SmeltIron(Skill):
                 raise Replan("拆解 raw_iron_block 后背包 raw_iron 未增加")
 
     def _mine(self, ex: "Executor", state: "State", pos, ores, drop: str) -> Iterator[dict]:
-        cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+        status = state.refresh_status(ex.client, max_age_s=0)
+        dimension = status.get("dimension")
+        cur = status.get("pos") or state.pos
         if math.dist(cur, pos) > MINING_REACH:
             yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
-        cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+        status = state.refresh_status(ex.client, max_age_s=0)
+        cur = status.get("pos") or state.pos
+        if status.get("dimension") != dimension:
+            raise Replan("移动到矿点期间维度变化，重新观察后再挖")
         if under_feet(cur, pos):
             raise Replan(f"观察到 {drop} 矿 {pos} 已在脚下，停止挖掘以保留支撑")
+        if math.dist(cur, pos) > MINING_REACH:
+            raise _OreRouteUnconfirmed(f"移动后未确认到达矿点 {pos} 的挖掘范围")
         block_type = bare(ex.client.get_block(pos).get("name"))
         if block_type not in ores:
             raise Replan(f"到达 {pos} 后 get_block 未确认目标矿 {ores}")
         yield from prepare_mining_pick(ex, state)
-        cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+        status = state.refresh_status(ex.client, max_age_s=0)
+        cur = status.get("pos") or state.pos
         if under_feet(cur, pos):
             raise Replan(f"装备后重新观察 {pos} 已在脚下，停止挖掘以保留支撑")
+        if (status.get("dimension") != dimension or math.dist(cur, pos) > MINING_REACH
+                or bare(ex.client.get_block(pos).get("name")) != block_type):
+            raise Replan(f"装备后矿点 {pos} 或站位已变化，重新观察后再挖")
         expected_drop = "raw_iron_block" if block_type == "raw_iron_block" else drop
         before = state.count(expected_drop)
         result = ex.dig(pos, collect=True)
@@ -189,10 +252,12 @@ class SmeltIron(Skill):
                 if pos is None:
                     # 井底正前与两侧均遇水/砾石受阻时，沿已挖阶梯后退一级尝试侧向分支。
                     if len(waypoints) >= 2 and backtracks < 2:
+                        prev = waypoints[-2]
+                        status = yield from move_local(ex, state, prev, require_move=True)
+                        if tuple(map(math.floor, status.get("pos") or state.pos)) != tuple(map(math.floor, prev)):
+                            raise Replan("未确认退到上一阶，保留原阶梯轨迹供退出")
                         backtracks += 1
                         waypoints.pop()
-                        prev = waypoints[-1]
-                        yield rec("move_to", ex.move_to(pos=prev, rng=1), pos=prev)
                         continue
                     break
                 visited.add((pos[0], pos[2]))
@@ -236,8 +301,8 @@ class SmeltIron(Skill):
             yield from self._unpack_raw_iron_blocks(ex, state)
         if state.count("raw_iron"):
             return
-        cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-        excluded = _session_excluded_for(ex.client, cur)
+        status = state.refresh_status(ex.client, max_age_s=0)
+        excluded = _session_excluded_for(ex.client, state, status)
         route_failures = len(excluded)
         checked_wide_shallow = False
         for _ in range(self.args["count"] + MAX_ORE_ROUTE_FAILURES + 2):
@@ -261,8 +326,10 @@ class SmeltIron(Skill):
                 yield from self._mine(ex, state, pos, IRON_ORES, "raw_iron")
             except Replan as err:
                 code, _ = failure(err)
+                if isinstance(err, _OreRouteUnconfirmed):
+                    code = "arrival_unconfirmed"
                 if (in_reach_only and math.dist(state.pos, pos) <= MINING_REACH) or code not in (
-                    "path_not_found", "unreachable", "move_timeout"
+                    "path_not_found", "unreachable", "move_timeout", "arrival_unconfirmed",
                 ):
                     raise
                 excluded.add(tuple(pos))
@@ -275,25 +342,16 @@ class SmeltIron(Skill):
 
     def _prepare_fuel(self, ex: "Executor", state: "State", count: int) -> Iterator[dict]:
         fuels = _fuels_for(state)
-        non_log = sum(state.count(n) * u // 2 for n, u in fuels if not n.endswith("_log"))
-        total_direct = sum(state.count(n) * u // 2 for n, u in fuels)
         # 1 原木合成 4 木板可将可熔炼件数由 1 件提升至 6 件；需熔 ≥3 件或直接燃料不足时优先拆板。
-        while non_log < count and (total_direct < count or count >= 3):
-            log_wood = next((w for w in WOODS if state.count(f"{w}_log") >= 1), None)
+        for _ in range(count):
+            log_wood = _log_for_fuel(state.count, fuels, count)
             if log_wood is None:
                 break
             plank = f"{log_wood}_planks"
-            before = state.count(plank)
-            yield rec("craft", ex.craft(plank, 1), item=plank)
-            state.refresh_inventory(ex.client)
-            if state.count(plank) <= before:
-                break
-            fuels = _fuels_for(state)
-            non_log = sum(state.count(n) * u // 2 for n, u in fuels if not n.endswith("_log"))
-            total_direct = sum(state.count(n) * u // 2 for n, u in fuels)
+            yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 1)
 
         # 若背包燃料仍不足（如起步造完工具仅剩 1 木板）且附近地表有树，顺手补砍 1 块原木转 4 木板。
-        if total_direct < count:
+        if _fuel_batches(state.count, fuels, count)[1]:
             log_types = [f"{w}_log" for w in WOODS]
             logs = ex.client.find_blocks(types=log_types, radius=24, limit=8).get("blocks") or []
             cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
@@ -306,14 +364,18 @@ class SmeltIron(Skill):
                 try:
                     if math.dist(cur, lpos) > MINING_REACH:
                         yield rec("move_to", ex.move_to(pos=lpos, rng=3), pos=lpos)
+                    cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                    if (under_feet(cur, lpos) or math.dist(cur, lpos) > MINING_REACH
+                            or bare(ex.client.get_block(lpos).get("name")) not in log_types):
+                        continue
                     before_logs = sum(state.count(x) for x in log_types)
                     yield rec("dig", ex.dig(lpos, collect=True), pos=lpos)
                     state.refresh_inventory(ex.client)
                     if sum(state.count(x) for x in log_types) > before_logs:
                         w = next((w for w in WOODS if state.count(f"{w}_log") >= 1), None)
                         if w is not None:
-                            yield rec("craft", ex.craft(f"{w}_planks", 1), item=f"{w}_planks")
-                            state.refresh_inventory(ex.client)
+                            plank = f"{w}_planks"
+                            yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 1)
                         break
                 except Replan as err:
                     code, _ = failure(err)
@@ -323,19 +385,9 @@ class SmeltIron(Skill):
                     raise
 
     def _fuel_plan(self, state: "State", count: int) -> list[tuple[str, int, int]]:
-        plan = []
-        remaining = count
-        for item, units in _fuels_for(state):
-            available = state.count(item)
-            if item == "stick" and available > 2 and remaining * 2 <= (available - 2) * units:
-                # 尽量保留 2 根木棍供下游合铁镐，仅在确有必要时烧完。
-                available -= 2
-            batch = min(remaining, available * units // 2)
-            if batch:
-                plan.append((item, math.ceil(batch * 2 / units), batch))
-                remaining -= batch
-            if not remaining:
-                return plan
+        plan, remaining = _fuel_batches(state.count, _fuels_for(state), count)
+        if not remaining:
+            return plan
         raise Replan(
             f"检查背包煤/木板/原木后燃料不足：需冶炼 {count} 个，"
             f"缺 {remaining} 个冶炼单位（至少 {math.ceil(remaining / 1.5)} 块木板）"
@@ -443,6 +495,7 @@ class SmeltIron(Skill):
                 return
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        state.invalidate_inventory()
         state.refresh_inventory(ex.client)
         start_ingots = state.count("iron_ingot")
         if state.count("raw_iron") < 1 and state.count("raw_iron_block") < 1 and state.count("furnace") < 1:
