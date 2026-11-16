@@ -45,6 +45,8 @@ CODE_CLASS: dict[str, str] = {
     # 目标/条件不成立：重规划（注意 bad_args 是单次参数不合法，绝不能当 FATAL 杀掉整场进程）
     "bad_args": REPLAN,
     "path_not_found": REPLAN,
+    # v1.3.11 §5：寻路 8 秒没位移。原样重发 move_to 还会卡住，要换 /control 脱困，所以归重规划
+    "stalled": REPLAN,
     "interrupted": REPLAN,
     "no_such_entity": REPLAN,
     "out_of_reach": REPLAN,
@@ -52,6 +54,8 @@ CODE_CLASS: dict[str, str] = {
     "missing_item": REPLAN,
     "missing_ammo": REPLAN,
     "missing_ingredients": REPLAN,
+    # v1.3.11 §5：背包满。物品留在原处，腾出空位前重发只会再失败
+    "inventory_full": REPLAN,
     "need_crafting_table": REPLAN,
     "need_furnace": REPLAN,
     "no_recipe": REPLAN,
@@ -61,11 +65,20 @@ CODE_CLASS: dict[str, str] = {
     "blocked_by_self": REPLAN,
     "nothing_to_dig": REPLAN,
     "undiggable": REPLAN,
+    # v1.3.11 §4.2：服务端没确认破坏，方块还在，须重新观察站位后再挖
+    "dig_unconfirmed": REPLAN,
     "use_window_api": REPLAN,
+    "no_window": REPLAN,
+    "section_full": REPLAN,
+    "no_output": REPLAN,
+    "option_unavailable": REPLAN,
     "cannot_interact": REPLAN,
     "cannot_use": REPLAN,
     "need_block_target": REPLAN,
     "not_hungry": REPLAN,
+    "cannot_sleep": REPLAN,
+    # 客户端自产：可选接口（OPTIONAL_ROUTES）在当前部署上不存在。只停这一招，不终止整场
+    "unsupported_api": REPLAN,
     "not_in_vehicle": REPLAN,
     "dismount_failed": REPLAN,
     "protected_region": REPLAN,
@@ -80,9 +93,13 @@ CODE_CLASS: dict[str, str] = {
     "unknown_api": FATAL,
 }
 
+# v1.3.3 以后才有的可选接口：旧部署返回 unknown_api 时只记为不支持，不按 FATAL 终止（见 Client.call）
+OPTIONAL_ROUTES: frozenset[str] = frozenset({"control", "look"})
+
 # 每个动作的 HTTP 超时（秒）：API 是阻塞式，超时 < 动作时长会误判失败
 ACTION_TIMEOUT = {
     "move_to": 180,
+    "control": 10,  # 按住时长上限 3 s；只挥击时按次数另算，见 Client.control
     "attack": 90,
     "shoot": 30,
     "use_item": 90,
@@ -220,6 +237,7 @@ class Client:
         self.bot_username: Optional[str] = None
         self._auth_lock = threading.RLock()
         self._posture = _POSTURE_RESET.copy()
+        self._route_support: dict[str, bool] = {}
         self._last_disconnect_mono: Optional[float] = None
         self.auto_wait_ready_on_relogin: bool = True
         self._load_cached_token()
@@ -341,10 +359,38 @@ class Client:
 
     def _is_game_action_path(self, path: str) -> bool:
         p = path.lstrip("/")
-        return p in ACTION_TIMEOUT or p in ("equip", "dismount", "drop", "chat", "posture")
+        return p in ACTION_TIMEOUT or p in ("equip", "dismount", "drop", "chat", "posture", "look")
+
+    def supports(self, route: str) -> Optional[bool]:
+        """可选接口的能力探测结果：True 已调通，False 当前部署没有该路径，None 还没试过。"""
+        return self._route_support.get(route.lstrip("/"))
 
     def call(self, path: str, body: Any = None, method: str = "POST", timeout: float = 30) -> dict:
-        """发一次调用，返回 result；失败抛 ApiError。401 / invalid_token 会单飞自动重登一次。"""
+        """发一次调用，返回 result；失败抛 ApiError。401 / invalid_token 会单飞自动重登一次。
+
+        可选接口（OPTIONAL_ROUTES）边用边探测：第一次返回 unknown_api 就记为不支持，
+        改抛 unsupported_api（REPLAN）。之后不再发请求，直接本地抛同一个码。
+        其它路径的 unknown_api 仍是 FATAL，说明客户端把必有接口写错了。
+        """
+        route = path.lstrip("/")
+        if route not in OPTIONAL_ROUTES:
+            return self._call(path, body, method, timeout)
+        if self._route_support.get(route) is False:
+            raise ApiError("unsupported_api", f"当前部署不支持 /{route}（此前已返回 unknown_api）", {"route": route})
+        try:
+            result = self._call(path, body, method, timeout)
+        except ApiError as e:
+            if e.code != "unknown_api":
+                if e.kind == REPLAN:
+                    self._route_support.setdefault(route, True)  # 业务错误（如 bad_args）说明路径存在；断网不算
+                raise
+            self._route_support[route] = False
+            self.log(f"[capability] /{route} 返回 unknown_api，本局按不支持处理")
+            raise ApiError("unsupported_api", f"当前部署不支持 /{route}", {"route": route}, http=e.http) from e
+        self._route_support[route] = True
+        return result
+
+    def _call(self, path: str, body: Any = None, method: str = "POST", timeout: float = 30) -> dict:
         used_token = self._ensure_token()
         try:
             payload = self._send(method, path, body, timeout, token=used_token)
@@ -603,8 +649,42 @@ class Client:
             body["source"] = source
         return self.action("use_item", body, stop_on=stop_on)
 
-    def attack(self, entity_id, timeout_ms=20000, *, stop_on=None) -> dict:
-        return self.action("attack", {"entity_id": entity_id, "timeout": timeout_ms}, stop_on=stop_on)
+    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
+        # v1.3.11 §4.6：max_hits 打够即返回；interval_ms 覆盖挥击间隔（50–5000）
+        body: dict = {"entity_id": entity_id, "timeout": timeout_ms}
+        if max_hits is not None:
+            body["max_hits"] = max_hits
+        if interval_ms is not None:
+            body["interval_ms"] = interval_ms
+        return self.action("attack", body, stop_on=stop_on)
+
+    def control(self, *, forward=None, back=None, left=None, right=None, jump=None, sneak=None,
+                sprint=None, yaw=None, pitch=None, hit=None, hit_interval_ms=None, ms=None,
+                stop_on=None) -> dict:
+        """v1.3.11 §4.16 底层按键，占动作锁。可选接口：旧部署上抛 unsupported_api（REPLAN）。"""
+        body = {k: v for k, v in {
+            "forward": forward, "back": back, "left": left, "right": right,
+            "jump": jump, "sneak": sneak, "sprint": sprint,
+            "yaw": yaw, "pitch": pitch, "hit": hit, "hit_interval_ms": hit_interval_ms, "ms": ms,
+        }.items() if v is not None}
+        timeout = ACTION_TIMEOUT["control"]
+        if ms is None and hit is not None and hit is not True:
+            # 只给 hit 时服务端按 (hit-1)×间隔 算时长，间隔缺省最长 1667 ms（重锤）
+            timeout += (int(hit) - 1) * (hit_interval_ms or 1667) / 1000
+        return self.action("control", body, timeout, stop_on=stop_on)
+
+    def look(self, yaw=None, pitch=None, *, pos=None, entity_id=None) -> dict:
+        """v1.3.11 §4.17 转向，不占动作锁。给 yaw/pitch（弧度）、pos 或 entity_id 之一。"""
+        body: dict = {}
+        if entity_id is not None:
+            body["entity_id"] = entity_id
+        elif pos is not None:
+            body["x"], body["y"], body["z"] = list(pos)[:3]
+        else:
+            body = {k: v for k, v in {"yaw": yaw, "pitch": pitch}.items() if v is not None}
+        if not body:
+            raise ValueError("look 需要 yaw/pitch、pos 或 entity_id")
+        return self.call("look", body, timeout=10)
 
     def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100, *, stop_on=None) -> dict:
         body: dict = {"weapon": weapon, "charge_ms": charge_ms}
