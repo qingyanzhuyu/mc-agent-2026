@@ -54,8 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="聚焦推进并验收目标台账中的 goal_id；多个用逗号分隔表示同一轮一起追（如 smelt_iron,kill_a_mob）")
     p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
     p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
-    p.add_argument("--strategy", choices=("rule", "llm"), default="rule",
-                   help="战略层目标选择实现：rule=性价比排序（默认），llm=事件驱动异步模型选目标")
+    p.add_argument("--strategy", choices=("legacy", "rule", "llm"), default="rule",
+                   help="战略层目标选择实现：rule=性价比排序（默认），llm=事件驱动异步模型选目标，legacy=直调旧版 RulePlanner.choose 基线")
     p.add_argument("--strategy-review-s", type=float, default=None,
                    help="战略层例行复核目标的间隔秒数（默认 600s，可由 MC_STRATEGY_REVIEW_S 覆盖）")
     p.add_argument("--require-iron", action="store_true", default=None,
@@ -100,6 +100,9 @@ def _run_dry(cfg: Config, *, min_verified: str = "offline", strategy: str = "rul
     d = planner.choose(st)
     print(f"[dry] 空包规则首拍决策 -> {d.skill} ({d.reason})")
     cp = CampaignPlanner(mode="campaign", strategy=strategy, min_verified=min_verified)
+    if strategy != "llm" and cp.select(st, []).skill is None:
+        print(f"[dry] strategy={strategy} 空包首拍未产出技能")
+        return 1
     ctx = cp.build_context(st)
     rendered = ctx.render()
     if len(rendered) > 2000:
