@@ -1,8 +1,6 @@
 """Witness a dry obsidian harvest or confirmed fluid cooling before sending dig."""
 from __future__ import annotations
 
-from math import ceil, dist
-
 from ..runtime import EnvBlocked, Replan
 from .base import failure, rec
 from .field import equip_item, scan_blocks
@@ -12,6 +10,7 @@ from .nether_site import (
     FLUID, GRAVITY, OBSIDIAN, PORTAL, _above, _approach, _block, _cell, _center, _dimension,
     _flag, _ground, _name, _near, _neighbors, _pos, _stable, _standing, _walk,
 )
+from .sightline import can_see_block
 from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 _CONTAINERS = ("chest", "trapped_chest", "barrel")
@@ -36,40 +35,38 @@ def _durable_pick(state):
     return None
 
 
-def _line_clear(ex, pos, target, *, wet=False):
+def _line_clear(ex, source, target, *, wet=False):
     """Confirm a short exposed face before asking an action that can auto-path."""
-    eye = (pos[0], pos[1] + 1.62, pos[2])
-    center = tuple(v + 0.5 for v in target)
-    samples = max(1, ceil(4 * dist(eye, center)))
-    cells = {_cell(tuple(a + (b - a) * (step / samples) for a, b in zip(eye, center)))
-             for step in range(1, samples)}
-    cells.discard(target)
     allowed = AIR | {"water"} if wet else AIR
-    return all(_name(ex, cell) in allowed for cell in cells)
+    return can_see_block(ex, source, target, passable=allowed, face_fallback=True)
 
 
 def _work_route(ex, status, target):
     start = _cell(_pos(status))
-    if target[::2] != start[::2] and _near(_pos(status), target, radius=3.75):
+    if target[::2] != start[::2] and _near(status, target, radius=3.75):
         return []
     x, _, z = target
     stands = [(x + dx, start[1], z + dz) for dx, dz in
               ((1, 0), (-1, 0), (0, 1), (0, -1))]
-    routes = [_approach(ex, start, site) for site in stands if _near(_center(site), target, radius=3.75)]
+    routes = [
+        _approach(ex, start, site)
+        for site in stands
+        if _near({"pos": _center(site), "sneaking": status.get("sneaking")}, target, radius=3.75)
+    ]
     return min((route for route in routes if route is not None), key=len, default=None)
 
 
 def _at_work_site(ex, state, dimension, target, *, wet=False):
     status = state.refresh_status(ex.client, max_age_s=0)
     return (_dimension(status) == dimension and _standing(ex, status)
-            and _cell(_pos(status))[::2] != target[::2] and _near(_pos(status), target, radius=3.75)
-            and _line_clear(ex, _pos(status), target, wet=wet))
+            and _cell(_pos(status))[::2] != target[::2] and _near(status, target, radius=3.75)
+            and _line_clear(ex, status, target, wet=wet))
 
 
 def _still_safe(ex, state, dimension, target, health):
     status = state.refresh_status(ex.client, max_age_s=0)
     return (_dimension(status) == dimension and _standing(ex, status)
-            and status.get("health", 20) >= health and _near(_pos(status), target, radius=4))
+            and status.get("health", 20) >= health and _near(status, target, radius=4))
 
 
 def _take_available(ex, state, item, goal_qty, dimension):
@@ -173,7 +170,7 @@ def _cool_ore(ex, state, pos, dimension):
     prohibited = {current, *_neighbors(current)}
     targets = [side for side in _neighbors(pos) if side[::2] not in {p[::2] for p in prohibited}
                and _name(ex, side) in AIR and _stable(ex, _ground(side))
-               and _near(_pos(status), _ground(side), radius=3.75)]
+               and _near(status, _ground(side), radius=3.75)]
     if not targets or not (yield from _fetch_water(ex, state, dimension)):
         return False
     water = targets[0]
@@ -181,7 +178,7 @@ def _cool_ore(ex, state, pos, dimension):
     status = state.refresh_status(ex.client, max_age_s=0)
     current = _cell(_pos(status))
     if (not _at_work_site(ex, state, dimension, anchor)
-            or not _line_clear(ex, _pos(status), water)
+            or not _line_clear(ex, status, water)
             or _name(ex, water) not in AIR or not _stable(ex, anchor)):
         return False
     # §4.4：bot 站得比承载格高时传承载格即倒在顶面；平齐或更低时传目标空气格，避免倒在侧面。

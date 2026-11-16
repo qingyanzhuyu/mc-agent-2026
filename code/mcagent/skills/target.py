@@ -11,6 +11,7 @@ from .encounter import _completed, _retreat_clear, _verify_advancement, shoot_pr
 from .field import _cell, _observed_block, _standable_cell, move_local, scan_blocks
 from .items import bare
 from .registry import register
+from .sightline import eye_pos, feet_pos
 
 
 _ADVANCEMENT = "minecraft:adventure/bullseye"
@@ -72,18 +73,29 @@ def _retreat(ex, feet, target):
 
 
 def _range_ok(feet, aim):
-    eye = (feet[0], feet[1] + 1.62, feet[2])
-    return _horizontal(feet, aim) >= _MIN_RANGE and math.dist(eye, aim) <= _MAX_RANGE
+    eye = eye_pos(feet)
+    return _horizontal(eye, aim) >= _MIN_RANGE and math.dist(eye, aim) <= _MAX_RANGE
 
 
 def _walk_plan(ex, origin, target):
     """只接受有支撑的单向水平走廊，落点各向先过承重再逐格复核。"""
-    start = _cell(origin)
+    origin_pos = feet_pos(origin)
+    sneaking = origin.get("sneaking") if isinstance(origin, dict) else None
+    start = _cell(origin_pos)
     for dx, dz in _ADJACENT:
         line = [(start[0] + dx * n, start[1], start[2] + dz * n)
                 for n in range(1, _MIN_RANGE + 4)]
-        candidate = next((cell for cell in line
-                          if _range_ok(_foot_center(cell), _face_center(_foot_center(cell), target))), None)
+        candidate = next(
+            (
+                cell
+                for cell in line
+                if _range_ok(
+                    {"pos": _foot_center(cell), "sneaking": sneaking} if sneaking is not None else _foot_center(cell),
+                    _face_center(_foot_center(cell), target),
+                )
+            ),
+            None,
+        )
         if candidate is None or not _standable_cell(ex, candidate):
             continue
         if _retreat(ex, _foot_center(candidate), target) is None:
@@ -96,23 +108,24 @@ def _walk_plan(ex, origin, target):
 
 
 def _prepare_lane(ex, state, *, allow_place):
-    origin = _site_state(ex, state)["pos"]
+    status = _site_state(ex, state)
+    origin = status["pos"]
     observed = scan_blocks(ex, state, _TARGET, radius=_SCAN_RADIUS, limit=_LIMIT)
     if observed.get("ready") is False:
         raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描标靶射道")
     for block in observed["blocks"]:
         pos = tuple(block["pos"])
         aim = _face_center(origin, pos)
-        if _range_ok(origin, aim):
+        if _range_ok(status, aim):
             if (retreat := _retreat(ex, origin, pos)) and verify_shot_lane(
                     ex, state, aim, retreat_pos=retreat, min_horizontal=_MIN_RANGE, max_distance=_MAX_RANGE
             )["status"] == "clear":
                 return pos, [], False
-        elif _horizontal(origin, aim) < _MIN_RANGE and (route := _walk_plan(ex, origin, pos)):
+        elif _horizontal(origin, aim) < _MIN_RANGE and (route := _walk_plan(ex, status, pos)):
             return pos, route, False
     if allow_place:
         for pos in _placement_sites(ex, state):
-            if route := _walk_plan(ex, origin, pos):
+            if route := _walk_plan(ex, status, pos):
                 return pos, route, True
     raise EnvBlocked("没有可复核的 30 格标靶射位与退路，请换一处有安全跑道的空旷区域",
                      missing_predicate="safe_bullseye_lane",
@@ -148,7 +161,7 @@ def _shoot_center(ex, state, pos, weapon):
         raise Replan("射位复核时标靶已变化")
     aim = _face_center(start["pos"], pos)
     retreat = _retreat(ex, start["pos"], pos)
-    if not _range_ok(start["pos"], aim) or retreat is None:
+    if not _range_ok(start, aim) or retreat is None:
         raise Replan("当前位置未确认是距离合格的安全射位")
     if _completed(ex, _ADVANCEMENT):
         return
