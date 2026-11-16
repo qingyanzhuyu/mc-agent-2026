@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Generator
 
 from ..runtime import Executor, Replan, State
+from .base import failure
 from .items import bare
 from .windows import (
-    _positive_count, _put, _take, apply_window_ops, window_amount, window_section, window_view,
+    _positive_count, _put, _receipt_inventory_full, _take, apply_window_ops, window_amount, window_section, window_view,
 )
 
 
@@ -59,11 +60,20 @@ def load_furnace(
         if len(fuel_slot) != 1 or not old_item or type(old_count) is not int or old_count < 1:
             raise Replan(f"熔炉 {pos} fuel 槽观测不明确，停止换料")
         previous = state.count(old_item)
-        receipts.append((yield from apply_window_ops(ex, state, target, [
-            {"op": "take", "from": "fuel"},
-        ])))
+        try:
+            take_receipt = yield from apply_window_ops(ex, state, target, [
+                {"op": "take", "from": "fuel"},
+            ])
+        except Replan as exc:
+            if failure(exc)[0] == "inventory_full":
+                state.refresh_inventory(ex.client)
+                raise Replan(f"背包已满（inventory_full），熔炉 {pos} 换燃料无法取出 {old_item}；物品留在燃料槽") from exc
+            raise
+        receipts.append(take_receipt)
         state.refresh_inventory(ex.client)
         if state.count(old_item) < previous + old_count:
+            if _receipt_inventory_full(take_receipt):
+                raise Replan(f"背包已满（inventory_full），熔炉 {pos} 换燃料仅部分取出 {old_item}，燃料槽仍有余量")
             raise Replan(f"熔炉 {pos} 换燃料时未确认收到 {old_count} 个 {old_item}")
     for to, item, count in inputs:
         receipts.append((yield from _put(ex, state, target, {
@@ -90,10 +100,20 @@ def collect_furnace(
     pos = target.get("pos")
     message = (f"熔炉 {pos} take output 后背包铁锭未确认增加 {amount} 个"
                if item == "iron_ingot" and section == "output" else None)
-    receipt = yield from _take(ex, state, target, section, bare(item), amount, failure_message=message)
+    # §4.9：output 成品区只能整组取，放不下报 inventory_full；fuel 在不要求清空时允许部分取出。
+    allow_partial = section == "fuel" and not require_empty
+    receipt, gained, inv_full = yield from _take(
+        ex, state, target, section, bare(item), amount,
+        failure_message=message, allow_partial_on_full=allow_partial,
+    )
     after = None
     if inspect_after or require_empty:
         after = yield from inspect_furnace(ex, target)
         if require_empty and window_section(after, section):
             raise Replan(f"熔炉 {pos} 取出后 {section} 仍有剩余产物：{after}")
-    return {"receipt": receipt, "view": after, "count": amount}
+    return {
+        "receipt": receipt,
+        "view": after,
+        "count": min(gained, amount) if inv_full else amount,
+        "inventory_full": inv_full,
+    }

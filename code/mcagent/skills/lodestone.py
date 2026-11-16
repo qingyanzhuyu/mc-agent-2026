@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from ..runtime import EnvBlocked, Replan
-from .base import Skill, rec
+from .base import Skill, failure, rec
 from .enchant import _approach_block, _craft_plan, _inventory_rows, _nearby_blocks, _place_checked, _placement_sites, _site_state
 from .encounter import _completed, _verify_advancement
 from .field import equip_item
 from .interaction import use_item_on
 from .items import bare
 from .registry import register
-from .windows import take_container_item, window_amount, window_view
+from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 
 _ADVANCEMENT = "minecraft:adventure/use_lodestone"
@@ -64,8 +64,15 @@ def _find_stone(ex, state):
     for candidate in _nearby_blocks(ex, state, _CONTAINERS):
         pos = yield from _approach_block(ex, state, candidate)
         target = {"pos": pos}
-        view = yield from window_view(ex, target)
-        if (bare(view.get("window")) == candidate[1]
+        try:
+            view = yield from window_view(ex, target)
+        except Replan as exc:
+            code, _ = failure(exc)
+            if code in {"out_of_reach", "path_not_found", "cannot_interact", "not_loaded", "no_window", "stalled"}:
+                yield rec("window_view", target=target, error_code=code)
+                continue
+            raise
+        if (is_storage_window(view, candidate[1])
                 and window_amount(view, "container", _STONE) >= 1):
             yield from take_container_item(ex, state, target, "container", _STONE, 1, view=view)
             break

@@ -135,7 +135,7 @@ def _table_position(ex: Executor, state: State) -> Generator[dict, None, list[in
             result = ex.move_to(pos=pos, rng=2)
         except Replan as exc:
             code, _ = failure(exc)
-            if code not in {"path_not_found", "unreachable", "timeout", "move_timeout"}:
+            if code not in {"path_not_found", "unreachable", "timeout", "move_timeout", "stalled"}:
                 raise
             yield rec("move_to", pos=pos, error_code=code)
         else:
@@ -208,7 +208,34 @@ def craft_recipe(ex: Executor, state: State, item: str, *, goal_qty: int = 1) ->
             if isinstance(stack, dict) and (name := stack.get("name"))
         }
         # §4.8 没写 count 的精确单位。统一每次请求 1，再读背包核对一份产出。
-        yield rec("craft", ex.craft(item, 1), item=item, count=1)
+        try:
+            receipt = ex.craft(item, 1)
+        except Replan as exc:
+            code, extra = failure(exc)
+            if code == "inventory_full":
+                inventory = state.refresh_inventory(ex.client)
+                after = state.count(item)
+                if after > current:
+                    gained += after - current
+                    for name, previous in bag_before.items():
+                        used = previous - state.count(name)
+                        if used > 0:
+                            consumed[name] = consumed.get(name, 0) + used
+                    current = after
+                    if current >= goal_qty:
+                        yield rec("craft", {"crafted": item, "gained": gained, "inventory_full": True}, item=item, count=1)
+                        break
+                raise Replan(
+                    f"合成 {item} 时背包已满（inventory_full，现持 {after}/{goal_qty}），材料仍在包内，请先腾出一格空位"
+                ) from exc
+            if code == "no_window":
+                state.refresh_status(ex.client, max_age_s=0)
+                state.refresh_inventory(ex.client)
+                raise Replan(
+                    f"合成 {item} 时工作台窗口未打开（no_window，eye_dist={extra.get('eye_dist')}），请重新贴近无遮挡工作台"
+                ) from exc
+            raise
+        yield rec("craft", receipt, item=item, count=1)
         batches += 1
         inventory = state.refresh_inventory(ex.client)
         after = state.count(item)

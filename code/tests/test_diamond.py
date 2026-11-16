@@ -136,6 +136,31 @@ class DiamondTests(unittest.TestCase):
         self.assertEqual(state.count("diamond"), 1)
         world.assert_exhausted()
 
+    def test_generic_9x3_container_and_partial_inventory_full_stops_before_mining(self):
+        world = DiamondWorld(items={IRON: 1}, picks={IRON: 20},
+                             blocks={CHEST: "chest", ORE: "diamond_ore"}, exposed=(CHEST, ORE))
+        before = {"window": "generic_9x3", "target": "chest",
+                  "sections": {"container": [{"name": "diamond", "count": 4}]}}
+        after = {"window": "generic_9x3", "target": "chest",
+                 "sections": {"container": [{"name": "diamond", "count": 2}]}}
+
+        def partial_take(world, *, target, ops, **kwargs):
+            world.items["diamond"] = 2
+            return {"done": [{"op": "take", "took": {"diamond": 2}, "from": "container", "inventory_full": True}]}
+
+        world.queue("window_view", before, after)
+        world.queue("window_act", partial_take)
+        ex, state = world.session()
+        skill = MineDiamond(count=4)
+        seen = []
+        with self.assertRaisesRegex(Replan, "inventory_full"):
+            while not skill.step(ex, state):
+                seen.append(skill.last)
+        self.assertEqual([row["op"] for row in seen],
+                         ["window_view", "window_act", "window_view", "diamond_partial"])
+        self.assertNotIn("dig", ex.acts)
+        world.assert_exhausted()
+
     def test_copper_or_unknown_durability_is_insufficient(self):
         for item, picks in (("copper_pickaxe", {"copper_pickaxe": 10}), (IRON, {})):
             with self.subTest(item=item):

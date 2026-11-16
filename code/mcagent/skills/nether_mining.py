@@ -12,11 +12,13 @@ from .nether_site import (
     FLUID, GRAVITY, OBSIDIAN, PORTAL, _above, _approach, _block, _cell, _center, _dimension,
     _flag, _ground, _name, _near, _neighbors, _pos, _stable, _standing, _walk,
 )
-from .windows import take_container_item, window_amount, window_view
+from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 _CONTAINERS = ("chest", "trapped_chest", "barrel")
 _HAZARDS = frozenset({"fire", "soul_fire", "magma_block", "powder_snow", PORTAL})
-_WINDOW_UNREACHABLE = {"out_of_reach", "out_of_range", "path_not_found"}
+_WINDOW_UNREACHABLE = {
+    "out_of_reach", "out_of_range", "path_not_found", "cannot_interact", "not_loaded", "no_window", "stalled",
+}
 _PICKS = PICKAXE_ORDER[:2]
 
 
@@ -91,16 +93,21 @@ def _take_available(ex, state, item, goal_qty, dimension):
                 raise
             yield rec("window_view", target=target, error_code=code)
             continue
-        if (bare(view.get("window")) != hit["name"]
+        if (not is_storage_window(view, hit["name"])
                 or not _at_work_site(ex, state, dimension, pos)):
             continue
         state.refresh_inventory(ex.client)
         available = window_amount(view, "container", item)
         take = min(goal_qty - state.count(item), available)
         if take > 0:
-            yield from take_container_item(ex, state, target, "container", item, take, view=view)
+            taken = yield from take_container_item(ex, state, target, "container", item, take, view=view)
             if state.count(item) >= goal_qty:
                 return
+            if taken.get("inventory_full"):
+                raise Replan(
+                    f"从容器取出 {item} 时背包已满（inventory_full，本次实收 {taken['count']} 个，"
+                    f"现持 {state.count(item)}/{goal_qty}），剩余物品留在容器内，请先腾出空位"
+                )
 
 
 def _ore_environment(ex, pos):

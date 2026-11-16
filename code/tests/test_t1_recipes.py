@@ -34,6 +34,8 @@ class CraftWorld(GridWorld):
         result, changes = self.crafts.popleft()
         for name, delta in changes.items():
             self.items[name] = self.items.get(name, 0) + delta
+        if isinstance(result, ApiError):
+            raise result
         return result
 
 
@@ -164,6 +166,35 @@ class CraftRecipeTests(unittest.TestCase):
 
         self.assertEqual([name for name, _ in world.calls], ["craft"])
         self.assertEqual(world.items["shears"], 1)
+
+    def test_inventory_full_and_no_window_and_stalled_table_move(self):
+        world_full = CraftWorld(
+            items={"iron_ingot": 2},
+            crafts=[(ApiError("inventory_full", "bag full", {"gained": 0, "empty_slots": 0}), {})],
+        )
+        with self.assertRaisesRegex(Replan, "inventory_full"):
+            self.run_recipe(world_full, "shears")
+
+        world_partial_enough = CraftWorld(
+            items={"arrow": 3, "flint": 1, "stick": 1, "feather": 1},
+            tables=[(2, 64, 0)],
+            crafts=[(
+                ApiError("inventory_full", "partial fit", {"gained": 1, "empty_slots": 0}),
+                {"arrow": 1, "flint": -1, "stick": -1, "feather": -1},
+            )],
+        )
+        steps, result = self.run_recipe(world_partial_enough, "arrow", goal_qty=4)
+        self.assertEqual(result["after"], 4)
+        self.assertTrue(steps[0]["result"]["inventory_full"])
+
+        world_no_win = CraftWorld(
+            items={"iron_ingot": 3, "stick": 2},
+            tables=[(4, 64, 0), (6, 64, 0)],
+            moves=[ApiError("stalled", "blocked"), (5, 64, 0)],
+            crafts=[(ApiError("no_window", "table did not open", {"table": [6, 64, 0], "eye_dist": 4.8}), {})],
+        )
+        with self.assertRaisesRegex(Replan, "no_window"):
+            self.run_recipe(world_no_win, "iron_pickaxe")
 
 
 if __name__ == "__main__":

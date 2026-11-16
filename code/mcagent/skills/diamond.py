@@ -15,7 +15,7 @@ from .mining import MineStepUnsafe, mine_step
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
-from .windows import take_container_item, window_amount, window_view
+from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 _ARMOR = ("diamond_boots", "diamond_chestplate", "diamond_helmet", "diamond_leggings")
 _DIAMOND_PICKS = ("diamond_pickaxe", "netherite_pickaxe")
@@ -74,21 +74,27 @@ def _nearby_loot(ex, state, names, goal_qty: int, status):
             view = yield from window_view(ex, target)
         except Replan as exc:
             code, _ = failure(exc)
-            if code in {"out_of_reach", "path_not_found", "cannot_interact", "not_loaded"}:
+            if code in {"out_of_reach", "path_not_found", "cannot_interact", "not_loaded", "no_window", "stalled"}:
                 yield rec("window_view", target=target, error_code=code)
                 continue
             raise
         current = _safe_status(ex, state, dimension or None)
-        if (bare(view.get("window")) != block or _cell(current["pos"]) != _cell(status["pos"])
+        if (not is_storage_window(view, block) or _cell(current["pos"]) != _cell(status["pos"])
                 or not _in_reach(ex, current["pos"], pos, reach=3)):
             continue
         for item in names:
             available = window_amount(view, "container", item)
             take = min(available, goal_qty - state.count(item))
             if take > 0:
-                yield from take_container_item(ex, state, target, "container", item, take, view=view)
+                taken = yield from take_container_item(ex, state, target, "container", item, take, view=view)
                 if state.count(item) >= goal_qty:
                     return
+                if taken.get("inventory_full"):
+                    raise Replan(
+                        f"从容器取出 {item} 时背包已满（inventory_full，本次实收 {taken['count']} 个，"
+                        f"现持 {state.count(item)}/{goal_qty}），剩余物品留在容器内，请先腾出空位"
+                    )
+                view = taken["view"]
 
 
 @register
@@ -117,7 +123,13 @@ class MineDiamond(Skill):
         if initial >= goal_qty:
             return
         status = _safe_status(ex, state)
-        yield from _nearby_loot(ex, state, ("diamond",), goal_qty, status)
+        try:
+            yield from _nearby_loot(ex, state, ("diamond",), goal_qty, status)
+        except Replan:
+            looted = state.count("diamond")
+            if initial < looted < goal_qty:
+                yield self._partial(initial, looted, goal_qty)
+            raise
         if state.count("diamond") >= goal_qty:
             return
         start = _safe_status(ex, state, "overworld")

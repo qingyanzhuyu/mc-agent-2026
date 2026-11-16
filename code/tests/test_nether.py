@@ -165,6 +165,26 @@ class ObsidianTests(unittest.TestCase):
             self.run_skill(world)
         world.assert_exhausted()
 
+    def test_generic_9x3_chest_partial_inventory_full_replans_without_mining(self):
+        box = (1, 64, 1)
+        ore = (2, 64, 0)
+        world = NetherWorld(items={_PICK: 1}, extra={box: "barrel", ore: "obsidian"}, observed=(box, ore))
+
+        def partial_take(world, *, target, ops, **kwargs):
+            world.items["obsidian"] = 2
+            return {"done": [{"op": "take", "took": {"obsidian": 2}, "from": "container", "inventory_full": True}]}
+
+        world.queue(
+            "window_view",
+            {"window": "generic_9x3", "target": "barrel", "sections": {"container": [{"name": "obsidian", "count": 4}]}},
+            {"window": "generic_9x3", "target": "barrel", "sections": {"container": [{"name": "obsidian", "count": 2}]}},
+        )
+        world.queue("window_act", partial_take)
+        with self.assertRaisesRegex(Replan, "inventory_full"):
+            self.run_skill(world, count=4)
+        self.assertNotIn("dig", [op for op, _ in world.calls])
+        world.assert_exhausted()
+
     def test_dry_diamond_pick_harvest_checks_inventory_and_changed_block(self):
         ore = (2, 64, 0)
         world = NetherWorld(items={_PICK: 1}, extra={ore: "obsidian"}, observed=(ore,))

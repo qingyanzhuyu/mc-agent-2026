@@ -83,13 +83,16 @@ class LodestoneTests(unittest.TestCase):
         world.blocks[_CHEST] = "chest"
         world.queue("advancements", _progress(), _progress(True))
         world.queue("find_blocks", _find(), _find(("chest", _CHEST)))
-        world.queue("window_view", {"window": "chest", "sections": {"container": [{"name": "lodestone", "count": 1}]}},
-                    {"window": "chest", "sections": {"container": []}})
+        world.queue(
+            "window_view",
+            {"window": "generic_9x3", "target": "chest", "sections": {"container": [{"name": "lodestone", "count": 1}]}},
+            {"window": "generic_9x3", "target": "chest", "sections": {"container": []}},
+        )
 
         def take(world, *, ops, **kwargs):
             self.assertEqual(ops, [{"op": "take", "item": "lodestone", "count": 1, "from": "container"}])
             world.items["lodestone"] = 1
-            return {"taken": "lodestone"}
+            return {"done": [{"op": "take", "took": {"lodestone": 1}, "from": "container"}]}
 
         world.queue("window_act", take)
         world.queue("equip", _equip)

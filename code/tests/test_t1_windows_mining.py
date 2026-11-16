@@ -4,11 +4,14 @@ import unittest
 
 from mcagent.client import ApiError
 from mcagent.runtime import Replan
+from mcagent.skills.base import failure
 from mcagent.skills.furnace import collect_furnace, load_furnace
 from mcagent.skills.mining import MineStepUnsafe, mine_step, prepare_mining_pick
 from mcagent.skills.scripted_world import ScriptedWorld
 from mcagent.skills.testing import drive
-from mcagent.skills.windows import apply_window_ops, put_window_item, select_window_option
+from mcagent.skills.windows import (
+    apply_window_ops, is_storage_window, put_window_item, select_window_option, take_container_item,
+)
 
 TARGET = {"pos": [1, 64, 0]}
 FIRST = {"op": "put", "item": "raw_iron", "count": 1, "to": "input"}
@@ -128,6 +131,101 @@ class WindowScriptsTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "未安排"):
             world.get_entities()
         world.assert_exhausted()
+
+    def test_done_step_receipt_shape_resumes_unexecuted_suffix(self):
+        world = ScriptedWorld(items={"raw_iron": 1, "coal": 1})
+
+        def partial(world, **request):
+            world.items["raw_iron"] = 0
+            raise ApiError("section_full", "fuel occupied", {
+                "done": [{"op": "put", "put": "raw_iron", "count": 1, "to": "input"}],
+                "failed_op": 1,
+            })
+
+        def finish(world, **request):
+            self.assertEqual(request["ops"], [SECOND])
+            world.items["coal"] = 0
+            return {"done": [{"op": "put", "put": "coal", "count": 1, "to": "fuel"}]}
+
+        world.queue("window_act", partial, finish)
+        world.queue("window_view", window(input=[{"name": "raw_iron", "count": 1}], fuel=[]))
+        ex, state = world.session()
+        drive(apply_window_ops(
+            ex, state, TARGET, [FIRST, SECOND],
+            verify_pending=lambda pending, view, st: pending == (SECOND,) and st.count("raw_iron") == 0,
+        ), ex)
+        self.assertEqual(ex.acts, ["window/act", "window/view", "window/act"])
+        world.assert_exhausted()
+
+    def test_take_container_partial_and_zero_fit_inventory_full(self):
+        world = ScriptedWorld(items={"diamond": 62})
+        before = {"window": "generic_9x3", "target": "chest",
+                  "sections": {"container": [{"name": "diamond", "count": 5}]}}
+        after = {"window": "generic_9x3", "target": "chest",
+                 "sections": {"container": [{"name": "diamond", "count": 3}]}}
+        self.assertTrue(is_storage_window(before, "chest"))
+        self.assertFalse(is_storage_window(before, "barrel"))
+
+        def partial_take(world, **request):
+            world.items["diamond"] = 64
+            return {"done": [{"op": "take", "took": {"diamond": 2}, "from": "container", "inventory_full": True}]}
+
+        world.queue("window_view", before, after)
+        world.queue("window_act", partial_take)
+        ex, state = world.session()
+        got = {}
+
+        def run_partial():
+            got.update((yield from take_container_item(ex, state, TARGET, "container", "diamond", 5)))
+
+        drive(run_partial(), ex)
+        self.assertEqual(got["count"], 2)
+        self.assertTrue(got["inventory_full"])
+        self.assertEqual(state.count("diamond"), 64)
+        world.assert_exhausted()
+
+        world2 = ScriptedWorld()
+        world2.queue("window_view", before)
+        world2.queue("window_act", ApiError("inventory_full", "no space", {"failed_op": 0, "done": [], "window": before}))
+        world2.queue("window_view", before)
+        ex2, state2 = world2.session()
+        with self.assertRaisesRegex(Replan, "inventory_full") as caught:
+            drive(take_container_item(ex2, state2, TARGET, "container", "diamond", 5), ex2)
+        self.assertEqual(failure(caught.exception)[0], "inventory_full")
+        world2.assert_exhausted()
+
+    def test_collect_furnace_output_requires_whole_stack_while_fuel_allows_partial(self):
+        world = ScriptedWorld()
+        out_view = window(output=[{"name": "iron_ingot", "count": 3}])
+        world.queue("window_view", out_view, out_view)
+        world.queue("window_act", ApiError("inventory_full", "output requires full stack", {
+            "failed_op": 0, "done": [], "window": out_view,
+        }))
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "inventory_full") as caught:
+            drive(collect_furnace(ex, state, TARGET, item="iron_ingot"), ex)
+        self.assertEqual(failure(caught.exception)[0], "inventory_full")
+        world.assert_exhausted()
+
+        world2 = ScriptedWorld()
+        fuel_before = window(fuel=[{"name": "coal", "count": 4}])
+        fuel_after = window(fuel=[{"name": "coal", "count": 2}])
+
+        def take_fuel(world, **request):
+            world.items["coal"] = 2
+            return {"done": [{"op": "take", "took": {"coal": 2}, "from": "fuel", "inventory_full": True}]}
+
+        world2.queue("window_view", fuel_before, fuel_after)
+        world2.queue("window_act", take_fuel)
+        ex2, state2 = world2.session()
+        got = {}
+
+        def run_fuel():
+            got.update((yield from collect_furnace(ex2, state2, TARGET, item="coal", section="fuel")))
+
+        drive(run_fuel(), ex2)
+        self.assertEqual((got["count"], got["inventory_full"]), (2, True))
+        world2.assert_exhausted()
 
 
 class MineStepTests(unittest.TestCase):
