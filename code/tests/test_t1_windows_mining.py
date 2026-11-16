@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import unittest
+
+from mcagent.client import ApiError
+from mcagent.runtime import Replan
+from mcagent.skills.furnace import collect_furnace, load_furnace
+from mcagent.skills.mining import MineStepUnsafe, mine_step, prepare_mining_pick
+from mcagent.skills.scripted_world import ScriptedWorld
+from mcagent.skills.testing import drive
+from mcagent.skills.windows import apply_window_ops, put_window_item, select_window_option
+
+TARGET = {"pos": [1, 64, 0]}
+FIRST = {"op": "put", "item": "raw_iron", "count": 1, "to": "input"}
+SECOND = {"op": "put", "item": "coal", "count": 1, "to": "fuel"}
+
+
+def window(name="furnace", **sections):
+    return {"window": name, "sections": sections}
+
+
+class WindowScriptsTests(unittest.TestCase):
+    def test_partial_result_reobserves_and_sends_only_unexecuted_suffix(self):
+        world = ScriptedWorld(items={"raw_iron": 1, "coal": 1})
+
+        def partial(world, **request):
+            world.items["raw_iron"] = 0
+            raise ApiError("missing_item", "fuel slot temporarily unavailable", {"done": 1, "failed_op": 1})
+
+        def finish(world, **request):
+            self.assertEqual(request["ops"], [SECOND])
+            world.items["coal"] = 0
+            return {"done": 1}
+
+        world.queue("window_act", partial, finish)
+        world.queue("window_view", window(input=[{"name": "raw_iron", "count": 1}], fuel=[]))
+        ex, state = world.session()
+        def confirm(pending, view, state):
+            return (pending == (SECOND,) and bool(view["sections"]["input"])
+                    and view["sections"]["fuel"] == [] and state.count("raw_iron") == 0
+                    and state.count("coal") == 1)
+        drive(apply_window_ops(ex, state, TARGET, [FIRST, SECOND], verify_pending=confirm), ex)
+        self.assertEqual(ex.acts, ["window/act", "window/view", "window/act"])
+        world.assert_exhausted()
+
+    def test_conflicting_receipt_or_unsafe_effect_never_replays(self):
+        for extra, confirm in (
+            ({"done": 1, "failed_op": 0}, True),
+            ({"done": 1, "failed_op": 1}, False),
+            ({"done": 0, "failed_op": 0}, True),
+        ):
+            with self.subTest(extra=extra, confirm=confirm):
+                world = ScriptedWorld()
+                world.queue("window_act", ApiError("missing_item", "partial", extra))
+                world.queue("window_view", window())
+                ex, state = world.session()
+                flow = apply_window_ops(ex, state, TARGET, [FIRST, SECOND],
+                                        verify_pending=lambda *_: confirm)
+                with self.assertRaisesRegex(Replan, "partial"):
+                    drive(flow, ex)
+                self.assertEqual(ex.acts, ["window/act", "window/view"])
+                world.assert_exhausted()
+
+    def test_furnace_missing_fuel_refuses_to_partially_load_inputs(self):
+        world = ScriptedWorld(items={"raw_iron": 2})
+        world.queue("window_view", window())
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "coal"):
+            drive(load_furnace(ex, state, TARGET, raw_item="raw_iron", raw_count=2,
+                               fuel_item="coal", fuel_count=1), ex)
+        self.assertEqual(ex.acts, ["window/view"])
+
+    def test_furnace_fuel_slot_return_needs_inventory_confirmation(self):
+        world = ScriptedWorld()
+        world.queue("window_view", window(fuel=[{"name": "bucket", "count": 1}]), window(fuel=[]))
+
+        def take_bucket(world, **request):
+            self.assertEqual(request["ops"], [{"op": "take", "from": "fuel", "item": "bucket", "count": 1}])
+            world.items["bucket"] = 1
+            return {}
+
+        world.queue("window_act", take_bucket)
+        ex, state = world.session()
+        drive(collect_furnace(ex, state, TARGET, item="bucket", section="fuel", require_empty=True), ex)
+        self.assertEqual(state.count("bucket"), 1)
+        self.assertEqual(ex.acts, ["window/view", "window/act", "window/view"])
+        world.assert_exhausted()
+
+    def test_furnace_replacement_checks_returned_fuel_before_loading(self):
+        world = ScriptedWorld(items={"raw_iron": 1, "coal": 1})
+        world.queue("window_view", window(fuel=[{"name": "bucket", "count": 1}]))
+        world.queue("window_act", {})
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "未确认收到 1 个 bucket"):
+            drive(load_furnace(ex, state, TARGET, raw_item="raw_iron", raw_count=1,
+                               fuel_item="coal", fuel_count=1, replace_fuel=True), ex)
+        self.assertEqual(ex.acts, ["window/view", "window/act"])
+
+    def test_put_requires_window_evidence_even_after_inventory_debit(self):
+        world = ScriptedWorld(items={"lapis_lazuli": 1})
+        world.queue("window_view", window("enchanting_table", lapis=[]),
+                    window("enchanting_table", lapis=[{"name": "lapis_lazuli", "count": 1, "slot": 7}]))
+
+        def wrong_slot(world, **request):
+            world.items["lapis_lazuli"] = 0
+            return {}
+
+        world.queue("window_act", wrong_slot)
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "未确认"):
+            drive(put_window_item(ex, state, TARGET, "lapis_lazuli", 1, "lapis", slot=2), ex)
+        self.assertEqual(ex.acts, ["window/view", "window/act", "window/view"])
+
+    def test_select_requires_caller_postcondition(self):
+        world = ScriptedWorld()
+        world.queue("window_view", window("enchanting_table"), window("enchanting_table"))
+        world.queue("window_act", {})
+        ex, state = world.session()
+        with self.assertRaisesRegex(Replan, "select 0"):
+            drive(select_window_option(ex, state, TARGET, 0, verify=lambda *_: False), ex)
+        world.assert_exhausted()
+
+    def test_scripted_entity_reads_are_explicit_and_exhaustion_is_an_error(self):
+        world = ScriptedWorld()
+        world.queue("get_entities", {"entities": [{"id": 7}]}, {"entities": []})
+        self.assertEqual(world.get_entities()["entities"], [{"id": 7}])
+        self.assertEqual(world.get_entities()["entities"], [])
+        with self.assertRaisesRegex(AssertionError, "未安排"):
+            world.get_entities()
+        world.assert_exhausted()
+
+
+class MineStepTests(unittest.TestCase):
+    def test_only_allowed_pick_is_selected_even_if_more_powerful_pick_is_owned(self):
+        world = ScriptedWorld(items={"diamond_pickaxe": 1, "iron_pickaxe": 1})
+        ex, state = world.session()
+        drive(prepare_mining_pick(ex, state, allowed=frozenset({"iron_pickaxe"})), ex)
+        self.assertEqual(world.calls, [("equip", {"item": "iron_pickaxe", "slot": "hand"})])
+
+    def test_observed_column_leaves_floor_and_reaches_landing(self):
+        world = ScriptedWorld(items={"iron_pickaxe": 1}, blocks={(1, y, 0): "stone" for y in range(62, 66)})
+        ex, state = world.session()
+        drive(mine_step(ex, state, (1, 63, 0)), ex)
+        self.assertEqual(state.pos, [1.5, 63.0, 0.5])
+        self.assertEqual(world.blocks, {(1, 62, 0): "stone"})
+        self.assertEqual([op for op, _ in world.calls if op != "equip"], ["dig", "dig", "dig", "move_to"])
+
+    def test_dangerous_observed_roof_fails_before_any_action(self):
+        world = ScriptedWorld(blocks={(1, 62, 0): "stone", (1, 66, 0): "gravel"})
+        ex, state = world.session()
+        with self.assertRaises(MineStepUnsafe):
+            drive(mine_step(ex, state, (1, 63, 0)), ex)
+        self.assertEqual(ex.acts, [])

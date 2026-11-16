@@ -10,8 +10,14 @@ from typing import TYPE_CHECKING, Collection, Iterator, Optional
 
 from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
+from .furnace import collect_furnace, inspect_furnace, load_furnace
 from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe, record_mine_trail
+from .mining import (
+    SOLID_SUPPORT, MineStepUnsafe, mine_step, prepare_mining_pick, safe_mine_column,
+    under_feet,
+)
 from .registry import register
+from .windows import window_amount, window_section
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -22,7 +28,6 @@ WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "ma
 BASE_FUELS = (("coal", 16), ("charcoal", 16)) + tuple(
     (f"{w}_{suffix}", 3) for suffix in ("planks", "log") for w in WOODS
 )
-PEEL_SURFACE = frozenset(("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter"))
 RADIUS = 32
 MINING_REACH = 4
 PROSPECT_STEPS = 6
@@ -30,16 +35,6 @@ SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
 MAX_ORE_ROUTE_FAILURES = 3
 POLL_SECONDS = 2.0
-SOLID_SUPPORT = frozenset((
-    "stone", "cobblestone", "deepslate", "cobbled_deepslate",
-    "dirt", "coarse_dirt", "grass_block", "andesite", "diorite", "granite", "tuff",
-    "calcite", "dripstone_block", "clay",
-    "coal_ore", "deepslate_coal_ore", "copper_ore", "deepslate_copper_ore",
-    "lapis_ore", "deepslate_lapis_ore", "gold_ore", "deepslate_gold_ore",
-    "redstone_ore", "deepslate_redstone_ore",
-    "iron_ore", "deepslate_iron_ore", "raw_iron_block", "raw_copper_block",
-))
-
 # 按 client 实例隔离的同区块不可达矿点记忆，跨区块后自动失效，避免重入技能时重复撞死胡同洞穴。
 _SESSION_EXCLUDED: dict[int, tuple[tuple[int, int], set[tuple[int, int, int]]]] = {}
 
@@ -59,20 +54,6 @@ def _session_excluded_for(client: object, cur) -> set[tuple[int, int, int]]:
         _SESSION_EXCLUDED[key] = (chunk, fresh)
         return fresh
     return entry[1]
-
-
-def _under_feet(cur, pos) -> bool:
-    return (math.floor(cur[0]) == pos[0] and math.floor(cur[2]) == pos[2]
-            and pos[1] < cur[1])
-
-
-def _section(view: dict, section: str) -> list[dict]:
-    return (view.get("sections") or {}).get(section) or []
-
-
-def _amount(view: dict, section: str, item: str) -> int:
-    return sum(int(s.get("count", 0)) for s in _section(view, section)
-               if bare(s.get("name")) == item)
 
 
 def _fuels_for(state: "State") -> tuple[tuple[str, int], ...]:
@@ -100,18 +81,6 @@ class SmeltIron(Skill):
             return "背包缺煤、木板或原木燃料，且无可采煤的镐"
         return ""
 
-    def _prepare_pick(self, ex: "Executor", state: "State") -> Iterator[dict]:
-        inv = state.refresh_inventory(ex.client)
-        pick = best_pickaxe(state)
-        if pick not in STONE_OR_BETTER_PICKS:
-            raise Replan("挖掘前检查背包缺石镐或更好的镐")
-        if bare((inv.get("held", state.st.get("held")) or {}).get("name")) != pick:
-            yield rec("equip", ex.equip(pick, "hand"), item=pick)
-            inv = state.refresh_inventory(ex.client)
-            if best_pickaxe(state) not in STONE_OR_BETTER_PICKS or ("held" in inv and
-                    bare((inv.get("held") or {}).get("name")) != pick):
-                raise Replan(f"挖掘前装备 {pick} 后手持未确认")
-
     def _unpack_raw_iron_blocks(self, ex: "Executor", state: "State") -> Iterator[dict]:
         while state.count("raw_iron_block") >= 1:
             before = state.count("raw_iron")
@@ -125,14 +94,14 @@ class SmeltIron(Skill):
         if math.dist(cur, pos) > MINING_REACH:
             yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-        if _under_feet(cur, pos):
+        if under_feet(cur, pos):
             raise Replan(f"观察到 {drop} 矿 {pos} 已在脚下，停止挖掘以保留支撑")
         block_type = bare(ex.client.get_block(pos).get("name"))
         if block_type not in ores:
             raise Replan(f"到达 {pos} 后 get_block 未确认目标矿 {ores}")
-        yield from self._prepare_pick(ex, state)
+        yield from prepare_mining_pick(ex, state)
         cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-        if _under_feet(cur, pos):
+        if under_feet(cur, pos):
             raise Replan(f"装备后重新观察 {pos} 已在脚下，停止挖掘以保留支撑")
         expected_drop = "raw_iron_block" if block_type == "raw_iron_block" else drop
         before = state.count(expected_drop)
@@ -160,20 +129,12 @@ class SmeltIron(Skill):
             and tuple(b["pos"]) not in excluded
             and (not in_reach_only or math.dist(cur, b["pos"]) <= MINING_REACH)
             and (max_dy is None or abs(b["pos"][1] - cur[1]) <= max_dy)
-            and not _under_feet(cur, b["pos"])
+            and not under_feet(cur, b["pos"])
         ]
         if not in_reach_only and len(cands) > 1:
             # 稳定排序：优先高差 ≤12 格的地表崖壁/浅洞露矿，同档内保留原扫描近远顺序。
             cands.sort(key=lambda p: abs(p[1] - cur[1]) > 12.0)
         return cands
-
-    def _safe_column(self, ex: "Executor", pos) -> bool:
-        x, y, z = pos
-        # 只开凿已观察到的安全实心地层与原生矿石；未知方块、流体、落沙砾与设施一律不动。
-        return (bare(ex.client.get_block([x, y - 1, z]).get("name")) in SOLID_SUPPORT
-                and bare(ex.client.get_block([x, y + 3, z]).get("name")) in AIR | SOLID_SUPPORT
-                and all(bare(ex.client.get_block([x, y + dy, z]).get("name")) in AIR | SOLID_SUPPORT
-                        for dy in (2, 1, 0)))
 
     @staticmethod
     def _initial_heading(start: tuple[int, int, int], excluded: Collection[tuple[int, int, int]]) -> tuple[int, int]:
@@ -210,6 +171,12 @@ class SmeltIron(Skill):
         heading = self._initial_heading(start, excluded)
         waypoints: list[list[float]] = [[start[0] + 0.5, float(start_y), start[2] + 0.5]]
 
+        def observe_cut():
+            if state.count("raw_iron_block") >= 1:
+                yield from self._unpack_raw_iron_blocks(ex, state)
+            candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
+            return candidates if candidates or state.count("raw_iron") else None
+
         try:
             while completed_steps < max_steps:
                 cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
@@ -218,7 +185,7 @@ class SmeltIron(Skill):
                 dirs = (heading,) + tuple(d for d in ((1, 0), (-1, 0), (0, 1), (0, -1)) if d != heading)
                 pos = next(([x + dx, y - 1, z + dz] for dx, dz in dirs
                             if (x + dx, z + dz) not in visited
-                            and self._safe_column(ex, [x + dx, y - 1, z + dz])), None)
+                            and safe_mine_column(ex, [x + dx, y - 1, z + dz])), None)
                 if pos is None:
                     # 井底正前与两侧均遇水/砾石受阻时，沿已挖阶梯后退一级尝试侧向分支。
                     if len(waypoints) >= 2 and backtracks < 2:
@@ -229,49 +196,19 @@ class SmeltIron(Skill):
                         continue
                     break
                 visited.add((pos[0], pos[2]))
-                column_unsafe = False
-                # 从上往下清出三格；每个动作让出 Safety 边界，并重新观察承重/工具/站位。
-                for dy in (2, 1, 0):
-                    target = [pos[0], pos[1] + dy, pos[2]]
-                    bname = bare(ex.client.get_block(target).get("name"))
-                    if bname in AIR:
-                        continue
-                    yield from self._prepare_pick(ex, state)
-                    cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-                    if _under_feet(cur, target):
-                        raise Replan("探矿阶梯站位或承重/净空变化，停止挖掘以保留支撑")
-                    if not self._safe_column(ex, pos):
-                        has_alt = any(
-                            (x + dx, z + dz) not in visited and self._safe_column(ex, [x + dx, y - 1, z + dz])
-                            for dx, dz in dirs
-                        )
-                        if completed_steps == 0 and not has_alt:
-                            raise Replan("探矿阶梯站位或承重/净空变化，停止挖掘以保留支撑")
-                        column_unsafe = True
-                        break
-                    result = ex.dig(target, collect=bname not in PEEL_SURFACE)
-                    yield rec("dig", result, pos=target)
-                    state.refresh_inventory(ex.client)
-                    if state.count("raw_iron_block") >= 1:
-                        yield from self._unpack_raw_iron_blocks(ex, state)
-                    if result.get("warning") or best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
-                        raise Replan("探矿工具告警或已无石镐，停止开凿")
-                    candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
-                    if candidates or state.count("raw_iron"):
-                        return candidates
-                if column_unsafe:
-                    continue
-                if not self._safe_column(ex, pos) or any(
-                        bare(ex.client.get_block([pos[0], pos[1] + dy, pos[2]]).get("name")) not in AIR
-                        for dy in (2, 1, 0)):
+                try:
+                    dest, observation = yield from mine_step(ex, state, pos, after_dig=observe_cut)
+                except MineStepUnsafe as err:
                     if completed_steps > 0:
                         continue
-                    raise Replan("探矿阶梯承重/净空变化，停止下行")
-                dest = [pos[0] + 0.5, pos[1], pos[2] + 0.5]
-                yield rec("move_to", ex.move_to(pos=dest, rng=1), pos=dest)
-                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-                if tuple(map(math.floor, cur)) != tuple(pos):
-                    raise Replan("探矿阶梯未确认到达落脚点，停止下行")
+                    if err.stage == "cut" and any(
+                        (x + dx, z + dz) not in visited and safe_mine_column(ex, [x + dx, y - 1, z + dz])
+                        for dx, dz in dirs
+                    ):
+                        continue
+                    raise
+                if dest is None:
+                    return observation
                 heading = (pos[0] - x, pos[2] - z)
                 waypoints.append(dest)
                 completed_steps += 1
@@ -362,7 +299,7 @@ class SmeltIron(Skill):
             cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
             for b in logs:
                 lpos = b.get("pos")
-                if not (isinstance(lpos, list) and len(lpos) == 3) or _under_feet(cur, lpos):
+                if not (isinstance(lpos, list) and len(lpos) == 3) or under_feet(cur, lpos):
                     continue
                 if abs(lpos[1] - cur[1]) > 6.0:
                     continue
@@ -449,7 +386,7 @@ class SmeltIron(Skill):
                 for k in (1, 0):
                     cell = [pos[0], y + k, pos[2]]
                     if bare(ex.client.get_block(cell).get("name")) not in AIR:
-                        yield from self._prepare_pick(ex, state)
+                        yield from prepare_mining_pick(ex, state)
                         yield rec("dig", ex.dig(cell, collect=True), pos=cell)
                 if (bare(ex.client.get_block([pos[0], y - 1, pos[2]]).get("name")) in SOLID_SUPPORT
                         and all(bare(ex.client.get_block([pos[0], y + k, pos[2]]).get("name")) in AIR for k in (0, 1))):
@@ -465,28 +402,19 @@ class SmeltIron(Skill):
         for poll in range(5 * batch + 11):
             if poll:
                 time.sleep(POLL_SECONDS)
-            view = ex.window_view(target)
-            yield rec("window_view", view, target=target)
-            if not _section(view, "input") and _amount(view, "output", "iron_ingot") >= batch:
+            view = yield from inspect_furnace(ex, target)
+            if not window_section(view, "input") and window_amount(view, "output", "iron_ingot") >= batch:
                 break
             if time.monotonic() >= deadline:
                 break
         else:
             raise Replan(f"观察熔炉 {pos} 超过轮询上限，冶炼 {batch} 个铁超时：{view}")
-        if _section(view, "input") or _amount(view, "output", "iron_ingot") < batch:
+        if window_section(view, "input") or window_amount(view, "output", "iron_ingot") < batch:
             raise Replan(f"观察熔炉 {pos} 等待 {10 * batch + 20}s 后铁未烧完，检查燃料/原料：{view}")
-        amount = _amount(view, "output", "iron_ingot")
-        state.refresh_inventory(ex.client)
-        before_count = state.count("iron_ingot")
-        yield rec("window_act", ex.window_act(target, [{"op": "take", "from": "output", "item": "iron_ingot", "count": amount}]), target=target)
-        state.refresh_inventory(ex.client)
-        if state.count("iron_ingot") < before_count + amount:
-            raise Replan(f"熔炉 {pos} take output 后背包铁锭未确认增加 {amount} 个")
-        view = ex.window_view(target)
-        yield rec("window_view", view, target=target)
-        if _section(view, "output"):
-            raise Replan(f"熔炉 {pos} 取出后 output 仍有剩余产物：{view}")
-        return view
+        result = yield from collect_furnace(
+            ex, state, target, item="iron_ingot", view=view, require_empty=True,
+        )
+        return result["view"]
 
     def _recover_placed_furnace(self, ex: "Executor", state: "State") -> Iterator[dict]:
         """抢占或重连后若粗铁与熔炉均已离手，先检查附近已放熔炉回收在途铁锭，避免重复下矿。"""
@@ -499,24 +427,19 @@ class SmeltIron(Skill):
                 continue
             yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
             target = {"pos": pos}
-            view = ex.window_view(target)
-            yield rec("window_view", view, target=target)
-            in_raw = _amount(view, "input", "raw_iron")
-            out_ingot = _amount(view, "output", "iron_ingot")
+            view = yield from inspect_furnace(ex, target)
+            in_raw = window_amount(view, "input", "raw_iron")
+            out_ingot = window_amount(view, "output", "iron_ingot")
             if in_raw > 0:
-                if not (view.get("info") or {}).get("burning") and not _section(view, "fuel"):
+                if not (view.get("info") or {}).get("burning") and not window_section(view, "fuel"):
                     yield from self._prepare_fuel(ex, state, in_raw)
                     fuel, fuel_count, _ = self._fuel_plan(state, in_raw)[0]
-                    yield rec("window_act", ex.window_act(target, [{"op": "put", "item": fuel, "count": fuel_count, "to": "fuel"}]), target=target)
+                    yield from load_furnace(ex, state, target, fuel_item=fuel, fuel_count=fuel_count, view=view)
                 yield from self._poll_and_take(ex, state, pos, target, in_raw + out_ingot)
                 return
-            if out_ingot > 0 and not _section(view, "input"):
-                state.refresh_inventory(ex.client)
-                before_count = state.count("iron_ingot")
-                yield rec("window_act", ex.window_act(target, [{"op": "take", "from": "output", "item": "iron_ingot", "count": out_ingot}]), target=target)
-                state.refresh_inventory(ex.client)
-                if state.count("iron_ingot") < before_count + out_ingot:
-                    raise Replan(f"熔炉 {pos} take output 后背包铁锭未确认增加 {out_ingot} 个")
+            if out_ingot > 0 and not window_section(view, "input"):
+                yield from collect_furnace(ex, state, target, item="iron_ingot",
+                                           view=view, inspect_after=False)
                 return
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
@@ -540,7 +463,7 @@ class SmeltIron(Skill):
                 coal = ex.client.find_blocks(types=["coal_ore", "deepslate_coal_ore"], radius=8, limit=4).get("blocks") or []
                 cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
                 nearby = [b["pos"] for b in coal if isinstance(b.get("pos"), list)
-                          and len(b["pos"]) == 3 and not _under_feet(cur, b["pos"])]
+                          and len(b["pos"]) == 3 and not under_feet(cur, b["pos"])]
                 if not nearby:
                     break
                 yield from self._mine(ex, state, nearby[0], ("coal_ore", "deepslate_coal_ore"), "coal")
@@ -550,19 +473,13 @@ class SmeltIron(Skill):
         plan = self._fuel_plan(state, count)
         pos = yield from self._furnace(ex, state)
         target = {"pos": pos}
-        view = ex.window_view(target)
-        yield rec("window_view", view, target=target)
-        if _section(view, "input"):
-            raise Replan(f"观察熔炉 {pos} input 仍有原料，先处理已有冶炼任务后重规划")
-        if any(bare(s.get("name")) != "iron_ingot" for s in _section(view, "output")):
-            raise Replan(f"观察熔炉 {pos} output 被非铁产物占用，停止放料")
-        # 窗口 API 每次自动关闭（§4.9）；不进入持续潜行/举盾/拉弓状态。
+        view = yield from inspect_furnace(ex, target)
+        # 每次只放当前批次原料，避免剩余燃烧时间提前吃掉下一批材料。
         for fuel, fuel_count, batch in plan:
-            if _section(view, "fuel"):
-                yield rec("window_act", ex.window_act(target, [{"op": "take", "from": "fuel"}]), target=target)
-            # 每次只放当前批次原料，避免剩余燃烧时间提前吃掉下一批材料。
-            yield rec("window_act", ex.window_act(target, [{"op": "put", "item": "raw_iron", "count": batch, "to": "input"}]), target=target)
-            yield rec("window_act", ex.window_act(target, [{"op": "put", "item": fuel, "count": fuel_count, "to": "fuel"}]), target=target)
+            yield from load_furnace(
+                ex, state, target, raw_item="raw_iron", raw_count=batch, fuel_item=fuel,
+                fuel_count=fuel_count, view=view, replace_fuel=True, output_item="iron_ingot",
+            )
             view = yield from self._poll_and_take(ex, state, pos, target, batch)
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
