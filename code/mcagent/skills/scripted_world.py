@@ -96,8 +96,20 @@ class ScriptedWorld(GridWorld):
         return self._reply("use_item", dict(item=item, target=target, ms=ms, timeout_ms=timeout_ms,
                                            source=source, stop_on=stop_on))
 
-    def attack(self, entity_id, timeout_ms=20000, *, stop_on=None):
-        return self._reply("attack", dict(entity_id=entity_id, timeout_ms=timeout_ms, stop_on=stop_on))
+    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None):
+        req = dict(entity_id=entity_id, timeout_ms=timeout_ms, stop_on=stop_on)
+        if max_hits is not None:
+            req["max_hits"] = max_hits
+        if interval_ms is not None:
+            req["interval_ms"] = interval_ms
+        return self._reply("attack", req)
+
+    def control(self, **keys):
+        return self._reply("control", dict(keys))
+
+    def look(self, yaw=None, pitch=None, *, pos=None, entity_id=None):
+        req = {k: v for k, v in dict(yaw=yaw, pitch=pitch, pos=pos, entity_id=entity_id).items() if v is not None}
+        return self._reply("look", req)
 
     def shoot(self, entity_id=None, pos=None, weapon="bow", charge_ms=1100, *, stop_on=None):
         return self._reply("shoot", dict(entity_id=entity_id, pos=pos, weapon=weapon, charge_ms=charge_ms,

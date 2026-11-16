@@ -39,6 +39,12 @@ class FakeSession {
       events: [{ seq: 1, t: Date.now(), type: "spawn", pos: [0, 64, 0] }],
     };
   }
+  async control(params) {
+    return { forwarded: params };
+  }
+  async look(params) {
+    return { forwarded: params };
+  }
 }
 
 async function withServer(fn) {
@@ -86,6 +92,26 @@ test("HTTP contract: /healthz, 401 unauthorized, 404 unknown_api, 400 bad_json",
     assert.equal(badJson.status, 400);
     const bjPayload = await badJson.json();
     assert.equal(bjPayload.error.code, "bad_json");
+  });
+});
+
+test("HTTP contract: authenticated control and look forward the request to the bot session", async () => {
+  await withServer(async (base) => {
+    const response = await fetch(`${base}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "controls", password: "dev" }),
+    });
+    const { token } = await response.json();
+    for (const [route, body] of [["control", { jump: true, ms: 200 }], ["look", { yaw: 0.25, pitch: 0 }]]) {
+      const action = await fetch(`${base}/api/v1/${route}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      assert.equal(action.status, 200);
+      assert.deepEqual((await action.json()).result, { forwarded: body });
+    }
   });
 });
 

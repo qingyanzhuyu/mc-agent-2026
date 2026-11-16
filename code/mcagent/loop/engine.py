@@ -11,9 +11,9 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
-from ..client import ApiError, Client
+from ..client import FATAL, ApiError, Client
 from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
 from ..skills.base import Skill, failure
 from .auditor import SoakObserver
@@ -34,6 +34,15 @@ class LoopConfig:
     disconnect_on_exit: bool = False
     target_goal: Optional[str] = None
     stop_on_goal: bool = False
+    # 读状态遇到网关抖动（5xx / 网络 / 超时 / 服务端 internal 等非致命错误）时的自愈参数
+    transient_retries: int = 3         # 单拍内重试次数，用尽则跳过这一拍
+    transient_backoff_s: float = 1.0   # 首次退避秒数，此后翻倍
+    transient_backoff_max_s: float = 15.0
+    outage_limit_s: float = 600.0      # 连续故障超过此时长才停机；0 = 永不因此停机
+
+
+# 会话级错误：交给 `_recover_session_or_respawn` 处理，而不是按瞬时故障退避
+SESSION_CODES: frozenset[str] = frozenset({"dead", "not_connected", "wrong_server", "death_loop_cooldown"})
 
 
 @dataclass
@@ -44,6 +53,7 @@ class RunResult:
     deaths_recovered: int
     elapsed_s: float
     stop_reason: str
+    transient_faults: int = 0          # 因读状态瞬时故障而跳过的拍数
 
 
 class MainLoop:
@@ -60,6 +70,8 @@ class MainLoop:
         observer: Optional[SoakObserver] = None,
         safety: Optional[Safety] = None,
         log=print,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.client = client
         self.state = state
@@ -73,6 +85,10 @@ class MainLoop:
         self._path_failures: dict[str, int] = {}
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
+        self._sleep = sleep
+        self._clock = clock
+        self._outage_since: Optional[float] = None
+        self.transient_faults = 0
 
     def _resolve_goal_spec(self, gid: str) -> Optional[GoalSpec]:
         if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "ledger_map"):
@@ -118,6 +134,82 @@ class MainLoop:
         self.state.drain(self.client)
         if self.state.inventory_dirty or not self.state.inventory:
             self.state.refresh_inventory(self.client)
+
+    # ---- 瞬时故障自愈 -------------------------------------------------
+    def _backoff_s(self, attempt: int) -> float:
+        base = max(0.0, self.config.transient_backoff_s)
+        return min(max(base, self.config.transient_backoff_max_s), base * (2 ** attempt))
+
+    def _note_outage(self, e: ApiError) -> None:
+        if self._outage_since is None:
+            self._outage_since = self._clock()
+        self.recent_failures.append(f"loop: 读状态瞬时故障 {e}")
+
+    def _outage_exceeded(self) -> bool:
+        limit = self.config.outage_limit_s
+        return bool(limit > 0 and self._outage_since is not None
+                    and self._clock() - self._outage_since >= limit)
+
+    def _refresh_with_backoff(self) -> bool:
+        """刷新状态；非致命、非会话类错误按指数退避重试。
+
+        返回 True 表示刷新成功；False 表示重试用尽、本拍应跳过。
+        会话类错误（`SESSION_CODES`）与致命错误原样抛出，由调用方处理。
+        """
+        for attempt in range(max(0, self.config.transient_retries) + 1):
+            try:
+                self._refresh_world_state()
+            except ApiError as e:
+                if e.kind == FATAL or e.code in SESSION_CODES:
+                    raise
+                self._note_outage(e)
+                if attempt >= self.config.transient_retries:
+                    self.transient_faults += 1
+                    self.log(f"[loop] 读状态连续失败 {attempt + 1} 次（{e}），跳过本拍")
+                    return False
+                wait_s = self._backoff_s(attempt)
+                self.log(f"[loop] 读状态瞬时故障（{e}），{wait_s:.1f}s 后重试 ({attempt + 1}/{self.config.transient_retries})")
+                self._sleep(wait_s)
+                continue
+            self._outage_since = None
+            return True
+        return False
+
+    def _recover_guarded(self, pre_inv_fp: dict[str, int], initial_err: Optional[ApiError] = None) -> bool:
+        """会话/重生恢复；恢复本身遇到非致命错误时不让进程退出，下一拍再试。"""
+        try:
+            self._recover_session_or_respawn(pre_inv_fp, initial_err=initial_err)
+        except ApiError as e:
+            if e.kind == FATAL:
+                raise
+            self._note_outage(e)
+            self.transient_faults += 1
+            wait_s = self._backoff_s(self.config.transient_retries)
+            self.log(f"[loop] 会话恢复未完成（{e}），{wait_s:.1f}s 后下一拍重试")
+            self._sleep(wait_s)
+            return False
+        self._outage_since = None
+        return True
+
+    def _wait_ready_guarded(self) -> Optional[dict]:
+        """启动时等 ready；网关不可用时退避重试，超过停机上限返回 None。"""
+        attempt = 0
+        while True:
+            try:
+                st = self.client.wait_ready(timeout=120)
+            except ApiError as e:
+                if e.kind == FATAL:
+                    raise
+                self._note_outage(e)
+                if self._outage_exceeded():
+                    return None
+                wait_s = self._backoff_s(attempt)
+                attempt += 1
+                self.log(f"[loop] 启动等待 ready 失败（{e}），{wait_s:.1f}s 后重试")
+                self._sleep(wait_s)
+                continue
+            self._outage_since = None
+            return st
 
     def _is_dead_now(self) -> bool:
         if not self.state.st.get("alive", True):
@@ -234,10 +326,21 @@ class MainLoop:
 
         monitor = SafetyMonitor(self.client, self.state, self.executor, safety=self.safety) if self.config.enable_monitor else None
         try:
-            st = self.client.wait_ready(timeout=120)
+            st = self._wait_ready_guarded()
+            if st is None:
+                self.log(f"[loop] 启动后连续 {self.config.outage_limit_s:.0f}s 等不到 ready，停机")
+                stop_reason = "transient_outage"
+                return RunResult(0, 0, 0, 0, round(time.monotonic() - started_mono, 2),
+                                 stop_reason, self.transient_faults)
             self.state.set_status(st)
-            self.state.refresh_inventory(self.client)
-            self.state.drain(self.client)
+            try:
+                self.state.refresh_inventory(self.client)
+                self.state.drain(self.client)
+            except ApiError as e:
+                if e.kind == FATAL:
+                    raise
+                self.state.invalidate_inventory()  # 留给第一拍的刷新补读
+                self._note_outage(e)
             self._seen_deaths_len = len(self.state.deaths)
             self.log(f"[loop] 启动完成: {self.state.summary()}")
 
@@ -259,17 +362,29 @@ class MainLoop:
 
                 pre_inv_fp = _inv_fingerprint(self.state.inventory) or {}
                 try:
-                    self._refresh_world_state()
+                    refreshed = self._refresh_with_backoff()
                 except ApiError as e:
-                    if e.code in ("dead", "not_connected", "wrong_server", "death_loop_cooldown"):
-                        self._recover_session_or_respawn(pre_inv_fp, initial_err=e)
+                    if e.code not in SESSION_CODES:
+                        raise  # 只剩致命错误
+                    if self._recover_guarded(pre_inv_fp, initial_err=e):
                         deaths_recovered += 1
-                        continue
-                    raise
+                    elif self._outage_exceeded():
+                        stop_reason = "transient_outage"
+                        break
+                    continue
+                if not refreshed:
+                    if self._outage_exceeded():
+                        self.log(f"[loop] 连续 {self.config.outage_limit_s:.0f}s 读不到状态，停机")
+                        stop_reason = "transient_outage"
+                        break
+                    continue
 
                 if self._is_dead_now():
-                    self._recover_session_or_respawn(pre_inv_fp)
-                    deaths_recovered += 1
+                    if self._recover_guarded(pre_inv_fp):
+                        deaths_recovered += 1
+                    elif self._outage_exceeded():
+                        stop_reason = "transient_outage"
+                        break
                     continue
 
                 if self._sync_and_check_target_goal() and self.config.stop_on_goal:
@@ -312,6 +427,7 @@ class MainLoop:
                             return RunResult(
                                 steps, skills_ok, skills_replan, deaths_recovered,
                                 round(time.monotonic() - started_mono, 2), stop_reason,
+                                self.transient_faults,
                             )
 
                         if self._is_dead_now():
@@ -325,7 +441,12 @@ class MainLoop:
                             self._path_failures.pop(active_skill.goal, None)
                             if self.observer is not None and self.observer.tape is not None:
                                 self.observer.tape.end_skill_slice()
-                            self._refresh_world_state()
+                            try:
+                                # 技能已完成；这里读不到状态不应把它记成失败，留给下一拍刷新与恢复
+                                self._refresh_with_backoff()
+                            except ApiError as refresh_err:
+                                if refresh_err.kind == FATAL:
+                                    raise
                             skills_ok += 1
                             force_tick = any(
                                 g.skill == finished_name and g.done_advancements
@@ -387,8 +508,14 @@ class MainLoop:
                         if not is_death_err:
                             try:
                                 self.state.refresh_status(self.client, max_age_s=0)
-                            except ApiError:
-                                is_death_err = True
+                            except ApiError as refresh_err:
+                                if refresh_err.kind == FATAL:
+                                    raise
+                                # 会话类错误按死亡/断线恢复；网关抖动不算死亡，留给下一拍退避刷新
+                                if refresh_err.code in SESSION_CODES:
+                                    is_death_err = True
+                                else:
+                                    self._note_outage(refresh_err)
                         environment = e if isinstance(e, EnvBlocked) and not is_death_err else None
                         if environment is not None:
                             self._path_failures.pop(active_skill.goal, None)
@@ -430,8 +557,8 @@ class MainLoop:
                         active_skill = None
                         if is_death_err:
                             init_api_err = e if isinstance(e, ApiError) else None
-                            self._recover_session_or_respawn(pre_inv_fp, initial_err=init_api_err)
-                            deaths_recovered += 1
+                            if self._recover_guarded(pre_inv_fp, initial_err=init_api_err):
+                                deaths_recovered += 1
                 except Fatal as e:
                     if active_skill is not None:
                         if self.observer is not None and self.observer.tape is not None:
@@ -479,4 +606,5 @@ class MainLoop:
             deaths_recovered=deaths_recovered,
             elapsed_s=round(time.monotonic() - started_mono, 2),
             stop_reason=stop_reason,
+            transient_faults=self.transient_faults,
         )

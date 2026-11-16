@@ -105,6 +105,8 @@ const KNOWN_ROUTES = new Set([
   "POST events",
   "POST advancements",
   "POST move_to",
+  "POST control",
+  "POST look",
   "POST dig",
   "POST place",
   "POST interact",
@@ -293,6 +295,10 @@ function createBridgeServer(opts = {}) {
         result = session.getAdvancements(body);
       } else if (method === "POST" && route === "move_to") {
         result = await session.moveTo(body);
+      } else if (method === "POST" && route === "control") {
+        result = await session.control(body);
+      } else if (method === "POST" && route === "look") {
+        result = await session.look(body);
       } else if (method === "POST" && route === "dig") {
         result = await session.dig(body);
       } else if (method === "POST" && route === "place") {
@@ -386,7 +392,7 @@ if (require.main === module) {
 
   server.listen(bridgePort, bridgeHost, () => {
     console.log(
-      `[bridge] NMO API v1.3.1 Local Bridge listening on http://${bridgeHost}:${bridgePort}/api/v1` +
+      `[bridge] NMO API Local Bridge listening on http://${bridgeHost}:${bridgePort}/api/v1` +
         ` -> MC ${config.mcHost}:${config.mcPort} (version=${config.mcVersion})`
     );
   });

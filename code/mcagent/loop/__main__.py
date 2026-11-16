@@ -16,11 +16,11 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from ..client import Client, Config
+from ..client import ApiError, Client, Config
 from ..planner.llm import OFFICIAL_PROFILE, resolve_profile
 from ..planner.skill_choice import meets_verification
 from ..preflight import OFFICIAL_HOSTS
-from ..runtime import Executor, State
+from ..runtime import Executor, Fatal, State
 from ..skills import REGISTRY, contract_errors
 from .goals import normalize_goal_ids
 from . import (
@@ -265,11 +265,18 @@ def main(argv: list[str] | None = None) -> int:
         stop_on_goal=stop_on_goal,
     )
     loop = MainLoop(client, state, executor, planner, config=loop_cfg, observer=observer)
-    result = loop.run()
+    try:
+        result = loop.run()
+    except (Fatal, ApiError) as e:
+        # 主循环只让致命错误（凭据、接口路径）穿透；给出可读原因和非零退出码，不打 traceback
+        print(f"\n[loop] 致命错误，停机: {e}", file=sys.stderr)
+        if observer is not None:
+            print(f"[loop] 诊断汇总已写入: {observer.summary_path}", file=sys.stderr)
+        return 1
     print(f"\n[loop] 结束: {result}")
     if observer is not None:
         print(f"[loop] 诊断汇总已写入: {observer.summary_path}")
-    return 0
+    return 3 if result.stop_reason == "transient_outage" else 0
 
 
 if __name__ == "__main__":

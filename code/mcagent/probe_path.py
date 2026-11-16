@@ -63,7 +63,8 @@ def pathfinding_main(argv: list[str]) -> int:
     import argparse
     from datetime import datetime, timezone
     from pathlib import Path
-    from .client import DEFAULT_BASE
+    from urllib.parse import urlsplit
+    from .preflight import OFFICIAL_HOSTS
     from .runtime import Safety, SafetyMonitor
 
     parser = argparse.ArgumentParser(description="赛前官方寻路 probe；默认离线，不登录。")
@@ -90,7 +91,7 @@ def pathfinding_main(argv: list[str]) -> int:
         if args.dry or not args.live:
             parser.error("--snapshot 需要配合 --live（及非官方端点时的 --local-target）确认只读上线许可")
         cfg = Config.load()
-        official = cfg.base == DEFAULT_BASE
+        official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS
         if not official and not args.local_target:
             parser.error("非官方端点：只可显式 --local-target 做联调")
         c = Client(cfg)
@@ -137,7 +138,7 @@ def pathfinding_main(argv: list[str]) -> int:
         print(f"离线校验通过：{', '.join(selected)}；未发请求、未登录")
         return 0
     cfg = Config.load()
-    official = cfg.base == DEFAULT_BASE
+    official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS
     if not official and not args.local_target:
         parser.error("非官方端点：只可显式 --local-target 做联调，不能测官方寻路结论")
     # 显式 local-target 标记优先；即使 URL 是官方也不能误写成官方数据。

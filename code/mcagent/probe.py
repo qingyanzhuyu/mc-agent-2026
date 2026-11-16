@@ -9,9 +9,10 @@
     python -m mcagent.probe --no-dig       # 不动世界
     python -m mcagent.probe --no-move
     python -m mcagent.probe --pathfinding ...   # 转给 probe_path.py（寻路与手动兜底探测）
+    python -m mcagent.probe --api-capabilities --dry  # 查看部署能力探针计划
 结果写到 mcagent/probe/probe-YYYYmmdd-HHMMSS.json
 
-本文件只做基线测量。夹具在 probe_fixture.py，寻路实验在 probe_path.py。
+夹具在 probe_fixture.py，寻路实验在 probe_path.py。
 """
 from __future__ import annotations
 
@@ -22,7 +23,10 @@ import sys
 import time
 from typing import Callable
 
+from urllib.parse import urlsplit
+
 from .client import ApiError, Client, Config
+from .preflight import OFFICIAL_HOSTS
 from .probe_fixture import OUT_DIR, path_template, validate_fixture  # noqa: F401  后两个为旧导入路径保留
 from .probe_path import pathfinding_main
 from .runtime import Executor, Fatal, Replan, State
@@ -59,7 +63,85 @@ def bench(fn: Callable[[], object], n: int = 10, warmup: int = 1, pause_s: float
     }
 
 
+def _ready_and_idle(st: dict) -> bool:
+    return st.get("ready") is True and st.get("alive", True) and "busy" in st and st["busy"] is None
+
+
+def api_capabilities_main(argv: list[str]) -> int:
+    """用不含移动或攻击键的请求探测部署支持的接口，JSON 写到 stdout。"""
+    import argparse
+    import math
+
+    parser = argparse.ArgumentParser(description="探测当前部署的 API 能力；默认离线。")
+    parser.add_argument("--api-capabilities", action="store_true")
+    parser.add_argument("--local-target", action="store_true", help="显式标明目标为本地/联调网关")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry", action="store_true")
+    mode.add_argument("--live", action="store_true", help="获准登录测试账号并在 docs/05 占位后使用")
+    args = parser.parse_args(argv)
+    if not args.live:
+        print("离线计划：确认 ready 且 idle；发送无按键 /control，按当前角度调用 /look，检查 /stop 的 released。")
+        return 0
+
+    cfg = Config.load()
+    if not cfg.has_credentials:
+        print("没有凭据，先填 mcagent/.env")
+        return 2
+
+    official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS and not args.local_target
+    client = Client(cfg, log=lambda message: print(message, file=sys.stderr))
+    state = State()
+    ex = Executor(client, state, log=lambda *_: None)
+    report: dict = {"source": "official" if official else "local-target", "routes": {}}
+    idle_verified = False
+    try:
+        st = client.wait_ready(timeout=120)
+        report["status_fields"] = [field for field in ("speed", "velocity", "jumping") if field in st]
+        for route in ("control", "look", "stop"):
+            if route != "control":
+                st = client.status()
+            idle_verified = _ready_and_idle(st)
+            if not idle_verified:
+                report["blocked"] = {"route": route, "ready": st.get("ready"), "busy": st.get("busy", "missing")}
+                break
+            state.set_status(st)
+            try:
+                if route == "control":
+                    result = ex.control()  # §4.16 要求方向或 hit，正确实现会返回 bad_args。
+                elif route == "look":
+                    yaw, pitch = st.get("yaw"), st.get("pitch")
+                    if not all(type(a) in (int, float) and math.isfinite(a) for a in (yaw, pitch)):
+                        report["routes"][route] = {"skipped": "missing_angles"}
+                        continue
+                    result = ex.look(yaw=yaw, pitch=pitch)
+                else:
+                    result = ex.act("stop", client.stop, retries=0)
+                entry: dict = {"ok": True, "result": result}
+            except (ApiError, Replan, Fatal) as e:
+                code, _ = _unwrap_api_error(e)
+                entry = {"ok": False, "code": code}
+            if route in ("control", "look"):
+                supp = client.supports(route)
+                if isinstance(supp, bool):
+                    entry["supported"] = supp
+            report["routes"][route] = entry
+    except ApiError as e:
+        report["error"] = e.code
+    finally:
+        if idle_verified:
+            try:
+                if _ready_and_idle(client.status()):
+                    client.disconnect()
+            except ApiError as e:
+                report["cleanup_error"] = e.code
+
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return int(any(key in report for key in ("blocked", "error", "cleanup_error")))
+
+
 def main(argv: list[str]) -> int:
+    if "--api-capabilities" in argv:
+        return api_capabilities_main(argv)
     if "--pathfinding" in argv:
         return pathfinding_main(argv)
     do_dig = "--no-dig" not in argv

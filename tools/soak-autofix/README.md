@@ -81,7 +81,7 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 
 | 选项 | 连哪里 | 角色名 | 模型 | 启动前要求 |
 |---|---|---|---|---|
-| `--server official --official-llm custom`（**默认**，日常训练） | 比赛服官方端点 `mc-api.windywindie.top` | 只能用 `.env` 里的队伍正式账号 `MC_USER`/`MC_PASS`，不能改名、不能轮换 | 自备 key（`LLM_CUSTOM_*`，如并行云 DeepSeek-V4.1-Flash），玩家模型可热切换 | `.env` 有账号与 `LLM_CUSTOM_BASE/KEY`；先在 `docs/05` 账号表占位，再加 `--account-reserved` |
+| `--server official --official-llm custom`（**默认**，日常训练） | 比赛服官方端点：默认公网 `mc-api.windywindie.top`；在校内网络时设 `MC_OFFICIAL_API_BASE=https://apiin.nmo.net.cn/api/v1` 走校园网 | 只能用 `.env` 里的队伍正式账号 `MC_USER`/`MC_PASS`，不能改名、不能轮换 | 自备 key（`LLM_CUSTOM_*`，如并行云 DeepSeek-V4.1-Flash），玩家模型可热切换 | `.env` 有账号与 `LLM_CUSTOM_BASE/KEY`；先在 `docs/05` 账号表占位，再加 `--account-reserved` |
 | `--server official --official-llm official`（比赛彩排） | 同上 | 同上 | AIA 官方代理（`LLM_KEY`），与比赛当天完全一致 | `.env` 有 `LLM_KEY`；同样要占位 |
 | `--server local`（备选） | `MC_LOCAL_API_BASE`（默认 `127.0.0.1:8787` 本机网关 → 队内测试服） | `--bot-user` 随意起 | 自备 key | 网关已启动 |
 
