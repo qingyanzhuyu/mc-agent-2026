@@ -6,13 +6,15 @@ from collections import Counter
 from dataclasses import dataclass
 
 from ..runtime import EnvBlocked, Replan
-from .base import Skill, rec
+from .base import Skill, failure, rec
 from .encounter import _completed, _line_cells, _retreat_clear
 from .field import _cell, _grounded, _observed_block, _standable_cell, move_local, place_block, scan_blocks
 from .items import AIR, bare
 from .recipes import RECIPES, craft_recipe
 from .registry import register
-from .windows import put_window_item, select_window_option, take_container_item, window_amount, window_section, window_view
+from .windows import (
+    _receipt_inventory_full, apply_window_ops, take_container_item, window_section, window_view,
+)
 
 
 _ADVANCEMENT = "minecraft:story/enchant_item"
@@ -158,13 +160,20 @@ def _enchanted_in_bag(inventory, item=None):
 
 
 def _option(view, xp_level, max_lapis):
-    """§4.9 未给出附魔专项字段。只接受有明确编号、等级门槛和耗费的选项。"""
-    options = (view.get("info") or {}).get("options") or []
+    """§4.9：附魔台 options 含 index、level_required、lapis_cost、available（兼容旧字段 level_cost/enabled）。"""
+    top_options = view.get("options")
+    options = top_options if isinstance(top_options, list) else (view.get("info") or {}).get("options") or []
     eligible = []
     for row in options:
-        if not isinstance(row, dict) or row.get("enabled") is False:
+        if not isinstance(row, dict):
             continue
-        index, required, cost = (row.get(k) for k in ("index", "level_cost", "lapis_cost"))
+        if row.get("available") is False or row.get("enabled") is False:
+            continue
+        index = row.get("index")
+        required = row.get("level_required")
+        if required is None:
+            required = row.get("level_cost")
+        cost = row.get("lapis_cost")
         if not all(type(n) is int for n in (index, required, cost)):
             continue
         if 0 <= index < 3 and 1 <= cost <= min(3, max_lapis) and cost <= required <= xp_level:
@@ -174,9 +183,9 @@ def _option(view, xp_level, max_lapis):
 
 def _enchant_sections(view):
     sections = view.get("sections") or {}
-    if bare(view.get("window")) not in ("enchanting_table", "enchanting") or any(
+    if bare(view.get("window")) not in ("enchantment", "enchanting_table", "enchanting") or any(
             not isinstance(sections.get(name), list) for name in ("item", "lapis")):
-        raise Replan("附魔窗口缺少可核实的 item/lapis 分区，需探测 §4.9 实际快照")
+        raise Replan("附魔窗口缺少可核实的 item/lapis 分区，需核对 §4.9 enchantment 快照")
 
 
 def _enchanted_slot(view, item):
@@ -186,6 +195,15 @@ def _enchanted_slot(view, item):
     return None
 
 
+def _enchant_batch(item, lapis_count, option_index):
+    return [
+        {"op": "put", "item": item, "count": 1, "to": "item"},
+        {"op": "put", "item": "lapis_lazuli", "count": lapis_count, "to": "lapis"},
+        {"op": "select", "option": option_index},
+        {"op": "take", "from": "item"},
+    ]
+
+
 def _enchant_once(ex, state, pos, item):
     target = {"pos": pos}
     initial = yield from window_view(ex, target)
@@ -193,40 +211,61 @@ def _enchant_once(ex, state, pos, item):
     if any(window_section(initial, section) for section in ("item", "lapis", "output")):
         raise Replan("现场附魔窗口已有物品，请先核对并收回原有物品")
 
-    loaded = yield from put_window_item(ex, state, target, item, 1, "item")
-    _enchant_sections(loaded["view"])
     xp_level = state.refresh_status(ex.client, max_age_s=0).get("xp_level", 0)
+    inventory = state.refresh_inventory(ex.client)
+    if state.count(item) < 1:
+        raise Replan(f"附魔前背包缺少待附魔物品 {item}")
     budget = min(3, xp_level, state.count("lapis_lazuli"))
     if budget < 1:
-        raise Replan("放入装备后经验或青金石已不足")
-    option = _option(loaded["view"], xp_level, budget)
-    # 某些视图须有青金石才显示选项。缺价时预放本次安全上限，成交以实际扣量验收。
-    lapis = budget if option is None else option[0]
-    loaded = yield from put_window_item(ex, state, target, "lapis_lazuli", lapis, "lapis")
-    _enchant_sections(loaded["view"])
-    xp_level = state.refresh_status(ex.client, max_age_s=0).get("xp_level", 0)
-    option = _option(loaded["view"], xp_level, lapis)
-    if option is None:
-        raise Replan("附魔窗口没有可核对编号、青金石和经验的选项，请清点槽位后再计划")
-    cost, _, index = option
+        raise Replan("附魔前经验或青金石已不足")
+    if item == "book" and state.count("book") > 1 and inventory.get("empty_slots") == 0:
+        raise Replan("背包已满（inventory_full 风险），多本普通书附魔产出附魔书需至少 1 个空位")
+
+    # §4.9：界面不跨调用保持打开，附魔选项在放入物品后才生成，put/select/take 须写在同一次 act 里。
+    quoted = _option(initial, xp_level, budget)
+    cost, _, index = quoted if quoted is not None else (1, 1, 0)
     result_item = "enchanted_book" if item == "book" else item
+    before_lapis = state.count("lapis_lazuli")
 
-    bag_lapis = state.count("lapis_lazuli")
+    try:
+        receipt = yield from apply_window_ops(ex, state, target, _enchant_batch(item, cost, index))
+    except Replan as exc:
+        code, extra = failure(exc)
+        if code == "inventory_full":
+            state.refresh_inventory(ex.client)
+            raise Replan("附魔后取回物品时背包已满（inventory_full），请先腾出空位") from exc
+        err_window = extra.get("window")
+        if code == "option_unavailable" and quoted is None and isinstance(err_window, dict):
+            xp_level = state.refresh_status(ex.client, max_age_s=0).get("xp_level", 0)
+            state.refresh_inventory(ex.client)
+            budget = min(3, xp_level, state.count("lapis_lazuli"))
+            retry = _option(err_window, xp_level, budget)
+            if retry is not None and retry[2] != index and state.count(item) >= 1:
+                cost, _, index = retry
+                before_lapis = state.count("lapis_lazuli")
+                try:
+                    receipt = yield from apply_window_ops(ex, state, target, _enchant_batch(item, cost, index))
+                except Replan as retry_exc:
+                    if failure(retry_exc)[0] == "inventory_full":
+                        state.refresh_inventory(ex.client)
+                        raise Replan("附魔后取回物品时背包已满（inventory_full），请先腾出空位") from retry_exc
+                    raise
+            else:
+                raise Replan("附魔台无满足当前经验等级与青金石预算的可用选项（option_unavailable）") from exc
+        else:
+            raise
 
-    def verified_select(before, after, st):
-        _enchant_sections(before)
-        _enchant_sections(after)
-        old = bag_lapis + window_amount(before, "lapis", "lapis_lazuli")
-        remaining = st.count("lapis_lazuli") + window_amount(after, "lapis", "lapis_lazuli")
-        return (old - remaining == cost
-                and bool(_enchanted_slot(after, result_item) or _enchanted_in_bag(st.inventory, result_item)))
-
-    selected = yield from select_window_option(ex, state, target, index, verify=verified_select)
-    view = selected["view"]
-    if section := _enchanted_slot(view, result_item):
-        yield from take_container_item(ex, state, target, section, result_item, 1, view=view)
-    if not _enchanted_in_bag(state.refresh_inventory(ex.client), result_item):
-        raise Replan("取回物品后，背包未确认实际附魔字段")
+    after_inv = state.refresh_inventory(ex.client)
+    if _receipt_inventory_full(receipt) and not _enchanted_in_bag(after_inv, result_item):
+        raise Replan("附魔后取回物品时背包已满（inventory_full），请先腾出空位")
+    if not _enchanted_in_bag(after_inv, result_item):
+        end_window = receipt.get("window")
+        view = end_window if isinstance(end_window, dict) and isinstance(end_window.get("sections"), dict) else None
+        if view is not None and (section := _enchanted_slot(view, result_item)):
+            yield from take_container_item(ex, state, target, section, result_item, 1, view=view)
+            after_inv = state.refresh_inventory(ex.client)
+    if before_lapis - state.count("lapis_lazuli") < cost or not _enchanted_in_bag(after_inv, result_item):
+        raise Replan("附魔 select/take 后，背包未确认青金石扣除或实际附魔字段")
     yield rec("enchantment_evidence", None, item=result_item, option=index, quoted_lapis=cost,
               advancement_confirmed=_completed(ex, _ADVANCEMENT))
 
