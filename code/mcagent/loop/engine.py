@@ -376,7 +376,10 @@ class MainLoop:
                         is_death_err = (
                             died_during_skill
                             or code in ("dead", "not_connected", "death_loop_cooldown")
-                            or extra.get("interrupted_by") == "death"
+                            or (
+                                code == "interrupted"
+                                and extra.get("cause", extra.get("interrupted_by")) == "death"
+                            )
                             or self._is_dead_now()
                         )
                         self.recent_failures.append(f"{active_skill.name}: {e}")

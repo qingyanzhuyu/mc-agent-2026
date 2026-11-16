@@ -21,6 +21,9 @@ from typing import Any, Callable, Literal, Optional
 from .client import ApiError, FATAL, REPLAN, RETRY, Client
 
 
+OXYGEN_FULL = 20  # API §3.1, Minecraft 1.21
+
+
 class Replan(Exception):
     """前置条件不成立，当前任务作废，换一个目标。"""
 
@@ -63,7 +66,7 @@ class RuntimeConfig:
     stop_cooldown_s: float = 10.0
     hp_crit: float = 8.0
     hp_risk: float = 14.0
-    oxygen_warn: float = 80.0
+    oxygen_warn: float = 6.0
     hostile_risk_dist: float = 16.0
     hostile_flee_dist: float = 6.0
     night_start: float = 13000.0
@@ -81,6 +84,11 @@ class RuntimeConfig:
         values = {f.name: float(os.environ.get("MC_" + f.name.upper(), f.default)) for f in fields(cls)}
         if any(not math.isfinite(v) or v <= 0 for v in values.values()):
             raise ValueError("MC 运行时阈值必须为有限正数")
+        # 兼容已有 .env 中按旧网关 300 刻度配置的阈值（旧默认值为 80）。
+        if OXYGEN_FULL < values["oxygen_warn"] <= 300:
+            values["oxygen_warn"] /= 15
+        if values["oxygen_warn"] > OXYGEN_FULL:
+            raise ValueError("MC_OXYGEN_WARN 必须使用 1.21 的 20 格氧气刻度")
         if values["poll_risk_s"] > values["poll_safe_s"] or values["hp_crit"] > values["hp_risk"]:
             raise ValueError("风险轮询不能比安全轮询慢，危急血量不能高于预警血量")
         if values["safe_cooldown_s"] < 65:
@@ -433,8 +441,9 @@ class Safety:
         # 致命物理险情（岩浆/缺氧/失重坠落）必须排在 safe_mode 之前，避免 65s 避险锁存遮蔽当前逃生意图
         if st.get("in_lava"):
             add("escape_lava", "在岩浆里")
-        if st.get("submerged") and float(st.get("oxygen", 300)) < self.config.oxygen_warn:
-            add("surface", f"氧气 {st.get('oxygen')}")
+        oxygen = st.get("oxygen")
+        if st.get("submerged") and oxygen is not None and float(oxygen) < self.config.oxygen_warn:
+            add("surface", f"氧气 {oxygen}")
         support = s.get_support()
         if (
             support.get("risk")
@@ -789,10 +798,11 @@ class Executor:
     def equip(self, item, slot="hand", *, stop_on=None) -> dict:
         return self.act("equip", lambda: self.client.equip(item, slot, stop_on=stop_on))
 
-    def posture(self, sneak=None, shield=None) -> dict:
+    def posture(self, sneak=None, shield=None, *, jump=None) -> dict:
         # 规范 §4.11：/posture 不占动作锁，可在动作阻塞中途调用
         t0 = time.time()
-        res = self.client.posture(sneak=sneak, shield=shield)
+        jump_opts = {} if jump is None else {"jump": jump}
+        res = self.client.posture(sneak=sneak, shield=shield, **jump_opts)
         self._record({
             "t": round(t0, 3), "name": "posture", "ms": round((time.time() - t0) * 1000),
             "ok": True, "attempt": 1, "result": _shrink(res),

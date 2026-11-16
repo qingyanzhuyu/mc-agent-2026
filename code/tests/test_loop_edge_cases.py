@@ -362,6 +362,30 @@ class TestMainLoopDisasterRecovery(unittest.TestCase):
             self.assertEqual(res.stop_reason, "max_deaths_reached")
             self.assertGreaterEqual(res.skills_replan, 1)
 
+    def test_mainloop_recovers_from_death_interruption_before_status_and_events(self):
+        for extra, expected_deaths in (
+            ({"cause": "death"}, 1),
+            ({"interrupted_by": "death"}, 1),
+            ({"cause": "hurt"}, 0),
+        ):
+            with self.subTest(extra=extra):
+                _COOLDOWN.clear()
+                client = EdgeCaseMockClient(blocks={(1, 64, 0): "oak_log"})
+                client.action_errors = [ApiError("interrupted", "dig interrupted", extra)]
+                state = State()
+                planner = CampaignPlanner(
+                    mode="focus", focus_skill="gather_wood", focus_args={"count": 1}, min_verified="offline"
+                )
+                cfg = LoopConfig(max_deaths=1, idle_sleep_s=0.0, enable_monitor=False)
+                loop = MainLoop(
+                    client, state, CountingExecutor(client, state), planner, config=cfg, log=lambda *_: None
+                )
+
+                res = loop.run()
+
+                self.assertEqual(res.skills_replan, 1)
+                self.assertEqual(res.deaths_recovered, expected_deaths)
+
 
 # ============================================================================
 # 3. 死因分类准确性

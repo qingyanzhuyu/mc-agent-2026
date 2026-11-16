@@ -207,9 +207,27 @@ class MonitorTests(unittest.TestCase):
 
     def test_new_urgent_hazard_bypasses_other_kind_cooldown(self):
         self.tick(in_lava=True)
-        self.tick(submerged=True, oxygen=10)
+        self.tick(submerged=True, oxygen=5)
         self.tick()
         self.assertEqual(self.c.stops, 2)
+
+    def test_oxygen_uses_minecraft_1_21_scale(self):
+        self.tick(submerged=True)
+        for oxygen in (None, 20, 6):
+            with self.subTest(oxygen=oxygen):
+                self.tick(oxygen=oxygen)
+                self.assertEqual(self.c.stops, 0)
+        self.tick(submerged=False, oxygen=-1)
+        self.assertEqual(self.c.stops, 0)
+        self.tick(submerged=True, oxygen=5)
+        self.assertEqual(self.c.stops, 1)
+        self.assertEqual(self.s.safety_intent["kind"], "surface")
+
+    def test_legacy_oxygen_threshold_from_environment(self):
+        with patch.dict("os.environ", {"MC_OXYGEN_WARN": "80"}):
+            self.assertAlmostEqual(RuntimeConfig.load().oxygen_warn, 80 / 15)
+        with patch.dict("os.environ", {"MC_OXYGEN_WARN": "6"}):
+            self.assertEqual(RuntimeConfig.load().oxygen_warn, 6)
 
     def test_failed_stop_retries_but_failed_escape_does_not_restop(self):
         original = self.c.stop

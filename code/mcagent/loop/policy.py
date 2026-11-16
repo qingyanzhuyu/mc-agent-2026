@@ -15,7 +15,7 @@ from typing import Any, Callable, Collection, Mapping, Optional
 
 from ..planner import skill_choice
 from ..planner.llm import LLMClient, LLMError
-from ..runtime import EnvBlocked, State, _inv_fingerprint
+from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills.items import best_pickaxe
 from .goals import (
@@ -91,7 +91,8 @@ def build_state_summary(state: State, *, goal_hint: str = "") -> str:
     pick = best_pickaxe(state) or "无"
     lines = [
         f"位置={st.get('pos')} 维度={st.get('dimension', 'overworld')} 昼夜={'白天' if st.get('is_day', True) else '夜晚'}({st.get('time_of_day')})",
-        f"血量={st.get('health', 20)} 饱食={st.get('food', 20)} 氧气={st.get('oxygen', 300)} 安全模式={state.in_safe_mode}",
+        f"血量={st.get('health', 20)} 饱食={st.get('food', 20)} "
+        f"氧气={st.get('oxygen', OXYGEN_FULL)} 安全模式={state.in_safe_mode}",
         f"最近敌对={ (st.get('nearest_hostile') or {}).get('name', '无') } 距离={ (st.get('nearest_hostile') or {}).get('dist', '-') }",
         f"物资：最优镐={pick} 原木={total_logs(state)} 木板={total_planks(state)} 木棍={state.count('stick')} "
         f"工作台={state.count('crafting_table')} 圆石={total_cobble(state)} 熔炉={state.count('furnace')} 石剑={state.count('stone_sword')}",

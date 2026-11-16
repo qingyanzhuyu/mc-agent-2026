@@ -21,6 +21,10 @@ import requests
 
 DEFAULT_BASE = "https://mc-api.windywindie.top/api/v1"
 
+# §3.1 / §4.11: 姿态请求与响应使用不同的字段名。
+_POSTURE_FIELDS = {"sneak": "sneaking", "shield": "blocking", "jump": "jumping"}
+_POSTURE_RESET = dict.fromkeys(_POSTURE_FIELDS, False)
+
 # ---------------------------------------------------------------- 错误码分类
 RETRY = "retry"    # 等一会重试同一动作
 REPLAN = "replan"  # 前置条件不成立，换计划
@@ -215,7 +219,7 @@ class Client:
         self.expires_at: Optional[float] = None
         self.bot_username: Optional[str] = None
         self._auth_lock = threading.RLock()
-        self._posture: dict[str, bool] = {"sneak": False, "shield": False}
+        self._posture = _POSTURE_RESET.copy()
         self._last_disconnect_mono: Optional[float] = None
         self.auto_wait_ready_on_relogin: bool = True
         self._load_cached_token()
@@ -429,7 +433,7 @@ class Client:
         self.token = payload["token"]
         self.expires_at = _parse_iso(payload.get("expires_at"))
         self.bot_username = payload.get("bot_username")
-        self._posture = {"sneak": False, "shield": False}
+        self._posture = _POSTURE_RESET.copy()
         self._save_cached_token(payload.get("expires_at"))
         self.log(f"[auth] 登录成功 bot={self.bot_username} token 到期={payload.get('expires_at')}")
 
@@ -504,15 +508,14 @@ class Client:
 
     # ---- 观察 ----------------------------------------------------------
     def status(self, timeout: float = 10) -> dict:
+        previous = self._posture
         res = self.call("status", method="GET", timeout=timeout)
         if isinstance(res, dict):
             if not res.get("alive", True):
-                self._posture = {"sneak": False, "shield": False}
-            else:
-                if "sneaking" in res:
-                    self._posture["sneak"] = bool(res.get("sneaking"))
-                if "blocking" in res:
-                    self._posture["shield"] = bool(res.get("blocking"))
+                self._posture = _POSTURE_RESET.copy()
+            elif self._posture is previous:
+                # 并发轮询的旧响应不能覆盖刚成功设置的姿态。
+                self._posture = self._posture_from(res, previous)
         return res
 
     def inventory(self, timeout: float = 10) -> dict:
@@ -624,22 +627,29 @@ class Client:
         slot_norm = {"chest": "torso", "offhand": "off-hand"}.get(slot, slot)
         return self.action("equip", {"item": item, "slot": slot_norm}, stop_on=stop_on)
 
-    def posture(self, sneak=None, shield=None) -> dict:
-        # 规范 §4.11：/posture 是全量覆盖，未写字段在服务端会复位为 false。
-        # 无参调用保持 `{}` 全量复位语义；单参调用则合并当前已知姿态，防潜行搭桥时误松键坠落。
-        if sneak is None and shield is None:
-            body: dict = {}
-            target_sneak, target_shield = False, False
-        else:
-            target_sneak = self._posture["sneak"] if sneak is None else bool(sneak)
-            target_shield = self._posture["shield"] if shield is None else bool(shield)
-            body = {"sneak": target_sneak, "shield": target_shield}
+    @staticmethod
+    def _posture_from(response: Any, fallback: dict[str, bool]) -> dict[str, bool]:
+        if not isinstance(response, dict):
+            return fallback
+        return {
+            key: bool(response.get(field, fallback[key]))
+            for key, field in _POSTURE_FIELDS.items()
+        }
+
+    def posture(self, sneak=None, shield=None, *, jump=None) -> dict:
+        # §4.11：服务端全量覆盖。无参发 {} 复位，部分修改合并缓存中的姿态。
+        updates = {"sneak": sneak, "shield": shield, "jump": jump}
+        specified = {key: bool(value) for key, value in updates.items() if value is not None}
+        target = _POSTURE_RESET.copy()
+        body: dict = {}
+        if specified:
+            target = {**self._posture, **specified}
+            body = target.copy()
+            # 未使用 jump 时延续旧版网关的请求结构；服务端缺省即 false。
+            if jump is None and not target["jump"]:
+                del body["jump"]
         res = self.call("posture", body, timeout=10)
-        if isinstance(res, dict):
-            self._posture["sneak"] = bool(res.get("sneaking", target_sneak))
-            self._posture["shield"] = bool(res.get("blocking", target_shield))
-        else:
-            self._posture = {"sneak": target_sneak, "shield": target_shield}
+        self._posture = self._posture_from(res, target)
         return res
 
     def dismount(self, *, stop_on=None) -> dict:
@@ -663,7 +673,7 @@ class Client:
 
     def disconnect(self) -> dict:
         res = self.call("disconnect", {}, timeout=20)
-        self._posture = {"sneak": False, "shield": False}
+        self._posture = _POSTURE_RESET.copy()
         self._last_disconnect_mono = time.monotonic()
         return res
 
