@@ -20,6 +20,7 @@ from .mining import (
 )
 from .recipes import craft_recipe
 from .registry import register
+from .sightline import API_DIG_EYE_REACH, DIG_EYE_REACH, can_reach_block, eye_to_block_dist
 from .windows import window_amount, window_section
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ BASE_FUELS = (("coal", 16), ("charcoal", 16)) + tuple(
     (f"{w}_{suffix}", 3) for suffix in ("planks", "log") for w in WOODS
 )
 RADIUS = 32
-MINING_REACH = 4
+MINING_REACH = DIG_EYE_REACH
 PROSPECT_STEPS = 6
 SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
@@ -145,15 +146,17 @@ class SmeltIron(Skill):
         status = state.refresh_status(ex.client, max_age_s=0)
         dimension = status.get("dimension")
         cur = status.get("pos") or state.pos
-        if math.dist(cur, pos) > MINING_REACH:
+        stance = status if status.get("pos") is not None else cur
+        if not can_reach_block(ex, stance, pos, reach=MINING_REACH):
             yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
         status = state.refresh_status(ex.client, max_age_s=0)
         cur = status.get("pos") or state.pos
+        stance = status if status.get("pos") is not None else cur
         if status.get("dimension") != dimension:
             raise Replan("移动到矿点期间维度变化，重新观察后再挖")
         if under_feet(cur, pos):
             raise Replan(f"观察到 {drop} 矿 {pos} 已在脚下，停止挖掘以保留支撑")
-        if math.dist(cur, pos) > MINING_REACH:
+        if not can_reach_block(ex, stance, pos, reach=API_DIG_EYE_REACH):
             raise _OreRouteUnconfirmed(f"移动后未确认到达矿点 {pos} 的挖掘范围")
         block_type = bare(ex.client.get_block(pos).get("name"))
         if block_type not in ores:
@@ -161,9 +164,11 @@ class SmeltIron(Skill):
         yield from prepare_mining_pick(ex, state)
         status = state.refresh_status(ex.client, max_age_s=0)
         cur = status.get("pos") or state.pos
+        stance = status if status.get("pos") is not None else cur
         if under_feet(cur, pos):
             raise Replan(f"装备后重新观察 {pos} 已在脚下，停止挖掘以保留支撑")
-        if (status.get("dimension") != dimension or math.dist(cur, pos) > MINING_REACH
+        if (status.get("dimension") != dimension
+                or not can_reach_block(ex, stance, pos, reach=API_DIG_EYE_REACH)
                 or bare(ex.client.get_block(pos).get("name")) != block_type):
             raise Replan(f"装备后矿点 {pos} 或站位已变化，重新观察后再挖")
         expected_drop = "raw_iron_block" if block_type == "raw_iron_block" else drop
@@ -182,17 +187,19 @@ class SmeltIron(Skill):
         in_reach_only: bool = False,
         max_dy: Optional[float] = None,
     ) -> list:
-        search_radius = MINING_REACH if in_reach_only else radius
+        search_radius = math.ceil(API_DIG_EYE_REACH) if in_reach_only else radius
         limit = 16 if in_reach_only else 64
         blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=search_radius, limit=limit).get("blocks") or []
-        cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+        status = state.refresh_status(ex.client, max_age_s=0)
+        cur = status.get("pos") or state.pos
+        stance = status if status.get("pos") is not None else cur
         cands = [
             b["pos"] for b in blocks
             if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
             and tuple(b["pos"]) not in excluded
-            and (not in_reach_only or math.dist(cur, b["pos"]) <= MINING_REACH)
             and (max_dy is None or abs(b["pos"][1] - cur[1]) <= max_dy)
             and not under_feet(cur, b["pos"])
+            and (not in_reach_only or can_reach_block(ex, stance, b["pos"], reach=MINING_REACH))
         ]
         if not in_reach_only and len(cands) > 1:
             # 稳定排序：优先高差 ≤12 格的地表崖壁/浅洞露矿，同档内保留原扫描近远顺序。
@@ -333,7 +340,12 @@ class SmeltIron(Skill):
                     "path_not_found", "unreachable", "move_timeout", "stalled", "arrival_unconfirmed",
                 )
                 if not dig_skip and (
-                    (in_reach_only and math.dist(state.pos, pos) <= MINING_REACH) or not route_skip
+                    (
+                        in_reach_only
+                        and eye_to_block_dist(state.st, pos) <= MINING_REACH
+                        and can_reach_block(ex, state.st, pos, reach=MINING_REACH)
+                    )
+                    or not route_skip
                 ):
                     raise
                 excluded.add(tuple(pos))
@@ -358,7 +370,9 @@ class SmeltIron(Skill):
         if _fuel_batches(state.count, fuels, count)[1]:
             log_types = [f"{w}_log" for w in WOODS]
             logs = ex.client.find_blocks(types=log_types, radius=24, limit=8).get("blocks") or []
-            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            status = state.refresh_status(ex.client, max_age_s=0)
+            cur = status.get("pos") or state.pos
+            stance = status if status.get("pos") is not None else cur
             for b in logs:
                 lpos = b.get("pos")
                 if not (isinstance(lpos, list) and len(lpos) == 3) or under_feet(cur, lpos):
@@ -366,10 +380,13 @@ class SmeltIron(Skill):
                 if abs(lpos[1] - cur[1]) > 6.0:
                     continue
                 try:
-                    if math.dist(cur, lpos) > MINING_REACH:
+                    if not can_reach_block(ex, stance, lpos, reach=MINING_REACH):
                         yield rec("move_to", ex.move_to(pos=lpos, rng=3), pos=lpos)
-                    cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
-                    if (under_feet(cur, lpos) or math.dist(cur, lpos) > MINING_REACH
+                    status = state.refresh_status(ex.client, max_age_s=0)
+                    cur = status.get("pos") or state.pos
+                    stance = status if status.get("pos") is not None else cur
+                    if (under_feet(cur, lpos)
+                            or not can_reach_block(ex, stance, lpos, reach=API_DIG_EYE_REACH)
                             or bare(ex.client.get_block(lpos).get("name")) not in log_types):
                         continue
                     before_logs = sum(state.count(x) for x in log_types)
@@ -382,6 +399,9 @@ class SmeltIron(Skill):
                             yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 1)
                         break
                 except Replan as err:
+                    status = state.refresh_status(ex.client, max_age_s=0)
+                    cur = status.get("pos") or state.pos
+                    stance = status if status.get("pos") is not None else cur
                     code, _ = failure(err)
                     if code in (
                         "path_not_found", "unreachable", "move_timeout", "stalled",
