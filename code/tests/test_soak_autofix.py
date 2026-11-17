@@ -886,9 +886,9 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
 
         soak_ctl.teardown_session(self.session)
 
-    def test_fixer_presets_codex_61sol_xhigh_and_agy_hydrogen_high(self):
+    def test_fixer_presets_codex_62sol_xhigh_and_agy_hydrogen_high(self):
         codex_tmpl = soak_ctl.FIXER_PRESETS["codex"]
-        self.assertIn("-m gpt-6.1-sol", codex_tmpl)
+        self.assertIn("-m gpt-6.2-sol", codex_tmpl)
         self.assertIn('model_reasoning_effort="xhigh"', codex_tmpl)
 
         agy_tmpl = soak_ctl.FIXER_PRESETS["agy"]
@@ -1130,7 +1130,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
     def test_fixer_model_catalog_hot_switch_and_per_machine_fixer_user(self):
         cat = soak_ctl.FIXER_PRESETS
         for eff in ("low", "medium", "high", "xhigh", "max"):
-            for model in ("gpt-6.1-sol", "gpt-6-astra"):
+            for model in ("gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra"):
                 tmpl = cat[f"codex:{model}:{eff}"]
                 self.assertIn(f"-m {model} ", tmpl)
                 self.assertIn(f'model_reasoning_effort="{eff}"', tmpl)
@@ -1139,7 +1139,7 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         for eff in ("low", "medium", "high"):
             self.assertIn(f"--model gemini-4-carbon-{eff} --effort {eff} ", cat[f"agy:gemini-4-carbon-{eff}"])
         self.assertNotIn("agy:gemini-4-carbon-xhigh", cat)
-        self.assertEqual(cat["codex"], cat["codex:gpt-6.1-sol:xhigh"])
+        self.assertEqual(cat["codex"], cat["codex:gpt-6.2-sol:xhigh"])
         self.assertEqual(cat["agy"], cat["agy:gemini-4-hydrogen-high"])
         self.assertEqual(set(cat), set(soak_ctl.FIXER_PRESET_LABELS))
         for tmpl in cat.values():  # 模板只留 {fixer_wt} {prompt_file} 两个占位

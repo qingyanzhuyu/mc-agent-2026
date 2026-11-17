@@ -94,13 +94,14 @@ python3 tools/soak-autofix/dashboard.py --port 8791 --session-dir code/mcagent/l
 
 | 写法 | 含义 |
 |---|---|
+| `codex:gpt-6.2-sol:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6.2-sol -c model_reasoning_effort=...` |
 | `codex:gpt-6.1-sol:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6.1-sol -c model_reasoning_effort=...` |
 | `codex:gpt-6-astra:{low,medium,high,xhigh,max}` | `codex exec -m gpt-6-astra ...` |
 | `agy:gemini-4-hydrogen-{low,medium,high,xhigh}` | `agy --model gemini-4-hydrogen-<档> --effort <档>` |
 | `agy:gemini-4-carbon-{low,medium,high}` | `agy --model gemini-4-carbon-<档> --effort <档>`（carbon 没有 xhigh） |
-| `codex` / `agy` / `claude` | 旧简写：6.1-sol xhigh / hydrogen high / `claude -p` |
+| `codex` / `agy` / `claude` | 简写：6.2-sol xhigh / hydrogen high / `claude -p` |
 
-模型 id 与档位来自 2026-11-14 本机 `agy models` 与 `~/.codex/models_cache.json`；codex 的 `ultra` 档会自动派子代理，无人值守修单不收。
+模型 id 与档位来自本机 `agy models` 与 `~/.codex/models_cache.json`；codex 的 `ultra` 档会自动派子代理，无人值守修单不收。
 
 ```bash
 python3 tools/soak-autofix/soak_ctl.py set-goal --session-dir code/mcagent/logs/soak-cont --fixer-preset codex:gpt-6-astra:high
@@ -111,14 +112,14 @@ python3 tools/soak-autofix/soak_ctl.py set-goal --session-dir code/mcagent/logs/
 内置模型分工（默认）：
 - **工位 A（进游戏玩的玩家 `--player-model`）**：默认 `DeepSeek-V4.1-Flash`（自动注入子进程 `LLM_CUSTOM_MODEL`，无需改 `.env`；也可传 `--player-model DeepSeek-V4-Pro-0813` 或 `Qwen3.6-Flash`）
 - **工位 B（改代码的修单入口 `--fixer-preset`）**：
-  - `codex`（默认）：`gpt-6.1-sol` + `model_reasoning_effort="xhigh"`
+  - `codex`（默认）：`gpt-6.2-sol` + `model_reasoning_effort="xhigh"`
   - `agy`：Antigravity CLI（`gemini-4-hydrogen-high` + `--effort high`）
   - `claude`：Claude Code CLI
 
 确保本地联调网关 `tools/local-api-bridge` 已启动后执行：
 
 ```bash
-# 启动 5 轮连续挂机 + Codex (gpt-6.1-sol xhigh) 自动修单（默认预设即 codex）
+# 启动 5 轮连续挂机 + Codex (gpt-6.2-sol xhigh) 自动修单（默认预设即 codex）
 python3 tools/soak-autofix/soak_ctl.py run \
   --session-dir code/mcagent/logs/soak-night-01 \
   --branch feat/soak-autofix \
