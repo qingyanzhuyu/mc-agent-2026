@@ -66,8 +66,8 @@ SECRET_SCAN_RE = re.compile(
     r"(sk-[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._\-]{16,}|MC_PASS\s*=\s*\S+|LLM_API_KEY\s*=\s*\S+)"
 )
 
-# 工位 B 修单模型目录（2026-11-14 本机实测：`agy models` 与 ~/.codex/models_cache.json）
-# - codex：gpt-6.1-sol / gpt-6-astra 都支持 low/medium/high/xhigh/max（另有 ultra 会自动派子代理，无人值守修单不收）
+# 工位 B 修单模型目录（~/.codex/models_cache.json 与 `agy models`）
+# - codex：gpt-6.2-sol / gpt-6.1-sol / gpt-6.1-terra / gpt-6-astra 都支持 low/medium/high/xhigh/max（另有 ultra 会自动派子代理，无人值守修单不收）
 # - agy：hydrogen 有 low/medium/high/xhigh 四档，carbon 有 low/medium/high 三档；档位写在模型名里，--effort 同步传
 _CODEX_FIXER_TMPL = (
     "codex exec -C {{fixer_wt}} -s workspace-write "
@@ -79,6 +79,7 @@ _AGY_FIXER_TMPL = (
     "--dangerously-skip-permissions --disable-slash-commands -p=\"$(cat {{prompt_file}})\""
 )
 CODEX_FIXER_MODELS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "gpt-6.2-sol": ("GPT-6.2-Sol", "codex", ("low", "medium", "high", "xhigh", "max")),
     "gpt-6.1-sol": ("GPT-6.1-Sol", "codex", ("low", "medium", "high", "xhigh", "max")),
     "gpt-6.1-terra": ("GPT-6.1-Terra", "codex", ("low", "medium", "high", "xhigh", "max")),
     "gpt-6-astra": ("GPT-6-Astra", "codex", ("low", "medium", "high", "xhigh", "max")),
@@ -104,9 +105,9 @@ def _build_fixer_catalog() -> tuple[dict[str, str], dict[str, str]]:
             key = f"agy:{model}-{eff}"
             presets[key] = _AGY_FIXER_TMPL.format(model=model, effort=eff)
             labels[key] = f"agy · {title} · {eff}"
-    # 兼容旧名字：codex = 6.1-sol xhigh，agy = hydrogen high
-    presets["codex"] = presets["codex:gpt-6.1-sol:xhigh"]
-    labels["codex"] = "codex（= Codex · GPT-6.1-Sol · xhigh）"
+    # 兼容简写：codex = 6.2-sol xhigh，agy = hydrogen high
+    presets["codex"] = presets["codex:gpt-6.2-sol:xhigh"]
+    labels["codex"] = "codex（= Codex · GPT-6.2-Sol · xhigh）"
     presets["agy"] = presets["agy:gemini-4-hydrogen-high"]
     labels["agy"] = "agy（= agy · Gemini 4 Hydrogen · high）"
     presets["claude"] = 'cd {fixer_wt} && claude -p --allowedTools "Read,Edit,Write,Grep,Glob,Bash" < {prompt_file}'
@@ -2762,7 +2763,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fixer-preset",
         choices=tuple(FIXER_PRESETS),
         default="codex",
-        help="工位 B 修单入口预设：codex（默认 gpt-6.1-sol xhigh）| agy（gemini-4-hydrogen-high）| claude",
+        help="工位 B 修单入口预设：codex（默认 gpt-6.2-sol xhigh）| agy（gemini-4-hydrogen-high）| claude",
     )
     p_dual.add_argument(
         "--server",

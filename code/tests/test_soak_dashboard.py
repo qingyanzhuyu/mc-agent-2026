@@ -168,8 +168,8 @@ class DashboardTests(unittest.TestCase):
         snap = self.console.snapshot()
         self.assertEqual(snap["state"]["fixer_preset"], "agy:gemini-4-hydrogen-xhigh")
         groups = {c["group"] for c in snap["fixer_catalog"]}
-        self.assertTrue({"Codex · GPT-6.1-Sol", "Codex · GPT-6-Astra", "agy · Gemini 4 Hydrogen",
-                         "agy · Gemini 4 Carbon"} <= groups)
+        self.assertTrue({"Codex · GPT-6.2-Sol", "Codex · GPT-6.1-Sol", "Codex · GPT-6-Astra",
+                         "agy · Gemini 4 Hydrogen", "agy · Gemini 4 Carbon"} <= groups)
         carbon = [c["key"] for c in snap["fixer_catalog"] if c["group"] == "agy · Gemini 4 Carbon"]
         self.assertEqual(carbon, ["agy:gemini-4-carbon-low", "agy:gemini-4-carbon-medium", "agy:gemini-4-carbon-high"])
         self.assertIn("DeepSeek-V4.1-Flash", [m["name"] for m in snap["player_models"]])
