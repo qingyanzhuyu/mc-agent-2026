@@ -150,7 +150,8 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         <label class="f wide">多个目标时<select id="modeSel"></select></label>
         <label class="f">工位 A 玩家模型<input id="modelIn" list="playerModels" placeholder="空 = 沿用 .env"></label>
         <label class="f">单目标最大尝试<input type="number" id="attemptsIn" min="1" max="20"></label>
-        <label class="f wide">工位 B 修单模型（下一单起生效）<select id="fixerSel"></select></label>
+        <label class="f">工位 B 修单模型（下一单起生效）<select id="fixerSel"></select></label>
+        <label class="f">工位 B 并发数<input type="number" id="workersIn" min="1" max="6"></label>
         <label class="f wide">技能验证门槛（下一轮起）<select id="minVerSel"></select></label>
       </div>
       <div class="row" style="margin-top:10px">
@@ -184,7 +185,8 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
           <div class="goalpick" id="sGoal" data-mode="sMode"></div>
           <span class="gpnote" id="sGoalNote"></span></div>
         <label class="f wide">多个目标时<select id="sMode"></select></label>
-        <label class="f wide">工位 B 修单模型<select id="sFixer"></select></label>
+        <label class="f">工位 B 修单模型<select id="sFixer"></select></label>
+        <label class="f">工位 B 并发数<input type="number" id="sWorkers" min="1" max="6"></label>
         <label class="f">工位 A 玩家模型<input id="sModel" list="playerModels"></label>
         <label class="f">单目标最大尝试<input type="number" id="sAttempts" min="1" max="20"></label>
         <label class="f wide">技能验证门槛（--min-verified）<select id="sMinVer"></select></label>
@@ -436,12 +438,14 @@ function fillForms(s) {
   const b = s.bounds, st = s.state, d = s.start_defaults;
   for (const el of [$("secRange"), $("secIn"), $("sSec")]) { el.min = b.seconds[0]; el.max = b.seconds[1]; }
   for (const el of [$("stepsIn"), $("sSteps")]) { el.min = b.steps[0]; el.max = b.steps[1]; }
+  if (b.fixer_workers) for (const el of [$("workersIn"), $("sWorkers")]) { el.min = b.fixer_workers[0]; el.max = b.fixer_workers[1]; }
   const sec = st.episode_seconds ?? d.episode_seconds;
   const steps = st.episode_steps ?? d.episode_steps;
   $("secRange").value = sec; $("secIn").value = sec; $("secOut").textContent = fmtS(Number(sec));
   $("stepsIn").value = steps;
   $("modelIn").value = s.session_exists ? (st.player_model ?? "") : d.player_model;
   $("attemptsIn").value = st.max_goal_attempts ?? d.max_goal_attempts;
+  $("workersIn").value = st.fixer_workers ?? d.fixer_workers ?? 3;
   selectOptions($("modeSel"), s.focus_modes, s.session_exists ? st.focus_mode : d.focus_mode, "together");
   selectOptions($("sMode"), s.focus_modes, d.focus_mode, "together");
   selectOptions($("minVerSel"), s.min_verified_choices || [], s.session_exists ? (st.min_verified || "") : (d.min_verified || ""), "");
@@ -454,6 +458,7 @@ function fillForms(s) {
 
   $("sBranch").value = d.branch; $("sEpisodes").value = d.episodes;
   fixerOptions($("sFixer"), s.fixer_catalog, d.fixer_preset);
+  $("sWorkers").value = d.fixer_workers ?? 3;
   $("sSec").value = d.episode_seconds; $("sSteps").value = d.episode_steps;
   goalPicker($("sGoal"), s.ledger, d.goal);
   $("sModel").value = d.player_model; $("sAttempts").value = d.max_goal_attempts;
@@ -520,7 +525,8 @@ function startParams() {
     episode_seconds: Number($("sSec").value), episode_steps: Number($("sSteps").value),
     goal: pickedGoals($("sGoal")), focus_mode: $("sMode").value, max_goal_attempts: Number($("sAttempts").value),
     llm: $("sLlm").checked, player_model: $("sModel").value.trim(),
-    fixer_preset: $("sFixer").value, skip_live_canary: $("sSkipCanary").checked,
+    fixer_preset: $("sFixer").value, fixer_workers: Number($("sWorkers").value),
+    skip_live_canary: $("sSkipCanary").checked,
     bot_user: $("sBot").value.trim(), rotate_user: $("sRotate").checked,
     server: $("sServer").value, account_reserved: $("sAck").checked,
     official_llm: $("sOfficialLlm").value,
@@ -601,7 +607,8 @@ function renderSettingsNote(s) {
       : `${selectedGoals.join("、")}（${modeStr}）`;
   }
   const mvTxt = st.min_verified ? `；验证门槛：${st.min_verified}` : "";
-  $("effNote").textContent = `${ov}；聚焦目标：${focusTxt}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${mvTxt}${cur}`;
+  const wTxt = st.fixer_workers ? `（${st.fixer_workers} 路并发）` : "";
+  $("effNote").textContent = `${ov}；聚焦目标：${focusTxt}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${wTxt}${mvTxt}${cur}`;
 
   const sb = $("syncBanner"), bm = $("btnFillMain");
   if (s.session_exists && s.main_ahead_commits > 0) {
@@ -857,6 +864,7 @@ $("btnApply").onclick = async () => {
     target_goal: pickedGoals($("goalSel")), focus_mode: $("modeSel").value,
     player_model: $("modelIn").value, max_goal_attempts: $("attemptsIn").value,
     fixer_preset: $("fixerSel").value,
+    fixer_workers: $("workersIn").value,
     min_verified: $("minVerSel").value,
   };
   try { await api("/api/settings", body); toast("已写入，下一轮开跑时生效"); refresh(); }

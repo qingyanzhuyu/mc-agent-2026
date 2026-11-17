@@ -671,6 +671,7 @@ class Console:
             "llm": True,
             "player_model": soak_ctl.DEFAULT_PLAYER_MODEL,
             "fixer_preset": "codex",
+            "fixer_workers": 3,
             "skip_live_canary": False,
             "bot_user": soak_ctl.DEFAULT_BOT_USER,
             "rotate_user": False,
@@ -830,6 +831,7 @@ class Console:
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
+                "fixer_workers": soak_ctl._extract_fixer_workers(st, 1),
                 "focus_mode": st.get("focus_mode", "together"),
                 "server_target": st.get("server_target", "local"),
                 "server_base": st.get("server_base", ""),
@@ -919,6 +921,7 @@ class Console:
             "bounds": {
                 "seconds": list(soak_ctl.EPISODE_SECONDS_BOUNDS),
                 "steps": list(soak_ctl.EPISODE_STEPS_BOUNDS),
+                "fixer_workers": list(soak_ctl.FIXER_WORKERS_BOUNDS),
             },
             "job": job,
         }
@@ -1062,6 +1065,8 @@ class Console:
             if fx not in soak_ctl.FIXER_PRESETS:
                 raise ValueError(f"未知修单模型 {fx!r}")
             changes["fixer_preset"] = fx
+        if payload.get("fixer_workers") not in (None, ""):
+            changes["fixer_workers"] = soak_ctl._validate_fixer_workers(payload["fixer_workers"])
         if payload.get("max_goal_attempts") not in (None, ""):
             n = int(payload["max_goal_attempts"])
             if not 1 <= n <= 20:
@@ -1093,6 +1098,7 @@ class Console:
                 "target_goal": st.get("target_goal", ""),
                 "player_model": st.get("player_model", ""),
                 "fixer_preset": st.get("fixer_preset", ""),
+                "fixer_workers": soak_ctl._extract_fixer_workers(st, 1),
                 "focus_mode": st.get("focus_mode", "together"),
                 "min_verified": st.get("min_verified", ""),
                 "max_goal_attempts": st.get("max_goal_attempts", 4),
@@ -1130,6 +1136,7 @@ class Console:
             raise ValueError("最大尝试轮数需在 1–20")
         if p["fixer_preset"] not in soak_ctl.FIXER_PRESETS:
             raise ValueError(f"未知修单预设 {p['fixer_preset']!r}")
+        p["fixer_workers"] = soak_ctl._validate_fixer_workers(p["fixer_workers"])
         p["goal"] = self._validate_goals(p["goal"], p["branch"])
         p["focus_mode"] = str(p["focus_mode"] or "together")
         if p["focus_mode"] not in soak_ctl.FOCUS_MODES:
@@ -1173,6 +1180,7 @@ class Console:
             "--max-goal-attempts", str(p["max_goal_attempts"]),
             "--player-model", p["player_model"],
             "--fixer-preset", p["fixer_preset"],
+            "--fixer-workers", str(p["fixer_workers"]),
             "--bot-user", p["bot_user"],
             "--llm" if p["llm"] else "--no-llm",
         ]
