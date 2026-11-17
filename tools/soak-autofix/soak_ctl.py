@@ -751,6 +751,7 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
     skills_ok = 0
     skills_env_blocked = 0
     skills_budget_stopped = 0
+    steps_count = 0
     tl_sum_prompt = 0
     tl_sum_comp = 0
     tl_cum_prompt = 0
@@ -779,10 +780,13 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
                     elapsed_s = max(elapsed_s, float(ev.get("elapsed_s", 0.0) or 0.0))
                 ev_type = ev.get("event")
                 if ev_type == "run_start":
+                    steps_count = 0
                     if ev.get("source"):
                         source = str(ev["source"])
                     if ev.get("target_goal"):
                         target_goal = str(ev["target_goal"])
+                elif ev_type == "step":
+                    steps_count += 1
                 elif ev_type == "death_recovered":
                     deaths_recovered_count += 1
                 elif ev_type == "goal_reached" and ev.get("goal_id"):
@@ -854,6 +858,7 @@ def _summarize_episode_dir(ep_dir: Path) -> dict[str, Any]:
         "skills_completed": skills_ok,
         "skills_env_blocked": skills_env_blocked,
         "skills_budget_stopped": skills_budget_stopped,
+        "steps": steps_count,
         "elapsed_s": elapsed_s,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -957,6 +962,9 @@ def ingest_episode_and_check_rollback(
     ep_dir: Path,
     commit_sha: str,
     bot_user: str,
+    *,
+    configured_target_goal: Optional[str] = None,
+    skipped_goals: Sequence[str] = (),
 ) -> dict[str, Any]:
     summary = _summarize_episode_dir(ep_dir)
     parsed_incidents = summary.pop("parsed_incidents")
@@ -1101,8 +1109,11 @@ def ingest_episode_and_check_rollback(
             "run_dir": str(ep_dir.resolve()),
             "rolled_back": rolled_back_sha,
             "revert_reason": revert_reason if rolled_back_sha else None,
+            "skipped_goals": [str(g) for g in skipped_goals if str(g).strip()],
             **summary,
         }
+        if configured_target_goal is not None:
+            ep_meta["configured_target_goal"] = configured_target_goal
         st["episodes"].append(ep_meta)
         st["current_tip"] = _branch_tip(repo_root, branch)
         episodes_snap = list(st["episodes"])
@@ -1632,6 +1643,8 @@ def run_runner_loop(
                     else:
                         st_init.pop("min_verified", None)
     idx = 0
+    zero_step_streak = 0
+    last_zero_sig: Optional[tuple[str, str, str, tuple[str, ...]]] = None
     while episodes <= 0 or idx < episodes:
         if (session_dir / "STOP").exists():
             print("[runner] 检测到 STOP 标志文件，安全退出挂机循环。")
@@ -1729,13 +1742,48 @@ def run_runner_loop(
             env=run_env,
             check=False,
         )
-        meta = ingest_episode_and_check_rollback(session_dir, ep_id, ep_dir, tip_sha, bot_user)
+        meta = ingest_episode_and_check_rollback(
+            session_dir,
+            ep_id,
+            ep_dir,
+            tip_sha,
+            bot_user,
+            configured_target_goal=focus,
+            skipped_goals=skipped,
+        )
         results.append(meta)
         print(
             f"[runner] 完成 {ep_id}: skills_ok={meta['skills_completed']} bugs={meta['bugs_count']} "
             f"score={meta['server_score']}/{meta['inferred_score']} "
             f"tokens={meta['prompt_tokens']}/{meta['completion_tokens']} rolled_back={meta['rolled_back']}"
         )
+        zero_sig = (focus, focus_mode, tip_sha, tuple(skipped))
+        is_zero_step_win = (
+            episodes <= 0
+            and not rotate_user
+            and bool(active_goal)
+            and meta.get("stop_reason") == "goal_reached"
+            and int(meta.get("steps", 0) or 0) == 0
+            and int(meta.get("skills_completed", 0) or 0) == 0
+            and not meta.get("rolled_back")
+        )
+        if is_zero_step_win and last_zero_sig == zero_sig:
+            zero_step_streak += 1
+        elif is_zero_step_win:
+            zero_step_streak = 1
+            last_zero_sig = zero_sig
+        else:
+            zero_step_streak = 0
+            last_zero_sig = None
+
+        if zero_step_streak >= 2:
+            skip_msg = f"（另有 {len(skipped)} 个目标已升级人工跳过：{', '.join(skipped)}）" if skipped else ""
+            print(
+                f"[runner] 连续 {zero_step_streak} 轮在 0 步即触发 goal_reached（未开启 --rotate-user 且当前活跃目标"
+                f" {active_goal} 均已在持久角色上达成{skip_msg}），自动写入 STOP 防止空转。"
+            )
+            (session_dir / "STOP").write_text(_utc_now(), encoding="utf-8")
+            break
     return results
 
 
@@ -2365,6 +2413,64 @@ def inject_and_set_goal(
         }
 
 
+def reset_escalated_goals(
+    session_dir: Path,
+    *,
+    goals: Optional[Sequence[str]] = None,
+    include_non_goal: bool = False,
+    clear_stop: bool = False,
+) -> dict[str, Any]:
+    """将已升级人工（escalated_human）的异常单重置为 pending（attempts 清零，保留门禁审计历史）。
+
+    默认仅重置 GOAL_MISS 类目标单，避免误把因缺少技能名而无法跑通的 session 级单重新塞回队列。
+    """
+    session_dir = session_dir.resolve()
+    target_set = set(split_goal_ids(goals)) if goals else set()
+    now_str = _utc_now()
+    reset_fps: list[str] = []
+    reset_goals: list[str] = []
+
+    with locked_state(session_dir) as st:
+        if not st:
+            raise ValueError("会话还没初始化：找不到有效的 state.json")
+        incidents = st.get("incidents") or {}
+        for fp, rec in incidents.items():
+            if not isinstance(rec, dict) or rec.get("status") != "escalated_human":
+                continue
+            is_goal_miss = rec.get("code") == "GOAL_MISS" or str(fp).startswith("GOAL_MISS:")
+            gid = str(rec.get("goal_id") or (str(fp).removeprefix("GOAL_MISS:") if str(fp).startswith("GOAL_MISS:") else "")).strip()
+            if target_set:
+                if not is_goal_miss or gid not in target_set:
+                    continue
+            elif not include_non_goal and not is_goal_miss:
+                continue
+
+            rec.setdefault("reset_history", []).append({
+                "at": now_str,
+                "previous_status": "escalated_human",
+                "previous_attempts": int(rec.get("attempts", 0) or 0),
+            })
+            rec["status"] = "pending"
+            rec["attempts"] = 0
+            rec["fix_commit"] = None
+            for k in ("active_attempt_dir", "worker_wt", "claimed_at", "claimed_by"):
+                rec.pop(k, None)
+            reset_fps.append(str(fp))
+            if gid and gid not in reset_goals:
+                reset_goals.append(gid)
+
+    if clear_stop:
+        (session_dir / "STOP").unlink(missing_ok=True)
+    write_review_report(session_dir)
+    return {
+        "ok": True,
+        "reset_count": len(reset_fps),
+        "reset_fingerprints": reset_fps,
+        "reset_goals": reset_goals,
+        "cleared_stop": bool(clear_stop),
+    }
+
+
 def write_review_report(session_dir: Path) -> Path:
     st = read_state(session_dir)
     branch = st["target_branch"]
@@ -2446,7 +2552,7 @@ def write_review_report(session_dir: Path) -> Path:
         for fp, r in sorted(st["incidents"].items()):
             fix_s = f"`{r['fix_commit'][:7]}`" if r.get("fix_commit") else "-"
             lines.append(
-                f"| `{fp}` | `{r['severity']}/{r['category']}` | `{r['status']}` | {r['attempts']} | {fix_s} |"
+                f"| `{fp}` | `{r.get('severity', '-')}/{r.get('category', '-')}` | `{r.get('status', '-')}` | {r.get('attempts', 0)} | {fix_s} |"
             )
 
     lines.extend(["", "## 四、各轮挂机指标曲线汇总", ""])
@@ -2494,9 +2600,9 @@ def write_review_report(session_dir: Path) -> Path:
             tok_s = f"`{p_tok:,} / {c_tok:,}`"
             val_s = format_episode_value(p_tok, c_tok, el_s)
             lines.append(
-                f"| `{e['ep_id']}` | `{e['commit'][:7]}` | `{e['bot_user']}` | "
-                f"{e['skills_completed']} | {e['bugs_count']} | "
-                f"{e['server_score']} / {e['inferred_score']} | {goal_s} | {tok_s} | {val_s} | {rb} |"
+                f"| `{e.get('ep_id', '-')}` | `{(e.get('commit') or '')[:7]}` | `{e.get('bot_user', '-')}` | "
+                f"{e.get('skills_completed', 0)} | {e.get('bugs_count', 0)} | "
+                f"{e.get('server_score', 0)} / {e.get('inferred_score', 0)} | {goal_s} | {tok_s} | {val_s} | {rb} |"
             )
 
     telemetry_rows: list[tuple[str, str, dict[str, Any]]] = []
@@ -2751,6 +2857,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_set.add_argument("--skip-offline-gate", action="store_true", help="仅测试夹具用：跳过合入后的离线编译与单测")
 
+    p_rst = sub.add_parser("reset-goals", help="将已升级人工（escalated_human）的目标单重置回 pending 以恢复追目标与修单")
+    p_rst.add_argument("--session-dir", required=True)
+    p_rst.add_argument("--goal", default="", help="可选：只重置指定的 goal_id，多个用逗号分隔（空=重置全部 GOAL_MISS 升级单）")
+    p_rst.add_argument("--all", action="store_true", help="一并重置非 GOAL_MISS 的 escalated_human 异常单（如 session 级单）")
+    p_rst.add_argument("--clear-stop", action="store_true", help="重置后同时删除会话 STOP 标志文件")
+
     p_st = sub.add_parser("status", help="查看当前待修队列与待审分支进度")
     p_st.add_argument("--session-dir", required=True)
 
@@ -3002,6 +3114,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             fixer_workers=args.fixer_workers,
             focus_mode=args.focus_mode,
             skip_offline_gate=args.skip_offline_gate,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 1
+
+    if args.cmd == "reset-goals":
+        res = reset_escalated_goals(
+            session_dir,
+            goals=split_goal_ids(args.goal) if args.goal else None,
+            include_non_goal=bool(args.all),
+            clear_stop=bool(args.clear_stop),
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0 if res.get("ok") else 1

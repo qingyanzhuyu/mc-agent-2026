@@ -776,6 +776,40 @@ class Console:
         tot_out = sum(int(e.get("completion_tokens", 0) or 0) for e in episodes)
         tot_elapsed = sum(float(e.get("elapsed_s", 0.0) or 0.0) for e in episodes)
 
+        incidents_map = st.get("incidents") or {}
+        selected_goals = soak_ctl.split_goal_ids(st.get("target_goal", ""))
+        escalated_set = {
+            gid for gid in selected_goals
+            if isinstance(incidents_map.get(f"GOAL_MISS:{gid}"), dict)
+            and incidents_map[f"GOAL_MISS:{gid}"].get("status") == "escalated_human"
+        }
+        focus_mode_val = st.get("focus_mode") if st.get("focus_mode") in soak_ctl.FOCUS_MODES else "together"
+        next_round_str, skipped_list = soak_ctl.pick_round_goals(
+            selected_goals, focus_mode_val, len(episodes), escalated_set
+        )
+        goal_statuses: dict[str, dict[str, Any]] = {}
+        for fp, rec in incidents_map.items():
+            if not isinstance(rec, dict):
+                continue
+            is_gm = rec.get("code") == "GOAL_MISS" or str(fp).startswith("GOAL_MISS:")
+            if not is_gm:
+                continue
+            gid = str(rec.get("goal_id") or str(fp).removeprefix("GOAL_MISS:")).strip()
+            if not gid:
+                continue
+            goal_statuses[gid] = {
+                "status": rec.get("status") or "",
+                "attempts": int(rec.get("attempts", 0) or 0),
+                "incident_id": rec.get("incident_id") or "",
+            }
+        focus_summary = {
+            "selected": selected_goals,
+            "escalated": skipped_list,
+            "active_pool": [gid for gid in selected_goals if gid not in escalated_set],
+            "next_round": soak_ctl.split_goal_ids(next_round_str),
+            "goal_statuses": goal_statuses,
+        }
+
         return {
             "now": time.time(),
             "session_dir": str(self.session_dir),
@@ -810,11 +844,13 @@ class Console:
                 "total_elapsed_s": round(tot_elapsed, 1),
             },
             "live": live,
+            "focus_summary": focus_summary,
             "episodes": [
                 {k: e.get(k) for k in (
-                    "ep_id", "at", "commit", "bot_user", "source", "elapsed_s", "stop_reason",
+                    "ep_id", "at", "commit", "bot_user", "source", "elapsed_s", "stop_reason", "steps",
                     "skills_completed", "skills_env_blocked", "skills_budget_stopped",
                     "bugs_count", "p0_bugs", "server_score", "inferred_score", "deaths", "target_goal",
+                    "target_goals", "configured_target_goal", "skipped_goals",
                     "target_goal_reached", "target_goal_elapsed_s", "goals_reached", "prompt_tokens",
                     "target_goals_reached", "environment_blocked_goals", "decision_sources",
                     "completion_tokens", "rolled_back", "revert_reason",
@@ -1253,6 +1289,24 @@ class Console:
             lambda: soak_ctl.inject_and_set_goal(self.session_dir, merge_ref=ref, target_goal=tgt),
         )
 
+    def reset_escalated_goals(
+        self,
+        goals: Any = None,
+        *,
+        include_non_goal: bool = False,
+        clear_stop: bool = False,
+    ) -> dict[str, Any]:
+        if not (self.session_dir / "state.json").exists():
+            raise ValueError("会话还没初始化：先一键启动一次双工位")
+        goal_list = soak_ctl.split_goal_ids(goals) if goals else None
+        reset_res = soak_ctl.reset_escalated_goals(
+            self.session_dir,
+            goals=goal_list,
+            include_non_goal=bool(include_non_goal),
+            clear_stop=bool(clear_stop),
+        )
+        return {"reset": reset_res, "snapshot": self.snapshot()}
+
 
 # ============================================================================
 # HTTP 层
@@ -1340,6 +1394,15 @@ def make_handler(console: Console, port: int):
                 if path == "/api/inject":
                     return self._json(200, {"ok": True, "result": console.inject(
                         str(payload.get("merge_ref") or ""), payload.get("goal"))})
+                if path == "/api/reset_goals":
+                    return self._json(200, {
+                        "ok": True,
+                        "result": console.reset_escalated_goals(
+                            payload.get("goals"),
+                            include_non_goal=bool(payload.get("include_non_goal")),
+                            clear_stop=bool(payload.get("clear_stop")),
+                        ),
+                    })
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 return self._json(400, {"ok": False, "error": str(exc)})
             return self._json(404, {"ok": False, "error": "not found"})

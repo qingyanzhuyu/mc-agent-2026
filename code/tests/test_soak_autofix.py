@@ -1433,5 +1433,149 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         )
         soak_ctl.teardown_session(self.session)
 
+    def test_zero_step_spin_guard_records_skipped_goals_and_reset_escalated_goals(self):
+        soak_ctl.init_session(
+            self.repo,
+            self.session,
+            target_branch="feat/spin-guard",
+            target_goal="prep_wood,smelt_iron,kill_a_mob",
+            max_goal_attempts=5,
+        )
+        with soak_ctl.locked_state(self.session) as st_mut:
+            st_mut["incidents"]["GOAL_MISS:smelt_iron"] = {
+                "fingerprint": "GOAL_MISS:smelt_iron",
+                "incident_id": "INC-012",
+                "code": "GOAL_MISS",
+                "severity": "P1",
+                "category": "strategy",
+                "skill": "smelt_iron",
+                "goal_id": "smelt_iron",
+                "status": "escalated_human",
+                "attempts": 5,
+                "fix_commit": "deadbeef",
+                "gate_history": [{"ok": True}],
+            }
+            st_mut["incidents"]["GOAL_MISS:kill_a_mob"] = {
+                "fingerprint": "GOAL_MISS:kill_a_mob",
+                "incident_id": "INC-016",
+                "code": "GOAL_MISS",
+                "severity": "P1",
+                "category": "strategy",
+                "skill": "hunt_mob",
+                "goal_id": "kill_a_mob",
+                "status": "escalated_human",
+                "attempts": 5,
+                "fix_commit": None,
+                "gate_history": [{"ok": True}],
+            }
+            st_mut["incidents"]["756ba1d380"] = {
+                "fingerprint": "756ba1d380",
+                "incident_id": "INC-001",
+                "code": "LLM_INVALID_OR_TIMEOUT",
+                "severity": "P3",
+                "category": "strategy",
+                "skill": "session",
+                "goal_id": "",
+                "status": "escalated_human",
+                "attempts": 2,
+                "fix_commit": None,
+                "gate_history": [{"ok": False}],
+            }
+
+        real_run = subprocess.run
+        seen_zero_calls: list[str] = []
+
+        def mock_zero_step(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                goal = cmd[cmd.index("--goal") + 1] if "--goal" in cmd else ""
+                seen_zero_calls.append(goal)
+                if len(seen_zero_calls) >= 5:
+                    (self.session / "STOP").write_text("safety-cap", encoding="utf-8")
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                (rdir / "timeline.jsonl").write_text(
+                    json.dumps({"event": "run_start", "source": "local-target", "target_goal": goal}) + "\n"
+                    + json.dumps({
+                        "event": "run_end",
+                        "elapsed_s": 4.2,
+                        "stop_reason": "goal_reached",
+                        "source": "local-target",
+                        "target_goal": goal,
+                        "goals_reached": {"prep_wood": 3.0},
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_zero_step):
+            res = soak_ctl.run_runner_loop(self.session, episodes=0, rotate_user=False, use_llm=False)
+
+        self.assertEqual(len(res), 2)
+        self.assertTrue((self.session / "STOP").exists())
+        st = soak_ctl.read_state(self.session)
+        ep1 = st["episodes"][0]
+        self.assertEqual(ep1["configured_target_goal"], "prep_wood,smelt_iron,kill_a_mob")
+        self.assertEqual(ep1["skipped_goals"], ["smelt_iron", "kill_a_mob"])
+        self.assertEqual(ep1["steps"], 0)
+        self.assertEqual(ep1["target_goal"], "prep_wood")
+
+        # 仅重置指定 GOAL_MISS 目标
+        r1 = soak_ctl.reset_escalated_goals(self.session, goals=["smelt_iron"])
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["reset_goals"], ["smelt_iron"])
+        st = soak_ctl.read_state(self.session)
+        self.assertEqual(st["incidents"]["GOAL_MISS:smelt_iron"]["status"], "pending")
+        self.assertEqual(st["incidents"]["GOAL_MISS:smelt_iron"]["attempts"], 0)
+        self.assertIsNone(st["incidents"]["GOAL_MISS:smelt_iron"]["fix_commit"])
+        self.assertEqual(len(st["incidents"]["GOAL_MISS:smelt_iron"]["gate_history"]), 1)
+        self.assertEqual(len(st["incidents"]["GOAL_MISS:smelt_iron"]["reset_history"]), 1)
+        self.assertEqual(st["incidents"]["GOAL_MISS:kill_a_mob"]["status"], "escalated_human")
+        self.assertEqual(st["incidents"]["756ba1d380"]["status"], "escalated_human")
+        self.assertTrue((self.session / "STOP").exists())
+
+        # CLI reset-goals 默认重置剩余 GOAL_MISS（不含非 GOAL_MISS）
+        rc = soak_ctl.main(["reset-goals", "--session-dir", str(self.session)])
+        self.assertEqual(rc, 0)
+        st = soak_ctl.read_state(self.session)
+        self.assertEqual(st["incidents"]["GOAL_MISS:kill_a_mob"]["status"], "pending")
+        self.assertEqual(st["incidents"]["756ba1d380"]["status"], "escalated_human")
+
+        # include_non_goal + clear_stop
+        r2 = soak_ctl.reset_escalated_goals(self.session, include_non_goal=True, clear_stop=True)
+        self.assertEqual(r2["reset_count"], 1)
+        self.assertFalse((self.session / "STOP").exists())
+        self.assertEqual(soak_ctl.read_state(self.session)["incidents"]["756ba1d380"]["status"], "pending")
+
+        # rotate_user=True 时不触发持久角色 0 步空转停机；有 step 事件会正确计数并打断空转连击
+        call_idx = 0
+
+        def mock_rot_or_step(cmd, *args, **kwargs):
+            nonlocal call_idx
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv" and "--run-dir" in cmd:
+                call_idx += 1
+                goal = cmd[cmd.index("--goal") + 1] if "--goal" in cmd else ""
+                rdir = Path(cmd[cmd.index("--run-dir") + 1])
+                (rdir / "incidents").mkdir(parents=True, exist_ok=True)
+                lines = [json.dumps({"event": "run_start", "source": "local-target", "target_goal": goal})]
+                if call_idx == 2:
+                    lines.append(json.dumps({"event": "step", "op": "dig", "elapsed_s": 2.0}))
+                lines.append(json.dumps({
+                    "event": "run_end", "elapsed_s": 4.2, "stop_reason": "goal_reached",
+                    "source": "local-target", "target_goal": goal, "goals_reached": {"prep_wood": 3.0},
+                }))
+                (rdir / "timeline.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                if call_idx >= 5:
+                    (self.session / "STOP").write_text("done", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_rot_or_step):
+            rot_res = soak_ctl.run_runner_loop(self.session, episodes=3, rotate_user=True, use_llm=False)
+        self.assertEqual(len(rot_res), 3)
+        self.assertEqual(rot_res[1]["steps"], 1)
+        self.assertFalse((self.session / "STOP").exists())
+        soak_ctl.teardown_session(self.session)
+
 if __name__ == "__main__":
     unittest.main()
