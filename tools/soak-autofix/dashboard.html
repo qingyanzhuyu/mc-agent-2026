@@ -79,9 +79,12 @@ input[type=range] { padding: 0; }
 .bar.hot > i { background: var(--warn); }
 .barlabel { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
 .goalpick { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); max-height: 200px; overflow: auto; padding: 4px 8px; }
+.goalpick.expanded { max-height: none; }
+.gphead { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .goalpick .gp-group { font-size: 11px; color: var(--muted); margin: 6px 0 2px; font-weight: 600; }
-.goalpick label { display: flex; gap: 6px; align-items: baseline; font-size: 12.5px; color: var(--text); padding: 2px 0; cursor: pointer; }
+.goalpick label { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; font-size: 12.5px; color: var(--text); padding: 2px 0; cursor: pointer; }
 .goalpick label .dim { font-size: 11.5px; }
+.gp-skip { white-space: normal; min-width: 190px; max-width: 320px; word-break: break-word; font-size: 11.5px; margin-top: 3px; }
 .gpnote { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .events { list-style: none; margin: 10px 0 0; padding: 0; max-height: 260px; overflow: auto; font-size: 12.5px; }
 .events li { display: grid; grid-template-columns: 52px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
@@ -140,7 +143,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         </label>
         <label class="f">秒数<input type="number" id="secIn" step="10"></label>
         <label class="f">步数<input type="number" id="stepsIn" step="5"></label>
-        <div class="f wide">聚焦目标（可多选）<div class="goalpick" id="goalSel" data-mode="modeSel"></div>
+        <div class="f wide">
+          <div class="gphead"><span>聚焦目标（可多选）</span><button type="button" class="sm" id="btnGoalExpand">展开全部</button></div>
+          <div class="goalpick" id="goalSel" data-mode="modeSel"></div>
           <span class="gpnote" id="goalSelNote"></span></div>
         <label class="f wide">多个目标时<select id="modeSel"></select></label>
         <label class="f">工位 A 玩家模型<input id="modelIn" list="playerModels" placeholder="空 = 沿用 .env"></label>
@@ -151,6 +156,7 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
       <div class="row" style="margin-top:10px">
         <button class="primary" id="btnApply">应用到下一轮</button>
         <button id="btnClearBudget">清除轮长覆盖</button>
+        <button id="btnResetEscalated" title="把已升级人工（escalated_human）的 GOAL_MISS 目标单重置回待修，恢复本轮追目标">重置升级人工目标</button>
       </div>
       <p class="note" id="effNote"></p>
     </section>
@@ -173,7 +179,9 @@ dialog .body { padding: 14px; max-height: 70vh; overflow: auto; }
         <label class="f">轮数（0 = 一直跑）<input type="number" id="sEpisodes" min="0"></label>
         <label class="f">每轮秒数<input type="number" id="sSec" step="10"></label>
         <label class="f">每轮步数<input type="number" id="sSteps" step="5"></label>
-        <div class="f wide">聚焦目标（可多选）<div class="goalpick" id="sGoal" data-mode="sMode"></div>
+        <div class="f wide">
+          <div class="gphead"><span>聚焦目标（可多选）</span><button type="button" class="sm" id="btnSGoalExpand">展开全部</button></div>
+          <div class="goalpick" id="sGoal" data-mode="sMode"></div>
           <span class="gpnote" id="sGoalNote"></span></div>
         <label class="f wide">多个目标时<select id="sMode"></select></label>
         <label class="f wide">工位 B 修单模型<select id="sFixer"></select></label>
@@ -330,18 +338,38 @@ function quotaPctText(pTok, cTok, elapsedS, quota) {
   return `8h≈入${in8.toFixed(1)}%/出${out8.toFixed(1)}%`;
 }
 
+function goalStatusBadge(info) {
+  if (!info || !info.status) return "";
+  if (info.status === "escalated_human") return '<span class="tag bad">已升级跳过</span>';
+  if (info.status === "claimed") return '<span class="tag official">在修</span>';
+  if (info.status === "pending") return '<span class="tag local">待修</span>';
+  if (info.status === "resolved_by_run") return '<span class="tag ok">实跑达成</span>';
+  if (info.status === "fixed") return '<span class="tag ok">已修待测</span>';
+  return `<span class="tag">${esc(info.status)}</span>`;
+}
+
+function syncGoalPickerStatuses(el, goalStatuses) {
+  if (!el) return;
+  const gs = goalStatuses || {};
+  for (const lbl of el.querySelectorAll("label[data-gid]")) {
+    const slot = lbl.querySelector(".gp-status");
+    if (slot) slot.innerHTML = goalStatusBadge(gs[lbl.dataset.gid]);
+  }
+}
+
 function goalPicker(el, goals, selected) {
   const chosen = new Set(Array.isArray(selected) ? selected : String(selected || "").split(",").filter(Boolean));
   const groups = { candidate: [], graduated: [], live: [], draft: [] };
   goals.forEach((g) => (groups[g.stage] || groups.draft).push(g));
+  const gs = (snap && snap.focus_summary && snap.focus_summary.goal_statuses) || {};
   let html = "";
   for (const st of ["candidate", "graduated", "live", "draft"]) {
     if (!groups[st].length) continue;
     html += `<div class="gp-group">${STAGE_CN[st]}</div>` + groups[st].map((g) => {
       const meta = [g.tier || "", g.score ? `${g.score}分` : "", g.skill || ""].filter(Boolean).join(" · ");
-      return `<label title="${esc(g.prereq_goals && g.prereq_goals.length ? "前置：" + g.prereq_goals.join("、") : "")}">` +
+      return `<label data-gid="${esc(g.id)}" title="${esc(g.prereq_goals && g.prereq_goals.length ? "前置：" + g.prereq_goals.join("、") : "")}">` +
         `<input type="checkbox" value="${esc(g.id)}"${chosen.has(g.id) ? " checked" : ""}>` +
-        `<span class="mono">${esc(g.id)}</span><span class="dim">${esc(g.title || "")}${meta ? `（${esc(meta)}）` : ""}</span></label>`;
+        `<span class="mono">${esc(g.id)}</span><span class="gp-status">${goalStatusBadge(gs[g.id])}</span><span class="dim">${esc(g.title || "")}${meta ? `（${esc(meta)}）` : ""}</span></label>`;
     }).join("");
   }
   el.innerHTML = html;
@@ -354,8 +382,19 @@ function pickedGoals(el) { return [...el.querySelectorAll("input:checked")].map(
 function pickerNote(el) {
   const ids = pickedGoals(el);
   const note = $(el.id + "Note");
-  if (note) note.textContent = ids.length ? `已选 ${ids.length} 个：${ids.join("、")}` : "一个都不选 = 跑全部已激活目标（不聚焦）";
-  if (el.dataset.mode) $(el.dataset.mode).disabled = ids.length < 2;
+  const gs = (snap && snap.focus_summary && snap.focus_summary.goal_statuses) || {};
+  const skipped = ids.filter((id) => gs[id] && gs[id].status === "escalated_human");
+  const activeCount = ids.length - skipped.length;
+  if (note) {
+    if (!ids.length) {
+      note.textContent = "一个都不选 = 跑全部已激活目标（不聚焦）";
+    } else if (skipped.length) {
+      note.textContent = `已选 ${ids.length} 个（实跑 ${activeCount} 个，${skipped.length} 个因升级人工自动跳过：${skipped.join("、")}）`;
+    } else {
+      note.textContent = `已选 ${ids.length} 个：${ids.join("、")}`;
+    }
+  }
+  if (el.dataset.mode) $(el.dataset.mode).disabled = activeCount < 2;
 }
 
 function selectOptions(sel, items, current, fallback = "") {
@@ -537,9 +576,30 @@ function renderSettingsNote(s) {
     : "未设热覆盖，沿用启动参数";
   const cur = live && !live.finished ? `；正在跑的 ${live.ep_id} 上限 ${fmtS(live.max_seconds)} / ${live.max_steps} 步` : "";
   const pm = (st.server_target === "official" && st.official_llm === "official") ? "AIA 官方代理（比赛同款）" : (st.player_model || "沿用 .env");
-  const nGoals = (st.target_goal || "").split(",").filter(Boolean).length;
-  const focusTxt = !nGoals ? "全部" : nGoals === 1 ? st.target_goal
-    : `${st.target_goal.split(",").join("、")}（${st.focus_mode === "rotate" ? "每轮轮换一个" : "同轮一起跑"}）`;
+  const fs = s.focus_summary || {};
+  const gs = fs.goal_statuses || {};
+  syncGoalPickerStatuses($("goalSel"), gs);
+  syncGoalPickerStatuses($("sGoal"), gs);
+  syncGoalPickerStatuses($("iGoal"), gs);
+  pickerNote($("goalSel"));
+  pickerNote($("sGoal"));
+  const escAll = Object.values(gs).filter((x) => x && x.status === "escalated_human").length;
+  $("btnResetEscalated").disabled = !escAll;
+  $("btnResetEscalated").textContent = escAll ? `重置升级人工目标 (${escAll})` : "重置升级人工目标";
+
+  const selectedGoals = Array.isArray(fs.selected) ? fs.selected : (st.target_goal || "").split(",").filter(Boolean);
+  const escalatedGoals = Array.isArray(fs.escalated) ? fs.escalated : [];
+  const activeGoals = Array.isArray(fs.active_pool) ? fs.active_pool : selectedGoals;
+  const nGoals = selectedGoals.length;
+  const modeStr = st.focus_mode === "rotate" ? "每轮轮换一个" : "同轮一起跑";
+  let focusTxt = "全部";
+  if (nGoals === 1 && !escalatedGoals.length) {
+    focusTxt = selectedGoals[0];
+  } else if (nGoals > 0) {
+    focusTxt = escalatedGoals.length
+      ? `已选 ${nGoals} 个 / 实跑 ${activeGoals.length} 个（${activeGoals.length ? activeGoals.join("、") + "；" : ""}已升级人工跳过 ${escalatedGoals.length} 个：${escalatedGoals.join("、")}；${modeStr}）`
+      : `${selectedGoals.join("、")}（${modeStr}）`;
+  }
   const mvTxt = st.min_verified ? `；验证门槛：${st.min_verified}` : "";
   $("effNote").textContent = `${ov}；聚焦目标：${focusTxt}；玩家模型：${pm}；修单模型：${fixerLabel(s, st.fixer_preset) || "沿用启动参数"}${mvTxt}${cur}`;
 
@@ -595,7 +655,12 @@ function renderLive(s) {
   const srvTag = L.source === "official" || /windywindie|nmo\.net\.cn/.test(L.base || "") ? "比赛服" : "自建测试服";
   const posTxt = Array.isArray(L.pos) ? `[${L.pos.map((n) => Number(n).toFixed(0)).join(",")}]` : "";
   const stratTxt = L.strategy ? ` · 战略 ${L.strategy}` : "";
-  $("liveSub").textContent = `${L.ep_id} · ${srvTag} · ${L.bot_user || "-"} · ${L.model || "-"}${stratTxt} · @${L.commit || "-"}${posTxt ? " · " + posTxt : ""} · 目标 ${L.target_goal ? L.target_goal.split(",").join("、") : "全部"} · ${state}`;
+  const lGoals = (L.target_goal || "").split(",").filter(Boolean);
+  const selLen = (s.focus_summary && Array.isArray(s.focus_summary.selected)) ? s.focus_summary.selected.length : 0;
+  const liveGoalTxt = !lGoals.length
+    ? "全部"
+    : (selLen > lGoals.length ? `实跑 ${lGoals.length}/${selLen} 个（${lGoals.join("、")}）` : lGoals.join("、"));
+  $("liveSub").textContent = `${L.ep_id} · ${srvTag} · ${L.bot_user || "-"} · ${L.model || "-"}${stratTxt} · @${L.commit || "-"}${posTxt ? " · " + posTxt : ""} · 目标 ${liveGoalTxt} · ${state}`;
   $("tLabel").textContent = `${fmtS(L.elapsed_s)} / ${fmtS(L.max_seconds)}`;
   $("sLabel").textContent = `${L.steps} / ${L.max_steps ?? "-"}`;
   setBar("tBar", L.elapsed_s, L.max_seconds); setBar("sBar", L.steps, L.max_steps);
@@ -623,23 +688,40 @@ function renderLive(s) {
 }
 
 function renderTables(s) {
+  const selN = (s.focus_summary && Array.isArray(s.focus_summary.selected)) ? s.focus_summary.selected.length : 0;
   $("epBody").innerHTML = s.episodes.map((e) => {
     const tg = (e.target_goal || "").split(",").filter(Boolean);
+    const cfg = (e.configured_target_goal || "").split(",").filter(Boolean);
+    const skip = Array.isArray(e.skipped_goals) ? e.skipped_goals.filter(Boolean) : [];
     const rmap = e.target_goals_reached || {};
     const bmap = e.environment_blocked_goals || {};
-    const goal = tg.length ? tg.map((g) => {
-      const ok = g in rmap ? rmap[g] : g in (e.goals_reached || {});
-      if (ok) return `<span class="yes">✓</span> ${esc(g)}`;
-      if (g in bmap) {
-        const info = bmap[g] || {};
-        return `<span class="hold" title="${esc((info.message || "") + (info.wake_on ? " [" + info.wake_on + "]" : ""))}">⏸ ${esc(g)}</span>`;
-      }
-      return `<span class="no">✗</span> ${esc(g)}`;
-    }).join("<br>") : '<span class="dim">全部</span>';
+    let goal = '<span class="dim">全部</span>';
+    if (tg.length) {
+      const head = skip.length
+        ? `<div class="dim">实跑 ${tg.length}/${cfg.length || (tg.length + skip.length)} 个</div>`
+        : (cfg.length && cfg.length !== tg.length)
+          ? `<div class="dim">实跑 ${tg.length}/${cfg.length} 个</div>`
+          : (selN > tg.length)
+            ? `<div class="dim">实跑 ${tg.length} 个（左侧当前选 ${selN} 个）</div>`
+            : `<div class="dim">实跑 ${tg.length} 个</div>`;
+      const items = tg.map((g) => {
+        const ok = g in rmap ? rmap[g] : g in (e.goals_reached || {});
+        if (ok) return `<span class="yes">✓</span> ${esc(g)}`;
+        if (g in bmap) {
+          const info = bmap[g] || {};
+          return `<span class="hold" title="${esc((info.message || "") + (info.wake_on ? " [" + info.wake_on + "]" : ""))}">⏸ ${esc(g)}</span>`;
+        }
+        return `<span class="no">✗</span> ${esc(g)}`;
+      }).join("<br>");
+      const skipLine = skip.length
+        ? `<div class="hold gp-skip" title="${esc(skip.join("、"))}">⏭ 跳过(升级人工 ${skip.length})：${esc(skip.join("、"))}</div>`
+        : "";
+      goal = `${head}${items}${skipLine}`;
+    }
     const reached = Object.entries(e.goals_reached || {}).map(([g, t]) => `${esc(g)} <span class="dim">${fmtS(t)}</span>`).join("，") || '<span class="dim">无</span>';
     const at = e.at ? new Date(e.at).toLocaleTimeString() : "-";
     const sr = e.stop_reason || "-";
-    const srLabel = STOP_CN[sr] ? `${STOP_CN[sr]}` : sr;
+    const srLabel = (STOP_CN[sr] ? `${STOP_CN[sr]}` : sr) + (sr === "goal_reached" && e.steps === 0 && !e.skills_completed ? " (0步空跑)" : "");
     const pTok = e.prompt_tokens || 0, cTok = e.completion_tokens || 0;
     const qTxt = quotaPctText(pTok, cTok, e.elapsed_s, s.quota);
     const tokCell = `${pTok.toLocaleString()} / ${cTok.toLocaleString()}${qTxt ? `<br><span class="dim" style="font-size:11px">${esc(qTxt)}</span>` : ""}`;
@@ -780,6 +862,25 @@ $("btnApply").onclick = async () => {
   try { await api("/api/settings", body); toast("已写入，下一轮开跑时生效"); refresh(); }
   catch (e) { toast(e.message, "bad"); }
 };
+function bindGoalExpand(btnId, boxId) {
+  $(btnId).onclick = () => {
+    const exp = $(boxId).classList.toggle("expanded");
+    $(btnId).textContent = exp ? "收起列表" : "展开全部";
+  };
+}
+bindGoalExpand("btnGoalExpand", "goalSel");
+bindGoalExpand("btnSGoalExpand", "sGoal");
+
+$("btnResetEscalated").onclick = async () => {
+  if (!confirm("将所有已升级人工（escalated_human）的 GOAL_MISS 目标单重置回 pending（attempts 清零），让下一轮重新追踪并允许自动修单？")) return;
+  try {
+    const j = await api("/api/reset_goals", {});
+    const rst = (j.result && j.result.reset) || {};
+    toast(rst.reset_count ? `已重置 ${rst.reset_count} 个目标：${(rst.reset_goals || []).join("、")}` : "当前没有已升级人工的 GOAL_MISS 目标");
+    refresh();
+  } catch (e) { toast(e.message, "bad"); }
+};
+
 $("btnClearBudget").onclick = async () => {
   try { await api("/api/settings", { clear_budget: true }); formsFilled = false; toast("已清除轮长覆盖，下一轮回到启动参数"); refresh(); }
   catch (e) { toast(e.message, "bad"); }

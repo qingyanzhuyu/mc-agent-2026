@@ -525,6 +525,82 @@ class DashboardTests(unittest.TestCase):
         dom_ids = set(re.findall(r'id="([^"]+)"', head_html))
         used_ids = set(re.findall(r'\$\("([^"]+)"\)', js_tail))
         self.assertEqual(used_ids - dom_ids, set())
+        self.assertIn("btnResetEscalated", dom_ids)
+        self.assertIn("focus_summary", js_tail)
+
+    def test_snapshot_exposes_focus_summary_goal_statuses_and_reset_goals_endpoint(self):
+        self._init_state(
+            target_goal="prep_wood,smelt_iron,kill_a_mob",
+            focus_mode="together",
+            episodes=[{
+                "ep_id": "ep-0001",
+                "at": "2026-11-16T20:00:00Z",
+                "commit": "b" * 40,
+                "source": "local-target",
+                "elapsed_s": 4.5,
+                "stop_reason": "goal_reached",
+                "steps": 0,
+                "skills_completed": 0,
+                "target_goal": "prep_wood,kill_a_mob",
+                "configured_target_goal": "prep_wood,smelt_iron,kill_a_mob",
+                "skipped_goals": ["smelt_iron"],
+                "goals_reached": {"prep_wood": 3.0},
+            }],
+            incidents={
+                "GOAL_MISS:smelt_iron": {
+                    "incident_id": "INC-012",
+                    "fingerprint": "GOAL_MISS:smelt_iron",
+                    "code": "GOAL_MISS",
+                    "goal_id": "smelt_iron",
+                    "skill": "smelt_iron",
+                    "status": "escalated_human",
+                    "attempts": 5,
+                    "fix_commit": None,
+                    "gate_history": [{"ok": True}],
+                },
+                "GOAL_MISS:kill_a_mob": {
+                    "incident_id": "INC-016",
+                    "fingerprint": "GOAL_MISS:kill_a_mob",
+                    "code": "GOAL_MISS",
+                    "goal_id": "kill_a_mob",
+                    "skill": "hunt_mob",
+                    "status": "pending",
+                    "attempts": 1,
+                },
+            },
+        )
+        snap = self.console.snapshot()
+        fs = snap["focus_summary"]
+        self.assertEqual(fs["selected"], ["prep_wood", "smelt_iron", "kill_a_mob"])
+        self.assertEqual(fs["escalated"], ["smelt_iron"])
+        self.assertEqual(fs["active_pool"], ["prep_wood", "kill_a_mob"])
+        self.assertEqual(fs["next_round"], ["prep_wood", "kill_a_mob"])
+        self.assertEqual(fs["goal_statuses"]["smelt_iron"]["status"], "escalated_human")
+        self.assertEqual(fs["goal_statuses"]["kill_a_mob"]["status"], "pending")
+        self.assertEqual(snap["episodes"][0]["skipped_goals"], ["smelt_iron"])
+        self.assertEqual(snap["episodes"][0]["configured_target_goal"], "prep_wood,smelt_iron,kill_a_mob")
+        self.assertEqual(snap["episodes"][0]["steps"], 0)
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        httpd = dash.ThreadingHTTPServer(("127.0.0.1", port), dash.make_handler(self.console, port))
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/api/reset_goals", body=json.dumps({"goals": ["smelt_iron"]}),
+                         headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["result"]["reset"]["reset_goals"], ["smelt_iron"])
+            self.assertEqual(body["result"]["snapshot"]["focus_summary"]["escalated"], [])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == "__main__":
