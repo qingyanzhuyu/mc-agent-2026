@@ -526,7 +526,31 @@ class DashboardTests(unittest.TestCase):
         used_ids = set(re.findall(r'\$\("([^"]+)"\)', js_tail))
         self.assertEqual(used_ids - dom_ids, set())
         self.assertIn("btnResetEscalated", dom_ids)
+        self.assertIn("workersIn", dom_ids)
+        self.assertIn("sWorkers", dom_ids)
         self.assertIn("focus_summary", js_tail)
+
+    def test_fixer_workers_settings_validation_and_run_cmd(self):
+        self._init_state(fixer_preset="codex", fixer_workers=3)
+        snap = self.console.snapshot()
+        self.assertEqual(snap["state"]["fixer_workers"], 3)
+        self.assertEqual(snap["start_defaults"]["fixer_workers"], 3)
+        self.assertEqual(snap["bounds"]["fixer_workers"], [1, 6])
+
+        res = self.console.apply_settings({"fixer_workers": "4"})
+        self.assertEqual(res["fixer_workers"], 4)
+        st = json.loads((self.session / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["fixer_workers"], 4)
+
+        for bad in ({"fixer_workers": 0}, {"fixer_workers": 7}, {"fixer_workers": "abc"}):
+            with self.assertRaises(ValueError, msg=bad):
+                self.console.apply_settings(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                self.console._validate_start(bad)
+
+        p = self.console._validate_start({"fixer_workers": 3})
+        cmd = self.console.build_run_cmd(p)
+        self.assertEqual(cmd[cmd.index("--fixer-workers") + 1], "3")
 
     def test_snapshot_exposes_focus_summary_goal_statuses_and_reset_goals_endpoint(self):
         self._init_state(
