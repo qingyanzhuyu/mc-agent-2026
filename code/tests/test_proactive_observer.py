@@ -526,6 +526,36 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
             self.assertRegex(spam_p2[0]["fingerprint"], r"^SKILL_SPAM_LOOP:craft_gear:[0-9a-f]{6}$")
             self._assert_proactive_fields(spam_p2[0], obs_p2, expected_severity="P2")
 
+        # 3 次重试/挂起 + 终于成功 1 次（ok == 1 < 2）：属于正常重试恢复而非刷屏，不误报 SKILL_SPAM_LOOP
+        with tempfile.TemporaryDirectory() as tmp_retry:
+            obs_retry = SoakObserver(tmp_retry, target_goal="upgrade_tools")
+            state_retry = _make_ready_state()
+            for _ in range(2):
+                _run_skill_cycle(
+                    obs_retry,
+                    make("craft_gear", {"item": "stone_pickaxe"}),
+                    state_retry,
+                    outcome="replan",
+                    error_code="path_not_found",
+                )
+            obs_retry.on_skill_start(make("craft_gear", {"item": "stone_pickaxe"}), "rule", "busy", state_retry)
+            obs_retry.on_skill_end(
+                make("craft_gear", {"item": "stone_pickaxe"}),
+                "env_blocked",
+                state_retry,
+                environment=EnvBlocked("busy", missing_predicate="idle", searched_volume="-", wake_on="chunk_moved"),
+            )
+            _run_skill_cycle(
+                obs_retry,
+                make("craft_gear", {"item": "stone_pickaxe"}),
+                state_retry,
+                outcome="completed",
+                gain_item="stone_pickaxe",
+            )
+            obs_retry.on_run_end(state_retry, stop_reason="goal_reached")
+            incs_retry = _read_incidents(Path(tmp_retry))
+            self.assertFalse(any(i["code"] == "SKILL_SPAM_LOOP" for i in incs_retry), incs_retry)
+
     def test_skill_spam_loop_gather_wood_thresholds(self):
         # 7 次不触发
         with tempfile.TemporaryDirectory() as tmp_7:

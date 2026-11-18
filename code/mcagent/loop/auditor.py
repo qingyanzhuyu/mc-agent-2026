@@ -872,9 +872,12 @@ class SoakObserver:
         for key, entry in self.skill_arg_stats.items():
             sname = str(entry["skill"])
             started = int(entry.get("started", 0))
+            ok_count = int(entry.get("ok", 0))
+            # 只有真正多次成功却仍重复同参调用（如 13 把石剑 / 129 原木）才算 SKILL_SPAM_LOOP，
+            # 避免把“前置偶发失败重试 2~3 次后终于成功 1 次”的正常恢复流程误判为刷屏。
             is_spam = (
-                (sname == "craft_gear" and started >= 4)
-                or (sname not in ("craft_gear", "scout_island") and started >= 8)
+                (sname == "craft_gear" and started >= 4 and ok_count >= 2)
+                or (sname not in ("craft_gear", "scout_island") and started >= 8 and ok_count >= 2)
                 or (sname == "scout_island" and started >= 20 and has_unreached_target)
             )
             if is_spam:
