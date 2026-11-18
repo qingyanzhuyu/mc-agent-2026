@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import threading
 import time
@@ -52,6 +53,7 @@ class TapeRecorder:
         self._ring: deque[dict] = deque(maxlen=ring_size)
         self._skill_slice: list[dict] = []
         self._recording_skill = False
+        self._path_stats: dict[str, dict[str, Any]] = {}
         if tape_path:
             parent = os.path.dirname(os.path.abspath(tape_path))
             if parent:
@@ -77,6 +79,25 @@ class TapeRecorder:
             items = list(self._ring)
         return copy.deepcopy(items[-n:])
 
+    def path_stats(self) -> dict[str, dict[str, Any]]:
+        """返回按端点聚合的只读延迟与成功/失败计数快照。"""
+        with self._lock:
+            snapshot = {p: dict(s) for p, s in self._path_stats.items()}
+        out: dict[str, dict[str, Any]] = {}
+        for path, s in snapshot.items():
+            count = int(s["count"])
+            total_ms = float(s["total_ms"])
+            max_ms = float(s["max_ms"])
+            out[path] = {
+                "count": count,
+                "ok": int(s["ok"]),
+                "errors": int(s["errors"]),
+                "total_ms": round(total_ms, 1),
+                "avg_ms": round(total_ms / count, 1) if count > 0 else 0.0,
+                "max_ms": round(max_ms, 1),
+            }
+        return out
+
     def record(
         self,
         *,
@@ -92,6 +113,12 @@ class TapeRecorder:
         clean_path = path.lstrip("/")
         if clean_path.startswith("auth/"):
             return {}
+        try:
+            ms_val = float(ms)
+        except (TypeError, ValueError):
+            ms_val = 0.0
+        if not math.isfinite(ms_val) or ms_val <= 0.0:
+            ms_val = 0.0
         entry: dict[str, Any] = {
             "t": round(time.time(), 3),
             "ms": round(ms, 1),
@@ -112,6 +139,23 @@ class TapeRecorder:
             self._ring.append(entry)
             if self._recording_skill and thread == "main":
                 self._skill_slice.append(copy.deepcopy(entry))
+            stat = self._path_stats.get(clean_path)
+            if stat is None:
+                stat = {
+                    "count": 0,
+                    "ok": 0,
+                    "errors": 0,
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                }
+                self._path_stats[clean_path] = stat
+            stat["count"] += 1
+            if ok:
+                stat["ok"] += 1
+            else:
+                stat["errors"] += 1
+            stat["total_ms"] += ms_val
+            stat["max_ms"] = max(stat["max_ms"], ms_val)
             if self.tape_path:
                 with open(self.tape_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")

@@ -38,6 +38,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Collection, Iterator, Optional, Sequence
@@ -60,6 +61,16 @@ FORBIDDEN_EDIT_PATHS: frozenset[str] = frozenset({
     "code/mcagent/skills/testing.py",
     "code/mcagent/planner/decision.py",
     "AGENTS.md",
+})
+GOAL_RECURRENCE_EXTRA_FILES: tuple[str, ...] = (
+    "code/mcagent/loop/policy.py",
+    "code/mcagent/loop/starter_skills.py",
+    "code/mcagent/loop/goals.py",
+)
+PROACTIVE_WIDE_INCIDENT_CODES: frozenset[str] = frozenset({
+    "DISPATCH_STARVATION",
+    "SKILL_SPAM_LOOP",
+    "API_BOTTLENECK_SLOW",
 })
 
 SECRET_SCAN_RE = re.compile(
@@ -471,12 +482,16 @@ def validate_target_branch(branch: str) -> str:
     return b
 
 
+def _normalize_rel_path(raw: Any) -> str:
+    return str(raw or "").strip().replace("\\", "/").lstrip("./")
+
+
 def is_allowed_edit_path(
     rel_path: str,
     *,
     narrow_files: Optional[Sequence[str]] = None,
 ) -> tuple[bool, str]:
-    norm = rel_path.strip().lstrip("./").replace("\\", "/")
+    norm = _normalize_rel_path(rel_path)
     if not norm:
         return False, "空路径"
     if norm in FORBIDDEN_EDIT_PATHS:
@@ -488,9 +503,9 @@ def is_allowed_edit_path(
         return False, f"不在自动修复允许白名单内: {norm}"
     if narrow_files:
         allowed_narrow = {
-            p.strip().lstrip("./").replace("\\", "/")
+            norm_p
             for p in narrow_files
-            if p and p.strip()
+            if (norm_p := _normalize_rel_path(p))
         }
         if allowed_narrow and not (
             norm in allowed_narrow or fnmatch.fnmatch(norm, "code/tests/test_*.py")
@@ -500,6 +515,35 @@ def is_allowed_edit_path(
                 f"超出目标单收窄白名单（仅限 {sorted(allowed_narrow)} 及 code/tests/test_*.py）: {norm}",
             )
     return True, ""
+
+
+def _effective_goal_narrow_files(inc_rec: dict[str, Any]) -> Optional[list[str]]:
+    """计算 GOAL_MISS 异常单的有效收窄白名单。
+
+    - 非 GOAL_MISS 或原始 editable_files 为空时返回 None（走全量 ALLOWED_EDIT_PATTERNS）；
+    - 首次或此前未产生已提交实测失败（last_failed_fix_commit 为空）时仅返回原始收窄列表；
+    - 一旦曾合入修复却在实跑复发（last_failed_fix_commit 非空），自动追加规划与前置协同文件
+      (policy.py / starter_skills.py / goals.py)，去重保序（仍受 FORBIDDEN_EDIT_PATHS 保护）。
+    """
+    if not isinstance(inc_rec, dict) or inc_rec.get("code") != "GOAL_MISS":
+        return None
+    raw_files = inc_rec.get("editable_files") or []
+    base_files: list[str] = []
+    seen: set[str] = set()
+    for p in raw_files:
+        norm = _normalize_rel_path(p)
+        if norm and norm not in seen:
+            seen.add(norm)
+            base_files.append(norm)
+    if not base_files:
+        return None
+    if str(inc_rec.get("last_failed_fix_commit") or "").strip():
+        for extra in GOAL_RECURRENCE_EXTRA_FILES:
+            norm_extra = _normalize_rel_path(extra)
+            if norm_extra and norm_extra not in seen:
+                seen.add(norm_extra)
+                base_files.append(norm_extra)
+    return base_files
 
 
 def _max_attempts_for(st: dict[str, Any], inc_rec: dict[str, Any]) -> int:
@@ -1124,6 +1168,516 @@ def ingest_episode_and_check_rollback(
     return ep_meta
 
 
+def _opt_nonneg_int(val: Any) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def _opt_nonneg_float(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) and x >= 0.0 else None
+
+
+def _normalize_decision_sources(raw: Any) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        n = _opt_nonneg_int(v)
+        if n is not None and str(k).strip():
+            out[str(k).strip()] = n
+    return out
+
+
+def _normalize_http_top_paths(raw: Any, elapsed_s: Optional[float]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        entries = [
+            {"path": k, **(v if isinstance(v, dict) else {"count": v})}
+            for k, v in raw.items()
+        ]
+    elif isinstance(raw, (list, tuple)):
+        entries = [e for e in raw if isinstance(e, dict)]
+    else:
+        return []
+
+    for item in entries:
+        path = str(item.get("path") or item.get("endpoint") or "").strip()
+        if not path:
+            continue
+        cnt = _opt_nonneg_int(item.get("count") if item.get("count") is not None else item.get("calls")) or 0
+        total_s = _opt_nonneg_float(item.get("total_s"))
+        if total_s is None:
+            ms_val = _opt_nonneg_float(item.get("total_ms") if item.get("total_ms") is not None else item.get("ms"))
+            total_s = (ms_val / 1000.0) if ms_val is not None else 0.0
+        pct_raw = (
+            item.get("pct")
+            if item.get("pct") is not None
+            else (item.get("pct_of_elapsed") if item.get("pct_of_elapsed") is not None else item.get("share_pct"))
+        )
+        pct = _opt_nonneg_float(pct_raw)
+        if pct is None and item.get("ratio") is not None:
+            r = _opt_nonneg_float(item.get("ratio"))
+            if r is not None:
+                pct = r * 100.0
+        items.append({"path": path, "count": cnt, "total_s": round(total_s, 3), "pct": pct})
+
+    total_sum_s = sum(x["total_s"] for x in items)
+    denom = elapsed_s if (elapsed_s is not None and elapsed_s > 0.0) else total_sum_s
+    for x in items:
+        if x["pct"] is None:
+            x["pct"] = round((x["total_s"] / denom * 100.0) if denom > 0.0 else 0.0, 1)
+        else:
+            x["pct"] = round(float(x["pct"]), 1)
+
+    items.sort(key=lambda x: (-x["total_s"], -x["count"], x["path"]))
+    return items[:5]
+
+
+def _normalize_repeated_skill_args(raw: Any, *, min_count: int = 1) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                cnt = _opt_nonneg_int(item.get("count") if item.get("count") is not None else item.get("started"))
+                if cnt is not None and cnt < min_count:
+                    continue
+                norm_item = dict(item)
+                if cnt is not None and norm_item.get("count") is None:
+                    norm_item["count"] = cnt
+                out.append(norm_item)
+            elif item:
+                out.append({"label": str(item), "count": None})
+    elif isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                cnt = _opt_nonneg_int(v.get("count") if v.get("count") is not None else v.get("started"))
+                if cnt is not None and cnt < min_count:
+                    continue
+                norm_item = {"label": str(k), **v}
+                if cnt is not None and norm_item.get("count") is None:
+                    norm_item["count"] = cnt
+                out.append(norm_item)
+            else:
+                cnt = _opt_nonneg_int(v)
+                if cnt is not None and cnt >= min_count:
+                    out.append({"label": str(k), "count": cnt})
+    out.sort(key=lambda x: (-(_opt_nonneg_int(x.get("count")) or 0), str(x.get("skill") or x.get("label") or "")))
+    return out[:10]
+
+
+def _backfill_from_timeline(tl_path: Path) -> dict[str, Any]:
+    recent: deque[dict[str, Any]] = deque(maxlen=12)
+    start_sources: dict[str, int] = {}
+    skill_arg_counts: dict[tuple[str, str], tuple[str, Any, int]] = {}
+    tl_llm_calls = 0
+    tl_llm_fallbacks = 0
+    run_end_sources: dict[str, int] = {}
+    run_end_llm_calls: Optional[int] = None
+    run_end_llm_fallbacks: Optional[int] = None
+    max_elapsed: Optional[float] = None
+
+    try:
+        raw_lines = tl_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            ev = json.loads(s)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        el = _opt_nonneg_float(ev.get("elapsed_s"))
+        if el is not None:
+            max_elapsed = el if max_elapsed is None else max(max_elapsed, el)
+        ev_type = ev.get("event")
+        if ev_type == "skill_start":
+            sk = str(ev.get("skill") or "").strip()
+            src = str(ev.get("source") or "").strip()
+            if src:
+                start_sources[src] = start_sources.get(src, 0) + 1
+            args_obj = ev.get("args") if isinstance(ev.get("args"), dict) else {}
+            if sk:
+                args_key = json.dumps(args_obj, sort_keys=True, ensure_ascii=False)
+                prev_cnt = skill_arg_counts.get((sk, args_key), (sk, args_obj, 0))[2]
+                skill_arg_counts[(sk, args_key)] = (sk, args_obj, prev_cnt + 1)
+            recent.append({
+                "event": "skill_start",
+                "elapsed_s": el,
+                "skill": sk,
+                "args": args_obj,
+                "source": src,
+                "reason": str(ev.get("reason") or "")[:120],
+            })
+        elif ev_type == "skill_end":
+            recent.append({
+                "event": "skill_end",
+                "elapsed_s": el,
+                "skill": str(ev.get("skill") or "").strip(),
+                "outcome": str(ev.get("outcome") or "").strip(),
+                "error_code": str(ev.get("error_code") or "").strip(),
+                "error_msg": str(ev.get("error_msg") or "")[:120],
+                "postcondition_error": str(ev.get("postcondition_error") or "")[:120],
+            })
+        elif ev_type == "llm_call":
+            tl_llm_calls += 1
+            if "ok" in ev and not ev.get("ok"):
+                tl_llm_fallbacks += 1
+        elif ev_type == "run_end":
+            ds = _normalize_decision_sources(ev.get("decision_sources"))
+            if ds:
+                run_end_sources = ds
+            c_calls = _opt_nonneg_int(ev.get("llm_calls"))
+            if c_calls is not None:
+                run_end_llm_calls = c_calls
+            c_fb = _opt_nonneg_int(ev.get("llm_fallbacks"))
+            if c_fb is not None:
+                run_end_llm_fallbacks = c_fb
+            recent.append({
+                "event": "run_end",
+                "elapsed_s": el,
+                "stop_reason": str(ev.get("stop_reason") or "").strip(),
+                "target_goal_reached": ev.get("target_goal_reached"),
+                "goals_reached": ev.get("goals_reached") if isinstance(ev.get("goals_reached"), dict) else {},
+            })
+
+    decision_sources = run_end_sources if run_end_sources else start_sources
+    llm_calls = run_end_llm_calls if run_end_llm_calls is not None else (tl_llm_calls if tl_llm_calls > 0 else None)
+    if run_end_llm_fallbacks is not None:
+        llm_fallbacks: Optional[int] = run_end_llm_fallbacks
+    elif tl_llm_calls > 0:
+        llm_fallbacks = tl_llm_fallbacks
+    elif decision_sources:
+        llm_fallbacks = decision_sources.get("llm_fallback_rule", 0)
+    else:
+        llm_fallbacks = None
+
+    repeated = [
+        {"skill": sk, "args": args_obj, "count": cnt}
+        for (_, _), (sk, args_obj, cnt) in skill_arg_counts.items()
+        if cnt >= 2
+    ]
+    repeated.sort(key=lambda x: (-x["count"], x["skill"]))
+
+    return {
+        "elapsed_s": max_elapsed,
+        "decision_sources": decision_sources,
+        "llm_calls": llm_calls,
+        "llm_fallbacks": llm_fallbacks,
+        "repeated_skill_args": repeated[:10],
+        "recent_decisions": list(recent),
+    }
+
+
+def _backfill_http_top_from_tape(tape_path: Path, elapsed_s: Optional[float]) -> list[dict[str, Any]]:
+    try:
+        if not tape_path.is_file() or tape_path.stat().st_size > 5 * 1024 * 1024:
+            return []
+        stats: dict[str, dict[str, float]] = {}
+        for line in tape_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                ev = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            path = str(ev.get("path") or "").strip().lstrip("/")
+            if not path:
+                continue
+            ms = _opt_nonneg_float(ev.get("ms")) or 0.0
+            rec = stats.setdefault(path, {"count": 0.0, "total_ms": 0.0})
+            rec["count"] += 1.0
+            rec["total_ms"] += ms
+        if not stats:
+            return []
+        return _normalize_http_top_paths(
+            {p: {"count": int(v["count"]), "total_ms": v["total_ms"]} for p, v in stats.items()},
+            elapsed_s,
+        )
+    except Exception:
+        return []
+
+
+def _extract_prompt_episode_context(inc_json: dict[str, Any], inc_path: str) -> dict[str, Any]:
+    """只读安全提取并回填整局运行剖面（优先 episode_profile，缺失字段从 ep_dir 兜底回填）。"""
+    out: dict[str, Any] = {
+        "ep_dir": "",
+        "summary_path": "",
+        "timeline_path": "",
+        "elapsed_s": None,
+        "llm_calls": None,
+        "llm_fallbacks": None,
+        "decision_sources": {},
+        "http_top_paths": [],
+        "repeated_skill_args": [],
+        "recent_decisions": [],
+    }
+    try:
+        safe_json = inc_json if isinstance(inc_json, dict) else {}
+        raw_profile = safe_json.get("episode_profile")
+        profile = raw_profile if isinstance(raw_profile, dict) else {}
+        detail = safe_json.get("detail") if isinstance(safe_json.get("detail"), dict) else {}
+
+        ep_dir: Optional[Path] = None
+        if inc_path and str(inc_path).strip():
+            cand = Path(str(inc_path)).parent.parent
+            if cand.is_dir():
+                ep_dir = cand
+        if ep_dir is None:
+            raw_ep = profile.get("ep_dir") or profile.get("run_dir") or safe_json.get("run_dir")
+            if raw_ep and str(raw_ep).strip():
+                cand = Path(str(raw_ep))
+                if cand.is_dir():
+                    ep_dir = cand
+        if ep_dir is not None:
+            out["ep_dir"] = str(ep_dir)
+
+        summary_raw = str(profile.get("summary_path") or "").strip()
+        if summary_raw:
+            out["summary_path"] = summary_raw
+        elif ep_dir is not None and (ep_dir / "summary.md").is_file():
+            out["summary_path"] = str(ep_dir / "summary.md")
+
+        timeline_raw = str(profile.get("timeline_path") or "").strip()
+        if timeline_raw:
+            out["timeline_path"] = timeline_raw
+        elif ep_dir is not None and (ep_dir / "timeline.jsonl").is_file():
+            out["timeline_path"] = str(ep_dir / "timeline.jsonl")
+
+        elapsed_s = _opt_nonneg_float(
+            profile.get("elapsed_s") if profile.get("elapsed_s") is not None else profile.get("duration_s")
+        )
+        if elapsed_s is None:
+            elapsed_s = _opt_nonneg_float(profile.get("total_elapsed_s"))
+
+        llm_block = profile.get("llm") if isinstance(profile.get("llm"), dict) else {}
+        llm_calls = _opt_nonneg_int(
+            profile.get("llm_calls")
+            if profile.get("llm_calls") is not None
+            else (profile.get("llm_call_count") if profile.get("llm_call_count") is not None else llm_block.get("calls"))
+        )
+        llm_fallbacks = _opt_nonneg_int(
+            profile.get("llm_fallbacks")
+            if profile.get("llm_fallbacks") is not None
+            else (
+                profile.get("llm_fallback_count")
+                if profile.get("llm_fallback_count") is not None
+                else llm_block.get("fallbacks")
+            )
+        )
+        decision_sources = _normalize_decision_sources(
+            profile.get("decision_sources")
+            if profile.get("decision_sources") is not None
+            else profile.get("step_sources")
+        )
+
+        raw_repeated = None
+        min_rep = 1
+        for rep_key in ("repeated_skill_args", "repeated_skills", "skill_arg_stats"):
+            if profile.get(rep_key):
+                raw_repeated = profile.get(rep_key)
+                min_rep = 2 if rep_key == "skill_arg_stats" else 1
+                break
+        repeated_skill_args = _normalize_repeated_skill_args(raw_repeated, min_count=min_rep)
+
+        raw_recent = None
+        for rec_key in ("recent_decisions", "decision_history", "recent_skill_decisions", "skill_timeline"):
+            if isinstance(profile.get(rec_key), list) and profile.get(rec_key):
+                raw_recent = profile.get(rec_key)
+                break
+        recent_decisions = list(raw_recent[-12:]) if raw_recent else []
+
+        # 从 timeline.jsonl 回填缺失字段
+        need_tl_backfill = (
+            elapsed_s is None
+            or llm_calls is None
+            or llm_fallbacks is None
+            or not decision_sources
+            or not recent_decisions
+            or not repeated_skill_args
+        )
+        if need_tl_backfill and out["timeline_path"]:
+            tl_file = Path(out["timeline_path"])
+            if tl_file.is_file():
+                tl_ctx = _backfill_from_timeline(tl_file)
+                if elapsed_s is None:
+                    elapsed_s = tl_ctx.get("elapsed_s")
+                if llm_calls is None:
+                    llm_calls = tl_ctx.get("llm_calls")
+                if llm_fallbacks is None:
+                    llm_fallbacks = tl_ctx.get("llm_fallbacks")
+                if not decision_sources and tl_ctx.get("decision_sources"):
+                    decision_sources = tl_ctx["decision_sources"]
+                if not recent_decisions and tl_ctx.get("recent_decisions"):
+                    recent_decisions = tl_ctx["recent_decisions"]
+                if not repeated_skill_args and tl_ctx.get("repeated_skill_args"):
+                    repeated_skill_args = tl_ctx["repeated_skill_args"]
+
+        if elapsed_s is None:
+            elapsed_s = _opt_nonneg_float(detail.get("elapsed_s"))
+
+        raw_http_top = None
+        for http_key in (
+            "http_top_paths",
+            "top_http_paths",
+            "http_bottlenecks",
+            "api_bottlenecks",
+            "http_path_top",
+            "http_stats",
+            "path_stats",
+        ):
+            if profile.get(http_key):
+                raw_http_top = profile.get(http_key)
+                break
+        http_top_paths = _normalize_http_top_paths(raw_http_top, elapsed_s)
+        if not http_top_paths and ep_dir is not None:
+            http_top_paths = _backfill_http_top_from_tape(ep_dir / "http_tape.jsonl", elapsed_s)
+
+        out["elapsed_s"] = elapsed_s
+        out["llm_calls"] = llm_calls
+        out["llm_fallbacks"] = llm_fallbacks
+        out["decision_sources"] = decision_sources
+        out["http_top_paths"] = http_top_paths
+        out["repeated_skill_args"] = repeated_skill_args
+        out["recent_decisions"] = recent_decisions
+    except Exception:
+        pass
+    return out
+
+
+def _format_decision_entry_line(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return f"   - {entry}"
+    el = entry.get("elapsed_s")
+    ts = f"{float(el):.1f}s" if isinstance(el, (int, float)) else (f"{entry.get('t')}s" if entry.get("t") is not None else "-")
+    ev_type = entry.get("event")
+    sk = entry.get("skill") or ""
+    if ev_type == "skill_start":
+        args_s = json.dumps(entry.get("args") or {}, ensure_ascii=False)
+        src = entry.get("source") or "-"
+        reason = str(entry.get("reason") or "")[:80]
+        return f"   - [{ts}] `skill_start` `{sk}`({args_s}) source=`{src}`" + (f" reason={reason}" if reason else "")
+    if ev_type == "skill_end":
+        out = entry.get("outcome") or "-"
+        err = entry.get("postcondition_error") or entry.get("error_code") or entry.get("error_msg") or ""
+        return f"   - [{ts}] `skill_end` `{sk}` outcome=`{out}`" + (f" ({err})" if err else "")
+    if ev_type == "run_end":
+        sr = entry.get("stop_reason") or "-"
+        tr = entry.get("target_goal_reached")
+        goals = sorted((entry.get("goals_reached") or {}).keys()) if isinstance(entry.get("goals_reached"), dict) else []
+        return f"   - [{ts}] `run_end` stop_reason=`{sr}` target_goal_reached=`{tr}` goals_reached=`{goals}`"
+    parts = [f"[{ts}]"]
+    if sk:
+        parts.append(f"`{sk}`")
+    if entry.get("args") is not None:
+        parts.append(f"args={json.dumps(entry.get('args'), ensure_ascii=False)}")
+    if entry.get("source"):
+        parts.append(f"source=`{entry['source']}`")
+    if entry.get("outcome"):
+        parts.append(f"outcome=`{entry['outcome']}`")
+    if entry.get("error_code"):
+        parts.append(f"err=`{entry['error_code']}`")
+    if entry.get("reason"):
+        parts.append(f"reason={str(entry['reason'])[:80]}")
+    if len(parts) == 1:
+        parts.append(json.dumps(entry, ensure_ascii=False))
+    return "   - " + " ".join(parts)
+
+
+def _format_episode_context_section(ctx: dict[str, Any]) -> str:
+    summary_p = ctx.get("summary_path") or ""
+    timeline_p = ctx.get("timeline_path") or ""
+    if summary_p or timeline_p:
+        sum_disp = f"`{summary_p}`" if summary_p else "未落盘（同局目录下 `summary.md`）"
+        tl_disp = f"`{timeline_p}`" if timeline_p else "未落盘（同局目录下 `timeline.jsonl`）"
+        files_line = f"- **同局全貌诊断文件（动手前请先通读）**：`summary.md` = {sum_disp} · `timeline.jsonl` = {tl_disp}"
+    else:
+        files_line = "- **同局全貌诊断文件（动手前请先通读）**：若同局存在 `summary.md` 与 `timeline.jsonl`，请先阅读这两份文件理解整局因果，勿只盯末尾 10 条磁带。"
+
+    elapsed_s = ctx.get("elapsed_s")
+    elapsed_disp = f"`{float(elapsed_s):.1f}s`" if elapsed_s is not None else "`未知`"
+    llm_calls = ctx.get("llm_calls")
+    llm_fb = ctx.get("llm_fallbacks")
+    llm_calls_disp = f"`{llm_calls}`" if llm_calls is not None else "`未知`"
+    llm_fb_disp = f"`{llm_fb}`" if llm_fb is not None else "`未知`"
+
+    sources = ctx.get("decision_sources") or {}
+    total_src = sum(sources.values())
+    if total_src > 0:
+        src_parts = [
+            f"`{k}`={v} ({v / total_src * 100.0:.1f}%)"
+            for k, v in sorted(sources.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        src_disp = " · ".join(src_parts)
+    else:
+        src_disp = "暂无"
+
+    http_top = ctx.get("http_top_paths") or []
+    if http_top:
+        http_lines = "\n".join(
+            f"   - `{item['path']}`: {item['count']} 次, 累计 {float(item['total_s']):.2f}s / {float(item['pct']):.1f}%"
+            for item in http_top[:5]
+        )
+    else:
+        http_lines = "   - 暂无全局 HTTP 耗时统计"
+
+    rep_items = ctx.get("repeated_skill_args") or []
+    if rep_items:
+        rep_rendered: list[str] = []
+        for r in rep_items:
+            if isinstance(r, dict) and r.get("skill"):
+                args_s = json.dumps(r.get("args") or {}, ensure_ascii=False)
+                cnt = r.get("count")
+                cnt_s = f" ×{cnt}" if cnt is not None else ""
+                rep_rendered.append(f"   - `{r['skill']}`({args_s}){cnt_s}")
+            elif isinstance(r, dict):
+                lbl = r.get("label") or r.get("key") or json.dumps(r, ensure_ascii=False)
+                cnt = r.get("count")
+                cnt_s = f" ×{cnt}" if cnt is not None else ""
+                rep_rendered.append(f"   - `{lbl}`{cnt_s}")
+            else:
+                rep_rendered.append(f"   - {r}")
+        rep_lines = "\n".join(rep_rendered)
+    else:
+        rep_lines = "   - 暂无明显重复同参调用"
+
+    recent = ctx.get("recent_decisions") or []
+    if recent:
+        recent_lines = "\n".join(_format_decision_entry_line(ev) for ev in recent[-12:])
+    else:
+        recent_lines = "   - 暂无调度流水记录"
+
+    return f"""
+## 1C. 全局运行剖面与瓶颈线索（勿只盯末尾 10 条磁带）
+{files_line}
+- **整局耗时 / LLM 遥测**：整局耗时 {elapsed_disp} · LLM 调用 {llm_calls_disp} 次 · 回退规则 {llm_fb_disp} 次
+- **决策来源占比**：{src_disp}
+- **HTTP 耗时 Top 5 端点**：
+{http_lines}
+- **重复同参技能调用 (`repeated_skill_args`)**：
+{rep_lines}
+- **最近 12 条技能调度决策流水**：
+{recent_lines}\n"""
+
+
 def _render_fixer_prompt(
     inc_rec: dict[str, Any],
     inc_json: dict[str, Any],
@@ -1132,26 +1686,34 @@ def _render_fixer_prompt(
     subagent_model: str = DEFAULT_FIXER_SUBAGENT_MODEL,
     subagent_effort: str = DEFAULT_FIXER_SUBAGENT_EFFORT,
 ) -> str:
-    tape_preview = json.dumps((inc_json.get("http_tape") or [])[-10:], ensure_ascii=False, indent=2)
+    safe_json = inc_json if isinstance(inc_json, dict) else {}
+    tape_preview = json.dumps((safe_json.get("http_tape") or [])[-10:], ensure_ascii=False, indent=2)
     inc_path = str(inc_rec.get("incident_path") or "")
-    skill_ctx = inc_json.get("skill_context") or {}
-    detail = inc_json.get("detail") or {}
-    skill_args = inc_json.get("skill_args") if inc_json.get("skill_args") is not None else skill_ctx.get("args", {})
-    outcome = inc_json.get("outcome") if inc_json.get("outcome") is not None else skill_ctx.get("outcome")
-    error_code = inc_json.get("error_code") if inc_json.get("error_code") is not None else skill_ctx.get("error_code")
+    skill_ctx = safe_json.get("skill_context") or {}
+    detail = safe_json.get("detail") or {}
+    skill_args = safe_json.get("skill_args") if safe_json.get("skill_args") is not None else skill_ctx.get("args", {})
+    outcome = safe_json.get("outcome") if safe_json.get("outcome") is not None else skill_ctx.get("outcome")
+    error_code = safe_json.get("error_code") if safe_json.get("error_code") is not None else skill_ctx.get("error_code")
     error_msg = (
-        inc_json.get("error_msg")
-        if inc_json.get("error_msg") is not None
+        safe_json.get("error_msg")
+        if safe_json.get("error_msg") is not None
         else (skill_ctx.get("error_msg") or detail.get("summary"))
     )
 
-    is_goal_miss = inc_rec.get("code") == "GOAL_MISS"
-    goal_id = str(inc_rec.get("goal_id") or inc_json.get("goal_id") or detail.get("goal_id") or "")
-    narrow_files = [
-        str(p)
-        for p in (inc_rec.get("editable_files") or inc_json.get("editable_files") or detail.get("editable_files") or [])
-        if p
-    ]
+    inc_code = str(inc_rec.get("code") or "")
+    is_goal_miss = inc_code == "GOAL_MISS"
+    goal_id = str(inc_rec.get("goal_id") or safe_json.get("goal_id") or detail.get("goal_id") or "")
+    raw_editable = (
+        inc_rec.get("editable_files")
+        or safe_json.get("editable_files")
+        or detail.get("editable_files")
+        or []
+    )
+    eff_rec = inc_rec if inc_rec.get("editable_files") else {**inc_rec, "editable_files": raw_editable}
+    narrow_files = _effective_goal_narrow_files(eff_rec)
+    last_failed_sha = str(inc_rec.get("last_failed_fix_commit") or "").strip()
+    is_recurrence_unlocked = bool(is_goal_miss and narrow_files and last_failed_sha)
+
     topic_raw = goal_id or str(inc_rec.get("skill") or "fix")
     safe_goal_id = re.sub(r"[^A-Za-z0-9_]+", "_", topic_raw.lower()).strip("_") or "goal"
     safe_inc_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(inc_rec.get("incident_id") or "inc").lower()).strip("_") or "inc"
@@ -1171,19 +1733,39 @@ def _render_fixer_prompt(
 - **最近一次 Replan (`last_replan`)**：`{json.dumps(detail.get('last_replan'), ensure_ascii=False)}`
 - **技能执行统计 (`skill_stats`)**：`{json.dumps(detail.get('skill_stats', {}), ensure_ascii=False)}`\n"""
 
+    ep_ctx = _extract_prompt_episode_context(safe_json, inc_path)
+    profile_section = _format_episode_context_section(ep_ctx)
+
     if is_goal_miss and narrow_files:
         narrow_list_str = "、".join(f"`{f}`" for f in narrow_files)
         target_skill_started = detail.get("target_skill_started")
         bottleneck_skill = str(detail.get("bottleneck_skill") or inc_rec.get("skill") or "").strip()
+        if is_recurrence_unlocked:
+            recurrence_note = (
+                f"\n   - **复发跨模块扩权已解锁**：前次提交 (`{last_failed_sha[:8]}`) 合入后在真实跑局中仍复发失败，"
+                "已自动解锁规划与前置协同文件 `code/mcagent/loop/policy.py`、`code/mcagent/loop/starter_skills.py`、"
+                "`code/mcagent/loop/goals.py`（可协同排查规划调度、饱和过滤、前置目标与预算止损）。"
+            )
+            other_mod_rule = "修改上述扩权白名单之外的其他无关 `skills/*.py` 或 `loop/*.py` 将被 Gate 1 直接拒绝！"
+        else:
+            recurrence_note = ""
+            other_mod_rule = "修改 `code/mcagent/loop/policy.py`、其他无关 `skills/*.py` 或 `loop/*.py` 将被 Gate 1 直接拒绝！"
         whitelist_block = f"""2. **目标单收窄文件白名单（Gate 1 动态收窄强校验，越界直接拒绝并丢弃改动）**：
-   - **本单只允许修改/新增**：{narrow_list_str} 以及 `code/tests/test_*.py`。
+   - **本单只允许修改/新增**：{narrow_list_str} 以及 `code/tests/test_*.py`。{recurrence_note}
    - **允许从零创建新技能文件与 `@register` 新 L3 技能**：当前诊断 `target_skill_started={target_skill_started}`，目标/瓶颈技能为 `{bottleneck_skill or goal_id}`；若目标主技能尚未启动（`False`）或该技能尚不在 `code/mcagent/skills/REGISTRY` 中，你**有权修改或直接从零创建**上述精确白名单内的领域文件（{narrow_list_str}），并严格参照 `code/mcagent/skills/__init__.py` 与 `code/mcagent/skills/README.md` 定义且 `@register` 新的 L3 `Skill` 子类（`load_all()` 会自动扫描发现 `skills/` 下所有 `.py` 模块）。**严禁**在 {narrow_list_str} 之外新建不同文件名的技能文件！
    - **建议单测命名避免并发冲突**：新增单元测试文件请优先命名为 `{suggested_test_path}`（或按主题命名为 `code/tests/test_soak_<topic>.py`），避免多个并行修单工位碰撞测试文件名。
-   - **严禁越界触碰其他模块**：修改 `code/mcagent/loop/policy.py`、其他无关 `skills/*.py` 或 `loop/*.py` 将被 Gate 1 直接拒绝！
+   - **严禁越界触碰其他模块**：{other_mod_rule}
    - **严禁触碰冻结底座**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{{base,registry,testing}}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
     else:
+        proactive_guidance = ""
+        if inc_code in PROACTIVE_WIDE_INCIDENT_CODES:
+            proactive_guidance = (
+                f"\n   - **广域策略/瓶颈单协同授权（`{inc_code}`）**："
+                "你有权跨 `loop/*.py` 与 `skills/*.py` 协同根治调度饥饿、无效重复刷技能与频繁探测瓶颈"
+                "（如调整规划优先级/饱和过滤、补齐 `can_start`/`verify_done` 去重、或减少无谓循环探测）。"
+            )
         whitelist_block = f"""2. **文件白名单（严禁越界）**：
-   - **只允许修改/新增**：`code/mcagent/loop/*.py`、`code/mcagent/skills/*.py`（不含冻结文件）、`code/tests/test_*.py`。
+   - **只允许修改/新增**：`code/mcagent/loop/*.py`、`code/mcagent/skills/*.py`（不含冻结文件）、`code/tests/test_*.py`。{proactive_guidance}
    - **允许修改已有技能或从零新建技能模块**：除修改已有 `code/mcagent/skills/*.py` 外，你**有权直接新建领域文件** `code/mcagent/skills/<module>.py` 并用 `@register` 注册新 L3 `Skill`（`code/mcagent/skills/__init__.py` 与 `code/mcagent/skills/README.md` 中的 `load_all()` 会自动发现并接入 `REGISTRY`），同时仍须严守下方冻结保护文件清单。
    - **建议单测命名避免并发冲突**：新增单元测试文件请优先命名为 `{suggested_test_path}`（或按主题命名为 `code/tests/test_soak_<topic>.py`），避免多个并行修单工位碰撞测试文件名。
    - **严禁触碰**：`code/mcagent/client.py`、`code/mcagent/runtime.py`、`code/mcagent/skills/{{base,registry,testing}}.py`、`code/mcagent/planner/decision.py`、`AGENTS.md`、`.env*`。"""
@@ -1206,9 +1788,9 @@ def _render_fixer_prompt(
 - **触发技能**：`{inc_rec['skill']}` · 参数：`{json.dumps(skill_args, ensure_ascii=False)}`
 - **结果 / 报错码**：`{outcome}` / `{error_code}`
 - **错误信息**：`{error_msg}`
-- **后置断言信息**：`{inc_json.get('postcondition_error')}`
+- **后置断言信息**：`{safe_json.get('postcondition_error')}`
 - **异常包完整路径**：`{inc_path}`
-{goal_section}
+{goal_section}{profile_section}
 ## 2. 最近 HTTP 交互磁带切片（末尾 10 条）
 ```json
 {tape_preview}
@@ -1219,20 +1801,20 @@ def _render_fixer_prompt(
 {whitelist_block}{subagent_section}
 3. **补充离线回归单测**：在 `code/tests/` 中针对该根因补充至少 1 条确定性单测（新建文件建议命名为 `{suggested_test_path}`），确保 `cd {fixer_wt}/code && uv run python -m unittest discover -s tests` 全部通过。
 4. **不要自己执行 `git commit`**：保留工作区修改即可，外层 `soak_ctl.py verify-and-promote` 会独立运行四道门禁并统一提交到待审分支。
+
+## 3B. 主动排雷与防敷衍硬要求（机器与人工协同审阅）
+1. **严禁“只改/只加测试文件、不改任何生产代码”的空转补丁**：Gate 1 会直接拒收；若确属当前白名单改不到的冻结底座或跨文件问题，禁止写一个“记录限制的测试”混过关，应在最终结论里清晰报告跨模块根因并保留干净退出（或只修当前允许层确有责任的部分）。
+2. **先查全局，再动手修**：先读 `summary.md` 与 `timeline.jsonl`，排查是否同时存在 LLM 选技失焦、重复合成/采集、无效循环、`env_blocked` 假唤醒、步数卡死。
+3. **举一反三（排查同类隐患）**：改某个技能或规划分支前，主动用 `rg` 扫描当前白名单可写文件及同级相关技能中是否存在同样模式缺陷（状态未刷新、缺 `can_start` 去重、缺少安全站位/冷却校验、缺 `verify_done` 验证、异常码吞掉），并在同一白名单范围内顺手一并加固。
+4. **可证伪回归测试**：单测必须先能稳定复现失败现场，再验证修复后恢复，同时补负例（确认不误伤正常场景）。
 """
 
 
 def _incident_edit_scope(inc_rec: dict[str, Any]) -> frozenset[str]:
     """返回异常单的可写作用域集合；非收窄 GOAL_MISS 或空列表返回通配 `{'*'}`。"""
-    if inc_rec.get("code") == "GOAL_MISS":
-        raw_files = inc_rec.get("editable_files") or []
-        normed = frozenset(
-            str(p).strip().lstrip("./").replace("\\", "/")
-            for p in raw_files
-            if str(p).strip()
-        )
-        if normed:
-            return normed
+    narrow = _effective_goal_narrow_files(inc_rec)
+    if narrow:
+        return frozenset(narrow)
     return frozenset({"*"})
 
 
@@ -1397,20 +1979,29 @@ def _collect_worktree_changes(wt_dir: Path) -> list[str]:
 def _check_gate1_in_worktree(
     wt_dir: Path, inc_rec: dict[str, Any]
 ) -> tuple[list[str], Optional[tuple[str, str]]]:
-    """在指定 worktree 内独立校验 Gate 1（非空改动、路径白名单、密钥泄露扫描）。"""
+    """在指定 worktree 内独立校验 Gate 1（非空改动、路径白名单、防纯测试空转、密钥泄露扫描）。"""
     changed_files = _collect_worktree_changes(wt_dir)
     if not changed_files:
         return [], ("gate1_whitelist", "fixer 工位没有任何文件改动")
 
-    narrow_files = (
-        inc_rec.get("editable_files")
-        if inc_rec.get("code") == "GOAL_MISS" and inc_rec.get("editable_files")
-        else None
-    )
+    narrow_files = _effective_goal_narrow_files(inc_rec)
     for rel in changed_files:
         ok, why = is_allowed_edit_path(rel, narrow_files=narrow_files)
         if not ok:
             return changed_files, ("gate1_whitelist", why)
+
+    has_prod_edit = any(
+        (norm_rel := _normalize_rel_path(rel)).startswith("code/mcagent/") and norm_rel.endswith(".py")
+        for rel in changed_files
+    )
+    if not has_prod_edit:
+        return (
+            changed_files,
+            (
+                "gate1_whitelist",
+                "仅改动测试文件而未修改任何生产代码（code/mcagent/**/*.py）；禁止只写测试敷衍交差，请真正修复根因",
+            ),
+        )
 
     diff_txt = _git(wt_dir, "diff", "HEAD", check=False).stdout
     untracked_raw = _git(
@@ -1492,7 +2083,7 @@ def verify_and_promote(
         write_review_report(session_dir)
         return {"ok": False, "failed_gate": gate, "detail": detail}
 
-    # ---------------- Gate 1: 修改文件白名单 + 密钥泄露扫描 ----------------
+    # ---------------- Gate 1: 修改文件白名单 + 防纯测试空转 + 密钥泄露扫描 ----------------
     changed_files, gate1_err = _check_gate1_in_worktree(fixer_wt, inc_rec)
     if gate1_err is not None:
         return _fail(gate1_err[0], gate1_err[1])
@@ -1516,17 +2107,42 @@ def verify_and_promote(
             tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-600:]
             return _fail(f"gate2_{step_name}", tail)
 
-    # ---------------- Gate 3: 独立测试号真机 focus / goal 金丝雀小灶验收 ----------------
+    # ---------------- Gate 3: 独立测试号真机 focus / goal / campaign 金丝雀小灶验收 ----------------
     skill_name = str(inc_rec.get("skill") or "").strip()
     goal_id = str(inc_rec.get("goal_id") or "").strip()
-    is_goal_canary = inc_rec.get("code") == "GOAL_MISS" and bool(goal_id)
-    if live_canary and (is_goal_canary or skill_name):
+    inc_code = str(inc_rec.get("code") or "")
+    inc_cat = str(inc_rec.get("category") or "")
+    is_goal_canary = bool(goal_id) and (
+        inc_code == "GOAL_MISS"
+        or inc_cat == "strategy"
+        or inc_code in PROACTIVE_WIDE_INCIDENT_CODES
+        or skill_name in ("", "session")
+    )
+    is_session_canary = (not is_goal_canary) and skill_name == "session"
+    is_focus_canary = (not is_goal_canary) and bool(skill_name) and skill_name != "session"
+    run_live_canary = bool(live_canary and (is_goal_canary or is_session_canary or is_focus_canary))
+    canary_summary: Optional[dict[str, Any]] = None
+
+    if run_live_canary:
         canary_dir = attempt_dir / "live_canary"
         if is_goal_canary:
             cmd = [
                 "uv", "run", "python", "-m", "mcagent.loop",
                 "--mode", "campaign",
                 "--goal", goal_id,
+                "--soak",
+                "--local-target", "--live",
+                "--user", fixer_bot_user,
+                "--run-dir", str(canary_dir),
+                "--max-steps", str(canary_max_steps),
+                "--max-seconds", str(canary_max_seconds),
+                "--disconnect-on-exit",
+            ]
+        elif is_session_canary:
+            cmd = [
+                "uv", "run", "python", "-m", "mcagent.loop",
+                "--mode", "campaign",
+                "--llm",
                 "--soak",
                 "--local-target", "--live",
                 "--user", fixer_bot_user,
@@ -1570,6 +2186,15 @@ def verify_and_promote(
         canary_summary = _summarize_episode_dir(canary_dir)
         if canary_summary["bugs_count"] > 0:
             return _fail("gate3_live_canary_bugs", f"金丝雀验收仍触发 {canary_summary['bugs_count']} 个 bug 异常单")
+        if (
+            is_goal_canary
+            and canary_summary.get("stop_reason") == "goal_stopped_out"
+            and not canary_summary.get("target_goal_reached")
+        ):
+            return _fail(
+                "gate3_live_canary_stopped_out",
+                f"金丝雀验收在 {canary_summary.get('steps', 0)} 步因 goal_stopped_out 提前止损退出且未达成目标 {goal_id}",
+            )
 
     # ---------------- Gate 4: 提交到单一待审分支并通知 Runner 下一轮热切换 ----------------
     _git(fixer_wt, "add", *changed_files)
@@ -1585,13 +2210,21 @@ def verify_and_promote(
         rec["attempts"] = int(rec.get("attempts", 0)) + 1
         rec["status"] = "fixed"
         rec["fix_commit"] = new_sha
-        rec.setdefault("gate_history", []).append({
+        history_entry: dict[str, Any] = {
             "at": _utc_now(),
             "ok": True,
             "commit": new_sha,
             "changed_files": changed_files,
-            "live_canary": bool(live_canary and (is_goal_canary or skill_name)),
-        })
+            "live_canary": run_live_canary,
+        }
+        if canary_summary is not None:
+            history_entry["canary_summary"] = {
+                "steps": int(canary_summary.get("steps", 0) or 0),
+                "skills_completed": int(canary_summary.get("skills_completed", 0) or 0),
+                "target_goal_reached": bool(canary_summary.get("target_goal_reached", False)),
+                "stop_reason": str(canary_summary.get("stop_reason") or ""),
+            }
+        rec.setdefault("gate_history", []).append(history_entry)
         st["commits"].append({
             "sha": new_sha,
             "at": _utc_now(),

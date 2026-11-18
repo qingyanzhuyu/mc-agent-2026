@@ -129,6 +129,10 @@ def _format_source_breakdown(counts: dict[str, int], unit: str) -> str:
     return f"共 `{total}` {unit}（" + " · ".join(parts) + "）"
 
 
+def _skill_args_key(skill_name: str, args: Optional[Mapping[str, Any]]) -> str:
+    return f"{skill_name}:{json.dumps(dict(args or {}), sort_keys=True, ensure_ascii=False, separators=(',', ':'), default=str)}"
+
+
 def git_provenance(cwd: Optional[str] = None) -> dict[str, Any]:
     work = cwd or os.path.dirname(os.path.abspath(__file__))
     info: dict[str, Any] = {"commit": "unknown", "branch": "unknown", "dirty": None}
@@ -204,8 +208,11 @@ class SoakObserver:
         self._skill_ctx: Optional[dict] = None
         self._last_skill_snapshots: dict[str, tuple[dict, list[dict]]] = {}
         self._last_replan: Optional[dict[str, Any]] = None
+        self._decision_history: deque[dict[str, Any]] = deque(maxlen=30)
 
         self.skill_stats: dict[str, dict[str, int]] = {}
+        self.skill_elapsed_s: dict[str, float] = {}
+        self.skill_arg_stats: dict[str, dict[str, Any]] = {}
         self.env_variance_counts: dict[str, int] = {}
         self.environment_blocked_goals: dict[str, dict[str, str]] = {}
         self.decision_sources: dict[str, int] = {}
@@ -244,16 +251,29 @@ class SoakObserver:
         self.on_progress_tick(state, client=None, force=True)
         self.write_summary()
 
+    def _ensure_skill_arg_entry(self, skill_name: str, args_dict: dict[str, Any]) -> dict[str, Any]:
+        arg_key = _skill_args_key(skill_name, args_dict)
+        return self.skill_arg_stats.setdefault(arg_key, {
+            "skill": skill_name,
+            "args": copy.deepcopy(args_dict),
+            "started": 0,
+            "ok": 0,
+            "replan": 0,
+            "env_blocked": 0,
+            "total_elapsed_s": 0.0,
+        })
+
     def on_skill_start(self, skill, plan_source: str, reason: str, state: State) -> dict[str, int]:
         st = state.snapshot()
         inv = copy.deepcopy(state.inventory)
         fp = _inv_fingerprint(inv) or {}
         if self.tape is not None:
             self.tape.begin_skill_slice()
+        args_dict = dict(getattr(skill, "args", None) or {})
         self._skill_ctx = {
             "skill": skill.name,
             "goal": skill.goal,
-            "args": dict(skill.args),
+            "args": copy.deepcopy(args_dict),
             "plan_source": plan_source,
             "reason": reason,
             "started_elapsed_s": self._elapsed_s(),
@@ -266,6 +286,8 @@ class SoakObserver:
         }
         stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "budget_stopped": 0, "bug": 0})
         stat["started"] += 1
+        arg_entry = self._ensure_skill_arg_entry(skill.name, args_dict)
+        arg_entry["started"] += 1
         self.decision_sources[plan_source] = self.decision_sources.get(plan_source, 0) + 1
         self._append_jsonl(self.timeline_path, {
             "event": "skill_start",
@@ -389,8 +411,21 @@ class SoakObserver:
         environment_recovery: bool = False,
     ) -> None:
         tape_slice = self.tape.end_skill_slice() if self.tape is not None else []
+        had_start_ctx = self._skill_ctx is not None
+        now_elapsed = self._elapsed_s()
         ctx = self._skill_ctx or {"skill": skill.name, "args": dict(skill.args), "before_counts": {}}
         ctx["outcome"] = outcome
+        started_el = ctx.get("started_elapsed_s")
+        skill_dt = max(0.0, round(now_elapsed - float(started_el), 2)) if started_el is not None else 0.0
+        self.skill_elapsed_s[skill.name] = round(self.skill_elapsed_s.get(skill.name, 0.0) + skill_dt, 2)
+
+        raw_args = ctx.get("args") if ctx.get("args") is not None else getattr(skill, "args", None)
+        args_dict = dict(raw_args or {})
+        arg_entry = self._ensure_skill_arg_entry(skill.name, args_dict)
+        if not had_start_ctx:
+            arg_entry["started"] += 1
+        arg_entry["total_elapsed_s"] = round(float(arg_entry.get("total_elapsed_s", 0.0)) + skill_dt, 2)
+
         stat = self.skill_stats.setdefault(skill.name, {"started": 0, "ok": 0, "replan": 0, "budget_stopped": 0, "bug": 0})
 
         post_err = ""
@@ -401,38 +436,55 @@ class SoakObserver:
             if post_err:
                 outcome = "postcondition_failed"
                 ctx["outcome"] = outcome
-                stat["bug"] += 1
-                self._report_incident(
-                    code="SKILL_POSTCONDITION_FAIL",
-                    severity="P1",
-                    category="bug",
-                    title=post_err,
-                    detail={"skill": skill.name, "args": skill.args},
-                    state=state,
-                    outcome=outcome,
-                    skill_ctx=ctx,
-                    tape_slice=tape_slice,
-                )
-            else:
-                stat["ok"] += 1
-                # 经后置判据确认的成功打断该目标的连续失败，其他目标的历史保持不变。
-                self._goal_failures.pop(skill.goal, None)
+
+        self._decision_history.append({
+            "elapsed_s": now_elapsed,
+            "skill": skill.name,
+            "args": copy.deepcopy(args_dict),
+            "source": str(ctx.get("plan_source") or "rule"),
+            "reason": str(ctx.get("reason") or ""),
+            "outcome": outcome,
+            "error_code": error_code,
+            "error_msg": error_msg[:200],
+            "steps": int(ctx.get("steps") or 0),
+        })
+
+        if post_err:
+            stat["bug"] += 1
+            self._report_incident(
+                code="SKILL_POSTCONDITION_FAIL",
+                severity="P1",
+                category="bug",
+                title=post_err,
+                detail={"skill": skill.name, "args": skill.args},
+                state=state,
+                outcome=outcome,
+                skill_ctx=ctx,
+                tape_slice=tape_slice,
+            )
+        elif outcome == "completed":
+            stat["ok"] += 1
+            arg_entry["ok"] += 1
+            # 经后置判据确认的成功打断该目标的连续失败，其他目标的历史保持不变。
+            self._goal_failures.pop(skill.goal, None)
         elif outcome == "budget_stopped":
             # 外层运行预算只说明未继续执行，不能判定技能失败；保留流水与姿态核对。
             stat["budget_stopped"] += 1
         elif environment is not None:
             key = f"{skill.name}:env_blocked"
             self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
+            arg_entry["env_blocked"] += 1
             self._goal_failures.pop(skill.goal, None)
         else:
             stat["replan"] += 1
+            arg_entry["replan"] += 1
             if outcome == "replan":
                 self._last_replan = {
                     "skill": skill.name,
                     "args": dict(skill.args),
                     "error_code": error_code,
                     "error_msg": error_msg[:200],
-                    "elapsed_s": self._elapsed_s(),
+                    "elapsed_s": now_elapsed,
                 }
             self._classify_skill_failure(
                 skill, outcome, error_code, error_msg, state, ctx, tape_slice,
@@ -673,6 +725,7 @@ class SoakObserver:
             for gid in self.target_goals:
                 if not reached_map[gid] and gid not in self.environment_blocked_goals:
                     self._report_goal_miss(gid, state, stop_reason)
+            self._report_proactive_anomalies(state, stop_reason)
 
         self._append_jsonl(self.timeline_path, {
             "event": "run_end",
@@ -760,6 +813,215 @@ class SoakObserver:
             tape_slice=saved_tape,
         )
 
+    def _report_proactive_anomalies(self, state: State, stop_reason: str) -> None:
+        if stop_reason in ("keyboard_interrupt", "transient_outage"):
+            return
+
+        tape_slice = self.tape.recent(30) if self.tape is not None else []
+        has_unreached_target = any(
+            gid not in self.goals_reached and gid not in self.environment_blocked_goals
+            for gid in self.target_goals
+        )
+
+        # a) DISPATCH_STARVATION
+        total_starts = sum(s["started"] for s in self.skill_stats.values())
+        if self.target_goals and total_starts >= 10:
+            llm_calls = len(self.llm_latencies_ms)
+            fallback_rate = (self.llm_fallbacks / llm_calls) if llm_calls > 0 else 0.0
+            for gid in self.target_goals:
+                if gid in self.goals_reached or gid in self.environment_blocked_goals:
+                    continue
+                g = self._ledger_map.get(gid)
+                target_skill = g.skill if g is not None else ""
+                target_starts = self.skill_stats.get(target_skill, {}).get("started", 0) if target_skill else 0
+                non_target_max = max(
+                    (st["started"] for sname, st in self.skill_stats.items() if sname != target_skill),
+                    default=0,
+                )
+                starved = (target_starts <= 2 or target_starts < total_starts * 0.15) and non_target_max >= 6
+                llm_degraded = self.llm_fallbacks >= 5 and fallback_rate >= 0.35
+                if starved or llm_degraded:
+                    self._report_incident(
+                        code="DISPATCH_STARVATION",
+                        severity="P1",
+                        category="strategy",
+                        custom_fingerprint=f"DISPATCH_STARVATION:{gid}",
+                        title=f"目标 {gid} 调度饥饿：主技能 {target_skill or 'unknown'} 启动 {target_starts}/{total_starts} 次",
+                        detail={
+                            "goal_id": gid,
+                            "target_skill": target_skill,
+                            "target_starts": target_starts,
+                            "total_starts": total_starts,
+                            "non_target_max_starts": non_target_max,
+                            "llm_calls": llm_calls,
+                            "llm_fallbacks": self.llm_fallbacks,
+                            "fallback_rate": round(fallback_rate, 3),
+                            "stop_reason": stop_reason,
+                            "decision_sources": dict(self.decision_sources),
+                            "skill_stats": copy.deepcopy(self.skill_stats),
+                        },
+                        extra_top_fields={"goal_id": gid, "editable_files": [], "proactive": True},
+                        state=state,
+                        outcome="dispatch_starvation",
+                        skill_ctx={"skill": target_skill or "session", "args": {}},
+                        tape_slice=tape_slice,
+                    )
+
+        # b) SKILL_SPAM_LOOP
+        sev = "P1" if has_unreached_target else "P2"
+        for key, entry in self.skill_arg_stats.items():
+            sname = str(entry["skill"])
+            started = int(entry.get("started", 0))
+            is_spam = (
+                (sname == "craft_gear" and started >= 4)
+                or (sname not in ("craft_gear", "scout_island") and started >= 8)
+                or (sname == "scout_island" and started >= 20 and has_unreached_target)
+            )
+            if is_spam:
+                args_tag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
+                args_preview = json.dumps(entry["args"], sort_keys=True, ensure_ascii=False)
+                self._report_incident(
+                    code="SKILL_SPAM_LOOP",
+                    severity=sev,
+                    category="strategy",
+                    custom_fingerprint=f"SKILL_SPAM_LOOP:{sname}:{args_tag}",
+                    title=f"技能 {sname} 同参数高频空转 {started} 次 ({args_preview[:80]})",
+                    detail={
+                        "skill": sname,
+                        "args": copy.deepcopy(entry["args"]),
+                        "started": started,
+                        "ok": int(entry.get("ok", 0)),
+                        "replan": int(entry.get("replan", 0)),
+                        "env_blocked": int(entry.get("env_blocked", 0)),
+                        "total_elapsed_s": round(float(entry.get("total_elapsed_s", 0.0)), 2),
+                        "has_unreached_target": has_unreached_target,
+                        "stop_reason": stop_reason,
+                    },
+                    extra_top_fields={"editable_files": [], "proactive": True},
+                    state=state,
+                    outcome="skill_spam_loop",
+                    skill_ctx={"skill": sname, "args": copy.deepcopy(entry["args"])},
+                    tape_slice=tape_slice,
+                )
+
+        # c) API_BOTTLENECK_SLOW
+        elapsed_now = self._elapsed_s()
+        path_stats_fn = getattr(self.tape, "path_stats", None) if self.tape is not None else None
+        if elapsed_now >= 60.0 and callable(path_stats_fn):
+            raw_stats = path_stats_fn()
+            if isinstance(raw_stats, Mapping):
+                elapsed_ms = elapsed_now * 1000.0
+                sorted_paths = sorted(
+                    raw_stats.items(),
+                    key=lambda kv: (-float(kv[1].get("total_ms", 0.0)), str(kv[0])),
+                )
+                for slow_path, st in sorted_paths:
+                    total_ms = float(st.get("total_ms", 0.0))
+                    ratio = total_ms / elapsed_ms
+                    if total_ms >= 20_000.0 and ratio >= 0.30:
+                        pct = round(ratio * 100.0, 1)
+                        count = int(st.get("count", 0))
+                        avg_ms = (
+                            round(float(st["avg_ms"]), 1)
+                            if "avg_ms" in st
+                            else (round(total_ms / count, 1) if count > 0 else 0.0)
+                        )
+                        max_ms = round(float(st.get("max_ms", 0.0)), 1)
+                        self._report_incident(
+                            code="API_BOTTLENECK_SLOW",
+                            severity="P2",
+                            category="strategy",
+                            custom_fingerprint=f"API_BOTTLENECK_SLOW:{slow_path}",
+                            title=f"接口 /{str(slow_path).lstrip('/')} 累计耗时 {total_ms / 1000.0:.1f}s（占运行时长 {pct:.1f}%）",
+                            detail={
+                                "path": str(slow_path),
+                                "count": count,
+                                "ok": int(st.get("ok", 0)),
+                                "errors": int(st.get("errors", 0)),
+                                "total_ms": round(total_ms, 1),
+                                "avg_ms": avg_ms,
+                                "max_ms": max_ms,
+                                "pct_of_elapsed": pct,
+                                "elapsed_s": elapsed_now,
+                                "stop_reason": stop_reason,
+                            },
+                            extra_top_fields={"editable_files": [], "proactive": True},
+                            state=state,
+                            outcome="api_bottleneck_slow",
+                            skill_ctx={"skill": "session", "args": {}},
+                            tape_slice=tape_slice,
+                        )
+
+    def build_episode_profile(self, state: Optional[State] = None) -> dict[str, Any]:
+        """构建零额外 RTT 的全局运行剖面（深拷贝/只读安全）。"""
+        elapsed_s = self._elapsed_s()
+
+        skill_stats_copy: dict[str, dict[str, Any]] = {}
+        for sname, st in self.skill_stats.items():
+            row: dict[str, Any] = dict(st)
+            row["elapsed_s"] = round(self.skill_elapsed_s.get(sname, 0.0), 2)
+            skill_stats_copy[sname] = row
+
+        repeated_candidates = [
+            copy.deepcopy(entry)
+            for entry in self.skill_arg_stats.values()
+            if int(entry.get("started", 0)) >= 3
+        ]
+        repeated_candidates.sort(
+            key=lambda entry: (
+                -int(entry.get("started", 0)),
+                -float(entry.get("total_elapsed_s", 0.0)),
+                str(entry.get("skill", "")),
+            )
+        )
+        repeated_skill_args = repeated_candidates[:8]
+
+        http_stats: list[dict[str, Any]] = []
+        path_stats_fn = getattr(self.tape, "path_stats", None) if self.tape is not None else None
+        if callable(path_stats_fn):
+            raw_stats = path_stats_fn()
+            if isinstance(raw_stats, Mapping):
+                for path, st in raw_stats.items():
+                    count = int(st.get("count", 0))
+                    total_ms_raw = float(st.get("total_ms", 0.0))
+                    total_ms = round(total_ms_raw, 1)
+                    avg_ms = (
+                        round(float(st["avg_ms"]), 1)
+                        if "avg_ms" in st
+                        else (round(total_ms_raw / count, 1) if count > 0 else 0.0)
+                    )
+                    max_ms = round(float(st.get("max_ms", 0.0)), 1)
+                    pct_of_elapsed = (
+                        round(total_ms_raw / (elapsed_s * 1000.0) * 100.0, 1)
+                        if elapsed_s > 0.0
+                        else 0.0
+                    )
+                    http_stats.append({
+                        "path": str(path),
+                        "count": count,
+                        "ok": int(st.get("ok", 0)),
+                        "errors": int(st.get("errors", 0)),
+                        "total_ms": total_ms,
+                        "avg_ms": avg_ms,
+                        "max_ms": max_ms,
+                        "pct_of_elapsed": pct_of_elapsed,
+                    })
+                http_stats.sort(key=lambda item: (-item["total_ms"], -item["count"], item["path"]))
+                http_stats = http_stats[:8]
+
+        return {
+            "elapsed_s": elapsed_s,
+            "decision_sources": dict(self.decision_sources),
+            "step_sources": dict(self.step_sources),
+            "llm_calls": len(self.llm_latencies_ms),
+            "llm_fallbacks": self.llm_fallbacks,
+            "goals_reached": dict(self.goals_reached),
+            "skill_stats": skill_stats_copy,
+            "repeated_skill_args": repeated_skill_args,
+            "http_stats": http_stats,
+            "recent_decisions": copy.deepcopy(list(self._decision_history)[-15:]),
+        }
+
     # ---- 去重立档与汇总看板 --------------------------------------------
     def _report_incident(
         self,
@@ -791,6 +1053,8 @@ class SoakObserver:
             inc["count"] += 1
             inc["last_seen_s"] = now_elapsed
             inc["last_detail"] = detail
+            inc["run_dir"] = str(self.run_dir)
+            inc["episode_profile"] = self.build_episode_profile(state)
             if extra_top_fields:
                 inc.update(extra_top_fields)
             Path(inc["path"]).write_text(json.dumps(inc, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -819,6 +1083,7 @@ class SoakObserver:
             "source": self.source,
             "git": self.git,
             "world_snapshot_id": self.world_snapshot_id,
+            "run_dir": str(self.run_dir),
             "run_meta": self.run_meta,
             "detail": detail,
             "last_detail": detail,
@@ -835,6 +1100,7 @@ class SoakObserver:
             "recent_steps": list(self._recent_steps)[-15:],
             "recent_events": list(state.events)[-20:],
             "http_tape": tape_data or [],
+            "episode_profile": self.build_episode_profile(state),
             "path": str(fpath),
         }
         if extra_top_fields:
@@ -963,6 +1229,34 @@ class SoakObserver:
             lines += ["", "## 四、已知环境波动计数（仅统计，不入缺陷榜）"]
             for k, cnt in sorted(self.env_variance_counts.items(), key=lambda kv: -kv[1]):
                 lines.append(f"- `{k}`: {cnt} 次")
+
+        profile = self.build_episode_profile()
+        http_stats = profile["http_stats"]
+        repeated_args = profile["repeated_skill_args"]
+        if http_stats or repeated_args:
+            lines += ["", "## 五、接口耗时与高频行为剖析"]
+            if http_stats:
+                lines += [
+                    "",
+                    "### 接口耗时 Top（按总耗时）",
+                    "",
+                    "| 接口 | 次数 | 成功 | 失败 | 总耗时(ms) | 均耗(ms) | 最大(ms) | 占运行时长 |",
+                    "|---|---:|---:|---:|---:|---:|---:|---:|",
+                ]
+                for row in http_stats:
+                    lines.append(
+                        f"| `/{row['path'].lstrip('/')}` | {row['count']} | {row['ok']} | {row['errors']} | "
+                        f"{row['total_ms']:.1f} | {row['avg_ms']:.1f} | {row['max_ms']:.1f} | {row['pct_of_elapsed']:.1f}% |"
+                    )
+            if repeated_args:
+                lines += ["", "### 高频同参数技能调用（`started >= 3`）"]
+                for entry in repeated_args:
+                    args_str = json.dumps(entry.get("args") or {}, ensure_ascii=False, sort_keys=True)
+                    lines.append(
+                        f"- `{entry['skill']}` `{args_str}`：启动 `{entry['started']}` 次，"
+                        f"完成 `{entry['ok']}`，Replan `{entry['replan']}`，"
+                        f"环境阻塞 `{entry['env_blocked']}`，累计耗时 `{float(entry.get('total_elapsed_s', 0.0)):.2f}s`"
+                    )
 
         text = "\n".join(lines) + "\n"
         self.summary_path.write_text(text, encoding="utf-8")
