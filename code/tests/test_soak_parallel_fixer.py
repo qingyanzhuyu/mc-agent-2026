@@ -471,6 +471,131 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
         prompt1 = Path(item1["prompt_file"]).read_text(encoding="utf-8")
         self.assertIn(str(wt1), prompt1)
 
+    def test_proactive_domain_partitioning_fills_three_workers_without_breaking_wildcards(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "DISPATCH_STARVATION:enter_the_nether": {
+                    "incident_id": "INC-N-STARVE",
+                    "fingerprint": "DISPATCH_STARVATION:enter_the_nether",
+                    "code": "DISPATCH_STARVATION",
+                    "goal_id": "enter_the_nether",
+                    "skill": "build_and_enter_portal",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": [],
+                    "attempts": 0,
+                },
+                "GOAL_MISS:enter_the_nether": {
+                    "incident_id": "INC-N-MISS",
+                    "fingerprint": "GOAL_MISS:enter_the_nether",
+                    "code": "GOAL_MISS",
+                    "goal_id": "enter_the_nether",
+                    "skill": "build_and_enter_portal",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": ["code/mcagent/skills/nether.py"],
+                    "attempts": 0,
+                },
+                "GOAL_MISS:prep_diamond_pickaxe": {
+                    "incident_id": "INC-D-MISS",
+                    "fingerprint": "GOAL_MISS:prep_diamond_pickaxe",
+                    "code": "GOAL_MISS",
+                    "goal_id": "prep_diamond_pickaxe",
+                    "skill": "craft_diamond_gear",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": ["code/mcagent/skills/diamond.py"],
+                    "attempts": 0,
+                },
+                "SKILL_SPAM_LOOP:scout_island:4fe949": {
+                    "incident_id": "INC-S-SPAM",
+                    "fingerprint": "SKILL_SPAM_LOOP:scout_island:4fe949",
+                    "code": "SKILL_SPAM_LOOP",
+                    "skill": "scout_island",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": [],
+                    "attempts": 0,
+                },
+                "SKILL_SPAM_LOOP:gather_wood:dfd326": {
+                    "incident_id": "INC-W-SPAM",
+                    "fingerprint": "SKILL_SPAM_LOOP:gather_wood:dfd326",
+                    "code": "SKILL_SPAM_LOOP",
+                    "skill": "gather_wood",
+                    "severity": "P2",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": [],
+                    "attempts": 0,
+                },
+                "API_BOTTLENECK_SLOW:move_to": {
+                    "incident_id": "INC-API-1",
+                    "fingerprint": "API_BOTTLENECK_SLOW:move_to",
+                    "code": "API_BOTTLENECK_SLOW",
+                    "skill": "session",
+                    "severity": "P2",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": [],
+                    "attempts": 0,
+                },
+                "API_BOTTLENECK_SLOW:find_blocks": {
+                    "incident_id": "INC-API-2",
+                    "fingerprint": "API_BOTTLENECK_SLOW:find_blocks",
+                    "code": "API_BOTTLENECK_SLOW",
+                    "skill": "session",
+                    "severity": "P2",
+                    "category": "strategy",
+                    "status": "pending",
+                    "editable_files": [],
+                    "attempts": 0,
+                },
+            }
+
+        claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3)
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed],
+            [
+                "DISPATCH_STARVATION:enter_the_nether",
+                "GOAL_MISS:prep_diamond_pickaxe",
+                "SKILL_SPAM_LOOP:scout_island:4fe949",
+            ],
+        )
+
+        # Next batch mixes API_BOTTLENECK_SLOW + remaining starter/nether domains, while keeping two API_BOTTLENECK_SLOW mutually exclusive.
+        claimed2 = soak_ctl.claim_parallel_incidents(self.session, max_workers=3)
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed2],
+            [
+                "GOAL_MISS:enter_the_nether",
+                "SKILL_SPAM_LOOP:gather_wood:dfd326",
+                "API_BOTTLENECK_SLOW:move_to",
+            ],
+        )
+
+        # _incident_edit_scope stays wildcard for non-GOAL_MISS contracts.
+        st_now = soak_ctl.read_state(self.session)
+        self.assertEqual(
+            soak_ctl._incident_edit_scope(st_now["incidents"]["API_BOTTLENECK_SLOW:find_blocks"]),
+            frozenset({"*"}),
+        )
+
+        # A merge_conflict_requeue history escalates the scope to include policy.py / goals.py / starter_skills.py.
+        scope_clean = soak_ctl._claim_parallel_scope(st_now["incidents"]["GOAL_MISS:enter_the_nether"])
+        conflict_rec = {
+            "code": "SKILL_SPAM_LOOP",
+            "skill": "hunt_mob",
+            "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+        }
+        conflict_scope = soak_ctl._claim_parallel_scope(conflict_rec)
+        self.assertIn("code/mcagent/loop/policy.py", conflict_scope)
+        self.assertFalse(soak_ctl._scopes_conflict(scope_clean, conflict_scope))
+
 
 class TestRunFixerBatchExecution(unittest.TestCase):
     """验证 run_fixer_batch 真实并发、串行合并、门禁隔离、冲突重入与超时清理。"""
