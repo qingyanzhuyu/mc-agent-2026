@@ -554,6 +554,51 @@ class WoodStoneSaturationMenuTests(unittest.TestCase):
         self.assertIn("mine_stone", seen_stone_fb)
         self.assertNotIn("gather_wood", seen_stone_fb)
 
+        # 4) 多目标显式点名了 mine_stone（且其已完成、仅剩 deflect_arrow 排第一），
+        #    仍不得将显式目标对应的 mine_stone 从菜单剔除，但无关且已饱和的 gather_wood 仍应过滤
+        multi_ledger = (
+            GoalSpec(
+                id="mine_stone",
+                title="采集圆石",
+                tier="T1",
+                score=5,
+                skill="mine_stone",
+                done_items=("cobblestone>=3",),
+                stage="graduated",
+            ),
+            GoalSpec(
+                id="deflect_arrow",
+                title="盾反",
+                tier="T1",
+                score=15,
+                skill="deflect_skeleton_arrow",
+                done_advancements=("minecraft:story/deflect_arrow",),
+                stage="graduated",
+            ),
+        )
+        multi_reg = {
+            "deflect_skeleton_arrow": _DeflectArrowStub,
+            "gather_wood": GatherWood,
+            "mine_stone": MineStone,
+            "scout_island": ScoutIsland,
+        }
+        multi_state = _make_state([
+            {"name": "wooden_pickaxe", "count": 1, "slot": 0},
+            {"name": "oak_log", "count": 21, "slot": 1},
+            {"name": "cobblestone", "count": 88, "slot": 2},
+        ])
+        dec_multi, seen_multi = self._run_llm_select(
+            state=multi_state,
+            target_goal=("deflect_arrow", "mine_stone"),
+            ledger=multi_ledger,
+            registry=multi_reg,
+            reply_skill="mine_stone",
+        )
+        self.assertEqual(dec_multi.source, "llm")
+        self.assertEqual(dec_multi.skill.name, "mine_stone")
+        self.assertIn("mine_stone", seen_multi)
+        self.assertNotIn("gather_wood", seen_multi)
+
     def test_no_filtering_when_target_goal_is_none(self):
         # 对应 test_soak_gather_wood_inc_001.py 场景：oak_log=80 且 target_goal=None，不应剔除菜单
         state = _make_state([

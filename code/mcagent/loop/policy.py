@@ -476,13 +476,26 @@ class CampaignPlanner:
             ranked = self.rules._rank(state)
             if ranked:
                 top_g = ranked[0].step_goal
-                wants_wood = top_g.skill == "gather_wood" or any(
-                    fb_s == "gather_wood" and not check_item_expr(state, expr)
-                    for expr, fb_s, _ in top_g.gather_fallbacks
+                explicit_target_skills = {
+                    self.rules.ledger_map[gid].skill
+                    for gid in normalize_goal_ids(self.target_goal)
+                    if gid in self.rules.ledger_map
+                }
+                wants_wood = (
+                    "gather_wood" in explicit_target_skills
+                    or top_g.skill == "gather_wood"
+                    or any(
+                        fb_s == "gather_wood" and not check_item_expr(state, expr)
+                        for expr, fb_s, _ in top_g.gather_fallbacks
+                    )
                 )
-                wants_stone = top_g.skill == "mine_stone" or any(
-                    fb_s == "mine_stone" and not check_item_expr(state, expr)
-                    for expr, fb_s, _ in top_g.gather_fallbacks
+                wants_stone = (
+                    "mine_stone" in explicit_target_skills
+                    or top_g.skill == "mine_stone"
+                    or any(
+                        fb_s == "mine_stone" and not check_item_expr(state, expr)
+                        for expr, fb_s, _ in top_g.gather_fallbacks
+                    )
                 )
                 saturated_skills: list[str] = []
                 if not wants_wood and (total_logs(state) * 4 + total_planks(state)) >= 64:
