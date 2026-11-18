@@ -44,6 +44,12 @@ _ITEM_MILESTONES: tuple[tuple[str, tuple[str, ...], int], ...] = (
 
 _SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
+# 站位/工况前置未确认类环境变量：属于局部作业站位问题，不等于真实资源枯竭（如 wood / exposed_iron）
+_STANCE_ONLY_ENV_PREDICATES: frozenset[str] = frozenset({
+    "dry_work_stand",
+    "unconfirmed_work_stand",
+})
+
 # 初赛公告参考额度口径与满场时长（用于报告额度占比与 8h 满场外推）
 QUOTA_INPUT_TOKENS = 8_000_000
 QUOTA_OUTPUT_TOKENS = 1_500_000
@@ -474,7 +480,8 @@ class SoakObserver:
             key = f"{skill.name}:env_blocked"
             self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
             arg_entry["env_blocked"] += 1
-            self._goal_failures.pop(skill.goal, None)
+            if environment.missing_predicate not in _STANCE_ONLY_ENV_PREDICATES:
+                self._goal_failures.pop(skill.goal, None)
         else:
             stat["replan"] += 1
             arg_entry["replan"] += 1
@@ -707,6 +714,14 @@ class SoakObserver:
         self._append_jsonl(self.curve_path, point)
         return point
 
+    def _real_env_blocked_goals(self) -> dict[str, dict[str, str]]:
+        """返回排除纯站位/工况未确认类环境变量后的真实环境阻塞目标映射。"""
+        return {
+            gid: ev
+            for gid, ev in self.environment_blocked_goals.items()
+            if isinstance(ev, Mapping) and ev.get("missing_predicate") not in _STANCE_ONLY_ENV_PREDICATES
+        }
+
     def on_run_end(
         self, state: State, client=None, *, stop_reason: str = "",
         environment_blocked: Optional[Mapping[str, EnvBlocked]] = None,
@@ -722,8 +737,9 @@ class SoakObserver:
 
         # 人工中断与接口长时间不可用都不是策略或代码问题，不派 GOAL_MISS 修单
         if stop_reason not in ("keyboard_interrupt", "transient_outage"):
+            real_env_blocked = self._real_env_blocked_goals()
             for gid in self.target_goals:
-                if not reached_map[gid] and gid not in self.environment_blocked_goals:
+                if not reached_map[gid] and gid not in real_env_blocked:
                     self._report_goal_miss(gid, state, stop_reason)
             self._report_proactive_anomalies(state, stop_reason)
 
@@ -818,8 +834,13 @@ class SoakObserver:
             return
 
         tape_slice = self.tape.recent(30) if self.tape is not None else []
+        real_env_blocked = self._real_env_blocked_goals()
         has_unreached_target = any(
-            gid not in self.goals_reached and gid not in self.environment_blocked_goals
+            gid not in self.goals_reached and gid not in real_env_blocked
+            for gid in self.target_goals
+        )
+        has_any_unreached_goal = any(
+            gid not in self.goals_reached
             for gid in self.target_goals
         )
 
@@ -829,7 +850,7 @@ class SoakObserver:
             llm_calls = len(self.llm_latencies_ms)
             fallback_rate = (self.llm_fallbacks / llm_calls) if llm_calls > 0 else 0.0
             for gid in self.target_goals:
-                if gid in self.goals_reached or gid in self.environment_blocked_goals:
+                if gid in self.goals_reached or gid in real_env_blocked:
                     continue
                 g = self._ledger_map.get(gid)
                 target_skill = g.skill if g is not None else ""
@@ -870,7 +891,6 @@ class SoakObserver:
         # b) SKILL_SPAM_LOOP
         # 非物品配方参数类技能（如 gather_wood(count)、mine_stone(count)、scout_island(radius)）按技能名聚合，
         # 避免仅因数量/半径微调就把同一空转根因拆成多张慢速修单；合成类仍按 item 分开。
-        sev = "P1" if has_unreached_target else "P2"
         spam_groups: dict[str, dict[str, Any]] = {}
         for entry in self.skill_arg_stats.values():
             sname = str(entry["skill"])
@@ -903,14 +923,25 @@ class SoakObserver:
             sname = str(entry["skill"])
             started = int(entry["started"])
             ok_count = int(entry["ok"])
+            extreme_hard_floor = (
+                (sname == "scout_island" and started >= 60)
+                or (sname == "surface_for_air" and started >= 30)
+            )
             # 只有真正多次成功却仍重复同技能/同物品调用（如 13 把石剑 / 129 原木）才算 SKILL_SPAM_LOOP，
-            # 避免把“前置偶发失败重试 2~3 次后终于成功 1 次”的正常恢复流程误判为刷屏。
+            # 避免把“前置偶发失败重试 2~3 次后终于成功 1 次”的正常恢复流程误判为刷屏；
+            # 但达到极端硬阈值（如 scout_island>=60 / surface_for_air>=30）时无论 ok 次数与 env_blocked 均触发。
             is_spam = (
                 (sname == "craft_gear" and started >= 4 and ok_count >= 2)
                 or (sname not in ("craft_gear", "scout_island") and started >= 8 and ok_count >= 2)
                 or (sname == "scout_island" and started >= 20 and has_unreached_target)
+                or extreme_hard_floor
             )
             if is_spam:
+                item_sev = (
+                    "P1"
+                    if (has_unreached_target or (extreme_hard_floor and has_any_unreached_goal))
+                    else "P2"
+                )
                 args_tag = hashlib.sha1(group_key.encode("utf-8")).hexdigest()[:6]
                 variants = entry.get("args_variants") or []
                 args_preview = json.dumps(
@@ -920,7 +951,7 @@ class SoakObserver:
                 )
                 self._report_incident(
                     code="SKILL_SPAM_LOOP",
-                    severity=sev,
+                    severity=item_sev,
                     category="strategy",
                     custom_fingerprint=f"SKILL_SPAM_LOOP:{sname}:{args_tag}",
                     title=f"技能 {sname} 重复空转 {started} 次 ({args_preview[:80]})",

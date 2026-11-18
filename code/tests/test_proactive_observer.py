@@ -104,6 +104,7 @@ def _run_skill_cycle(
     error_msg: str = "",
     elapsed_delta_s: float = 0.0,
     gain_item: str | None = None,
+    environment: EnvBlocked | None = None,
 ) -> None:
     """驱动一次零网络技能生命周期钩子。"""
     obs.on_skill_start(skill, source, reason, state)
@@ -118,12 +119,18 @@ def _run_skill_cycle(
         error_code=error_code,
         error_msg=error_msg,
         died_or_disconnected=False,
+        environment=environment,
     )
 
 
 def _read_incidents(run_dir: Path) -> list[dict]:
     files = sorted((run_dir / "incidents").glob("INC-*.json"))
     return [json.loads(p.read_text(encoding="utf-8")) for p in files]
+
+
+def _read_timeline(run_dir: Path) -> list[dict]:
+    lines = (run_dir / "timeline.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 class TapeRecorderPathStatsTests(unittest.TestCase):
@@ -650,6 +657,237 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
             self.assertEqual(len(spam20), 1, incs20)
             self.assertRegex(spam20[0]["fingerprint"], r"^SKILL_SPAM_LOOP:scout_island:[0-9a-f]{6}$")
             self._assert_proactive_fields(spam20[0], obs20, expected_severity="P1")
+
+    def test_stance_only_env_blocked_on_run_end_preserves_timeline_and_incidents(self):
+        for pred in ("dry_work_stand", "unconfirmed_work_stand"):
+            with self.subTest(predicate=pred, case="goal_miss_and_starvation"), tempfile.TemporaryDirectory() as tmp:
+                obs = SoakObserver(tmp, target_goal="smelt_iron")
+                state = _make_ready_state()
+                for _ in range(7):
+                    _run_skill_cycle(obs, make("gather_wood", {"count": 3}), state, gain_item="oak_log")
+                for _ in range(3):
+                    _run_skill_cycle(obs, make("mine_stone", {"count": 3}), state, gain_item="cobblestone")
+                obs.on_run_end(
+                    state,
+                    stop_reason="env_blocked",
+                    environment_blocked={
+                        "smelt_iron": EnvBlocked(
+                            "站位工况未确认", missing_predicate=pred, searched_volume="r=4", wake_on="chunk_moved"
+                        )
+                    },
+                )
+
+                timeline = _read_timeline(Path(tmp))
+                run_end = [row for row in timeline if row.get("event") == "run_end"][-1]
+                self.assertIn("smelt_iron", run_end["environment_blocked_goals"])
+                self.assertEqual(run_end["environment_blocked_goals"]["smelt_iron"]["missing_predicate"], pred)
+
+                incs = _read_incidents(Path(tmp))
+                self.assertTrue(any(i["fingerprint"] == "GOAL_MISS:smelt_iron" for i in incs), incs)
+                starv = [i for i in incs if i["fingerprint"] == "DISPATCH_STARVATION:smelt_iron"]
+                self.assertEqual(len(starv), 1, incs)
+                self._assert_proactive_fields(starv[0], obs, expected_severity="P1")
+
+            with self.subTest(predicate=pred, case="scout_island_spam_p1"), tempfile.TemporaryDirectory() as tmp_sp:
+                obs_sp = SoakObserver(tmp_sp, target_goal="upgrade_tools")
+                state_sp = _make_ready_state()
+                for _ in range(20):
+                    _run_skill_cycle(obs_sp, make("scout_island"), state_sp)
+                obs_sp.on_run_end(
+                    state_sp,
+                    stop_reason="env_blocked",
+                    environment_blocked={
+                        "upgrade_tools": EnvBlocked(
+                            "站位工况未确认", missing_predicate=pred, searched_volume="r=4", wake_on="chunk_moved"
+                        )
+                    },
+                )
+
+                timeline_sp = _read_timeline(Path(tmp_sp))
+                run_end_sp = [row for row in timeline_sp if row.get("event") == "run_end"][-1]
+                self.assertIn("upgrade_tools", run_end_sp["environment_blocked_goals"])
+                self.assertEqual(run_end_sp["environment_blocked_goals"]["upgrade_tools"]["missing_predicate"], pred)
+
+                incs_sp = _read_incidents(Path(tmp_sp))
+                self.assertTrue(any(i["fingerprint"] == "GOAL_MISS:upgrade_tools" for i in incs_sp), incs_sp)
+                self.assertTrue(any(i["fingerprint"] == "DISPATCH_STARVATION:upgrade_tools" for i in incs_sp), incs_sp)
+                spam = [i for i in incs_sp if i["code"] == "SKILL_SPAM_LOOP" and i["skill"] == "scout_island"]
+                self.assertEqual(len(spam), 1, incs_sp)
+                self._assert_proactive_fields(spam[0], obs_sp, expected_severity="P1")
+
+    def test_stance_only_env_blocked_on_skill_end_does_not_clear_goal_failures(self):
+        for pred in ("dry_work_stand", "unconfirmed_work_stand"):
+            with self.subTest(predicate=pred), tempfile.TemporaryDirectory() as tmp:
+                obs = SoakObserver(tmp, target_goal="smelt_iron")
+                state = _make_ready_state()
+                skill = _make_stub_skill("smelt_iron", "iron:smelt")
+
+                for _ in range(2):
+                    _run_skill_cycle(obs, skill, state, outcome="replan", error_code="path_not_found")
+                self.assertEqual(len(obs._goal_failures[skill.goal]), 2)
+
+                _run_skill_cycle(
+                    obs,
+                    skill,
+                    state,
+                    outcome="env_blocked",
+                    environment=EnvBlocked(
+                        "站位工况未确认", missing_predicate=pred, searched_volume="r=3", wake_on="chunk_moved"
+                    ),
+                )
+                self.assertIn(skill.goal, obs._goal_failures)
+                self.assertEqual(len(obs._goal_failures[skill.goal]), 2)
+                self.assertFalse(any(i["code"] == "REPLAN_OSCILLATION" for i in _read_incidents(Path(tmp))))
+
+                _run_skill_cycle(obs, skill, state, outcome="replan", error_code="path_not_found")
+                incs = _read_incidents(Path(tmp))
+                self.assertTrue(any(i["code"] == "REPLAN_OSCILLATION" for i in incs), incs)
+
+    def test_real_env_blocked_positive_control_clears_goal_failures_and_suppresses_incidents(self):
+        for pred in ("wood", "exposed_iron", "idle"):
+            with self.subTest(predicate=pred, case="on_skill_end"), tempfile.TemporaryDirectory() as tmp:
+                obs = SoakObserver(tmp, target_goal="smelt_iron")
+                state = _make_ready_state()
+                skill = _make_stub_skill("smelt_iron", "iron:smelt")
+
+                for _ in range(2):
+                    _run_skill_cycle(obs, skill, state, outcome="replan", error_code="path_not_found")
+                self.assertEqual(len(obs._goal_failures[skill.goal]), 2)
+
+                _run_skill_cycle(
+                    obs,
+                    skill,
+                    state,
+                    outcome="env_blocked",
+                    environment=EnvBlocked(
+                        "真实资源耗尽", missing_predicate=pred, searched_volume="r=24", wake_on="chunk_moved"
+                    ),
+                )
+                self.assertNotIn(skill.goal, obs._goal_failures)
+
+                _run_skill_cycle(obs, skill, state, outcome="replan", error_code="path_not_found")
+                self.assertFalse(
+                    any(i["code"] == "REPLAN_OSCILLATION" for i in _read_incidents(Path(tmp))),
+                    f"{pred} 应清空 _goal_failures 避免误报 REPLAN_OSCILLATION",
+                )
+
+        for pred in ("wood", "exposed_iron"):
+            with self.subTest(predicate=pred, case="on_run_end"), tempfile.TemporaryDirectory() as tmp_end:
+                obs_end = SoakObserver(tmp_end, target_goal="smelt_iron")
+                state_end = _make_ready_state()
+                for _ in range(20):
+                    _run_skill_cycle(obs_end, make("scout_island"), state_end)
+                obs_end.on_run_end(
+                    state_end,
+                    stop_reason="env_blocked",
+                    environment_blocked={
+                        "smelt_iron": EnvBlocked(
+                            "真实资源耗尽", missing_predicate=pred, searched_volume="r=24", wake_on="chunk_moved"
+                        )
+                    },
+                )
+                timeline = _read_timeline(Path(tmp_end))
+                run_end = [row for row in timeline if row.get("event") == "run_end"][-1]
+                self.assertEqual(run_end["environment_blocked_goals"]["smelt_iron"]["missing_predicate"], pred)
+
+                incs = _read_incidents(Path(tmp_end))
+                self.assertFalse(
+                    any(
+                        i["code"] in ("GOAL_MISS", "DISPATCH_STARVATION", "SKILL_SPAM_LOOP")
+                        for i in incs
+                    ),
+                    incs,
+                )
+
+    def test_skill_spam_loop_extreme_hard_floors_and_boundaries(self):
+        wood_block = {
+            "upgrade_tools": EnvBlocked(
+                "周边无原木", missing_predicate="wood", searched_volume="r=24", wake_on="chunk_moved"
+            )
+        }
+
+        # 1) scout_island >= 60：即使唯一目标被真实 wood EnvBlocked，仍触发 P1
+        with tempfile.TemporaryDirectory() as tmp_s60_p1:
+            obs = SoakObserver(tmp_s60_p1, target_goal="upgrade_tools")
+            state = _make_ready_state()
+            for _ in range(60):
+                _run_skill_cycle(obs, make("scout_island"), state)
+            obs.on_run_end(state, stop_reason="env_blocked", environment_blocked=wood_block)
+            spam = [i for i in _read_incidents(Path(tmp_s60_p1)) if i["code"] == "SKILL_SPAM_LOOP"]
+            self.assertEqual(len(spam), 1)
+            self.assertEqual(spam[0]["skill"], "scout_island")
+            self._assert_proactive_fields(spam[0], obs, expected_severity="P1")
+
+        # 2) scout_island >= 60：target_goal=None 或目标已达成 -> P2
+        for label, target_goal, items in (
+            ("no_target", None, {}),
+            ("target_reached", "upgrade_tools", {"stone_pickaxe": 1}),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp_s60_p2:
+                obs = SoakObserver(tmp_s60_p2, target_goal=target_goal)
+                state = _make_ready_state(items)
+                for _ in range(60):
+                    _run_skill_cycle(obs, make("scout_island"), state)
+                obs.on_run_end(state, stop_reason="max_steps")
+                spam = [i for i in _read_incidents(Path(tmp_s60_p2)) if i["code"] == "SKILL_SPAM_LOOP"]
+                self.assertEqual(len(spam), 1)
+                self.assertEqual(spam[0]["skill"], "scout_island")
+                self._assert_proactive_fields(spam[0], obs, expected_severity="P2")
+
+        # 3) surface_for_air >= 30（ok >= 2 与 ok == 0 两种场景）：目标被 wood EnvBlocked 仍触发 P1
+        for mode in ("ok_ge_2", "ok_zero"):
+            with self.subTest(case=f"surface_30_{mode}"), tempfile.TemporaryDirectory() as tmp_air30:
+                obs = SoakObserver(tmp_air30, target_goal="upgrade_tools")
+                state = _make_ready_state()
+                air_skill = _make_stub_skill("surface_for_air", "survive:air")
+                if mode == "ok_ge_2":
+                    for _ in range(30):
+                        _run_skill_cycle(obs, air_skill, state, outcome="completed")
+                else:
+                    for _ in range(15):
+                        _run_skill_cycle(obs, air_skill, state, outcome="replan", error_code="path_not_found")
+                    for _ in range(15):
+                        _run_skill_cycle(
+                            obs,
+                            air_skill,
+                            state,
+                            outcome="env_blocked",
+                            environment=wood_block["upgrade_tools"],
+                        )
+                obs.on_run_end(state, stop_reason="env_blocked", environment_blocked=wood_block)
+                spam = [
+                    i
+                    for i in _read_incidents(Path(tmp_air30))
+                    if i["code"] == "SKILL_SPAM_LOOP" and i["skill"] == "surface_for_air"
+                ]
+                self.assertEqual(len(spam), 1)
+                self._assert_proactive_fields(spam[0], obs, expected_severity="P1")
+
+        # 4) surface_for_air == 29 边界：ok >= 2 + wood EnvBlocked -> P2；ok == 0 -> 不触发
+        with tempfile.TemporaryDirectory() as tmp_air29_ok:
+            obs = SoakObserver(tmp_air29_ok, target_goal="upgrade_tools")
+            state = _make_ready_state()
+            air_skill = _make_stub_skill("surface_for_air", "survive:air")
+            for _ in range(29):
+                _run_skill_cycle(obs, air_skill, state, outcome="completed")
+            obs.on_run_end(state, stop_reason="env_blocked", environment_blocked=wood_block)
+            spam = [
+                i
+                for i in _read_incidents(Path(tmp_air29_ok))
+                if i["code"] == "SKILL_SPAM_LOOP" and i["skill"] == "surface_for_air"
+            ]
+            self.assertEqual(len(spam), 1)
+            self._assert_proactive_fields(spam[0], obs, expected_severity="P2")
+
+        with tempfile.TemporaryDirectory() as tmp_air29_zero:
+            obs = SoakObserver(tmp_air29_zero, target_goal="upgrade_tools")
+            state = _make_ready_state()
+            air_skill = _make_stub_skill("surface_for_air", "survive:air")
+            for _ in range(29):
+                _run_skill_cycle(obs, air_skill, state, outcome="replan", error_code="path_not_found")
+            obs.on_run_end(state, stop_reason="env_blocked", environment_blocked=wood_block)
+            incs = _read_incidents(Path(tmp_air29_zero))
+            self.assertFalse(any(i["code"] == "SKILL_SPAM_LOOP" for i in incs), incs)
 
     def test_api_bottleneck_slow_thresholds_and_negative_bounds(self):
         # 正向命中：elapsed >= 60s, total_ms >= 20_000, pct >= 0.30

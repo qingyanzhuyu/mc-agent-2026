@@ -596,6 +596,145 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
         self.assertIn("code/mcagent/loop/policy.py", conflict_scope)
         self.assertFalse(soak_ctl._scopes_conflict(scope_clean, conflict_scope))
 
+    def test_dispatch_starvation_scope_and_cross_domain_conflict_and_escalation(self):
+        nether_starve = {
+            "incident_id": "INC-DS-NETHER",
+            "fingerprint": "DISPATCH_STARVATION:enter_the_nether",
+            "code": "DISPATCH_STARVATION",
+            "goal_id": "enter_the_nether",
+            "skill": "build_and_enter_portal",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+        iron_starve = {
+            "incident_id": "INC-DS-IRON",
+            "fingerprint": "DISPATCH_STARVATION:smelt_iron",
+            "code": "DISPATCH_STARVATION",
+            "goal_id": "smelt_iron",
+            "skill": "smelt_iron",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+
+        nether_scope = soak_ctl._claim_parallel_scope(nether_starve)
+        iron_scope = soak_ctl._claim_parallel_scope(iron_starve)
+        self.assertEqual(
+            nether_scope,
+            frozenset({
+                "code/mcagent/skills/nether.py",
+                "code/mcagent/loop/policy.py",
+                "code/mcagent/loop/goals.py",
+            }),
+        )
+        self.assertEqual(
+            iron_scope,
+            frozenset({
+                "code/mcagent/skills/iron.py",
+                "code/mcagent/loop/policy.py",
+                "code/mcagent/loop/goals.py",
+            }),
+        )
+        self.assertTrue(soak_ctl._scopes_conflict(nether_scope, iron_scope))
+
+        escalated_starve = {
+            **nether_starve,
+            "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+        }
+        self.assertEqual(soak_ctl._claim_parallel_scope(escalated_starve), frozenset({"*"}))
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                nether_starve["fingerprint"]: dict(nether_starve),
+                iron_starve["fingerprint"]: dict(iron_starve),
+            }
+
+        claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3)
+        self.assertEqual([c["fingerprint"] for c in claimed], ["DISPATCH_STARVATION:enter_the_nether"])
+        st_after = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after["incidents"]["DISPATCH_STARVATION:smelt_iron"]["status"], "pending")
+
+    def test_dispatch_starvation_conflicts_with_recurring_goal_miss_and_keeps_three_way_parallelism(self):
+        starve_rec = {
+            "incident_id": "INC-DS-1",
+            "fingerprint": "DISPATCH_STARVATION:enter_the_nether",
+            "code": "DISPATCH_STARVATION",
+            "goal_id": "enter_the_nether",
+            "skill": "build_and_enter_portal",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+        recurring_goal = {
+            "incident_id": "INC-GM-REC",
+            "fingerprint": "GOAL_MISS:prep_diamond_pickaxe",
+            "code": "GOAL_MISS",
+            "goal_id": "prep_diamond_pickaxe",
+            "skill": "craft_diamond_gear",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": ["code/mcagent/skills/diamond.py"],
+            "last_failed_fix_commit": "deadbeef",
+            "attempts": 1,
+        }
+        spam_rec = {
+            "incident_id": "INC-SPAM-1",
+            "fingerprint": "SKILL_SPAM_LOOP:gather_wood:abc123",
+            "code": "SKILL_SPAM_LOOP",
+            "skill": "gather_wood",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+        api_rec = {
+            "incident_id": "INC-API-1",
+            "fingerprint": "API_BOTTLENECK_SLOW:move_to",
+            "code": "API_BOTTLENECK_SLOW",
+            "skill": "session",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+
+        starve_scope = soak_ctl._claim_parallel_scope(starve_rec)
+        recurring_scope = soak_ctl._claim_parallel_scope(recurring_goal)
+        self.assertTrue(set(soak_ctl.GOAL_RECURRENCE_EXTRA_FILES).issubset(recurring_scope))
+        self.assertTrue(soak_ctl._scopes_conflict(starve_scope, recurring_scope))
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                starve_rec["fingerprint"]: dict(starve_rec),
+                recurring_goal["fingerprint"]: dict(recurring_goal),
+                spam_rec["fingerprint"]: dict(spam_rec),
+                api_rec["fingerprint"]: dict(api_rec),
+            }
+
+        claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3)
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed],
+            [
+                "DISPATCH_STARVATION:enter_the_nether",
+                "SKILL_SPAM_LOOP:gather_wood:abc123",
+                "API_BOTTLENECK_SLOW:move_to",
+            ],
+        )
+        st_after = soak_ctl.read_state(self.session)
+        self.assertEqual(st_after["incidents"]["GOAL_MISS:prep_diamond_pickaxe"]["status"], "pending")
+
 
 class TestRunFixerBatchExecution(unittest.TestCase):
     """验证 run_fixer_batch 真实并发、串行合并、门禁隔离、冲突重入与超时清理。"""

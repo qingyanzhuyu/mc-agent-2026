@@ -472,7 +472,7 @@ class ProbeIntegrationTests(unittest.TestCase):
 
         client.get_block = get_block
 
-        def move_to(x=None, z=None, y=None, entity_id=None, rng=1, pos=None, stop_on=None):
+        def move_to(x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None, stop_on=None):
             target = list(pos) if pos is not None else [x, client.st["pos"][1] if y is None else y, z]
             if target == [4, 64, 0]:
                 raise ApiError("path_not_found", "blocked by stone wall")
@@ -769,7 +769,7 @@ class AuditRegressionTests(unittest.TestCase):
 
         move_calls = []
 
-        def move_to(x=None, z=None, y=None, entity_id=None, rng=1, pos=None, stop_on=None):
+        def move_to(x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None, stop_on=None):
             move_calls.append({"x": x, "z": z, "y": y, "pos": pos})
             if pos is not None:
                 dest = [float(pos[0]), float(pos[1]), float(pos[2])]
