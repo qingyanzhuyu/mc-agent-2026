@@ -64,7 +64,7 @@ class RuntimeConfig:
     # 临时工程值，必须用官方 C1/寻路证据标定；不代表已验证的生存阈值。
     poll_safe_s: float = 4.0
     poll_risk_s: float = 1.0
-    observer_min_interval_s: float = 0.05
+    observer_min_interval_s: float = 0.25
     status_ttl_s: float = 1.0
     stop_cooldown_s: float = 10.0
     hp_crit: float = 8.0
@@ -904,22 +904,39 @@ class SafetyMonitor:
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def next_interval(self) -> float:
-        if self.interval_s is not None:
-            return self.interval_s
-        if self.continuous:
-            return self.config.observer_min_interval_s
+    def _is_risk_state(self) -> bool:
+        """Return whether cached telemetry or risk context indicates elevated hazard."""
         st, cfg = self.state.snapshot(), self.config
         rc = self.state.get_risk_context()
         hostile = st.get("nearest_hostile") or {}
         tod = float(st.get("time_of_day", 0)) % 24000
-        risk = (not st or cfg.night_start <= tod <= cfg.night_end
-                or "nether" in st.get("dimension", "")
-                or float(st.get("health", 20)) < cfg.hp_risk
-                or float(hostile.get("dist", 999)) <= cfg.hostile_risk_dist
-                or st.get("in_water") or st.get("in_lava") or st.get("on_fire")
-                or st.get("on_ground") is False or any(rc.values()))
-        return cfg.poll_risk_s if risk else cfg.poll_safe_s
+        return bool(
+            not st
+            or cfg.night_start <= tod <= cfg.night_end
+            or "nether" in st.get("dimension", "")
+            or float(st.get("health", 20)) < cfg.hp_risk
+            or float(hostile.get("dist", 999)) <= cfg.hostile_risk_dist
+            or st.get("in_water")
+            or st.get("submerged")
+            or st.get("in_lava")
+            or st.get("on_fire")
+            or st.get("on_ground") is False
+            or any(rc.values())
+        )
+
+    def _continuous_wait_s(self) -> float:
+        """Yield tightly on risk/airborne states and back off safely on dry ground."""
+        base = float(self.config.observer_min_interval_s)
+        if self._is_risk_state():
+            return base
+        return min(float(self.config.poll_risk_s), base * 3.0)
+
+    def next_interval(self) -> float:
+        if self.interval_s is not None:
+            return self.interval_s
+        if self.continuous:
+            return self._continuous_wait_s()
+        return self.config.poll_risk_s if self._is_risk_state() else self.config.poll_safe_s
 
     def _get_block_uncached(self, pos: list[int]) -> dict:
         fn = self.client.get_block
@@ -1077,7 +1094,7 @@ class SafetyMonitor:
                 if self.interval_s is not None:
                     wait_s = max(0.0, float(self.interval_s) - (time.monotonic() - started))
                 else:
-                    wait_s = max(0.0, float(self.config.observer_min_interval_s))
+                    wait_s = max(0.0, self._continuous_wait_s())
             else:
                 # 从轮询开始计时，慢 RTT 时不堆积补发。
                 wait_s = max(0.01, self.next_interval() - (time.monotonic() - started))
