@@ -35,10 +35,13 @@ from mcagent.skills.items import (
 from mcagent.skills.testing import CountingExecutor, GridWorld, drive
 
 try:
-    from mcagent.skills.nav import _read_block, recover_move
+    from mcagent.skills.nav import _read_block, _step_recover, recover_move, sneak_bridge, step_up_1x2
 except (ImportError, AttributeError):
     _read_block = None  # type: ignore[assignment]
+    _step_recover = None  # type: ignore[assignment]
     recover_move = None  # type: ignore[assignment]
+    sneak_bridge = None  # type: ignore[assignment]
+    step_up_1x2 = None  # type: ignore[assignment]
 
 
 # -----------------------------------------------------------------------------
@@ -125,6 +128,7 @@ class RecoveryGridWorld(GridWorld):
         pos=None,
         timeout=None,
         *,
+        retries=None,
         stop_on=None,
     ) -> dict:
         self.calls.append(("move_to", {"x": x, "z": z, "y": y, "pos": pos}))
@@ -874,6 +878,161 @@ class NavRecoveryOneActionPerStepTests(unittest.TestCase):
         self.assertIn("place", ops)
         self.assertAlmostEqual(world.st["pos"][0], 1.5)
         self.assertAlmostEqual(world.st["pos"][1], 66.0)
+
+
+# -----------------------------------------------------------------------------
+# 11. nav.py move_to timeout=20.0 / retries=0 与 timeout 恢复/抢占穿透测试
+# -----------------------------------------------------------------------------
+
+
+class _SpyMoveExecutor(CountingExecutor):
+    """记录传给 ex.move_to(...) 的 (timeout, retries) 并透传给真实 Executor.move_to。"""
+
+    def __init__(self, client: Any, state: State):
+        super().__init__(client, state)
+        self.move_to_calls: list[tuple[Any, Any]] = []
+
+    def move_to(
+        self,
+        x=None,
+        z=None,
+        y=None,
+        entity_id=None,
+        rng=1,
+        pos=None,
+        timeout=None,
+        *,
+        retries=2,
+        stop_on=None,
+    ) -> dict:
+        self.move_to_calls.append((timeout, retries))
+        return super().move_to(
+            x=x,
+            z=z,
+            y=y,
+            entity_id=entity_id,
+            rng=rng,
+            pos=pos,
+            timeout=timeout,
+            retries=retries,
+            stop_on=stop_on,
+        )
+
+
+def _spy_session(world: RecoveryGridWorld) -> tuple[_SpyMoveExecutor, State]:
+    state = State()
+    state.set_status(world.status())
+    state.set_inventory(world.inventory())
+    return _SpyMoveExecutor(world, state), state
+
+
+@unittest.skipIf(
+    any(fn is None for fn in (_step_recover, recover_move, sneak_bridge, step_up_1x2)),
+    "mcagent.skills.nav 相关原语尚未实现",
+)
+class NavMoveTimeoutRetryTests(unittest.TestCase):
+    def test_recover_move_tactic_a_passes_timeout_and_zero_retries(self):
+        world = RecoveryGridWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={(0, 63, 0): "dirt", (1, 63, 0): "dirt"},
+        )
+        ex, state = _spy_session(world)
+        steps = drive(recover_move(ex, state, dest=(5, 64, 0)), ex)
+        self.assertEqual([s["op"] for s in steps], ["move_to_recover"])
+        self.assertEqual(ex.move_to_calls, [(20.0, 0)])
+
+    def test_sneak_bridge_passes_timeout_and_zero_retries(self):
+        world = RecoveryGridWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={(0, 63, 0): "stone"},
+            items={"dirt": 6},
+        )
+        ex, state = _spy_session(world)
+        blocks = [[1, 63, 0], [2, 63, 0], [3, 63, 0], [4, 63, 0]]
+        steps = drive(sneak_bridge(ex, state, blocks), ex)
+        self.assertIn("move_to_bridge", [s["op"] for s in steps])
+        self.assertEqual(ex.move_to_calls, [(20.0, 0)])
+
+    def test_step_up_1x2_passes_timeout_and_zero_retries(self):
+        world = RecoveryGridWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={(0, 63, 0): "dirt"},
+            items={"dirt": 4},
+        )
+        ex, state = _spy_session(world)
+        steps = drive(step_up_1x2(ex, state, [[1, 64, 0], [0, 65, 0]]), ex)
+        self.assertIn("step_up_to", [s["op"] for s in steps])
+        self.assertEqual(ex.move_to_calls, [(20.0, 0)])
+
+    def test_step_recover_and_recover_move_handle_timeout_without_retries(self):
+        self.assertEqual(NAV_FAIL_CODES, ("path_not_found", "unreachable", "move_timeout", "stalled"))
+        self.assertNotIn("timeout", NAV_FAIL_CODES)
+
+        # 直接测试 _step_recover
+        world1 = RecoveryGridWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={(0, 63, 0): "dirt", (1, 63, 0): "dirt"},
+        )
+        world1.move_to_error = ApiError("timeout", "simulated timeout")
+        ex1, _ = world1.session()
+        steps1 = drive(_step_recover(ex1, [1.5, 64.0, 0.5]), ex1)
+        self.assertEqual(len(steps1), 1)
+        self.assertEqual(steps1[0]["op"], "move_to_recover")
+        self.assertEqual(steps1[0]["error_code"], "timeout")
+        self.assertEqual(len([c for c in world1.calls if c[0] == "move_to"]), 1)
+
+        # 通过 recover_move 战术 (a) 测试
+        world2 = RecoveryGridWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={(0, 63, 0): "dirt", (1, 63, 0): "dirt"},
+            fail_move_codes=["timeout"],
+        )
+        ex2, state2 = world2.session()
+        steps2 = drive(recover_move(ex2, state2, dest=(5, 64, 0)), ex2)
+        self.assertEqual(len(steps2), 1)
+        self.assertEqual(steps2[0]["op"], "move_to_recover")
+        self.assertEqual(steps2[0]["error_code"], "timeout")
+        self.assertEqual(len([c for c in world2.calls if c[0] == "move_to"]), 1)
+
+    def test_preemption_from_timeout_or_interrupted_reraises(self):
+        for cause_code in ("timeout", "interrupted"):
+            with self.subTest(cause_code=cause_code):
+                err1 = Replan("动作被安全层抢占")
+                err1.__cause__ = ApiError(cause_code, f"simulated {cause_code}")
+                world1 = RecoveryGridWorld(
+                    pos=(0.5, 64.0, 0.5),
+                    blocks={(0, 63, 0): "dirt", (1, 63, 0): "dirt"},
+                )
+                world1.move_to_error = err1
+                ex1, _ = world1.session()
+                with self.assertRaisesRegex(Replan, "安全层抢占"):
+                    drive(_step_recover(ex1, [1.5, 64.0, 0.5]), ex1)
+
+                err2 = Replan("动作被安全层抢占")
+                err2.__cause__ = ApiError(cause_code, f"simulated {cause_code}")
+                world2 = RecoveryGridWorld(
+                    pos=(0.5, 64.0, 0.5),
+                    blocks={(0, 63, 0): "dirt", (1, 63, 0): "dirt"},
+                )
+                world2.move_to_error = err2
+                ex2, state2 = world2.session()
+                with self.assertRaisesRegex(Replan, "安全层抢占"):
+                    drive(recover_move(ex2, state2, dest=(5, 64, 0)), ex2)
+
+        # 原生 ApiError("interrupted") 经 Executor 包装为 Replan 后也必须穿透
+        world3 = RecoveryGridWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={(0, 63, 0): "dirt", (1, 63, 0): "dirt"},
+        )
+        world3.move_to_error = ApiError("interrupted", "动作被安全监控层抢占")
+        ex3, _ = world3.session()
+        with self.assertRaises((ApiError, Replan)) as ctx:
+            drive(_step_recover(ex3, [1.5, 64.0, 0.5]), ex3)
+        exc = ctx.exception
+        self.assertTrue(
+            getattr(exc, "code", None) == "interrupted"
+            or getattr(getattr(exc, "__cause__", None), "code", None) == "interrupted"
+        )
 
 
 if __name__ == "__main__":

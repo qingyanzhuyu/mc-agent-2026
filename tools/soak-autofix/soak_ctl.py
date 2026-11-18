@@ -1894,12 +1894,16 @@ def _claim_parallel_scope(inc_rec: dict[str, Any]) -> frozenset[str]:
     )
     if code == "API_BOTTLENECK_SLOW":
         return frozenset({"*"}) if had_merge_conflict else frozenset({"domain:api_bottleneck_slow"})
+    if code == "DISPATCH_STARVATION" and had_merge_conflict:
+        return frozenset({"*"})
     if code in _DOMAIN_SCOPED_INCIDENT_CODES:
         skill = str(inc_rec.get("skill") or "").strip()
         goal_id = str(inc_rec.get("goal_id") or "").strip()
         domain = SKILL_CONFLICT_DOMAIN.get(skill) or GOAL_CONFLICT_DOMAIN.get(goal_id)
         if domain:
             scope = set(domain)
+            if code == "DISPATCH_STARVATION":
+                scope.update({"code/mcagent/loop/policy.py", "code/mcagent/loop/goals.py"})
             if had_merge_conflict or str(inc_rec.get("last_failed_fix_commit") or "").strip():
                 scope.update(GOAL_RECURRENCE_EXTRA_FILES)
             return frozenset(scope)
@@ -3135,6 +3139,7 @@ def reset_escalated_goals(
     session_dir: Path,
     *,
     goals: Optional[Sequence[str]] = None,
+    fingerprints: Optional[Sequence[str]] = None,
     include_non_goal: bool = False,
     clear_stop: bool = False,
 ) -> dict[str, Any]:
@@ -3144,6 +3149,7 @@ def reset_escalated_goals(
     """
     session_dir = session_dir.resolve()
     target_set = set(split_goal_ids(goals)) if goals else set()
+    fp_set = set(split_goal_ids(fingerprints)) if fingerprints else set()
     now_str = _utc_now()
     reset_fps: list[str] = []
     reset_goals: list[str] = []
@@ -3157,7 +3163,12 @@ def reset_escalated_goals(
                 continue
             is_goal_miss = rec.get("code") == "GOAL_MISS" or str(fp).startswith("GOAL_MISS:")
             gid = str(rec.get("goal_id") or (str(fp).removeprefix("GOAL_MISS:") if str(fp).startswith("GOAL_MISS:") else "")).strip()
-            if target_set:
+            if fp_set:
+                if str(fp) not in fp_set:
+                    continue
+                if target_set and (not is_goal_miss or gid not in target_set):
+                    continue
+            elif target_set:
                 if not is_goal_miss or gid not in target_set:
                     continue
             elif not include_non_goal and not is_goal_miss:
@@ -3171,7 +3182,7 @@ def reset_escalated_goals(
             rec["status"] = "pending"
             rec["attempts"] = 0
             rec["fix_commit"] = None
-            for k in ("active_attempt_dir", "worker_wt", "claimed_at", "claimed_by"):
+            for k in ("active_attempt_dir", "worker_wt", "claimed_at", "claimed_by", "last_failed_fix_commit"):
                 rec.pop(k, None)
             reset_fps.append(str(fp))
             if gid and gid not in reset_goals:
@@ -3578,7 +3589,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rst = sub.add_parser("reset-goals", help="将已升级人工（escalated_human）的目标单重置回 pending 以恢复追目标与修单")
     p_rst.add_argument("--session-dir", required=True)
     p_rst.add_argument("--goal", default="", help="可选：只重置指定的 goal_id，多个用逗号分隔（空=重置全部 GOAL_MISS 升级单）")
-    p_rst.add_argument("--all", action="store_true", help="一并重置非 GOAL_MISS 的 escalated_human 异常单（如 session 级单）")
+    p_rst.add_argument("--all", "--include-non-goal", dest="include_non_goal", action="store_true", help="一并重置非 GOAL_MISS 的 escalated_human 异常单（如 session 级单）")
+    p_rst.add_argument("--fingerprints", default="", help="可选：只重置指定的 fingerprint，多个用逗号分隔")
     p_rst.add_argument("--clear-stop", action="store_true", help="重置后同时删除会话 STOP 标志文件")
 
     p_st = sub.add_parser("status", help="查看当前待修队列与待审分支进度")
@@ -3840,7 +3852,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         res = reset_escalated_goals(
             session_dir,
             goals=split_goal_ids(args.goal) if args.goal else None,
-            include_non_goal=bool(args.all),
+            fingerprints=split_goal_ids(args.fingerprints) if args.fingerprints else None,
+            include_non_goal=bool(args.include_non_goal),
             clear_stop=bool(args.clear_stop),
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))

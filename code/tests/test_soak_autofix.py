@@ -9,7 +9,9 @@
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -1576,6 +1578,215 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         self.assertEqual(rot_res[1]["steps"], 1)
         self.assertFalse((self.session / "STOP").exists())
         soak_ctl.teardown_session(self.session)
+
+    def _seed_escalated_incidents(
+        self,
+        branch: str,
+        records: dict[str, dict],
+    ) -> None:
+        """Initialize a session and populate state['incidents'] with escalated_human records."""
+        soak_ctl.init_session(self.repo, self.session, target_branch=branch)
+        with soak_ctl.locked_state(self.session) as st_mut:
+            for fp, rec in records.items():
+                st_mut["incidents"][fp] = {
+                    "fingerprint": fp,
+                    "incident_id": rec.get("incident_id", f"INC-{fp[:6]}"),
+                    "code": rec.get("code", "GOAL_MISS"),
+                    "severity": rec.get("severity", "P1"),
+                    "category": rec.get("category", "strategy"),
+                    "skill": rec.get("skill", "smelt_iron"),
+                    "goal_id": rec.get("goal_id", ""),
+                    "status": rec.get("status", "escalated_human"),
+                    "attempts": rec.get("attempts", 4),
+                    "fix_commit": rec.get("fix_commit"),
+                    "gate_history": [{"ok": True}],
+                    **({"last_failed_fix_commit": rec["last_failed_fix_commit"]} if "last_failed_fix_commit" in rec else {}),
+                }
+
+    def test_reset_escalated_goals_clears_last_failed_fix_commit(self):
+        self._seed_escalated_incidents(
+            "feat/reset-stale-failed-commit",
+            {
+                "GOAL_MISS:smelt_iron": {
+                    "code": "GOAL_MISS",
+                    "goal_id": "smelt_iron",
+                    "attempts": 4,
+                    "fix_commit": "deadbeef",
+                    "last_failed_fix_commit": "cafebabe",
+                },
+            },
+        )
+        try:
+            res = soak_ctl.reset_escalated_goals(self.session)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["reset_count"], 1)
+            self.assertEqual(res["reset_fingerprints"], ["GOAL_MISS:smelt_iron"])
+            rec = soak_ctl.read_state(self.session)["incidents"]["GOAL_MISS:smelt_iron"]
+            self.assertEqual(rec["status"], "pending")
+            self.assertEqual(rec["attempts"], 0)
+            self.assertIsNone(rec["fix_commit"])
+            self.assertNotIn("last_failed_fix_commit", rec)
+        finally:
+            soak_ctl.teardown_session(self.session)
+
+    def test_reset_escalated_goals_fingerprints_selective_includes_non_goal(self):
+        self._seed_escalated_incidents(
+            "feat/reset-fingerprints",
+            {
+                "GOAL_MISS:smelt_iron": {
+                    "code": "GOAL_MISS",
+                    "goal_id": "smelt_iron",
+                    "attempts": 3,
+                    "fix_commit": "aaa1111",
+                    "last_failed_fix_commit": "bbb2222",
+                },
+                "GOAL_MISS:kill_a_mob": {
+                    "code": "GOAL_MISS",
+                    "goal_id": "kill_a_mob",
+                    "attempts": 5,
+                    "fix_commit": "ccc3333",
+                    "last_failed_fix_commit": "ddd4444",
+                },
+                "DISPATCH_STARVATION:craft_pickaxe": {
+                    "code": "DISPATCH_STARVATION",
+                    "skill": "craft_pickaxe",
+                    "goal_id": "",
+                    "attempts": 4,
+                    "fix_commit": "eee5555",
+                    "last_failed_fix_commit": "fff6666",
+                },
+                "756ba1d380": {
+                    "code": "LLM_INVALID_OR_TIMEOUT",
+                    "severity": "P3",
+                    "skill": "session",
+                    "goal_id": "",
+                    "attempts": 2,
+                    "fix_commit": None,
+                    "last_failed_fix_commit": "1234abcd",
+                },
+                "999aaa111b": {
+                    "code": "LLM_INVALID_OR_TIMEOUT",
+                    "severity": "P3",
+                    "skill": "session",
+                    "goal_id": "",
+                    "attempts": 2,
+                    "fix_commit": "7777eeee",
+                    "last_failed_fix_commit": "8888ffff",
+                },
+            },
+        )
+        try:
+            res = soak_ctl.reset_escalated_goals(
+                self.session,
+                fingerprints=["DISPATCH_STARVATION:craft_pickaxe", "756ba1d380"],
+                include_non_goal=False,
+            )
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["reset_count"], 2)
+            self.assertEqual(set(res["reset_fingerprints"]), {"DISPATCH_STARVATION:craft_pickaxe", "756ba1d380"})
+            self.assertEqual(res["reset_goals"], [])
+
+            incidents = soak_ctl.read_state(self.session)["incidents"]
+            for fp in ("DISPATCH_STARVATION:craft_pickaxe", "756ba1d380"):
+                self.assertEqual(incidents[fp]["status"], "pending")
+                self.assertEqual(incidents[fp]["attempts"], 0)
+                self.assertIsNone(incidents[fp]["fix_commit"])
+                self.assertNotIn("last_failed_fix_commit", incidents[fp])
+
+            for fp in ("GOAL_MISS:smelt_iron", "GOAL_MISS:kill_a_mob", "999aaa111b"):
+                self.assertEqual(incidents[fp]["status"], "escalated_human")
+            self.assertEqual(incidents["GOAL_MISS:kill_a_mob"]["attempts"], 5)
+            self.assertEqual(incidents["GOAL_MISS:kill_a_mob"]["last_failed_fix_commit"], "ddd4444")
+            self.assertEqual(incidents["999aaa111b"]["last_failed_fix_commit"], "8888ffff")
+        finally:
+            soak_ctl.teardown_session(self.session)
+
+    def test_cli_reset_goals_include_non_goal_and_fingerprints(self):
+        self._seed_escalated_incidents(
+            "feat/cli-reset-goals",
+            {
+                "GOAL_MISS:smelt_iron": {
+                    "code": "GOAL_MISS",
+                    "goal_id": "smelt_iron",
+                    "attempts": 4,
+                    "fix_commit": "deadbeef",
+                    "last_failed_fix_commit": "cafebabe",
+                },
+                "GOAL_MISS:kill_a_mob": {
+                    "code": "GOAL_MISS",
+                    "goal_id": "kill_a_mob",
+                    "attempts": 5,
+                    "fix_commit": "ccc3333",
+                    "last_failed_fix_commit": "ddd4444",
+                },
+                "DISPATCH_STARVATION:wood": {
+                    "code": "DISPATCH_STARVATION",
+                    "skill": "wood",
+                    "goal_id": "",
+                    "attempts": 3,
+                    "fix_commit": "1111aaaa",
+                    "last_failed_fix_commit": "2222bbbb",
+                },
+                "756ba1d380": {
+                    "code": "LLM_INVALID_OR_TIMEOUT",
+                    "severity": "P3",
+                    "skill": "session",
+                    "goal_id": "",
+                    "attempts": 2,
+                    "fix_commit": None,
+                    "last_failed_fix_commit": "3333cccc",
+                },
+            },
+        )
+        try:
+            # 1) --fingerprints fp1,fp2 only resets the matching incidents and clears last_failed_fix_commit
+            buf1 = io.StringIO()
+            with contextlib.redirect_stdout(buf1):
+                rc1 = soak_ctl.main([
+                    "reset-goals",
+                    "--session-dir", str(self.session),
+                    "--fingerprints", "GOAL_MISS:smelt_iron,DISPATCH_STARVATION:wood",
+                ])
+            self.assertEqual(rc1, 0)
+            payload1 = json.loads(buf1.getvalue())
+            self.assertTrue(payload1["ok"])
+            self.assertEqual(payload1["reset_count"], 2)
+            self.assertEqual(set(payload1["reset_fingerprints"]), {"GOAL_MISS:smelt_iron", "DISPATCH_STARVATION:wood"})
+
+            incidents = soak_ctl.read_state(self.session)["incidents"]
+            for fp in ("GOAL_MISS:smelt_iron", "DISPATCH_STARVATION:wood"):
+                self.assertEqual(incidents[fp]["status"], "pending")
+                self.assertEqual(incidents[fp]["attempts"], 0)
+                self.assertIsNone(incidents[fp]["fix_commit"])
+                self.assertNotIn("last_failed_fix_commit", incidents[fp])
+            self.assertEqual(incidents["GOAL_MISS:kill_a_mob"]["status"], "escalated_human")
+            self.assertEqual(incidents["GOAL_MISS:kill_a_mob"]["last_failed_fix_commit"], "ddd4444")
+            self.assertEqual(incidents["756ba1d380"]["status"], "escalated_human")
+            self.assertEqual(incidents["756ba1d380"]["last_failed_fix_commit"], "3333cccc")
+
+            # 2) --include-non-goal resets remaining GOAL_MISS and non-GOAL_MISS escalated_human incidents
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                rc2 = soak_ctl.main([
+                    "reset-goals",
+                    "--session-dir", str(self.session),
+                    "--include-non-goal",
+                ])
+            self.assertEqual(rc2, 0)
+            payload2 = json.loads(buf2.getvalue())
+            self.assertTrue(payload2["ok"])
+            self.assertEqual(payload2["reset_count"], 2)
+            self.assertEqual(set(payload2["reset_fingerprints"]), {"GOAL_MISS:kill_a_mob", "756ba1d380"})
+
+            incidents_after = soak_ctl.read_state(self.session)["incidents"]
+            for fp in ("GOAL_MISS:kill_a_mob", "756ba1d380"):
+                self.assertEqual(incidents_after[fp]["status"], "pending")
+                self.assertEqual(incidents_after[fp]["attempts"], 0)
+                self.assertIsNone(incidents_after[fp]["fix_commit"])
+                self.assertNotIn("last_failed_fix_commit", incidents_after[fp])
+        finally:
+            soak_ctl.teardown_session(self.session)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -155,13 +155,13 @@ def _is_preemption(e: BaseException) -> bool:
 def _step_recover(ex: "Executor", target_pos: list[float]) -> Iterator[dict]:
     """执行一次脱困移动并按单步单动作契约 yield，仅吞掉已知寻路失败码。"""
     try:
-        res = ex.move_to(pos=target_pos, rng=0.5)
+        res = ex.move_to(pos=target_pos, rng=0.5, timeout=20.0, retries=0)
         yield rec("move_to_recover", res, pos=target_pos)
     except Replan as e:
         if _is_preemption(e):
             raise
         code, _ = failure(e)
-        if code in NAV_FAIL_CODES:
+        if code in NAV_FAIL_CODES or code == "timeout":
             yield rec("move_to_recover", pos=target_pos, error_code=code)
         else:
             raise
@@ -205,7 +205,7 @@ def sneak_bridge(ex: "Executor", state: "State", blocks: Sequence[Pos],
             if idx > 0 and math.dist(cur, center) > PLACE_REACH:
                 prev = blocks[idx - 1]
                 edge = [prev[0] + 0.5, prev[1] + 1, prev[2] + 0.5]
-                yield rec("move_to_bridge", ex.move_to(pos=edge, rng=1), pos=edge)
+                yield rec("move_to_bridge", ex.move_to(pos=edge, rng=1, timeout=20.0, retries=0), pos=edge)
                 ex.posture(sneak=True)
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
@@ -229,7 +229,7 @@ def step_up_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos],
         vert = cur[1] < pos[1] + 1.0 and cur[1] + PLAYER_HEIGHT > pos[1]
         if horiz and vert and last is not None:
             top = [last[0] + 0.5, last[1] + 1, last[2] + 0.5]
-            yield rec("step_up_to", ex.move_to(pos=top, rng=1), pos=top)
+            yield rec("step_up_to", ex.move_to(pos=top, rng=1, timeout=20.0, retries=0), pos=top)
         if block_name(ex, pos) in AIR:
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
