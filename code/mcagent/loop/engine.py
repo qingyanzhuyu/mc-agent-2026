@@ -39,6 +39,8 @@ class LoopConfig:
     transient_backoff_s: float = 1.0   # 首次退避秒数，此后翻倍
     transient_backoff_max_s: float = 15.0
     outage_limit_s: float = 600.0      # 连续故障超过此时长才停机；0 = 永不因此停机
+    continuous_observe: bool = True
+    async_observe_for_llm: bool = True
 
 
 # 会话级错误：交给 `_recover_session_or_respawn` 处理，而不是按瞬时故障退避
@@ -129,11 +131,20 @@ class MainLoop:
             return "max_deaths_reached"
         return None
 
-    def _refresh_world_state(self) -> None:
-        self.state.refresh_status(self.client)
-        self.state.drain(self.client)
+    def _refresh_world_state(self, *, inventory_only: bool = False) -> None:
+        if not inventory_only:
+            self.state.refresh_status(self.client)
+            self.state.drain(self.client)
         if self.state.inventory_dirty or not self.state.inventory:
             self.state.refresh_inventory(self.client)
+
+    def _use_async_observation(self, monitor: Optional[SafetyMonitor]) -> bool:
+        return bool(
+            monitor is not None
+            and self.config.async_observe_for_llm
+            and self.state._status_booted
+            and self.state._events_booted
+        )
 
     # ---- 瞬时故障自愈 -------------------------------------------------
     def _backoff_s(self, attempt: int) -> float:
@@ -150,7 +161,7 @@ class MainLoop:
         return bool(limit > 0 and self._outage_since is not None
                     and self._clock() - self._outage_since >= limit)
 
-    def _refresh_with_backoff(self) -> bool:
+    def _refresh_with_backoff(self, *, inventory_only: bool = False) -> bool:
         """刷新状态；非致命、非会话类错误按指数退避重试。
 
         返回 True 表示刷新成功；False 表示重试用尽、本拍应跳过。
@@ -158,7 +169,7 @@ class MainLoop:
         """
         for attempt in range(max(0, self.config.transient_retries) + 1):
             try:
-                self._refresh_world_state()
+                self._refresh_world_state(inventory_only=inventory_only)
             except ApiError as e:
                 if e.kind == FATAL or e.code in SESSION_CODES:
                     raise
@@ -217,6 +228,17 @@ class MainLoop:
         if len(self.state.deaths) > self._seen_deaths_len:
             return True
         return False
+
+    def _abort_fatal_skill(self, skill: Optional[Skill], err: Exception) -> None:
+        """中止遭遇致命错误的技能并记录收尾切片与 fatal 事件。"""
+        if skill is None:
+            return
+        if self.observer is not None and self.observer.tape is not None:
+            self.observer.tape.end_skill_slice()
+        skill.abort()
+        code, _ = failure(err)
+        if self.observer is not None:
+            self.observer.on_skill_end(skill, "fatal", self.state, error_code=code, error_msg=str(err))
 
     def _recover_session_or_respawn(
         self,
@@ -324,7 +346,18 @@ class MainLoop:
         stop_reason = "stopped"
         active_skill: Optional[Skill] = None
 
-        monitor = SafetyMonitor(self.client, self.state, self.executor, safety=self.safety) if self.config.enable_monitor else None
+        monitor = (
+            SafetyMonitor(
+                self.client,
+                self.state,
+                self.executor,
+                safety=self.safety,
+                continuous=self.config.continuous_observe,
+                refresh_inventory=self.config.continuous_observe,
+            )
+            if self.config.enable_monitor
+            else None
+        )
         try:
             st = self._wait_ready_guarded()
             if st is None:
@@ -362,7 +395,13 @@ class MainLoop:
 
                 pre_inv_fp = _inv_fingerprint(self.state.inventory) or {}
                 try:
-                    refreshed = self._refresh_with_backoff()
+                    if self._use_async_observation(monitor):
+                        if self.state.inventory_dirty or not self.state.inventory:
+                            refreshed = self._refresh_with_backoff(inventory_only=True)
+                        else:
+                            refreshed = True
+                    else:
+                        refreshed = self._refresh_with_backoff()
                 except ApiError as e:
                     if e.code not in SESSION_CODES:
                         raise  # 只剩致命错误
@@ -393,6 +432,12 @@ class MainLoop:
 
                 decision = self.planner.select(self.state, list(self.recent_failures))
                 if decision.skill is None:
+                    if getattr(decision, "stop_episode", False):
+                        if self.observer is not None:
+                            self.observer.on_progress_tick(self.state, client=self.client)
+                        self.log(f"[loop] 单目标止损退轮: {decision.reason}")
+                        stop_reason = "goal_stopped_out"
+                        break
                     if self.config.idle_sleep_s > 0:
                         time.sleep(self.config.idle_sleep_s)
                     if self.observer is not None:
@@ -411,6 +456,7 @@ class MainLoop:
                 died_during_skill = False
                 skill_t0 = time.monotonic()
                 goal_reached_now = False
+                skill_done = False
                 try:
                     while True:
                         budget = self._budget_exceeded(started_mono, steps, deaths_recovered)
@@ -436,57 +482,16 @@ class MainLoop:
 
                         done = active_skill.step(self.executor, self.state)
                         if done:
-                            skill_dt = max(0.0, time.monotonic() - skill_t0)
-                            finished_name = active_skill.name
-                            self._path_failures.pop(active_skill.goal, None)
-                            if self.observer is not None and self.observer.tape is not None:
-                                self.observer.tape.end_skill_slice()
-                            try:
-                                # 技能已完成；这里读不到状态不应把它记成失败，留给下一拍刷新与恢复
-                                self._refresh_with_backoff()
-                            except ApiError as refresh_err:
-                                if refresh_err.kind == FATAL:
-                                    raise
-                            skills_ok += 1
-                            force_tick = any(
-                                g.skill == finished_name and g.done_advancements
-                                for g in self._resolve_target_goal_specs()
-                            )
-                            if self.observer is not None:
-                                self.observer.on_skill_end(
-                                    active_skill, "completed", self.state, died_or_disconnected=False
-                                )
-                                self.observer.on_progress_tick(
-                                    self.state, client=self.client, force=force_tick
-                                )
-                            elif force_tick:
-                                try:
-                                    adv = self.client.advancements(status="completed", include_recipes=False)
-                                    for item in (adv.get("advancements") or []):
-                                        aid = item.get("id") if isinstance(item, dict) else None
-                                        if aid:
-                                            self._server_advancements.add(aid)
-                                except Exception:
-                                    pass
-                            completed_advs = set(self._server_advancements)
-                            if self.observer is not None:
-                                completed_advs.update(self.observer.server_advancements)
-                            if hasattr(self.planner, "record_skill_outcome"):
-                                self.planner.record_skill_outcome(
-                                    finished_name,
-                                    ok=True,
-                                    elapsed_s=skill_dt,
-                                    completed_advs=completed_advs,
-                                )
-                            active_skill = None
-                            if self._sync_and_check_target_goal() and self.config.stop_on_goal:
-                                stop_reason = "goal_reached"
-                                goal_reached_now = True
+                            skill_done = True
                             break
                         steps += 1
                         if self.observer is not None:
                             self.observer.on_step(active_skill, active_skill.last, self.state, client=self.client)
                 except (Replan, ApiError) as e:
+                    if isinstance(e, ApiError) and e.kind == FATAL:
+                        self._abort_fatal_skill(active_skill, e)
+                        active_skill = None
+                        raise
                     if active_skill is not None:
                         skill_dt = max(0.0, time.monotonic() - skill_t0)
                         failed_name = active_skill.name
@@ -560,20 +565,65 @@ class MainLoop:
                             if self._recover_guarded(pre_inv_fp, initial_err=init_api_err):
                                 deaths_recovered += 1
                 except Fatal as e:
-                    if active_skill is not None:
-                        if self.observer is not None and self.observer.tape is not None:
-                            self.observer.tape.end_skill_slice()
-                        active_skill.abort()
-                        code, _ = failure(e)
-                        if self.observer is not None:
-                            self.observer.on_skill_end(
-                                active_skill, "fatal", self.state, error_code=code, error_msg=str(e)
-                            )
-                        active_skill = None
+                    self._abort_fatal_skill(active_skill, e)
+                    active_skill = None
                     raise
                 except KeyboardInterrupt:
                     stop_reason = "keyboard_interrupt"
                     break
+
+                if skill_done and active_skill is not None:
+                    skill_dt = max(0.0, time.monotonic() - skill_t0)
+                    finished_skill = active_skill
+                    active_skill = None
+                    finished_name = finished_skill.name
+                    self._path_failures.pop(finished_skill.goal, None)
+                    if self.observer is not None and self.observer.tape is not None:
+                        self.observer.tape.end_skill_slice()
+                    try:
+                        if monitor is not None and self.config.async_observe_for_llm:
+                            if self.state.inventory_dirty:
+                                self.state.refresh_inventory(self.client)
+                        else:
+                            # 技能已完成；这里读不到状态不应把它记成失败，留给下一拍刷新与恢复
+                            self._refresh_with_backoff()
+                    except ApiError as refresh_err:
+                        if refresh_err.kind == FATAL:
+                            raise
+                    skills_ok += 1
+                    force_tick = any(
+                        g.skill == finished_name and g.done_advancements
+                        for g in self._resolve_target_goal_specs()
+                    )
+                    if self.observer is not None:
+                        self.observer.on_skill_end(
+                            finished_skill, "completed", self.state, died_or_disconnected=False
+                        )
+                        self.observer.on_progress_tick(
+                            self.state, client=self.client, force=force_tick
+                        )
+                    elif force_tick:
+                        try:
+                            adv = self.client.advancements(status="completed", include_recipes=False)
+                            for item in (adv.get("advancements") or []):
+                                aid = item.get("id") if isinstance(item, dict) else None
+                                if aid:
+                                    self._server_advancements.add(aid)
+                        except Exception:
+                            pass
+                    completed_advs = set(self._server_advancements)
+                    if self.observer is not None:
+                        completed_advs.update(self.observer.server_advancements)
+                    if hasattr(self.planner, "record_skill_outcome"):
+                        self.planner.record_skill_outcome(
+                            finished_name,
+                            ok=True,
+                            elapsed_s=skill_dt,
+                            completed_advs=completed_advs,
+                        )
+                    if self._sync_and_check_target_goal() and self.config.stop_on_goal:
+                        stop_reason = "goal_reached"
+                        goal_reached_now = True
 
                 if goal_reached_now:
                     break

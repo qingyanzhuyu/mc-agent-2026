@@ -717,7 +717,12 @@ class CraftGear(Skill):
         return ""
 
     def can_start(self, state: "State") -> bool:
-        return can_afford_gear(state, self.args["item"], assume_no_table=False)
+        target = str(self.args["item"])
+        if state.count(target) >= 1:
+            return False
+        if target == "wooden_pickaxe" and best_pickaxe(state) is not None:
+            return False
+        return can_afford_gear(state, target, assume_no_table=False)
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         target = str(self.args["item"])

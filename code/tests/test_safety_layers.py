@@ -1,4 +1,6 @@
 """四层基础设施：并发缓存、急停锁存、速率上限与非阻塞模型故障注入。"""
+import contextlib
+import copy
 import threading
 import time
 import unittest
@@ -6,7 +8,7 @@ from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from mcagent.client import ApiError, Client, Config, RequestLimiter
-from mcagent.runtime import Executor, RuntimeConfig, SafetyMonitor, State
+from mcagent.runtime import Executor, Replan, RuntimeConfig, SafetyMonitor, State
 from mcagent.planner.scheduler import DecisionScheduler
 from mcagent.probe import path_template, pathfinding_main, validate_fixture
 
@@ -332,7 +334,7 @@ class RequestTests(unittest.TestCase):
         self.assertGreaterEqual(times[4]-times[0], 1)
 
     def test_invalid_config_rejected(self):
-        for rate in (0, 5, float("nan")):
+        for rate in (0, 17, float("nan")):
             with self.assertRaises(ValueError):
                 Config("unused", "", "", max_rps=rate)
         with patch.dict("os.environ", {"MC_STATUS_TTL_S": "nan"}):
@@ -812,3 +814,176 @@ class AuditRegressionTests(unittest.TestCase):
         # manual_step_up 应记录脚底碰撞箱 place 被拒，并用 1x2 交替垫块登上 y=66
         self.assertEqual(by_case["manual_step_up"]["self_feet_place"]["code"], "blocked_by_self")
         self.assertEqual(by_case["manual_step_up"]["after"]["status"]["pos"][1], 66.0)
+
+
+class _ContinuousFakeClient(FakeClient):
+    """Thread-safe FakeClient supporting background_observation and use_cache tracking."""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.bg_enters = 0
+        self.bg_exits = 0
+        self.use_cache_calls = []
+        self.items = []
+        self.status_target = 0
+        self.status_reached = threading.Event()
+
+    @contextlib.contextmanager
+    def background_observation(self):
+        with self._lock:
+            self.bg_enters += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.bg_exits += 1
+
+    def get_block(self, pos, *, use_cache=True):
+        with self._lock:
+            self.use_cache_calls.append((list(pos), use_cache))
+        return super().get_block(pos)
+
+    def status(self):
+        with self._lock:
+            self.status_calls += 1
+            if self.status_target and self.status_calls >= self.status_target:
+                self.status_reached.set()
+            return copy.deepcopy(self.st)
+
+    def inventory(self):
+        with self._lock:
+            self.inventory_calls += 1
+            return {"items": copy.deepcopy(self.items)}
+
+    def events(self, **kwargs):
+        with self._lock:
+            evs, self.evs = self.evs, []
+            return {"events": evs, "last_seq": kwargs["since"] + len(evs)}
+
+
+class ContinuousMonitorTests(unittest.TestCase):
+    def test_runtime_config_observer_min_interval_s(self):
+        self.assertEqual(RuntimeConfig().observer_min_interval_s, 0.05)
+        with patch.dict("os.environ", {"MC_OBSERVER_MIN_INTERVAL_S": "0.12"}):
+            self.assertEqual(RuntimeConfig.load().observer_min_interval_s, 0.12)
+        for bad in ("0", "nan"):
+            with patch.dict("os.environ", {"MC_OBSERVER_MIN_INTERVAL_S": bad}):
+                with self.assertRaises(ValueError):
+                    RuntimeConfig.load()
+
+    def test_continuous_monitor_polls_immediately_uses_bg_context_and_refreshes_dirty_inventory(self):
+        c = _ContinuousFakeClient()
+        c.status_target = 3
+        s = State(replace(RuntimeConfig(), observer_min_interval_s=0.005, poll_safe_s=4.0, status_ttl_s=10.0))
+        ex = Executor(c, s, log=lambda *_: None)
+        mon = SafetyMonitor(c, s, ex, continuous=True, refresh_inventory=True)
+        mon.start()
+        try:
+            reached = c.status_reached.wait(1.0)
+        finally:
+            mon.close(timeout=1.0)
+        self.assertTrue(reached)
+        self.assertGreaterEqual(c.status_calls, 3)
+        self.assertGreaterEqual(c.bg_enters, 3)
+        self.assertEqual(c.bg_exits, c.bg_enters)
+        self.assertGreaterEqual(c.inventory_calls, 1)
+        self.assertFalse(s.inventory_dirty)
+
+    def test_continuous_monitor_refreshes_inventory_on_pickup_event(self):
+        c = _ContinuousFakeClient()
+        s = State(replace(RuntimeConfig(), observer_min_interval_s=0.005, status_ttl_s=10.0))
+        ex = Executor(c, s, log=lambda *_: None)
+        mon = SafetyMonitor(c, s, ex, continuous=True)
+        mon.tick()
+        self.assertFalse(s.inventory_dirty)
+
+        c.evs = [{"seq": 1, "type": "pickup", "item": "iron_ingot", "count": 2}]
+        c.items = [{"name": "iron_ingot", "count": 2}]
+        mon.tick()
+        self.assertEqual(s.count("iron_ingot"), 2)
+        self.assertFalse(s.inventory_dirty)
+
+    def test_continuous_monitor_respects_explicit_interval_s(self):
+        c = _ContinuousFakeClient()
+        s = State(replace(RuntimeConfig(), observer_min_interval_s=0.002))
+        ex = Executor(c, s, log=lambda *_: None)
+        mon = SafetyMonitor(c, s, ex, continuous=True, interval_s=0.15)
+        mon.start()
+        try:
+            time.sleep(0.07)
+        finally:
+            mon.close(timeout=1.0)
+        self.assertGreaterEqual(c.status_calls, 1)
+        self.assertLessEqual(c.status_calls, 2)
+
+    def test_check_support_passes_use_cache_false_and_handles_legacy_or_mock_get_block(self):
+        c1 = _ContinuousFakeClient()
+        c1.block = {"name": "stone"}
+        s1 = State()
+        s1.set_risk_context(void_guard=True)
+        mon1 = SafetyMonitor(c1, s1, Executor(c1, s1, log=lambda *_: None))
+        mon1.tick()
+        self.assertEqual(c1.use_cache_calls, [([0, 63, 0], False)])
+
+        c2 = FakeClient()
+        c2.block = {"name": "stone"}
+        s2 = State()
+        s2.set_risk_context(void_guard=True)
+        mon2 = SafetyMonitor(c2, s2, Executor(c2, s2, log=lambda *_: None))
+        mon2.tick()
+        self.assertEqual(c2.block_calls, [[0, 63, 0]])
+
+        c3 = FakeClient()
+        c3.st["on_ground"] = False
+        c3.get_block = Mock(side_effect=lambda p: {"name": "air"})
+        s3 = State()
+        s3.set_risk_context(void_guard=True)
+        mon3 = SafetyMonitor(c3, s3, Executor(c3, s3, log=lambda *_: None))
+        mon3.tick()
+        self.assertEqual(c3.get_block.call_count, 1)
+
+    def test_recording_subclass_with_zero_arg_tick_works_when_continuous(self):
+        class SubMon(SafetyMonitor):
+            def tick(self):
+                return super().tick()
+
+        logs = []
+        c = _ContinuousFakeClient()
+        s = State(replace(RuntimeConfig(), observer_min_interval_s=0.005, status_ttl_s=10.0))
+        ex = Executor(c, s, log=logs.append)
+        mon = SubMon(c, s, ex, continuous=True)
+        mon.tick()
+        c.st["pos"] = [1, 64, 0]
+        mon.tick()
+        self.assertEqual(c.status_calls, 2)
+        self.assertEqual(s.pos, [1, 64, 0])
+
+        c.status_target = 4
+        mon.start()
+        try:
+            reached = c.status_reached.wait(1.0)
+        finally:
+            mon.close(timeout=1.0)
+        self.assertTrue(reached)
+        self.assertEqual(logs, [])
+
+    def test_executor_act_invalidates_block_cache_only_for_world_actions(self):
+        c = FakeClient()
+        c.invalidate_block_cache = Mock()
+        s = State()
+        ex = Executor(c, s, log=lambda *_: None)
+
+        ex.act("dig", lambda: {"dug": "stone"})
+        ex.act("place", lambda: {"placed": "dirt"})
+        ex.act("interact", lambda: {})
+        ex.act("use_item", lambda: {})
+        self.assertEqual(c.invalidate_block_cache.call_count, 4)
+
+        ex.act("move_to", lambda: {"pos": [1, 64, 0]})
+        self.assertEqual(c.invalidate_block_cache.call_count, 4)
+
+        with self.assertRaises(Replan):
+            ex.act("dig", Mock(side_effect=ApiError("nothing_to_dig")))
+        self.assertEqual(c.invalidate_block_cache.call_count, 5)
+
