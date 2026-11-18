@@ -54,6 +54,7 @@ class PlanDecision:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     environment_recovery: bool = False
+    stop_episode: bool = False
 
 
 @dataclass
@@ -194,6 +195,20 @@ class RulePlanner:
                     targets[gid] = block
         return targets
 
+    def targets_exhausted(self, state: State) -> bool:
+        """聚焦目标尚未全部达成、当前无可执行步骤且未因环境条件挂起时判定为本轮止损。"""
+        if not self.target_goal:
+            return False
+        target_ids = normalize_goal_ids(self.target_goal)
+        if not target_ids or any(gid not in self.ledger_map for gid in target_ids):
+            return False
+        target_specs = [self.ledger_map[gid] for gid in target_ids]
+        if all(is_goal_achieved(g, state, self.completed_advancements) for g in target_specs):
+            return False
+        if self._rank(state):
+            return False
+        return not self.blocked_targets(state, self.target_goal, refresh=False)
+
     def _try_make(self, name: str, args: Optional[dict], state: State) -> Optional[Skill]:
         cls = self.registry.get(name)
         if cls is None or not skill_choice.meets_verification(cls, self.min_verified) or cls.blocked(state):
@@ -328,7 +343,12 @@ class RulePlanner:
                 if scout is not None:
                     return PlanDecision(scout, "rule", "聚焦目标因环境挂起，外迁重新观察", environment_recovery=True)
                 return PlanDecision(None, "idle", "等待聚焦目标的环境条件变化")
-            return PlanDecision(None, "idle", f"目标 {self.target_goal} 已达成或本轮已止损")
+            return PlanDecision(
+                None,
+                "idle",
+                f"目标 {self.target_goal} 已达成或本轮已止损",
+                stop_episode=self.targets_exhausted(state),
+            )
 
         # 常规战役模式：已激活台账目标全部达成后维持基础物资安全库存并持续探索
         if total_logs(state) * 4 + total_planks(state) < 8:
@@ -440,10 +460,43 @@ class CampaignPlanner:
             self._last_selected_goal_id = self.rules._last_selected_goal_id
             return dec
         self.rules.refresh_environment_blocks(state)
+        if self.rules.targets_exhausted(state):
+            self._last_selected_goal_id = None
+            return PlanDecision(
+                None,
+                "idle",
+                f"聚焦目标 {self.target_goal} 已触及本轮止损，结束无效循环",
+                stop_episode=True,
+            )
         ready_registry = {
             name: cls for name, cls in self.registry.items()
             if self.rules.environment_block(cls.goal) is None
         }
+        if self.target_goal:
+            ranked = self.rules._rank(state)
+            if ranked:
+                top_g = ranked[0].step_goal
+                wants_wood = top_g.skill == "gather_wood" or any(
+                    fb_s == "gather_wood" and not check_item_expr(state, expr)
+                    for expr, fb_s, _ in top_g.gather_fallbacks
+                )
+                wants_stone = top_g.skill == "mine_stone" or any(
+                    fb_s == "mine_stone" and not check_item_expr(state, expr)
+                    for expr, fb_s, _ in top_g.gather_fallbacks
+                )
+                saturated_skills: list[str] = []
+                if not wants_wood and (total_logs(state) * 4 + total_planks(state)) >= 64:
+                    saturated_skills.append("gather_wood")
+                if not wants_stone and total_cobble(state) >= 48:
+                    saturated_skills.append("mine_stone")
+                for skill_name in saturated_skills:
+                    if skill_name in ready_registry:
+                        candidate_registry = {
+                            name: cls for name, cls in ready_registry.items()
+                            if name != skill_name
+                        }
+                        if skill_choice.has_ready_skill(state, candidate_registry, self.min_verified):
+                            ready_registry = candidate_registry
         if not skill_choice.has_ready_skill(state, ready_registry, self.min_verified):
             dec = self.rules.choose(state)
             self._last_selected_goal_id = self.rules._last_selected_goal_id
@@ -539,4 +592,5 @@ class CampaignPlanner:
             prompt_tok,
             comp_tok,
             environment_recovery=fallback.environment_recovery,
+            stop_episode=fallback.stop_episode,
         )

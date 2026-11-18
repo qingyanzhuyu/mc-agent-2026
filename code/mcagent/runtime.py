@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import inspect
 import json
 import copy
 import math
@@ -62,6 +64,7 @@ class RuntimeConfig:
     # 临时工程值，必须用官方 C1/寻路证据标定；不代表已验证的生存阈值。
     poll_safe_s: float = 4.0
     poll_risk_s: float = 1.0
+    observer_min_interval_s: float = 0.05
     status_ttl_s: float = 1.0
     stop_cooldown_s: float = 10.0
     hp_crit: float = 8.0
@@ -741,6 +744,10 @@ class Executor:
         finally:
             if name in NON_IDEMPOTENT_ACTIONS or name in ("dig", "attack", "equip"):
                 self.state.invalidate_inventory()
+            if name in ("dig", "place", "interact", "use_item"):
+                inv_cache = getattr(self.client, "invalidate_block_cache", None)
+                if callable(inv_cache):
+                    inv_cache()
             with self._cond:
                 self.active_action = None
                 self._busy = False
@@ -856,18 +863,41 @@ class Executor:
 
 
 # ---------------------------------------------------------------- 后台监控与抢占闭环
+def _accepts_use_cache(fn: Any) -> bool:
+    """检查 fn 是否接受 use_cache 关键字参数。"""
+    side_effect = getattr(fn, "side_effect", None)
+    target = side_effect if callable(side_effect) and not isinstance(side_effect, type) else fn
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    param = sig.parameters.get("use_cache")
+    if param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+
 class SafetyMonitor:
     """唯一定时 status/events 读取者；持续危险一次抢占，软危险只发布意图。"""
 
     def __init__(self, client: Client, state: State, executor: Executor,
                  safety: Optional[Safety] = None,
                  on_hazard: Optional[Callable[[dict, Executor, State], None]] = None,
-                 interval_s: Optional[float] = None):
+                 interval_s: Optional[float] = None,
+                 continuous: bool = False,
+                 refresh_inventory: bool = False):
         self.client, self.state, self.executor = client, state, executor
         self.config = state.config
         self.safety = safety or Safety(self.config)
         self.on_hazard = on_hazard
         self.interval_s = interval_s
+        self.continuous = continuous
+        self.refresh_inventory = refresh_inventory
+        self._get_block_key: Optional[tuple] = None
+        self._get_block_supports_use_cache: Optional[bool] = None
         self._active: set[str] = set()
         self._triggered: dict[str, float] = {}
         self._last_y: Optional[float] = None
@@ -877,6 +907,8 @@ class SafetyMonitor:
     def next_interval(self) -> float:
         if self.interval_s is not None:
             return self.interval_s
+        if self.continuous:
+            return self.config.observer_min_interval_s
         st, cfg = self.state.snapshot(), self.config
         rc = self.state.get_risk_context()
         hostile = st.get("nearest_hostile") or {}
@@ -888,6 +920,18 @@ class SafetyMonitor:
                 or st.get("in_water") or st.get("in_lava") or st.get("on_fire")
                 or st.get("on_ground") is False or any(rc.values()))
         return cfg.poll_risk_s if risk else cfg.poll_safe_s
+
+    def _get_block_uncached(self, pos: list[int]) -> dict:
+        fn = self.client.get_block
+        if hasattr(fn, "_mock_calls"):
+            supports_use_cache = _accepts_use_cache(fn)
+        else:
+            key = (getattr(fn, "__func__", fn), getattr(fn, "__self__", None))
+            if self._get_block_key != key or self._get_block_supports_use_cache is None:
+                self._get_block_key = key
+                self._get_block_supports_use_cache = _accepts_use_cache(fn)
+            supports_use_cache = self._get_block_supports_use_cache
+        return fn(pos, use_cache=False) if supports_use_cache else fn(pos)
 
     def _check_support(self) -> None:
         st = self.state.snapshot()
@@ -924,7 +968,7 @@ class SafetyMonitor:
         under = [math.floor(pos[0]), math.floor(y - 0.01), math.floor(pos[2])]
         evidence: dict[str, Any] = {"pos": under, "status_pos": pos}
         try:
-            block = self.client.get_block(under)
+            block = self._get_block_uncached(under)
             evidence["block"] = block
             name = str(block.get("name", "")).removeprefix("minecraft:")
             if name in ("air", "cave_air", "void_air"):
@@ -941,7 +985,7 @@ class SafetyMonitor:
                         aabb_checked = []
                         for cx, cy, cz in corners:
                             cpos = [cx, cy, cz]
-                            cb = self.client.get_block(cpos)
+                            cb = self._get_block_uncached(cpos)
                             cname = str(cb.get("name", "")).removeprefix("minecraft:")
                             aabb_checked.append({"pos": cpos, "name": cname})
                             if cname and cname not in ("air", "cave_air", "void_air", "lava"):
@@ -958,7 +1002,7 @@ class SafetyMonitor:
                     below_checked = []
                     for dy in (1, 2):
                         bpos = [under[0], under[1] - dy, under[2]]
-                        b = self.client.get_block(bpos)
+                        b = self._get_block_uncached(bpos)
                         bname = str(b.get("name", "")).removeprefix("minecraft:")
                         below_checked.append({"pos": bpos, "name": bname})
                         if bname and bname not in ("air", "cave_air", "void_air", "lava"):
@@ -977,14 +1021,17 @@ class SafetyMonitor:
         evidence["at"] = time.monotonic()
         self.state.set_support(evidence)
 
-    def tick(self) -> Optional[dict]:
-        self.state.refresh_status(self.client)
+    def tick(self, *, force_status: Optional[bool] = None) -> Optional[dict]:
+        force = self.continuous if force_status is None else force_status
+        self.state.refresh_status(self.client, max_age_s=0 if force else None)
         # 先处理致命状态，再查支撑与事件，避免慢请求延误已观察到的岩浆/缺氧抢占。
         hazard = self._dispatch(reconcile=False)
         self._check_support()
         hazard = self._dispatch(reconcile=True) or hazard
         self.state.drain(self.client)
         after_events = self._dispatch(reconcile=False)
+        if (self.refresh_inventory or self.continuous) and (self.state.inventory_dirty or not self.state.inventory):
+            self.state.refresh_inventory(self.client)
         return after_events or hazard
 
     def _dispatch(self, reconcile: bool = True) -> Optional[dict]:
@@ -1018,11 +1065,23 @@ class SafetyMonitor:
         while not self._stop_ev.is_set():
             started = time.monotonic()
             try:
-                self.tick()
+                bg_obs = getattr(self.client, "background_observation", None)
+                ctx = bg_obs() if callable(bg_obs) else None
+                if ctx is None or not (hasattr(type(ctx), "__enter__") and hasattr(type(ctx), "__exit__")):
+                    ctx = contextlib.nullcontext()
+                with ctx:
+                    self.tick()
             except Exception as e:
                 self.executor.log(f"  [monitor] 轮询异常: {e}")
-            # 从轮询开始计时，慢 RTT 时不堆积补发。
-            self._stop_ev.wait(max(0.01, self.next_interval() - (time.monotonic() - started)))
+            if self.continuous:
+                if self.interval_s is not None:
+                    wait_s = max(0.0, float(self.interval_s) - (time.monotonic() - started))
+                else:
+                    wait_s = max(0.0, float(self.config.observer_min_interval_s))
+            else:
+                # 从轮询开始计时，慢 RTT 时不堆积补发。
+                wait_s = max(0.01, self.next_interval() - (time.monotonic() - started))
+            self._stop_ev.wait(wait_s)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():

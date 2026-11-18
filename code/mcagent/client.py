@@ -8,8 +8,11 @@
 """
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import math
+import numbers
 import os
 import sys
 import threading
@@ -20,6 +23,7 @@ from typing import Any, Optional
 import requests
 
 DEFAULT_BASE = "https://mc-api.windywindie.top/api/v1"
+MAX_RPS_CAP: float = 16.0
 
 # §3.1 / §4.11: 姿态请求与响应使用不同的字段名。
 _POSTURE_FIELDS = {"sneak": "sneaking", "shield": "blocking", "jump": "jumping"}
@@ -138,6 +142,18 @@ class ApiError(Exception):
 
 
 # ---------------------------------------------------------------- 配置
+def _parse_finite_float(raw: Any, err_msg: str) -> float:
+    if isinstance(raw, bool):
+        raise ValueError(err_msg)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(err_msg) from exc
+    if not math.isfinite(val):
+        raise ValueError(err_msg)
+    return val
+
+
 class Config:
     def __init__(
         self,
@@ -147,15 +163,25 @@ class Config:
         proxy: Optional[str] = None,
         token_file: Optional[str] = None,
         max_rps: Optional[float] = None,
+        block_cache_ttl_s: Optional[float] = None,
     ):
         self.base = base.rstrip("/")
         self.username = username
         self.password = password
         self.proxy = proxy
         self.token_file = token_file
-        self.max_rps = float(os.environ.get("MC_MAX_RPS", "4")) if max_rps is None else max_rps
-        if not math.isfinite(self.max_rps) or not 0 < self.max_rps <= 4:
-            raise ValueError("MC_MAX_RPS 必须在 (0, 4]，4 是客户端硬上限")
+
+        raw_rps = os.environ.get("MC_MAX_RPS", "16") if max_rps is None else max_rps
+        rps_err = "MC_MAX_RPS 必须在 (0, 16]，16 是客户端硬上限"
+        self.max_rps = _parse_finite_float(raw_rps, rps_err)
+        if not 0 < self.max_rps <= MAX_RPS_CAP:
+            raise ValueError(rps_err)
+
+        raw_ttl = os.environ.get("MC_BLOCK_CACHE_TTL_S", "1.5") if block_cache_ttl_s is None else block_cache_ttl_s
+        ttl_err = "MC_BLOCK_CACHE_TTL_S 必须为有限非负数"
+        self.block_cache_ttl_s = _parse_finite_float(raw_ttl, ttl_err)
+        if self.block_cache_ttl_s < 0:
+            raise ValueError(ttl_err)
 
     @classmethod
     def load(cls, env_file: str | None = None) -> "Config":
@@ -199,26 +225,39 @@ def _parse_iso(s: Optional[str]) -> Optional[float]:
 
 # ---------------------------------------------------------------- 客户端
 class RequestLimiter:
-    """所有请求共用的无突发限速；等待者不持锁睡眠，/stop 优先取下一槽。"""
+    """所有请求共用的无突发限速；等待者不持锁睡眠，/stop > 普通 > 后台观察。"""
 
     def __init__(self, rate: float):
         self.spacing = 1.0 / rate
         self._next = 0.0
         self._cond = threading.Condition()
         self._urgent = 0
+        self._normal = 0
 
-    def acquire(self, urgent: bool = False) -> None:
+    def acquire(self, urgent: bool = False, *, background: bool = False) -> None:
+        is_urgent = bool(urgent)
+        is_normal = not is_urgent and not bool(background)
         with self._cond:
-            self._urgent += int(urgent)
+            if is_urgent:
+                self._urgent += 1
+            elif is_normal:
+                self._normal += 1
             try:
                 while True:
                     delay = self._next - time.monotonic()
-                    if delay <= 0 and (urgent or not self._urgent):
+                    if delay <= 0 and (
+                        is_urgent
+                        or (is_normal and self._urgent == 0)
+                        or (not is_urgent and not is_normal and self._urgent == 0 and self._normal == 0)
+                    ):
                         self._next = time.monotonic() + self.spacing
                         return
                     self._cond.wait(max(0.001, delay) if delay > 0 else self.spacing)
             finally:
-                self._urgent -= int(urgent)
+                if is_urgent:
+                    self._urgent -= 1
+                elif is_normal:
+                    self._normal -= 1
                 self._cond.notify_all()
 
 
@@ -240,7 +279,23 @@ class Client:
         self._route_support: dict[str, bool] = {}
         self._last_disconnect_mono: Optional[float] = None
         self.auto_wait_ready_on_relogin: bool = True
+        self._bg_tls = threading.local()
+        self._block_cache_lock = threading.Lock()
+        self._block_cache: dict[tuple[int, int, int], tuple[float, dict]] = {}
+        self._block_cache_gen: int = 0
         self._load_cached_token()
+
+    def _is_background_thread(self) -> bool:
+        return getattr(self._bg_tls, "depth", 0) > 0
+
+    @contextlib.contextmanager
+    def background_observation(self):
+        depth = getattr(self._bg_tls, "depth", 0)
+        self._bg_tls.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._bg_tls.depth = max(0, getattr(self._bg_tls, "depth", 1) - 1)
 
     # ---- Token 缓存落盘 ------------------------------------------------
     def _load_cached_token(self) -> None:
@@ -303,12 +358,17 @@ class Client:
         auth: bool = True,
         token: Optional[str] = None,
     ) -> dict:
-        url = f"{self.cfg.base}/{path.lstrip('/')}"
+        route = path.lstrip("/")
+        url = f"{self.cfg.base}/{route}"
         headers = {"Content-Type": "application/json"}
         use_token = self.token if token is None else token
         if auth and use_token:
             headers["Authorization"] = f"Bearer {use_token}"
-        self._limiter.acquire(urgent=path.lstrip("/") == "stop")
+        is_urgent = route == "stop"
+        self._limiter.acquire(
+            urgent=is_urgent,
+            background=self._is_background_thread() and not is_urgent,
+        )
         try:
             if method == "GET":
                 r = self.session.get(url, headers=headers, params=body, timeout=timeout)
@@ -480,6 +540,7 @@ class Client:
         self.expires_at = _parse_iso(payload.get("expires_at"))
         self.bot_username = payload.get("bot_username")
         self._posture = _POSTURE_RESET.copy()
+        self.invalidate_block_cache()
         self._save_cached_token(payload.get("expires_at"))
         self.log(f"[auth] 登录成功 bot={self.bot_username} token 到期={payload.get('expires_at')}")
 
@@ -577,8 +638,52 @@ class Client:
             body["mature"] = mature
         return self.call("find_blocks", body, timeout=20)
 
-    def get_block(self, pos) -> dict:
-        return self.call("get_block", {"pos": list(pos)}, timeout=10)
+    def invalidate_block_cache(self) -> None:
+        with self._block_cache_lock:
+            self._block_cache.clear()
+            self._block_cache_gen += 1
+
+    @staticmethod
+    def _block_cache_key(pos: Any) -> Optional[tuple[int, int, int]]:
+        try:
+            coords = list(pos)
+        except TypeError:
+            return None
+        if len(coords) != 3:
+            return None
+        floored: list[int] = []
+        for v in coords:
+            if isinstance(v, bool) or not isinstance(v, numbers.Real):
+                return None
+            if not math.isfinite(float(v)):
+                return None
+            floored.append(math.floor(v))
+        return (floored[0], floored[1], floored[2])
+
+    def get_block(self, pos, *, use_cache: bool = True) -> dict:
+        pos_list = list(pos)
+        ttl = getattr(self.cfg, "block_cache_ttl_s", 0.0)
+        key = self._block_cache_key(pos_list) if (use_cache and ttl > 0) else None
+        with self._block_cache_lock:
+            gen_before = self._block_cache_gen
+            if key is not None:
+                entry = self._block_cache.get(key)
+                if entry is not None:
+                    expires_at, cached = entry
+                    if time.monotonic() < expires_at:
+                        return copy.deepcopy(cached)
+                    self._block_cache.pop(key, None)
+        res = self.call("get_block", {"pos": pos_list}, timeout=10)
+        if key is not None and isinstance(res, dict) and res.get("name"):
+            now = time.monotonic()
+            with self._block_cache_lock:
+                if self._block_cache_gen == gen_before:
+                    if len(self._block_cache) > 256:
+                        expired = [k for k, (exp, _) in self._block_cache.items() if now >= exp]
+                        for k in expired:
+                            self._block_cache.pop(k, None)
+                    self._block_cache[key] = (now + ttl, copy.deepcopy(res))
+        return copy.deepcopy(res) if isinstance(res, dict) else res
 
     def get_entities(self, radius=32, types=None) -> dict:
         body: dict = {"radius": radius}
@@ -619,13 +724,19 @@ class Client:
         return self.action("move_to", body, timeout, stop_on=stop_on)
 
     def dig(self, pos, collect=True, *, stop_on=None) -> dict:
-        return self.action("dig", {"pos": list(pos), "collect": collect}, stop_on=stop_on)
+        try:
+            return self.action("dig", {"pos": list(pos), "collect": collect}, stop_on=stop_on)
+        finally:
+            self.invalidate_block_cache()
 
     def place(self, item, pos=None, *, stop_on=None) -> dict:
         body: dict = {"item": item}
         if pos is not None:
             body["pos"] = list(pos)
-        return self.action("place", body, stop_on=stop_on)
+        try:
+            return self.action("place", body, stop_on=stop_on)
+        finally:
+            self.invalidate_block_cache()
 
     def interact(self, pos=None, entity_id=None, item=None, *, stop_on=None) -> dict:
         body: dict = {}
@@ -635,7 +746,10 @@ class Client:
             body["entity_id"] = entity_id
         if item:
             body["item"] = item
-        return self.action("interact", body, stop_on=stop_on)
+        try:
+            return self.action("interact", body, stop_on=stop_on)
+        finally:
+            self.invalidate_block_cache()
 
     def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None) -> dict:
         body: dict = {"item": item}
@@ -647,7 +761,10 @@ class Client:
             body["timeout"] = timeout_ms
         if source:
             body["source"] = source
-        return self.action("use_item", body, stop_on=stop_on)
+        try:
+            return self.action("use_item", body, stop_on=stop_on)
+        finally:
+            self.invalidate_block_cache()
 
     def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
         # v1.3.11 §4.6：max_hits 打够即返回；interval_ms 覆盖挥击间隔（50–5000）
@@ -749,13 +866,19 @@ class Client:
         return self.call("stop", {}, timeout=15)
 
     def connect(self, timeout=20) -> dict:
-        return self.call("connect", {}, timeout=timeout)
+        try:
+            return self.call("connect", {}, timeout=timeout)
+        finally:
+            self.invalidate_block_cache()
 
     def disconnect(self) -> dict:
-        res = self.call("disconnect", {}, timeout=20)
-        self._posture = _POSTURE_RESET.copy()
-        self._last_disconnect_mono = time.monotonic()
-        return res
+        try:
+            res = self.call("disconnect", {}, timeout=20)
+            self._posture = _POSTURE_RESET.copy()
+            self._last_disconnect_mono = time.monotonic()
+            return res
+        finally:
+            self.invalidate_block_cache()
 
 
 # ---------------------------------------------------------------- 自检
