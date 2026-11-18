@@ -735,6 +735,526 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
         st_after = soak_ctl.read_state(self.session)
         self.assertEqual(st_after["incidents"]["GOAL_MISS:prep_diamond_pickaxe"]["status"], "pending")
 
+    def test_relaxed_three_way_parallelism_same_starter_domain_and_llm_session(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        incidents = {
+            "SKILL_SPAM_LOOP:gather_wood:aaa111": {
+                "incident_id": "INC-WOOD",
+                "fingerprint": "SKILL_SPAM_LOOP:gather_wood:aaa111",
+                "code": "SKILL_SPAM_LOOP",
+                "skill": "gather_wood",
+                "severity": "P1",
+                "category": "strategy",
+                "status": "pending",
+                "editable_files": [],
+                "attempts": 0,
+            },
+            "REPLAN_OSCILLATION:surface_for_air:bbb222": {
+                "incident_id": "INC-AIR",
+                "fingerprint": "REPLAN_OSCILLATION:surface_for_air:bbb222",
+                "code": "REPLAN_OSCILLATION",
+                "skill": "surface_for_air",
+                "severity": "P1",
+                "category": "strategy",
+                "status": "pending",
+                "editable_files": [],
+                "attempts": 0,
+            },
+            "LLM_INVALID_OR_TIMEOUT:session:ccc333": {
+                "incident_id": "INC-LLM",
+                "fingerprint": "LLM_INVALID_OR_TIMEOUT:session:ccc333",
+                "code": "LLM_INVALID_OR_TIMEOUT",
+                "skill": "session",
+                "severity": "P3",
+                "category": "bug",
+                "status": "pending",
+                "editable_files": [],
+                "attempts": 0,
+            },
+        }
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {k: dict(v) for k, v in incidents.items()}
+
+        # Under strict: gather_wood and surface_for_air collide on starter_skills.py, LLM is wildcard.
+        strict_claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="strict")
+        self.assertEqual([c["fingerprint"] for c in strict_claimed], ["SKILL_SPAM_LOOP:gather_wood:aaa111"])
+
+        # Reset to pending and check explicit relaxed scope & 3-way claim.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {k: dict(v) for k, v in incidents.items()}
+
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(incidents["SKILL_SPAM_LOOP:gather_wood:aaa111"], parallel_policy="relaxed"),
+            frozenset({"skill:gather_wood"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(incidents["REPLAN_OSCILLATION:surface_for_air:bbb222"], parallel_policy="relaxed"),
+            frozenset({"skill:surface_for_air"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(incidents["LLM_INVALID_OR_TIMEOUT:session:ccc333"], parallel_policy="relaxed"),
+            frozenset({"domain:llm_session"}),
+        )
+
+        relaxed_claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            set(c["fingerprint"] for c in relaxed_claimed),
+            set(incidents.keys()),
+        )
+
+        # When parallel_policy=None, claim_parallel_incidents honors state.json["fixer_parallel_policy"].
+        with soak_ctl.locked_state(self.session) as st:
+            st["fixer_parallel_policy"] = "relaxed"
+            st["incidents"] = {k: dict(v) for k, v in incidents.items()}
+        state_claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3)
+        self.assertEqual(len(state_claimed), 3)
+
+    def test_relaxed_recurring_goal_miss_and_replan_keep_gate1_expansion(self):
+        goal_rec = {
+            "incident_id": "INC-GM-KILL",
+            "fingerprint": "GOAL_MISS:kill_a_mob",
+            "code": "GOAL_MISS",
+            "goal_id": "kill_a_mob",
+            "skill": "hunt_mob",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": ["code/mcagent/skills/combat.py"],
+            "last_failed_fix_commit": "deadbeef",
+            "attempts": 1,
+        }
+        replan_rec = {
+            "incident_id": "INC-RP-SEED",
+            "fingerprint": "REPLAN_OSCILLATION:plant_seed",
+            "code": "REPLAN_OSCILLATION",
+            "goal_id": "plant_seed",
+            "skill": "plant_seed",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "last_failed_fix_commit": "cafebabe",
+            "attempts": 1,
+        }
+        spam_rec = {
+            "incident_id": "INC-SP-STONE",
+            "fingerprint": "SKILL_SPAM_LOOP:mine_stone",
+            "code": "SKILL_SPAM_LOOP",
+            "skill": "mine_stone",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+
+        # Gate 1 expansion remains intact for recurring GOAL_MISS.
+        narrow = soak_ctl._effective_goal_narrow_files(goal_rec)
+        self.assertIsNotNone(narrow)
+        self.assertEqual(narrow[0], "code/mcagent/skills/combat.py")
+        for extra in soak_ctl.GOAL_RECURRENCE_EXTRA_FILES:
+            self.assertIn(extra, narrow)
+
+        # Under strict: GOAL_RECURRENCE_EXTRA_FILES causes starter_skills.py / policy.py collisions.
+        strict_goal_scope = soak_ctl._claim_parallel_scope(goal_rec, parallel_policy="strict")
+        strict_replan_scope = soak_ctl._claim_parallel_scope(replan_rec, parallel_policy="strict")
+        self.assertTrue(set(soak_ctl.GOAL_RECURRENCE_EXTRA_FILES).issubset(strict_goal_scope))
+        self.assertTrue(soak_ctl._scopes_conflict(strict_goal_scope, strict_replan_scope))
+
+        # Under relaxed: no GOAL_RECURRENCE_EXTRA_FILES in claim scope; all 3 claim simultaneously.
+        relaxed_goal_scope = soak_ctl._claim_parallel_scope(goal_rec, parallel_policy="relaxed")
+        self.assertEqual(relaxed_goal_scope, frozenset({"goal:kill_a_mob", "skill:hunt_mob"}))
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(replan_rec, parallel_policy="relaxed"),
+            frozenset({"skill:plant_seed"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(spam_rec, parallel_policy="relaxed"),
+            frozenset({"skill:mine_stone"}),
+        )
+
+        # GOAL_MISS without goal_id falls back to fingerprint (+ skill if set).
+        goal_no_id = {
+            "fingerprint": "GOAL_MISS:custom_fp",
+            "code": "GOAL_MISS",
+            "skill": "gather_wood",
+            "editable_files": ["code/mcagent/loop/starter_skills.py"],
+        }
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(goal_no_id, parallel_policy="relaxed"),
+            frozenset({"GOAL_MISS:custom_fp", "skill:gather_wood"}),
+        )
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                goal_rec["fingerprint"]: dict(goal_rec),
+                replan_rec["fingerprint"]: dict(replan_rec),
+                spam_rec["fingerprint"]: dict(spam_rec),
+            }
+        claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            set(c["fingerprint"] for c in claimed),
+            {"GOAL_MISS:kill_a_mob", "REPLAN_OSCILLATION:plant_seed", "SKILL_SPAM_LOOP:mine_stone"},
+        )
+
+    def test_relaxed_api_bottleneck_slow_and_combat_or_mob_death_scopes(self):
+        api_move = {
+            "incident_id": "INC-API-M",
+            "fingerprint": "API_BOTTLENECK_SLOW:move_to",
+            "code": "API_BOTTLENECK_SLOW",
+            "skill": "move_to",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        api_find = {
+            "incident_id": "INC-API-F",
+            "fingerprint": "API_BOTTLENECK_SLOW:find_blocks",
+            "code": "API_BOTTLENECK_SLOW",
+            "skill": "find_blocks",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        api_sess1 = {
+            "incident_id": "INC-API-S1",
+            "fingerprint": "API_BOTTLENECK_SLOW:session1",
+            "code": "API_BOTTLENECK_SLOW",
+            "skill": "session",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        api_sess2 = {
+            "incident_id": "INC-API-S2",
+            "fingerprint": "API_BOTTLENECK_SLOW:session2",
+            "code": "API_BOTTLENECK_SLOW",
+            "skill": "",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        combat1 = {
+            "incident_id": "INC-CMB-1",
+            "fingerprint": "COMBAT_OR_MOB_DEATH:1",
+            "code": "COMBAT_OR_MOB_DEATH",
+            "skill": "combat",
+            "severity": "P1",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+        combat2 = {
+            "incident_id": "INC-CMB-2",
+            "fingerprint": "COMBAT_OR_MOB_DEATH:2",
+            "code": "COMBAT_OR_MOB_DEATH",
+            "skill": "hunt_mob",
+            "severity": "P1",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(api_move, parallel_policy="relaxed"),
+            frozenset({"domain:api_bottleneck_slow:move_to"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(api_find, parallel_policy="relaxed"),
+            frozenset({"domain:api_bottleneck_slow:find_blocks"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(api_sess1, parallel_policy="relaxed"),
+            frozenset({"domain:api_bottleneck_slow"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(api_sess2, parallel_policy="relaxed"),
+            frozenset({"domain:api_bottleneck_slow"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(combat1, parallel_policy="relaxed"),
+            frozenset({"domain:combat_session"}),
+        )
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(combat1, parallel_policy="strict"),
+            frozenset({"*"}),
+        )
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                combat1["fingerprint"]: dict(combat1),
+                combat2["fingerprint"]: dict(combat2),
+                api_move["fingerprint"]: dict(api_move),
+                api_find["fingerprint"]: dict(api_find),
+            }
+        claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed],
+            ["COMBAT_OR_MOB_DEATH:1", "API_BOTTLENECK_SLOW:move_to", "API_BOTTLENECK_SLOW:find_blocks"],
+        )
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["COMBAT_OR_MOB_DEATH:2"]["status"],
+            "pending",
+        )
+
+        # Two session-level API_BOTTLENECK_SLOWs mutually exclude each other.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                api_sess1["fingerprint"]: dict(api_sess1),
+                api_sess2["fingerprint"]: dict(api_sess2),
+            }
+        claimed_sess = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(len(claimed_sess), 1)
+
+    def test_relaxed_dispatch_starvation_mutual_exclusion_and_three_way_mix(self):
+        starve1 = {
+            "incident_id": "INC-DS-1",
+            "fingerprint": "DISPATCH_STARVATION:enter_the_nether",
+            "code": "DISPATCH_STARVATION",
+            "goal_id": "enter_the_nether",
+            "skill": "build_and_enter_portal",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        starve2 = {
+            "incident_id": "INC-DS-2",
+            "fingerprint": "DISPATCH_STARVATION:smelt_iron",
+            "code": "DISPATCH_STARVATION",
+            "goal_id": "smelt_iron",
+            "skill": "smelt_iron",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        replan_stone = {
+            "incident_id": "INC-RP-STONE",
+            "fingerprint": "REPLAN_OSCILLATION:mine_stone",
+            "code": "REPLAN_OSCILLATION",
+            "skill": "mine_stone",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        llm_rec = {
+            "incident_id": "INC-LLM",
+            "fingerprint": "LLM_INVALID_OR_TIMEOUT:session",
+            "code": "LLM_INVALID_OR_TIMEOUT",
+            "skill": "session",
+            "severity": "P3",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+
+        s1 = soak_ctl._claim_parallel_scope(starve1, parallel_policy="relaxed")
+        s2 = soak_ctl._claim_parallel_scope(starve2, parallel_policy="relaxed")
+        self.assertIn("domain:dispatch", s1)
+        self.assertIn("domain:dispatch", s2)
+        self.assertTrue(soak_ctl._scopes_conflict(s1, s2))
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                starve1["fingerprint"]: dict(starve1),
+                starve2["fingerprint"]: dict(starve2),
+                replan_stone["fingerprint"]: dict(replan_stone),
+                llm_rec["fingerprint"]: dict(llm_rec),
+            }
+        claimed = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed],
+            [
+                "DISPATCH_STARVATION:enter_the_nether",
+                "REPLAN_OSCILLATION:mine_stone",
+                "LLM_INVALID_OR_TIMEOUT:session",
+            ],
+        )
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["DISPATCH_STARVATION:smelt_iron"]["status"],
+            "pending",
+        )
+
+    def test_relaxed_progressive_conflict_fallback(self):
+        wood_base = {
+            "incident_id": "INC-WOOD",
+            "fingerprint": "SKILL_SPAM_LOOP:gather_wood",
+            "code": "SKILL_SPAM_LOOP",
+            "skill": "gather_wood",
+            "gate_history": [{"failed_gate": "gate1_whitelist"}],  # non-conflict gates must not count
+        }
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(wood_base, parallel_policy="relaxed"),
+            frozenset({"skill:gather_wood"}),
+        )
+
+        # 1 merge_conflict_requeue -> downgrades to strict file scope.
+        wood_one_conflict = {
+            **wood_base,
+            "gate_history": [
+                {"failed_gate": "gate1_whitelist"},
+                {"failed_gate": "merge_conflict_requeue"},
+            ],
+        }
+        strict_wood = soak_ctl._claim_parallel_scope(wood_one_conflict, parallel_policy="strict")
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(wood_one_conflict, parallel_policy="relaxed"),
+            strict_wood,
+        )
+        self.assertIn("code/mcagent/loop/starter_skills.py", strict_wood)
+        self.assertTrue(set(soak_ctl.GOAL_RECURRENCE_EXTRA_FILES).issubset(strict_wood))
+
+        # DISPATCH_STARVATION and API_BOTTLENECK_SLOW downgrade to '*' on 1 conflict (matching strict).
+        for wide_rec in (
+            {
+                "code": "DISPATCH_STARVATION",
+                "goal_id": "enter_the_nether",
+                "skill": "build_and_enter_portal",
+                "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+            },
+            {
+                "code": "API_BOTTLENECK_SLOW",
+                "skill": "move_to",
+                "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+            },
+        ):
+            self.assertEqual(
+                soak_ctl._claim_parallel_scope(wide_rec, parallel_policy="relaxed"),
+                soak_ctl._claim_parallel_scope(wide_rec, parallel_policy="strict"),
+            )
+            self.assertEqual(
+                soak_ctl._claim_parallel_scope(wide_rec, parallel_policy="relaxed"),
+                frozenset({"*"}),
+            )
+
+        # 2 merge_conflict_requeues -> escalates to wildcard '*' even for GOAL_MISS / starter skill.
+        wood_two_conflicts = {
+            **wood_base,
+            "gate_history": [
+                {"failed_gate": "merge_conflict_requeue"},
+                {"failed_gate": "gate2_unittest"},
+                {"failed_gate": "merge_conflict_requeue"},
+            ],
+        }
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(wood_two_conflicts, parallel_policy="relaxed"),
+            frozenset({"*"}),
+        )
+        goal_two_conflicts = {
+            "code": "GOAL_MISS",
+            "goal_id": "mine_diamond",
+            "skill": "mine_diamond",
+            "editable_files": ["code/mcagent/skills/diamond.py"],
+            "gate_history": [
+                {"failed_gate": "merge_conflict_requeue"},
+                {"failed_gate": "merge_conflict_requeue"},
+            ],
+        }
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(goal_two_conflicts, parallel_policy="relaxed"),
+            frozenset({"*"}),
+        )
+
+    def test_relaxed_wild_fatal_and_empty_goal_stay_exclusive(self):
+        fatal_rec = {
+            "incident_id": "INC-FATAL",
+            "fingerprint": "FATAL_ENV_DEATH:lava",
+            "code": "FATAL_ENV_DEATH",
+            "skill": "lava",
+            "severity": "P0",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+        wild_goal = {
+            "incident_id": "INC-WILD-GOAL",
+            "fingerprint": "GOAL_MISS:explore",
+            "code": "GOAL_MISS",
+            "goal_id": "explore",
+            "skill": "explore",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": [],
+            "attempts": 0,
+        }
+        unknown_rec = {
+            "incident_id": "INC-UNK",
+            "fingerprint": "LOOP_CRASH:unknown",
+            "code": "LOOP_CRASH",
+            "skill": "loop",
+            "severity": "P2",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+        for rec in (fatal_rec, wild_goal, unknown_rec):
+            self.assertEqual(
+                soak_ctl._claim_parallel_scope(rec, parallel_policy="relaxed"),
+                frozenset({"*"}),
+            )
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        wood_rec = {
+            "incident_id": "INC-WOOD",
+            "fingerprint": "SKILL_SPAM_LOOP:gather_wood",
+            "code": "SKILL_SPAM_LOOP",
+            "skill": "gather_wood",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        llm_rec = {
+            "incident_id": "INC-LLM",
+            "fingerprint": "LLM_INVALID_OR_TIMEOUT:session",
+            "code": "LLM_INVALID_OR_TIMEOUT",
+            "skill": "session",
+            "severity": "P1",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+
+        # Wild FATAL_ENV_DEATH first (P0) blocks concurrent relaxed claims.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                fatal_rec["fingerprint"]: dict(fatal_rec),
+                wood_rec["fingerprint"]: dict(wood_rec),
+                llm_rec["fingerprint"]: dict(llm_rec),
+            }
+        claimed1 = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual([c["fingerprint"] for c in claimed1], ["FATAL_ENV_DEATH:lava"])
+        st1 = soak_ctl.read_state(self.session)
+        self.assertEqual(st1["incidents"]["SKILL_SPAM_LOOP:gather_wood"]["status"], "pending")
+        self.assertEqual(st1["incidents"]["LLM_INVALID_OR_TIMEOUT:session"]["status"], "pending")
+
+        # Lower-priority wild incident is skipped while relaxed disjoint incidents proceed.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                wood_rec["fingerprint"]: dict(wood_rec),
+                llm_rec["fingerprint"]: dict(llm_rec),
+                unknown_rec["fingerprint"]: dict(unknown_rec),
+            }
+        claimed2 = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            set(c["fingerprint"] for c in claimed2),
+            {"SKILL_SPAM_LOOP:gather_wood", "LLM_INVALID_OR_TIMEOUT:session"},
+        )
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["LOOP_CRASH:unknown"]["status"],
+            "pending",
+        )
+
 
 class TestRunFixerBatchExecution(unittest.TestCase):
     """验证 run_fixer_batch 真实并发、串行合并、门禁隔离、冲突重入与超时清理。"""
@@ -1119,6 +1639,243 @@ time.sleep(30)
         self.assertTrue(report_path.exists())
         self.assertFalse(stray_wt.exists())
         self.assertNotIn("worker-stray", _git(self.repo, "worktree", "list"))
+
+    def test_run_fixer_batch_default_relaxed_three_way_parallel(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "SKILL_SPAM_LOOP:gather_wood": {
+                    "incident_id": "INC-WOOD",
+                    "fingerprint": "SKILL_SPAM_LOOP:gather_wood",
+                    "code": "SKILL_SPAM_LOOP",
+                    "skill": "gather_wood",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "attempts": 0,
+                },
+                "REPLAN_OSCILLATION:surface_for_air": {
+                    "incident_id": "INC-AIR",
+                    "fingerprint": "REPLAN_OSCILLATION:surface_for_air",
+                    "code": "REPLAN_OSCILLATION",
+                    "skill": "surface_for_air",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "attempts": 0,
+                },
+                "LLM_INVALID_OR_TIMEOUT:session": {
+                    "incident_id": "INC-LLM",
+                    "fingerprint": "LLM_INVALID_OR_TIMEOUT:session",
+                    "code": "LLM_INVALID_OR_TIMEOUT",
+                    "skill": "session",
+                    "severity": "P2",
+                    "category": "bug",
+                    "status": "pending",
+                    "attempts": 0,
+                },
+            }
+
+        barrier_dir = self.root / "barrier_relaxed"
+        barrier_dir.mkdir(parents=True, exist_ok=True)
+        worker_script = self.root / "relaxed_barrier_worker.py"
+        worker_script.write_text(
+            f"""import sys, time
+from pathlib import Path
+
+bdir = Path({repr(str(barrier_dir))})
+wt = Path(sys.argv[1])
+skill = sys.argv[2]
+
+(bdir / f"{{skill}}.ready").write_text("ready", encoding="utf-8")
+
+t0 = time.time()
+while time.time() - t0 < 8.0:
+    if (bdir / "gather_wood.ready").exists() and (bdir / "surface_for_air.ready").exists() and (bdir / "session.ready").exists():
+        break
+    time.sleep(0.02)
+else:
+    sys.exit(1)
+
+(wt / "code" / "mcagent" / "skills" / f"fix_{{skill}}.py").write_text(f"# {{skill}} fixed\\n", encoding="utf-8")
+(wt / "code" / "tests" / f"test_relaxed_{{skill}}.py").write_text(f"OK = '{{skill}}'\\n", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        template = f"{sys.executable} {shlex.quote(str(worker_script))} {{fixer_wt}} {{skill}}"
+        real_run = subprocess.run
+
+        def mock_uv_only(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_only):
+            # Omitting parallel_policy defaults to resolve_parallel_policy(session_dir, "relaxed").
+            results = soak_ctl.run_fixer_batch(
+                self.session,
+                fixer_cmd_template=template,
+                max_workers=3,
+                live_canary=False,
+            )
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(r.get("ok") for r in results), f"results: {results}")
+        st_after = soak_ctl.read_state(self.session)
+        for fp in ("SKILL_SPAM_LOOP:gather_wood", "REPLAN_OSCILLATION:surface_for_air", "LLM_INVALID_OR_TIMEOUT:session"):
+            self.assertEqual(st_after["incidents"][fp]["status"], "fixed")
+
+    def test_run_fixer_batch_relaxed_progressive_conflict_fallback(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "SKILL_SPAM_LOOP:gather_wood": {
+                    "incident_id": "INC-WOOD",
+                    "fingerprint": "SKILL_SPAM_LOOP:gather_wood",
+                    "code": "SKILL_SPAM_LOOP",
+                    "skill": "gather_wood",
+                    "severity": "P2",
+                    "category": "strategy",
+                    "status": "pending",
+                    "attempts": 0,
+                },
+                "REPLAN_OSCILLATION:surface_for_air": {
+                    "incident_id": "INC-AIR",
+                    "fingerprint": "REPLAN_OSCILLATION:surface_for_air",
+                    "code": "REPLAN_OSCILLATION",
+                    "skill": "surface_for_air",
+                    "severity": "P1",
+                    "category": "strategy",
+                    "status": "pending",
+                    "attempts": 0,
+                },
+            }
+
+        promote_dir = self.root / "promote_signals"
+        promote_dir.mkdir(parents=True, exist_ok=True)
+        worker_script = self.root / "starter_conflict_worker.py"
+        worker_script.write_text(
+            f"""import sys, time
+from pathlib import Path
+
+pdir = Path({repr(str(promote_dir))})
+wt = Path(sys.argv[1])
+skill = sys.argv[2]
+val_map = {{"surface_for_air": 100, "gather_wood": 200, "mine_diamond": 300}}
+if skill == "gather_wood":
+    expected = "batch2.promoted" if (pdir / "batch2.active").exists() else "batch1.promoted"
+    t0 = time.time()
+    while time.time() - t0 < 8.0:
+        if (pdir / expected).exists():
+            break
+        time.sleep(0.02)
+    else:
+        sys.exit(1)
+(wt / "code" / "mcagent" / "loop" / "starter_skills.py").write_text(
+    f"LIMIT = {{val_map[skill]}}\\n",
+    encoding="utf-8",
+)
+""",
+            encoding="utf-8",
+        )
+        template = f"{sys.executable} {shlex.quote(str(worker_script))} {{fixer_wt}} {{skill}}"
+        real_run = subprocess.run
+        real_verify = soak_ctl.verify_and_promote
+
+        def mock_uv_only(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "uv":
+                return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        def signaled_verify(session_dir, fp, **kw):
+            res = real_verify(session_dir, fp, **kw)
+            if fp == "REPLAN_OSCILLATION:surface_for_air":
+                (promote_dir / "batch1.promoted").write_text("ok", encoding="utf-8")
+            elif fp == "REPLAN_OSCILLATION:mine_diamond":
+                (promote_dir / "batch2.promoted").write_text("ok", encoding="utf-8")
+            return res
+
+        # Batch 1: relaxed claims both starter tickets; surface_for_air promotes first,
+        # gather_wood hits cherry-pick conflict (conflict_count=1) and downgrades to strict scope.
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_only), \
+             patch.object(soak_ctl, "verify_and_promote", side_effect=signaled_verify):
+            res1 = soak_ctl.run_fixer_batch(
+                self.session,
+                fixer_cmd_template=template,
+                max_workers=2,
+                live_canary=False,
+            )
+
+        by_fp1 = {r["fingerprint"]: r for r in res1}
+        self.assertTrue(by_fp1["REPLAN_OSCILLATION:surface_for_air"]["ok"])
+        self.assertFalse(by_fp1["SKILL_SPAM_LOOP:gather_wood"]["ok"])
+        self.assertEqual(by_fp1["SKILL_SPAM_LOOP:gather_wood"]["failed_gate"], "merge_conflict_requeue")
+
+        st1 = soak_ctl.read_state(self.session)
+        wood_rec1 = st1["incidents"]["SKILL_SPAM_LOOP:gather_wood"]
+        self.assertEqual(wood_rec1["status"], "pending")
+        self.assertEqual(wood_rec1.get("attempts", 0), 0)
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(wood_rec1, parallel_policy="relaxed"),
+            soak_ctl._claim_parallel_scope(wood_rec1, parallel_policy="strict"),
+        )
+
+        # Batch 2: add disjoint-domain mine_diamond that also edits starter_skills.py;
+        # both claim (strict starter scope vs skill:mine_diamond), mine_diamond promotes first,
+        # gather_wood conflicts a 2nd time -> scope escalates to wildcard '*'.
+        (promote_dir / "batch2.active").write_text("1", encoding="utf-8")
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"]["REPLAN_OSCILLATION:mine_diamond"] = {
+                "incident_id": "INC-DIA",
+                "fingerprint": "REPLAN_OSCILLATION:mine_diamond",
+                "code": "REPLAN_OSCILLATION",
+                "skill": "mine_diamond",
+                "severity": "P1",
+                "category": "strategy",
+                "status": "pending",
+                "attempts": 0,
+            }
+
+        with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_only), \
+             patch.object(soak_ctl, "verify_and_promote", side_effect=signaled_verify):
+            res2 = soak_ctl.run_fixer_batch(
+                self.session,
+                fixer_cmd_template=template,
+                max_workers=2,
+                live_canary=False,
+            )
+
+        by_fp2 = {r["fingerprint"]: r for r in res2}
+        self.assertTrue(by_fp2["REPLAN_OSCILLATION:mine_diamond"]["ok"])
+        self.assertEqual(by_fp2["SKILL_SPAM_LOOP:gather_wood"]["failed_gate"], "merge_conflict_requeue")
+
+        st2 = soak_ctl.read_state(self.session)
+        wood_rec2 = st2["incidents"]["SKILL_SPAM_LOOP:gather_wood"]
+        self.assertEqual(
+            soak_ctl._claim_parallel_scope(wood_rec2, parallel_policy="relaxed"),
+            frozenset({"*"}),
+        )
+
+        # With conflict_count==2, gather_wood now blocks concurrent GOAL_MISS claims under relaxed.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"]["GOAL_MISS:combat"] = {
+                "incident_id": "INC-CMB",
+                "fingerprint": "GOAL_MISS:combat",
+                "code": "GOAL_MISS",
+                "goal_id": "kill_a_mob",
+                "skill": "combat",
+                "severity": "P3",
+                "category": "strategy",
+                "status": "pending",
+                "editable_files": ["code/mcagent/skills/combat.py"],
+                "attempts": 0,
+            }
+        claimed3 = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual([c["fingerprint"] for c in claimed3], ["SKILL_SPAM_LOOP:gather_wood"])
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["GOAL_MISS:combat"]["status"],
+            "pending",
+        )
 
 
 class TestWorkerBoundsAndCli(unittest.TestCase):
@@ -1598,6 +2355,209 @@ time.sleep(30)
             time.sleep(0.05)
         self.assertFalse(alive, f"gate child PID {child_pid} leaked after timeout")
 
+    def test_validate_and_resolve_parallel_policy(self):
+        self.assertEqual(soak_ctl.PARALLEL_POLICIES, ("relaxed", "strict"))
+
+        self.assertEqual(soak_ctl._validate_parallel_policy("relaxed"), "relaxed")
+        self.assertEqual(soak_ctl._validate_parallel_policy("strict"), "strict")
+        self.assertEqual(soak_ctl._validate_parallel_policy(" relaxed "), "relaxed")
+        self.assertEqual(soak_ctl._validate_parallel_policy(" strict\n"), "strict")
+
+        for bad in ("", "   ", "RELAXED", "fast", None, 123, True, False, []):
+            with self.assertRaises(ValueError):
+                soak_ctl._validate_parallel_policy(bad)
+
+        self.session.mkdir(parents=True, exist_ok=True)
+        # Missing state.json -> falls back to default_policy ("relaxed" by default).
+        (self.session / "state.json").unlink(missing_ok=True)
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session), "relaxed")
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session, "strict"), "strict")
+
+        # Corrupted JSON -> fallback.
+        (self.session / "state.json").write_text("{corrupted", encoding="utf-8")
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session), "relaxed")
+
+        # Missing key / invalid value -> fallback.
+        (self.session / "state.json").write_text(json.dumps({}), encoding="utf-8")
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session), "relaxed")
+        (self.session / "state.json").write_text(
+            json.dumps({"fixer_parallel_policy": "invalid"}),
+            encoding="utf-8",
+        )
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session), "relaxed")
+
+        # Valid values in state.json (including whitespace).
+        (self.session / "state.json").write_text(
+            json.dumps({"fixer_parallel_policy": " strict "}),
+            encoding="utf-8",
+        )
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session), "strict")
+        (self.session / "state.json").write_text(
+            json.dumps({"fixer_parallel_policy": "relaxed"}),
+            encoding="utf-8",
+        )
+        self.assertEqual(soak_ctl.resolve_parallel_policy(self.session, "strict"), "relaxed")
+
+    def test_run_cli_fixer_parallel_policy_propagation(self):
+        parser = soak_ctl.build_parser()
+        self.assertEqual(
+            parser.parse_args(["run", "--session-dir", str(self.session)]).fixer_parallel_policy,
+            "relaxed",
+        )
+        self.assertEqual(
+            parser.parse_args([
+                "run", "--session-dir", str(self.session), "--fixer-parallel-policy", "strict"
+            ]).fixer_parallel_policy,
+            "strict",
+        )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            parser.parse_args([
+                "run", "--session-dir", str(self.session), "--fixer-parallel-policy", "invalid"
+            ])
+        self.assertEqual(cm.exception.code, 2)
+
+        class DummyProc:
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        spawned_cmds: list[list[str]] = []
+
+        def capture_popen(cmd, *args, **kwargs):
+            spawned_cmds.append(list(cmd))
+            return DummyProc()
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+
+        # Default "relaxed" saves to state.json and propagates ["--fixer-parallel-policy", "relaxed"] to fixer-loop.
+        with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+             patch.object(soak_ctl, "check_server_target", return_value=[]), \
+             patch.object(soak_ctl, "init_session", return_value={}), \
+             patch.object(soak_ctl.subprocess, "Popen", side_effect=capture_popen):
+            rc_default = soak_ctl.main([
+                "run",
+                "--session-dir", str(self.session),
+                "--branch", "feat/soak-autofix",
+                "--server", "local",
+                "--episodes", "1",
+            ])
+        self.assertEqual(rc_default, 0)
+        fixer_inv = [c for c in spawned_cmds if "fixer-loop" in c]
+        self.assertEqual(len(fixer_inv), 1)
+        idx = fixer_inv[0].index("--fixer-parallel-policy")
+        self.assertEqual(fixer_inv[0][idx + 1], "relaxed")
+        self.assertEqual(soak_ctl.read_state(self.session)["fixer_parallel_policy"], "relaxed")
+
+        # Explicit "strict" saves to state.json and propagates ["--fixer-parallel-policy", "strict"] to fixer-loop.
+        spawned_cmds.clear()
+        with patch.object(soak_ctl, "find_repo_root", return_value=self.repo), \
+             patch.object(soak_ctl, "check_server_target", return_value=[]), \
+             patch.object(soak_ctl, "init_session", return_value={}), \
+             patch.object(soak_ctl.subprocess, "Popen", side_effect=capture_popen):
+            rc_strict = soak_ctl.main([
+                "run",
+                "--session-dir", str(self.session),
+                "--branch", "feat/soak-autofix",
+                "--server", "local",
+                "--episodes", "1",
+                "--fixer-parallel-policy", "strict",
+            ])
+        self.assertEqual(rc_strict, 0)
+        fixer_inv_s = [c for c in spawned_cmds if "fixer-loop" in c]
+        self.assertEqual(len(fixer_inv_s), 1)
+        idx_s = fixer_inv_s[0].index("--fixer-parallel-policy")
+        self.assertEqual(fixer_inv_s[0][idx_s + 1], "strict")
+        self.assertEqual(soak_ctl.read_state(self.session)["fixer_parallel_policy"], "strict")
+
+    def test_fixer_loop_cli_parallel_policy_dispatch(self):
+        parser = soak_ctl.build_parser()
+        self.assertIsNone(
+            parser.parse_args(["fixer-loop", "--session-dir", str(self.session)]).fixer_parallel_policy
+        )
+
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+
+        # Omitted CLI arg with no state override -> falls back to "relaxed".
+        with patch.object(soak_ctl, "run_fixer_batch", return_value=[{"ok": True}]) as mock_batch:
+            rc = soak_ctl.main([
+                "fixer-loop",
+                "--session-dir", str(self.session),
+                "--fixer-preset", "codex",
+                "--fixer-workers", "3",
+                "--once",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_batch.call_args.kwargs["parallel_policy"], "relaxed")
+
+        # Omitted CLI arg honors state.json["fixer_parallel_policy"] = "strict".
+        with soak_ctl.locked_state(self.session) as st:
+            st["fixer_parallel_policy"] = "strict"
+        with patch.object(soak_ctl, "run_fixer_batch", return_value=[{"ok": True}]) as mock_batch:
+            rc_state = soak_ctl.main([
+                "fixer-loop",
+                "--session-dir", str(self.session),
+                "--fixer-preset", "codex",
+                "--fixer-workers", "3",
+                "--once",
+            ])
+        self.assertEqual(rc_state, 0)
+        self.assertEqual(mock_batch.call_args.kwargs["parallel_policy"], "strict")
+
+        # Explicit CLI arg overrides state.json.
+        with soak_ctl.locked_state(self.session) as st:
+            st["fixer_parallel_policy"] = "relaxed"
+        with patch.object(soak_ctl, "run_fixer_batch", return_value=[{"ok": True}]) as mock_batch:
+            rc_override = soak_ctl.main([
+                "fixer-loop",
+                "--session-dir", str(self.session),
+                "--fixer-preset", "codex",
+                "--fixer-workers", "3",
+                "--fixer-parallel-policy", "strict",
+                "--once",
+            ])
+        self.assertEqual(rc_override, 0)
+        self.assertEqual(mock_batch.call_args.kwargs["parallel_policy"], "strict")
+
+    def test_inject_and_set_goal_parallel_policy_hot_switch_and_status(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+
+        res_bad = soak_ctl.inject_and_set_goal(self.session, fixer_parallel_policy="invalid")
+        self.assertFalse(res_bad["ok"])
+        self.assertEqual(res_bad["failed_step"], "invalid_fixer_parallel_policy")
+
+        res_strict = soak_ctl.inject_and_set_goal(self.session, fixer_parallel_policy="strict")
+        self.assertTrue(res_strict["ok"])
+        self.assertEqual(res_strict["fixer_parallel_policy"], "strict")
+        self.assertEqual(soak_ctl.read_state(self.session)["fixer_parallel_policy"], "strict")
+        report_strict = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("fixer_parallel_policy=strict", report_strict)
+
+        rc_set = soak_ctl.main([
+            "set-goal",
+            "--session-dir", str(self.session),
+            "--fixer-parallel-policy", "relaxed",
+        ])
+        self.assertEqual(rc_set, 0)
+        self.assertEqual(soak_ctl.read_state(self.session)["fixer_parallel_policy"], "relaxed")
+        report_relaxed = (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("fixer_parallel_policy=relaxed", report_relaxed)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_status = soak_ctl.main(["status", "--session-dir", str(self.session)])
+        self.assertEqual(rc_status, 0)
+        status_data = json.loads(buf.getvalue())
+        self.assertEqual(status_data["fixer_parallel_policy"], "relaxed")
+
 
 if __name__ == "__main__":
     unittest.main()
+

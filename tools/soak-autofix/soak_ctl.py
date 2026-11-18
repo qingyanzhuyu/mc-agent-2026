@@ -245,6 +245,41 @@ def resolve_fixer_workers(session_dir: Path, default_workers: int = 1) -> int:
     return _extract_fixer_workers(st, default_workers)
 
 
+PARALLEL_POLICIES: tuple[str, ...] = ("relaxed", "strict")
+
+
+def _validate_parallel_policy(val: Any) -> str:
+    """校验工位 B 并行认领调度策略，仅支持 relaxed / strict。"""
+    if not isinstance(val, str):
+        raise ValueError(f"fixer_parallel_policy={val!r} 非法：仅支持 {PARALLEL_POLICIES}")
+    s = val.strip()
+    if s not in PARALLEL_POLICIES:
+        raise ValueError(f"fixer_parallel_policy={val!r} 非法：仅支持 {PARALLEL_POLICIES}")
+    return s
+
+
+def _extract_parallel_policy(st: dict[str, Any], default_policy: str = "relaxed") -> str:
+    raw = st.get("fixer_parallel_policy") if isinstance(st, dict) else None
+    if raw is not None:
+        try:
+            return _validate_parallel_policy(raw)
+        except ValueError:
+            pass
+    try:
+        return _validate_parallel_policy(default_policy)
+    except ValueError:
+        return "relaxed"
+
+
+def resolve_parallel_policy(session_dir: Path, default_policy: str = "relaxed") -> str:
+    """取工位 B 并行调度策略：state.json 里有合法 fixer_parallel_policy 就用它，否则回落 default_policy。"""
+    try:
+        st = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        st = {}
+    return _extract_parallel_policy(st, default_policy)
+
+
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
 
 # 统一配置：一份 .env 同时装比赛服与自建测试服两套端点，每次启动选工位 A 进哪个（挂机中不切）。
@@ -1881,33 +1916,83 @@ def _scopes_conflict(a: frozenset[str], b: frozenset[str]) -> bool:
     return "*" in a or "*" in b or bool(a & b)
 
 
-def _claim_parallel_scope(inc_rec: dict[str, Any]) -> frozenset[str]:
-    """计算并行认领的领域冲突集，使不同领域策略/刷频单可满 3 路并发而未知野生单仍排他。"""
+def _claim_parallel_scope(
+    inc_rec: dict[str, Any],
+    *,
+    parallel_policy: str = "strict",
+) -> frozenset[str]:
+    """计算并行认领的领域冲突集，使不同领域策略/刷频单可满并发而未知野生单仍排他。"""
+    policy = _validate_parallel_policy(parallel_policy)
     if not isinstance(inc_rec, dict):
         return frozenset({"*"})
     code = str(inc_rec.get("code") or "").strip()
-    if code == "GOAL_MISS":
+    if policy == "strict":
+        if code == "GOAL_MISS":
+            return _incident_edit_scope(inc_rec)
+        had_merge_conflict = any(
+            isinstance(h, dict) and h.get("failed_gate") == "merge_conflict_requeue"
+            for h in (inc_rec.get("gate_history") or ())
+        )
+        if code == "API_BOTTLENECK_SLOW":
+            return frozenset({"*"}) if had_merge_conflict else frozenset({"domain:api_bottleneck_slow"})
+        if code == "DISPATCH_STARVATION" and had_merge_conflict:
+            return frozenset({"*"})
+        if code in _DOMAIN_SCOPED_INCIDENT_CODES:
+            skill = str(inc_rec.get("skill") or "").strip()
+            goal_id = str(inc_rec.get("goal_id") or "").strip()
+            domain = SKILL_CONFLICT_DOMAIN.get(skill) or GOAL_CONFLICT_DOMAIN.get(goal_id)
+            if domain:
+                scope = set(domain)
+                if code == "DISPATCH_STARVATION":
+                    scope.update({"code/mcagent/loop/policy.py", "code/mcagent/loop/goals.py"})
+                if had_merge_conflict or str(inc_rec.get("last_failed_fix_commit") or "").strip():
+                    scope.update(GOAL_RECURRENCE_EXTRA_FILES)
+                return frozenset(scope)
         return _incident_edit_scope(inc_rec)
-    had_merge_conflict = any(
-        isinstance(h, dict) and h.get("failed_gate") == "merge_conflict_requeue"
+
+    conflict_count = sum(
+        1
         for h in (inc_rec.get("gate_history") or ())
+        if isinstance(h, dict) and h.get("failed_gate") == "merge_conflict_requeue"
     )
-    if code == "API_BOTTLENECK_SLOW":
-        return frozenset({"*"}) if had_merge_conflict else frozenset({"domain:api_bottleneck_slow"})
-    if code == "DISPATCH_STARVATION" and had_merge_conflict:
+    if conflict_count >= 2:
         return frozenset({"*"})
+    if conflict_count == 1:
+        return _claim_parallel_scope(inc_rec, parallel_policy="strict")
+
+    skill = str(inc_rec.get("skill") or "").strip()
+    goal_id = str(inc_rec.get("goal_id") or "").strip()
+    if code == "API_BOTTLENECK_SLOW":
+        return frozenset({
+            f"domain:api_bottleneck_slow:{skill}"
+            if skill and skill != "session"
+            else "domain:api_bottleneck_slow"
+        })
+    if code == "LLM_INVALID_OR_TIMEOUT":
+        return frozenset({"domain:llm_session"})
+    if code == "COMBAT_OR_MOB_DEATH":
+        return frozenset({"domain:combat_session"})
+    if code == "GOAL_MISS":
+        if not _effective_goal_narrow_files(inc_rec):
+            return frozenset({"*"})
+        return frozenset(
+            ({f"goal:{goal_id}"} if goal_id else {str(inc_rec.get("fingerprint") or "*")})
+            | ({f"skill:{skill}"} if skill else set())
+        )
     if code in _DOMAIN_SCOPED_INCIDENT_CODES:
-        skill = str(inc_rec.get("skill") or "").strip()
-        goal_id = str(inc_rec.get("goal_id") or "").strip()
-        domain = SKILL_CONFLICT_DOMAIN.get(skill) or GOAL_CONFLICT_DOMAIN.get(goal_id)
-        if domain:
-            scope = set(domain)
-            if code == "DISPATCH_STARVATION":
-                scope.update({"code/mcagent/loop/policy.py", "code/mcagent/loop/goals.py"})
-            if had_merge_conflict or str(inc_rec.get("last_failed_fix_commit") or "").strip():
-                scope.update(GOAL_RECURRENCE_EXTRA_FILES)
-            return frozenset(scope)
-    return _incident_edit_scope(inc_rec)
+        if code == "DISPATCH_STARVATION":
+            return frozenset(
+                {"domain:dispatch"}
+                | ({f"skill:{skill}"} if skill else set())
+                | ({f"goal:{goal_id}"} if goal_id else set())
+            )
+        if skill in SKILL_CONFLICT_DOMAIN:
+            return frozenset({f"skill:{skill}"})
+        if goal_id in GOAL_CONFLICT_DOMAIN:
+            return frozenset({f"goal:{goal_id}"})
+        return _incident_edit_scope(inc_rec)
+    return frozenset({"*"})
+
 
 
 def _allocate_attempt_no(session_dir: Path, st: dict[str, Any]) -> int:
@@ -1995,12 +2080,20 @@ def claim_parallel_incidents(
     *,
     max_workers: int = 1,
     base_ref: Optional[str] = None,
+    parallel_policy: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """在独立临时 worktree 上批量认领互不冲突的待修异常单。"""
+    if parallel_policy is not None:
+        _validate_parallel_policy(parallel_policy)
     if int(max_workers) < 1:
         return []
     with locked_fixer_wt(session_dir):
         with locked_state(session_dir) as st:
+            eff_policy = (
+                _validate_parallel_policy(parallel_policy)
+                if parallel_policy is not None
+                else _extract_parallel_policy(st, default_policy="strict")
+            )
             repo_root = Path(st["repo_root"])
             fixer_wt = Path(st["fixer_wt"])
             branch = st["target_branch"]
@@ -2021,7 +2114,7 @@ def claim_parallel_incidents(
             for _, fp, rec in candidates:
                 if len(chosen_items) >= int(max_workers):
                     break
-                scope = _claim_parallel_scope(rec)
+                scope = _claim_parallel_scope(rec, parallel_policy=eff_policy)
                 if any(_scopes_conflict(scope, prev) for prev in selected_scopes):
                     continue
                 selected_scopes.append(scope)
@@ -2773,9 +2866,15 @@ def run_fixer_batch(
     live_canary: bool = True,
     fixer_bot_user: str = DEFAULT_FIXER_USER,
     fixer_preset_name: str = "",
+    parallel_policy: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """并行认领互不冲突的待修单并在各自临时 worktree 并发修复，由协调器串行合入与过四道门禁。"""
-    batch = claim_parallel_incidents(session_dir, max_workers=max_workers)
+    eff_policy = (
+        _validate_parallel_policy(parallel_policy)
+        if parallel_policy is not None
+        else resolve_parallel_policy(session_dir, "relaxed")
+    )
+    batch = claim_parallel_incidents(session_dir, max_workers=max_workers, parallel_policy=eff_policy)
     if not batch:
         return []
 
@@ -2968,6 +3067,7 @@ def inject_and_set_goal(
     clear_episode_budget: bool = False,
     fixer_preset: Optional[str] = None,
     fixer_workers: Optional[int] = None,
+    fixer_parallel_policy: Optional[str] = None,
     focus_mode: Optional[str] = None,
     skip_offline_gate: bool = False,
 ) -> dict[str, Any]:
@@ -2986,6 +3086,12 @@ def inject_and_set_goal(
             norm_workers = _validate_fixer_workers(fixer_workers)
         except ValueError as exc:
             return {"ok": False, "failed_step": "invalid_fixer_workers", "detail": str(exc)}
+    norm_parallel_policy: Optional[str] = None
+    if fixer_parallel_policy is not None:
+        try:
+            norm_parallel_policy = _validate_parallel_policy(fixer_parallel_policy)
+        except ValueError as exc:
+            return {"ok": False, "failed_step": "invalid_fixer_parallel_policy", "detail": str(exc)}
     budget_err = validate_episode_budget(episode_seconds, episode_steps)
     if budget_err:
         return {"ok": False, "failed_step": "invalid_episode_budget", "detail": budget_err}
@@ -3097,6 +3203,8 @@ def inject_and_set_goal(
                 st["fixer_preset"] = fixer_preset
             if norm_workers is not None:
                 st["fixer_workers"] = norm_workers
+            if norm_parallel_policy is not None:
+                st["fixer_parallel_policy"] = norm_parallel_policy
             if merged_sha:
                 st["commits"].append({
                     "sha": merged_sha,
@@ -3118,6 +3226,7 @@ def inject_and_set_goal(
             }
             final_fixer = st.get("fixer_preset", "")
             final_workers = _extract_fixer_workers(st, 1)
+            final_parallel_policy = _extract_parallel_policy(st, "relaxed")
             final_mode = st.get("focus_mode", "together")
 
         write_review_report(session_dir)
@@ -3128,6 +3237,7 @@ def inject_and_set_goal(
             "episode_budget_override": final_budget,
             "fixer_preset": final_fixer,
             "fixer_workers": final_workers,
+            "fixer_parallel_policy": final_parallel_policy,
             "focus_mode": final_mode,
             "previous_tip": prev_tip,
             "current_tip": final_tip,
@@ -3210,6 +3320,7 @@ def write_review_report(session_dir: Path) -> Path:
     tot_out = sum(int(e.get("completion_tokens", 0) or 0) for e in st["episodes"])
     tot_elapsed = sum(float(e.get("elapsed_s", 0.0) or 0.0) for e in st["episodes"])
     workers_n = _extract_fixer_workers(st, 1)
+    parallel_policy = _extract_parallel_policy(st, "relaxed")
 
     lines = [
         f"# 双工位挂机自愈待审报告（分支 `{branch}`）",
@@ -3223,6 +3334,7 @@ def write_review_report(session_dir: Path) -> Path:
         + ("（比赛服赛前训练，自备 key）" if (st.get("server_target") == "official" and st.get("official_llm", "custom") == "custom") else ""),
         f"- **修单模型（工位 B）**：`{FIXER_PRESET_LABELS.get(st.get('fixer_preset') or '', st.get('fixer_preset') or '沿用启动参数')}`",
         f"- **修单并发工人数（工位 B）**：`{workers_n}`（`fixer_workers={workers_n}`）",
+        f"- **修单并行调度策略（工位 B）**：`{parallel_policy}`（`fixer_parallel_policy={parallel_policy}`）",
         f"- **累计 Token 花费**：输入 `{tot_in:,}` / 输出 `{tot_out:,}`（{format_episode_value(tot_in, tot_out, tot_elapsed)}）",
     ]
     if st.get("target_goal"):
@@ -3460,6 +3572,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"工位 B 并发修单工人数（{FIXER_WORKERS_BOUNDS[0]}–{FIXER_WORKERS_BOUNDS[1]}，默认读取 state.json 或 1）",
     )
+    p_fix.add_argument(
+        "--fixer-parallel-policy",
+        choices=PARALLEL_POLICIES,
+        default=None,
+        help=f"工位 B 并行认领调度策略（{' | '.join(PARALLEL_POLICIES)}，默认读取 state.json 或 relaxed）",
+    )
 
     p_dual = sub.add_parser("run", help="一键并行启动 Runner + Fixer 双工位守护")
     p_dual.add_argument("--session-dir", required=True)
@@ -3533,6 +3651,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help=f"工位 B 并发修单工人数（{FIXER_WORKERS_BOUNDS[0]}–{FIXER_WORKERS_BOUNDS[1]}，默认 1）",
     )
+    p_dual.add_argument(
+        "--fixer-parallel-policy",
+        choices=PARALLEL_POLICIES,
+        default="relaxed",
+        help=f"工位 B 并行认领调度策略（{' | '.join(PARALLEL_POLICIES)}，默认 relaxed）",
+    )
     p_dual.add_argument("--skip-live-canary", action="store_true")
     p_dual.add_argument("--min-verified", choices=("", "offline", "live"), default="",
                         help="可选覆盖技能验证门槛（默认空=比赛服仅 live，自建服含 offline）")
@@ -3566,6 +3690,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=f"可选热切换工位 B 并发修单工人数（{FIXER_WORKERS_BOUNDS[0]}–{FIXER_WORKERS_BOUNDS[1]}）",
+    )
+    p_set.add_argument(
+        "--fixer-parallel-policy",
+        choices=PARALLEL_POLICIES,
+        default=None,
+        help=f"可选热切换工位 B 并行认领调度策略（{' | '.join(PARALLEL_POLICIES)}）",
     )
     p_set.add_argument(
         "--clear-episode-budget",
@@ -3681,6 +3811,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             except ValueError as exc:
                 print(f"[fixer-loop] {exc}", file=sys.stderr)
                 return 2
+        if args.fixer_parallel_policy is not None:
+            try:
+                _validate_parallel_policy(args.fixer_parallel_policy)
+            except ValueError as exc:
+                print(f"[fixer-loop] {exc}", file=sys.stderr)
+                return 2
         tmpl = args.fixer_cmd or (FIXER_PRESETS[args.fixer_preset] if args.fixer_preset else "")
         if not tmpl:
             print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
@@ -3698,6 +3834,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     _validate_fixer_workers(args.fixer_workers)
                     if args.fixer_workers is not None
                     else resolve_fixer_workers(session_dir, 1)
+                )
+                eff_policy = (
+                    _validate_parallel_policy(args.fixer_parallel_policy)
+                    if args.fixer_parallel_policy is not None
+                    else resolve_parallel_policy(session_dir, "relaxed")
                 )
                 if workers <= 1:
                     res = run_fixer_once(
@@ -3721,6 +3862,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         live_canary=not args.skip_live_canary,
                         fixer_bot_user=args.fixer_user,
                         fixer_preset_name=cur_name,
+                        parallel_policy=eff_policy,
                     )
                     if args.once:
                         if not batch:
@@ -3744,6 +3886,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             bot_user = validate_bot_user(args.bot_user)
             fixer_workers = _validate_fixer_workers(args.fixer_workers)
+            fixer_parallel_policy = _validate_parallel_policy(args.fixer_parallel_policy)
         except ValueError as exc:
             print(f"[run] {exc}", file=sys.stderr)
             return 2
@@ -3774,6 +3917,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             st_fx["focus_mode"] = args.focus_mode
             st_fx["official_llm"] = args.official_llm
             st_fx["fixer_workers"] = fixer_workers
+            st_fx["fixer_parallel_policy"] = fixer_parallel_policy
             if args.fixer_cmd:
                 st_fx.pop("fixer_preset", None)
             else:
@@ -3806,6 +3950,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "--session-dir", str(session_dir),
             "--fixer-cmd", tmpl,
             "--fixer-timeout", str(args.fixer_timeout),
+            "--fixer-parallel-policy", fixer_parallel_policy,
         ]
         if fixer_workers != 1:
             fixer_cmd.extend(["--fixer-workers", str(fixer_workers)])
@@ -3842,6 +3987,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             clear_episode_budget=args.clear_episode_budget,
             fixer_preset=args.fixer_preset,
             fixer_workers=args.fixer_workers,
+            fixer_parallel_policy=args.fixer_parallel_policy,
             focus_mode=args.focus_mode,
             skip_offline_gate=args.skip_offline_gate,
         )
@@ -3868,6 +4014,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "player_model": st.get("player_model", ""),
             "fixer_preset": st.get("fixer_preset", ""),
             "fixer_workers": _extract_fixer_workers(st, 1),
+            "fixer_parallel_policy": _extract_parallel_policy(st, "relaxed"),
             "focus_mode": st.get("focus_mode", "together"),
             "server_target": st.get("server_target", "local"),
             "server_base": st.get("server_base", ""),
