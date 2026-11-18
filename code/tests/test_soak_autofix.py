@@ -1787,6 +1787,48 @@ class SoakAutofixOrchestratorTests(unittest.TestCase):
         finally:
             soak_ctl.teardown_session(self.session)
 
+    def test_set_goal_hot_switches_fixer_parallel_policy_and_status(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/policy-hot-switch")
+        try:
+            # 1) Default policy resolves to "relaxed", and invalid policy is rejected without mutating state.
+            self.assertEqual(soak_ctl.resolve_parallel_policy(self.session), "relaxed")
+            bad = soak_ctl.inject_and_set_goal(self.session, fixer_parallel_policy="aggressive")
+            self.assertEqual((bad["ok"], bad["failed_step"]), (False, "invalid_fixer_parallel_policy"))
+
+            # 2) set-goal --fixer-parallel-policy strict -> state.json, REVIEW_REPORT.md, and status JSON update.
+            rc_strict = soak_ctl.main([
+                "set-goal",
+                "--session-dir", str(self.session),
+                "--fixer-parallel-policy", "strict",
+            ])
+            self.assertEqual(rc_strict, 0)
+            self.assertEqual(soak_ctl.read_state(self.session)["fixer_parallel_policy"], "strict")
+            self.assertIn(
+                "fixer_parallel_policy=strict",
+                (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8"),
+            )
+
+            buf_strict = io.StringIO()
+            with contextlib.redirect_stdout(buf_strict):
+                self.assertEqual(soak_ctl.main(["status", "--session-dir", str(self.session)]), 0)
+            self.assertEqual(json.loads(buf_strict.getvalue())["fixer_parallel_policy"], "strict")
+
+            # 3) set-goal --fixer-parallel-policy relaxed -> flips back cleanly.
+            rc_relaxed = soak_ctl.main([
+                "set-goal",
+                "--session-dir", str(self.session),
+                "--fixer-parallel-policy", "relaxed",
+            ])
+            self.assertEqual(rc_relaxed, 0)
+            self.assertEqual(soak_ctl.read_state(self.session)["fixer_parallel_policy"], "relaxed")
+            self.assertIn(
+                "fixer_parallel_policy=relaxed",
+                (self.session / "REVIEW_REPORT.md").read_text(encoding="utf-8"),
+            )
+        finally:
+            soak_ctl.teardown_session(self.session)
+
 
 if __name__ == "__main__":
     unittest.main()
+
