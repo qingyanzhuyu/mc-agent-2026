@@ -104,7 +104,7 @@ class ConfigCapAndEnvTests(unittest.TestCase):
         text = env_example.read_text(encoding="utf-8")
         self.assertIn("MC_MAX_RPS=16", text)
         self.assertIn("MC_BLOCK_CACHE_TTL_S=1.5", text)
-        self.assertIn("MC_OBSERVER_MIN_INTERVAL_S=0.05", text)
+        self.assertIn("MC_OBSERVER_MIN_INTERVAL_S=0.25", text)
 
 
 class RequestLimiterPriorityTests(unittest.TestCase):

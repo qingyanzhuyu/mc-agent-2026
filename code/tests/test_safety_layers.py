@@ -864,7 +864,7 @@ class _ContinuousFakeClient(FakeClient):
 
 class ContinuousMonitorTests(unittest.TestCase):
     def test_runtime_config_observer_min_interval_s(self):
-        self.assertEqual(RuntimeConfig().observer_min_interval_s, 0.05)
+        self.assertEqual(RuntimeConfig().observer_min_interval_s, 0.25)
         with patch.dict("os.environ", {"MC_OBSERVER_MIN_INTERVAL_S": "0.12"}):
             self.assertEqual(RuntimeConfig.load().observer_min_interval_s, 0.12)
         for bad in ("0", "nan"):
@@ -967,6 +967,32 @@ class ContinuousMonitorTests(unittest.TestCase):
             mon.close(timeout=1.0)
         self.assertTrue(reached)
         self.assertEqual(logs, [])
+
+    def test_continuous_monitor_paces_safe_vs_risk_intervals(self):
+        c = _ContinuousFakeClient()
+        s = State(RuntimeConfig())
+        ex = Executor(c, s, log=lambda *_: None)
+        mon = SafetyMonitor(c, s, ex, continuous=True)
+
+        # Safe dry grounded daytime overworld state backs off to 3x min (0.75s < status_ttl_s=1.0).
+        s.set_status({"ready": True, "alive": True, "health": 20, "pos": [0, 64, 0],
+                      "dimension": "overworld", "time_of_day": 6000, "on_ground": True})
+        self.assertAlmostEqual(mon.next_interval(), 0.75, places=6)
+
+        for patch_st, risk_ctx in (
+            ({"in_water": True}, {}),
+            ({"submerged": True}, {}),
+            ({"on_ground": False}, {}),
+            ({"health": 10}, {}),
+            ({"time_of_day": 14000}, {}),
+            ({}, {"void_guard": True}),
+        ):
+            s.set_risk_context(void_guard=False)
+            s.set_status({"ready": True, "alive": True, "health": 20, "pos": [0, 64, 0],
+                          "dimension": "overworld", "time_of_day": 6000, "on_ground": True, **patch_st})
+            if risk_ctx:
+                s.set_risk_context(**risk_ctx)
+            self.assertAlmostEqual(mon.next_interval(), 0.25, places=6)
 
     def test_executor_act_invalidates_block_cache_only_for_world_actions(self):
         c = FakeClient()
