@@ -868,12 +868,42 @@ class SoakObserver:
                     )
 
         # b) SKILL_SPAM_LOOP
+        # 非物品配方参数类技能（如 gather_wood(count)、mine_stone(count)、scout_island(radius)）按技能名聚合，
+        # 避免仅因数量/半径微调就把同一空转根因拆成多张慢速修单；合成类仍按 item 分开。
         sev = "P1" if has_unreached_target else "P2"
-        for key, entry in self.skill_arg_stats.items():
+        spam_groups: dict[str, dict[str, Any]] = {}
+        for entry in self.skill_arg_stats.values():
             sname = str(entry["skill"])
-            started = int(entry.get("started", 0))
-            ok_count = int(entry.get("ok", 0))
-            # 只有真正多次成功却仍重复同参调用（如 13 把石剑 / 129 原木）才算 SKILL_SPAM_LOOP，
+            args_dict = entry.get("args") or {}
+            if sname in ("craft_gear", "craft_iron_gear", "craft_diamond_gear") and args_dict.get("item") is not None:
+                group_key = _skill_args_key(sname, {"item": args_dict.get("item")})
+                group_args: dict[str, Any] = copy.deepcopy(args_dict)
+            else:
+                group_key = sname
+                group_args = copy.deepcopy(args_dict)
+            grp = spam_groups.setdefault(group_key, {
+                "skill": sname,
+                "args": group_args,
+                "args_variants": [],
+                "started": 0,
+                "ok": 0,
+                "replan": 0,
+                "env_blocked": 0,
+                "total_elapsed_s": 0.0,
+            })
+            if args_dict and args_dict not in grp["args_variants"]:
+                grp["args_variants"].append(copy.deepcopy(args_dict))
+            grp["started"] += int(entry.get("started", 0))
+            grp["ok"] += int(entry.get("ok", 0))
+            grp["replan"] += int(entry.get("replan", 0))
+            grp["env_blocked"] += int(entry.get("env_blocked", 0))
+            grp["total_elapsed_s"] += float(entry.get("total_elapsed_s", 0.0))
+
+        for group_key, entry in spam_groups.items():
+            sname = str(entry["skill"])
+            started = int(entry["started"])
+            ok_count = int(entry["ok"])
+            # 只有真正多次成功却仍重复同技能/同物品调用（如 13 把石剑 / 129 原木）才算 SKILL_SPAM_LOOP，
             # 避免把“前置偶发失败重试 2~3 次后终于成功 1 次”的正常恢复流程误判为刷屏。
             is_spam = (
                 (sname == "craft_gear" and started >= 4 and ok_count >= 2)
@@ -881,19 +911,25 @@ class SoakObserver:
                 or (sname == "scout_island" and started >= 20 and has_unreached_target)
             )
             if is_spam:
-                args_tag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
-                args_preview = json.dumps(entry["args"], sort_keys=True, ensure_ascii=False)
+                args_tag = hashlib.sha1(group_key.encode("utf-8")).hexdigest()[:6]
+                variants = entry.get("args_variants") or []
+                args_preview = json.dumps(
+                    variants if len(variants) > 1 else entry["args"],
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
                 self._report_incident(
                     code="SKILL_SPAM_LOOP",
                     severity=sev,
                     category="strategy",
                     custom_fingerprint=f"SKILL_SPAM_LOOP:{sname}:{args_tag}",
-                    title=f"技能 {sname} 同参数高频空转 {started} 次 ({args_preview[:80]})",
+                    title=f"技能 {sname} 重复空转 {started} 次 ({args_preview[:80]})",
                     detail={
                         "skill": sname,
                         "args": copy.deepcopy(entry["args"]),
+                        "args_variants": copy.deepcopy(variants),
                         "started": started,
-                        "ok": int(entry.get("ok", 0)),
+                        "ok": ok_count,
                         "replan": int(entry.get("replan", 0)),
                         "env_blocked": int(entry.get("env_blocked", 0)),
                         "total_elapsed_s": round(float(entry.get("total_elapsed_s", 0.0)), 2),

@@ -72,6 +72,65 @@ PROACTIVE_WIDE_INCIDENT_CODES: frozenset[str] = frozenset({
     "SKILL_SPAM_LOOP",
     "API_BOTTLENECK_SLOW",
 })
+_DOMAIN_SCOPED_INCIDENT_CODES: frozenset[str] = frozenset({
+    "REPLAN_OSCILLATION",
+    "STUCK_NO_PROGRESS",
+    "DIG_TOOL_WARNING",
+    "CONTRACT_OR_FATAL_ERROR",
+    "SKILL_SPAM_LOOP",
+    "DISPATCH_STARVATION",
+})
+_STARTER_DOMAIN = "code/mcagent/loop/starter_skills.py"
+_IRON_DOMAIN = "code/mcagent/skills/iron.py"
+_SURVIVAL_DOMAIN = "code/mcagent/skills/survival.py"
+_DIAMOND_DOMAIN = "code/mcagent/skills/diamond.py"
+_NETHER_DOMAIN = "code/mcagent/skills/nether.py"
+_COMBAT_DOMAIN = "code/mcagent/skills/combat.py"
+
+SKILL_CONFLICT_DOMAIN: dict[str, tuple[str, ...]] = {
+    "eat_food": (_STARTER_DOMAIN,),
+    "scout_island": (_STARTER_DOMAIN,),
+    "surface_for_air": (_STARTER_DOMAIN,),
+    "gather_wood": (_STARTER_DOMAIN,),
+    "craft_gear": (_STARTER_DOMAIN,),
+    "mine_stone": (_STARTER_DOMAIN,),
+    "get_stone": ("code/mcagent/skills/__init__.py",),
+    "smelt_iron": (_IRON_DOMAIN,),
+    "craft_iron_gear": (_IRON_DOMAIN,),
+    "fill_lava_bucket": (_IRON_DOMAIN,),
+    "sleep_in_bed": (_SURVIVAL_DOMAIN,),
+    "plant_seed": (_SURVIVAL_DOMAIN,),
+    "breed_animal": (_SURVIVAL_DOMAIN,),
+    "hunt_mob": (_SURVIVAL_DOMAIN, _COMBAT_DOMAIN),
+    "catch_fish": (_SURVIVAL_DOMAIN,),
+    "mine_diamond": (_DIAMOND_DOMAIN,),
+    "craft_diamond_gear": (_DIAMOND_DOMAIN,),
+    "mine_obsidian": (_NETHER_DOMAIN,),
+    "craft_flint_and_steel": (_NETHER_DOMAIN,),
+    "build_and_enter_portal": (_NETHER_DOMAIN,),
+    "deflect_skeleton_arrow": (_COMBAT_DOMAIN,),
+    "shoot_mob": (_COMBAT_DOMAIN,),
+    "fire_crossbow": (_COMBAT_DOMAIN,),
+}
+GOAL_CONFLICT_DOMAIN: dict[str, tuple[str, ...]] = {
+    "lava_bucket": (_IRON_DOMAIN,),
+    "smelt_iron": (_IRON_DOMAIN,),
+    "iron_tools": (_IRON_DOMAIN,),
+    "obtain_armor": (_IRON_DOMAIN,),
+    "sleep_in_bed": (_SURVIVAL_DOMAIN,),
+    "plant_seed": (_SURVIVAL_DOMAIN,),
+    "breed_an_animal": (_SURVIVAL_DOMAIN,),
+    "kill_a_mob": (_COMBAT_DOMAIN,),
+    "fishy_business": (_SURVIVAL_DOMAIN,),
+    "deflect_arrow": (_COMBAT_DOMAIN,),
+    "shoot_arrow": (_COMBAT_DOMAIN,),
+    "ol_betsy": (_COMBAT_DOMAIN,),
+    "mine_diamond": (_DIAMOND_DOMAIN,),
+    "shiny_gear": (_DIAMOND_DOMAIN,),
+    "prep_diamond_pickaxe": (_DIAMOND_DOMAIN,),
+    "form_obsidian": (_NETHER_DOMAIN,),
+    "enter_the_nether": (_NETHER_DOMAIN,),
+}
 
 SECRET_SCAN_RE = re.compile(
     r"(sk-[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._\-]{16,}|MC_PASS\s*=\s*\S+|LLM_API_KEY\s*=\s*\S+)"
@@ -1822,6 +1881,31 @@ def _scopes_conflict(a: frozenset[str], b: frozenset[str]) -> bool:
     return "*" in a or "*" in b or bool(a & b)
 
 
+def _claim_parallel_scope(inc_rec: dict[str, Any]) -> frozenset[str]:
+    """计算并行认领的领域冲突集，使不同领域策略/刷频单可满 3 路并发而未知野生单仍排他。"""
+    if not isinstance(inc_rec, dict):
+        return frozenset({"*"})
+    code = str(inc_rec.get("code") or "").strip()
+    if code == "GOAL_MISS":
+        return _incident_edit_scope(inc_rec)
+    had_merge_conflict = any(
+        isinstance(h, dict) and h.get("failed_gate") == "merge_conflict_requeue"
+        for h in (inc_rec.get("gate_history") or ())
+    )
+    if code == "API_BOTTLENECK_SLOW":
+        return frozenset({"*"}) if had_merge_conflict else frozenset({"domain:api_bottleneck_slow"})
+    if code in _DOMAIN_SCOPED_INCIDENT_CODES:
+        skill = str(inc_rec.get("skill") or "").strip()
+        goal_id = str(inc_rec.get("goal_id") or "").strip()
+        domain = SKILL_CONFLICT_DOMAIN.get(skill) or GOAL_CONFLICT_DOMAIN.get(goal_id)
+        if domain:
+            scope = set(domain)
+            if had_merge_conflict or str(inc_rec.get("last_failed_fix_commit") or "").strip():
+                scope.update(GOAL_RECURRENCE_EXTRA_FILES)
+            return frozenset(scope)
+    return _incident_edit_scope(inc_rec)
+
+
 def _allocate_attempt_no(session_dir: Path, st: dict[str, Any]) -> int:
     from_history = sum(len(r.get("gate_history", [])) for r in st.get("incidents", {}).values()) + 1
     from_state = int(st.get("next_attempt_no", 1) or 1)
@@ -1933,7 +2017,7 @@ def claim_parallel_incidents(
             for _, fp, rec in candidates:
                 if len(chosen_items) >= int(max_workers):
                     break
-                scope = _incident_edit_scope(rec)
+                scope = _claim_parallel_scope(rec)
                 if any(_scopes_conflict(scope, prev) for prev in selected_scopes):
                     continue
                 selected_scopes.append(scope)

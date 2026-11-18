@@ -580,6 +580,25 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
             self.assertRegex(spam8[0]["fingerprint"], r"^SKILL_SPAM_LOOP:gather_wood:[0-9a-f]{6}$")
             self._assert_proactive_fields(spam8[0], obs8, expected_severity="P2")
 
+        # 同一技能不同数量/半径参数变体应合并成单张 SKILL_SPAM_LOOP；不同 craft_gear 物品仍保持隔离。
+        with tempfile.TemporaryDirectory() as tmp_merged:
+            obs_m = SoakObserver(tmp_merged, target_goal="smelt_iron")
+            state_m = _make_ready_state()
+            for count in (3, 3, 3, 3, 5, 5, 5, 5):
+                _run_skill_cycle(obs_m, make("gather_wood", {"count": count}), state_m, gain_item="oak_log")
+            for radius in (24, 36):
+                for _ in range(10):
+                    _run_skill_cycle(obs_m, make("scout_island", {"radius": radius}), state_m)
+            for tool in ("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace"):
+                _run_skill_cycle(obs_m, make("craft_gear", {"item": tool}), state_m, gain_item=tool)
+            obs_m.on_run_end(state_m, stop_reason="max_steps")
+            incs_m = _read_incidents(Path(tmp_merged))
+            spam_m = [i for i in incs_m if i["code"] == "SKILL_SPAM_LOOP"]
+            spam_skills = sorted(i["skill"] for i in spam_m)
+            self.assertEqual(spam_skills, ["gather_wood", "scout_island"], incs_m)
+            wood_inc = next(i for i in spam_m if i["skill"] == "gather_wood")
+            self.assertEqual(len(wood_inc["detail"]["args_variants"]), 2)
+
     def test_skill_spam_loop_scout_island_thresholds_and_unreached_goal_guard(self):
         # 18 次（即使有未达成非 env_blocked 目标）不触发
         with tempfile.TemporaryDirectory() as tmp_18:
