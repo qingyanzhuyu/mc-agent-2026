@@ -20,6 +20,8 @@ import time
 from collections import deque
 from typing import Any, Callable, Literal, Optional
 
+import requests
+
 from .client import ApiError, FATAL, REPLAN, RETRY, Client
 
 
@@ -493,6 +495,8 @@ SNAPSHOT_INVENTORY_ACTIONS: frozenset[str] = frozenset({
 STOP_ON_TIMEOUT_ACTIONS: frozenset[str] = frozenset({
     "move_to", "control", "dig", "attack", "use_item",
 })
+# 单次尝试耗时已达到该阈值再触发 timeout 时不再无谓原地重试，直接清理并 Replan
+_NO_RETRY_TIMEOUT_ELAPSED_S = 20.0
 
 
 def _inv_fingerprint(inv: Optional[dict]) -> Optional[dict[str, int]]:
@@ -684,6 +688,7 @@ class Executor:
                 if eff_priority != "emergency" and self._preempt_epoch != start_epoch:
                     raise Replan(f"动作被安全层抢占: {self._preempt_reason}")
                 attempt += 1
+                attempt_started = time.monotonic()
                 try:
                     result = fn()
                     self.n_actions += 1
@@ -695,6 +700,7 @@ class Executor:
                         self.state.patch_action(result, action=name)
                     return result
                 except ApiError as e:
+                    attempt_elapsed = time.monotonic() - attempt_started
                     self.n_errors += 1
                     self._record({
                         "t": round(t0, 3), "name": name, "ms": round((time.time() - t0) * 1000),
@@ -729,7 +735,10 @@ class Executor:
                         if name in NON_IDEMPOTENT_ACTIONS and (status_tag == "unknown" or before_fp is None):
                             raise Replan(f"{name} 响应丢失且无法可靠判重，停止重试") from e
 
-                    if e.kind == RETRY and attempt <= retries:
+                    retryable = e.kind == RETRY and not (
+                        e.code == "timeout" and attempt_elapsed >= _NO_RETRY_TIMEOUT_ELAPSED_S
+                    )
+                    if retryable and attempt <= retries:
                         try:
                             wait_s = self._recover_session_if_needed(e, backoff, attempt)
                         except ApiError as rec_err:
@@ -755,11 +764,37 @@ class Executor:
                 self._cond.notify_all()
 
     # ---- 常用包装（顺便统一超时/参数与非幂等判重） --------------------
-    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None, *, stop_on=None) -> dict:
-        return self.act(
-            "move_to",
-            lambda: self.client.move_to(x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, stop_on=stop_on),
-        )
+    def move_to(
+        self,
+        x=None,
+        z=None,
+        y=None,
+        entity_id=None,
+        rng=1,
+        pos=None,
+        timeout=None,
+        *,
+        retries=2,
+        stop_on=None,
+    ) -> dict:
+        if retries is None:
+            retries = 2
+
+        def _call() -> dict:
+            if timeout is None:
+                return self.client.move_to(
+                    x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, stop_on=stop_on
+                )
+            try:
+                return self.client.move_to(
+                    x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, timeout=timeout, stop_on=stop_on
+                )
+            except ApiError as err:
+                if err.code == "network" and isinstance(err.__cause__, requests.ReadTimeout):
+                    raise ApiError("timeout", err.message, err.extra) from err
+                raise
+
+        return self.act("move_to", _call, retries=retries)
 
     def dig(self, pos, collect: bool = True, *, stop_on=None) -> dict:
         return self.act("dig", lambda: self.client.dig(pos, collect=collect, stop_on=stop_on))

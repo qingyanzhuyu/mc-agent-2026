@@ -1,6 +1,7 @@
 """D0 执行器恢复与安全抢占单测：验证非幂等动作防重、超时 /stop、抢占优先级与大厅恢复。"""
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 import time
@@ -12,6 +13,7 @@ import requests
 
 from mcagent.client import CODE_CLASS, REPLAN, Client, Config
 from mcagent.runtime import Executor, Replan, SafetyMonitor, State
+from mcagent.skills.base import failure
 
 
 class FakeResponse:
@@ -370,6 +372,124 @@ class ServerTimeoutNonIdempotentTests(unittest.TestCase):
         self.assertEqual(self.calls.count("stop"), 3)
         self.assertNotIn("inventory", self.calls)
         self.assertNotIn("status", self.calls)
+
+    @staticmethod
+    def _capture_move_to_timeouts(ex: Executor) -> list[float]:
+        """Wrap session.post to record timeout values passed for /move_to."""
+        seen: list[float] = []
+        orig_post = ex.client.session.post
+
+        def spy_post(
+            url: str, headers: dict | None = None, data: str = "{}", timeout: float = 30
+        ) -> FakeResponse:
+            if url.endswith("/move_to"):
+                seen.append(timeout)
+            return orig_post(url, headers=headers, data=data, timeout=timeout)
+
+        ex.client.session.post = spy_post
+        return seen
+
+    def test_move_to_explicit_timeout_and_zero_retries_stops_once_without_retry(self) -> None:
+        """显式传入 timeout=30.0, retries=0：透传 HTTP timeout、仅尝试 1 次并 /stop，不查背包/状态。"""
+        moves = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal moves
+            if url.endswith("/move_to"):
+                moves += 1
+                return FakeResponse(200, TIMEOUT_ERR)
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        seen_timeouts = self._capture_move_to_timeouts(ex)
+
+        with self.assertRaises(Replan) as ctx:
+            ex.move_to(pos=[10, 64, 10], rng=2, timeout=30.0, retries=0)
+
+        self.assertEqual(seen_timeouts, [30.0])
+        self.assertEqual(moves, 1)
+        self.assertEqual(self.calls, ["move_to", "stop"])
+        self.assertEqual(failure(ctx.exception)[0], "timeout")
+        self.assertNotIn("inventory", self.calls)
+        self.assertNotIn("status", self.calls)
+
+    def test_move_to_read_timeout_normalizes_to_timeout_and_stops_once(self) -> None:
+        """HTTP 层抛出 ReadTimeout（被 Client._send 转为 network）时，应归一为 timeout 并只发 1 次 + /stop。"""
+        moves = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal moves
+            if url.endswith("/move_to"):
+                moves += 1
+                raise requests.ReadTimeout("read timed out")
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        seen_timeouts = self._capture_move_to_timeouts(ex)
+
+        with self.assertRaises(Replan) as ctx:
+            ex.move_to(pos=[10, 64, 10], rng=2, timeout=30.0, retries=0)
+
+        self.assertEqual(seen_timeouts, [30.0])
+        self.assertEqual(moves, 1)
+        self.assertEqual(self.calls, ["move_to", "stop"])
+        self.assertEqual(failure(ctx.exception)[0], "timeout")
+        self.assertNotIn("inventory", self.calls)
+        self.assertNotIn("status", self.calls)
+
+    def test_move_to_long_attempt_elapsed_skips_retry(self) -> None:
+        """单次尝试耗时 >= 20s 的 timeout 不再重试，直接 /stop 后 Replan(timeout)。"""
+        moves = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal moves
+            if url.endswith("/move_to"):
+                moves += 1
+                return FakeResponse(200, TIMEOUT_ERR)
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        with mock.patch(
+            "mcagent.runtime.time.monotonic",
+            side_effect=itertools.chain([0.0], itertools.repeat(20.0)),
+        ):
+            with self.assertRaises(Replan) as ctx:
+                ex.move_to(10, 10)
+
+        self.assertEqual(moves, 1)
+        self.assertEqual(self.calls, ["move_to", "stop"])
+        self.assertEqual(failure(ctx.exception)[0], "timeout")
+
+    def test_move_to_fast_timeout_keeps_three_attempts(self) -> None:
+        """单次尝试耗时 < 20s 的 timeout 仍按默认 retries=2 执行共 3 次尝试。"""
+        moves = 0
+
+        def handler(method: str, url: str, headers: dict, body: Any) -> FakeResponse:
+            nonlocal moves
+            if url.endswith("/move_to"):
+                moves += 1
+                return FakeResponse(200, TIMEOUT_ERR)
+            if url.endswith("/stop"):
+                return FakeResponse(200, {"ok": True, "result": {"stopped": True}})
+            raise AssertionError(url)
+
+        ex = self._executor(handler)
+        with mock.patch(
+            "mcagent.runtime.time.monotonic",
+            side_effect=itertools.count(0.0, 5.0),
+        ):
+            with self.assertRaises(Replan) as ctx:
+                ex.move_to(10, 10)
+
+        self.assertEqual(moves, 3)
+        self.assertEqual(self.calls.count("stop"), 3)
+        self.assertEqual(failure(ctx.exception)[0], "timeout")
 
 
 class PreemptionAndSessionTests(unittest.TestCase):
