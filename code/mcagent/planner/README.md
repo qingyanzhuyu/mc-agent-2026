@@ -1,23 +1,24 @@
 # planner —— 决策层
 
-**职责**：看状态 → 输出**一个** `Decision`。不直接发 HTTP，不调 `Executor`。
+**职责**：看上下文/状态 → 输出战略目标 `Objective`、技能选择或兜底原子 `Decision`。不直接调 `Executor`。
 
 ```
-skill_choice.py  技能菜单 + 选择校验 + choose()        ← 常规路径：模型从菜单里选一个技能
-decision.py      Decision 数据结构 + 校验器（纯函数）   ← 兜底路径：没有技能覆盖时出一个原子动作
+objective.py     战略层：Objective 结构 + 目标菜单 + 校验 + choose_objective()  ← 选计分目标（--strategy llm）
+skill_choice.py  技能菜单 + 选择校验 + choose()                               ← 技能级菜单选择（兼容 --llm 及战术无技能兜底）
+decision.py      Decision 数据结构 + 校验器（纯函数）                         ← 原子动作兜底（没有技能覆盖时）
 llm.py           LLM 客户端 + 通用重问循环 ask_json() + 线路降级
 llm_fault.py     调用失败的分类（LLMError.kind）与熔断器
-scheduler.py     不阻塞动作的模型预取槽
+scheduler.py     不阻塞动作的事件驱动模型预取槽（DecisionScheduler）
 ```
 
-## 两条决策路径
+## 三条决策路径
 
-| | 常规：选技能 | 兜底：原子动作 |
-|---|---|---|
-| 模型输出 | `{"skill", "args", "why"}` | `{"goal", "action", "args", "why", "expect", "abort_if"}` |
-| 校验器 | `skill_choice.validate_choice()`，读 `skills.REGISTRY` 的声明 | `decision.validate()`，反射 `Client` 签名 |
-| 模型碰坐标吗 | 不碰（技能参数注册时就限制为标量） | 会碰，执行前要按 J17 二次核对 |
-| 入口 | `skill_choice.choose(llm, summary, state)` | `LLMClient.decide(summary)` |
+| | 战略：选计分目标（推荐） | 兼容/兜底：选技能 | 兜底：原子动作 |
+|---|---|---|---|
+| 模型输出 | `{"goal_id", "budget_s", "why"}` | `{"skill", "args", "why"}` | `{"goal", "action", "args", "why", "expect", "abort_if"}` |
+| 校验器 | `objective.validate_objective()`，核验台账、stage、未达成、未挂起与战术可展开 | `skill_choice.validate_choice()`，读 `skills.REGISTRY` 声明 | `decision.validate()`，反射 `Client` 签名 |
+| 模型碰坐标吗 | 不碰（上下文剥离坐标与实体 id，禁止透传规则答案） | 不碰（技能参数注册时就限制为标量） | 会碰，执行前要按 J17 二次核对 |
+| 入口 | `objective.choose_objective(llm, context, state)`（经 `DecisionScheduler` 异步调用） | `skill_choice.choose(llm, summary, state)` | `LLMClient.decide(summary)` |
 
 两个校验器都**不维护名单**：一个读技能自己的声明，一个反射客户端签名。完整规则见 `AGENTS.md` §9.5。
 
@@ -51,6 +52,7 @@ runtime/   执行器        单飞锁 / 错误分类 / 重试 / 打点
 | `llm.py` | LLM 客户端 + 决策重问循环；**15 个离线单测 + 真机 3/3 抽测**（`decide()`） |
 | `llm.py` 的降级 / `llm_fault.py` | 代理坏了改直连 + 两级熔断；18 个离线单测，**阈值未经真机标定** |
 | `skill_choice.py` | 菜单 / 校验 / `choose()`；离线单测覆盖，**提示词措辞未在真模型上抽测** |
+| `objective.py` / `scheduler.py` | 战略目标 `Objective` 菜单与校验 + 异步预取槽 `DecisionScheduler`；离线单测覆盖（`verified: offline`），**真模型与赛服待抽测** |
 
 `llm.py` 的三个实测结论已写进代码注释：
 1. `model` 只能写 `default`（后端是 qwen3.6-35b-a3b，字面写模型名会 403）
@@ -80,13 +82,11 @@ runtime/   执行器        单飞锁 / 错误分类 / 重试 / 打点
 | 缺省值 | 官方端点 / `default` / 7897 快路径代理 | 无（三项必填），代理缺省直连 |
 | 关思考字段被拒 400 | 不处理，如实报错 | 去掉字段原线路重发一次，之后不再带 |
 
-一次进程只用一套，两套之间**不会**自动切换。三道拦截：`preflight` BLOCK；`mcagent.loop --llm` 在 MC 指向官方端点时拒绝 custom；
+一次进程只用一套，两套之间**不会**自动切换。三道拦截：`preflight` BLOCK；`mcagent.loop --llm` / `--strategy llm` 在 MC 指向官方端点时拒绝 custom；
 custom 不借用官方的 `LLM_KEY`。临时切换：`LLM_PROFILE=custom uv run python -m mcagent.loop ...`。
 
-## 现在**没有**的东西
+## 仍待后续接入 / 标定的部分
 
-- 没有策略实现：挑哪个目标还是人定的
-
-加实现时：新建 `xxx.py`，导出 `def next_decision(state_summary: str, allowed: list[str]) -> dict`，
-返回**未校验**的 dict，调用方统一走 `validate()`。
-**跑通之前不要合进 main**（`AGENTS.md` §2 第 6 条）。
+- `Objective` 的路线分支（`route_branch`）字段：待子目标层（`loop/subgoals.py`）落地后接入。
+- 执行中途抢占切换目标（如沿路发现稀有机会）：当前仅在技能边界替换 `Objective`。
+- `OBJECTIVE_SYSTEM_PROMPT` 与 600s 例行复核间隔尚待靶场与官方模型真机抽测标定（`AGENTS.md` §2A.6）。

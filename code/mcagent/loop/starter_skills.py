@@ -16,7 +16,8 @@ from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from ..skills import nav
 from ..skills.base import Param, Skill, failure, rec
-from ..skills.items import AIR, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space
+from ..skills.items import AIR, MINE_TRAILS, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space
+from ..skills.recipes import craft_recipe
 from ..skills.registry import register
 from ..skills.sightline import (
     API_DIG_EYE_REACH,
@@ -47,7 +48,8 @@ STONE_Targets: tuple[str, ...] = ("stone", "cobblestone", "deepslate", "cobbled_
 PEEL_SURFACE: tuple[str, ...] = ("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter")
 SAFE_GROUND: tuple[str, ...] = (
     "grass_block", "dirt", "coarse_dirt", "stone", "cobblestone",
-    "sand", "sandstone", "gravel", "andesite", "diorite", "granite", "oak_planks",
+    "sand", "sandstone", "gravel", "andesite", "diorite", "granite",
+    "tuff", "oak_planks", "pale_oak_planks",
 )
 EDIBLE_FOODS: tuple[str, ...] = (
     "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod",
@@ -72,6 +74,7 @@ def reset_world_memo() -> None:
     VISITED_ANCHORS.clear()
     KNOWN_TABLES.clear()
     reset_all_world_memos()
+    MINE_TRAILS.clear()
 
 
 def _record_known_table(pos) -> None:
@@ -265,6 +268,8 @@ _GEAR_NEEDS: dict[str, tuple[int, int, int]] = {
 
 
 def can_afford_gear(state: "State", item: str, *, assume_no_table: bool = True) -> bool:
+    if item == "stick":
+        return total_planks(state) + 4 * total_logs(state) >= 2 or state.count("bamboo") >= 2
     if item not in _GEAR_NEEDS:
         return False
     p_need, s_need, c_need = _GEAR_NEEDS[item]
@@ -363,6 +368,30 @@ class ScoutIsland(Skill):
         memo.ingest_find_blocks(summary, dimension=dim, origin=st)
         hits = _scout_hits(summary)
 
+        # 若角色刚在探矿阶梯井底受阻（当前位置紧邻最近一条下探轨迹末端），先分段沿阶梯退回井口地表再外迁。
+        if MINE_TRAILS:
+            trail = MINE_TRAILS[-1]
+            tail = trail[-1]
+            if math.dist(cur, tail) <= 5.0 and trail[0][1] > cur[1] + 2.0:
+                MINE_TRAILS.pop()
+                indices = list(range(len(trail) - 1, -1, -10))
+                if indices[-1] != 0:
+                    indices.append(0)
+                for idx in indices:
+                    if idx == len(trail) - 1:
+                        continue
+                    wp = list(trail[idx])
+                    try:
+                        moved_up = ex.move_to(pos=wp, rng=2)
+                    except Replan as e:
+                        code, _ = failure(e)
+                        if code not in NAV_FAIL_CODES:
+                            raise
+                        yield rec("move_to", pos=wp, fingerprints=hits, error_code=code)
+                        break
+                    yield rec("move_to", moved_up, pos=wp, fingerprints=hits)
+                st, cur = _refresh_stance(ex, state)
+
         target_wood = None
         cur_wood_dist = 0.0
         if total_logs(state) == 0:
@@ -381,12 +410,13 @@ class ScoutIsland(Skill):
         land = ex.client.find_blocks(types=list(SAFE_GROUND), radius=min(r, 28), limit=land_limit)
         recent_anchors = VISITED_ANCHORS[-24:]
         cands = []
+        climb_cands = []
         for b in (land.get("blocks") or []):
             p = b.get("pos")
             if not (isinstance(p, list) and len(p) == 3):
                 continue
             dist = math.hypot(p[0] - cur[0], p[2] - cur[2])
-            if dist < 5.0 or abs(p[1] - cur[1]) > 10.0 or _is_protected(p, radius=8.0):
+            if _is_protected(p, radius=8.0):
                 continue
             visited_pen = 0
             for vx, vz in recent_anchors:
@@ -405,10 +435,13 @@ class ScoutIsland(Skill):
             else:
                 closer_to_wood = 1
                 wood_order = -dist
-            cands.append((visited_pen, -dist, closer_to_wood, wood_order, p))
+            if dist >= 5.0 and abs(p[1] - cur[1]) <= 10.0:
+                cands.append((visited_pen, -dist, closer_to_wood, wood_order, p))
+            elif dist >= 3.0 and 10.0 < (p[1] - cur[1]) <= 28.0:
+                climb_cands.append((visited_pen, p[1] - cur[1], closer_to_wood, wood_order, p))
 
         attempted_recovery = False
-        if not cands:
+        if not cands and not climb_cands:
             attempted_recovery = True
             escaped, arrived = yield from _run_nav_recovery(
                 ex, state, cur, dest=list(target_wood.pos) if target_wood is not None else None
@@ -417,16 +450,18 @@ class ScoutIsland(Skill):
                 VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
                 return
             raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
-        # 落水时先找最近的干燥落脚点；在陆地上优先低惩罚组，缺木时同组优先靠近已知远木，否则优先未访问远端。
+        # 落水时先找最近的干燥落脚点；在陆地上优先低惩罚组，缺木时同组优先靠近已知远木，否则优先未访问远端；平层无点时试爬回地表。
         cands.sort(
             key=(lambda item: (-item[1], item[0]))
             if st.get("in_water")
             else (lambda item: (item[0], item[2], item[3], item[1]))
         )
+        climb_cands.sort(key=lambda item: (item[0], item[1]))
+        all_cands = cands + climb_cands
         checked: list[list] = []
         attempts = 0
         last_nav_err: Optional[Replan] = None
-        for _, _, _, _, chosen in cands:
+        for _, _, _, _, chosen in all_cands:
             dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
             # 相邻方块通常属于同一片地形，失败后换一片；同时限制额外观察与动作预算。
             if any(math.dist(dest, old) < 3.0 for old in checked):
@@ -702,7 +737,7 @@ class CraftGear(Skill):
         "item": Param(
             str,
             "要合成的物品",
-            choices=("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace"),
+            choices=("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace", "stick"),
             default="wooden_pickaxe",
         ),
     }
@@ -712,7 +747,8 @@ class CraftGear(Skill):
 
     @classmethod
     def blocked(cls, state: "State") -> str:
-        if total_logs(state) + total_planks(state) + total_cobble(state) < 2:
+        if (total_logs(state) + total_planks(state) + total_cobble(state) < 2
+                and not can_afford_gear(state, "stick")):
             return "缺少原木、木板或圆石原料"
         return ""
 
@@ -726,6 +762,13 @@ class CraftGear(Skill):
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         target = str(self.args["item"])
+        if target == "stick":
+            state.invalidate_inventory()
+            state.refresh_inventory(ex.client)
+            if total_planks(state) < 2 and state.count("bamboo") < 2:
+                yield from _prepare_recipe_planks(ex, state, 2, "stick")
+            yield from craft_recipe(ex, state, "stick", goal_qty=state.count("stick") + 1)
+            return
         p_need, s_need, c_need = _GEAR_NEEDS[target]
         st, _ = _refresh_stance(ex, state)
         dim = _dim_of(st)

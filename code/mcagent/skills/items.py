@@ -52,6 +52,18 @@ PICKAXE_ORDER: tuple[str, ...] = (
 STONE_OR_BETTER_PICKS = frozenset({
     "stone_pickaxe", "copper_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
 })
+#: 下探阶梯的路点栈（起点在地表，终点在井底），供外迁技能在井底受困时沿原阶梯退回井口。
+MINE_TRAILS: list[list[tuple[float, float, float]]] = []
+
+
+def record_mine_trail(waypoints: list[list[float]]) -> None:
+    if len(waypoints) < 2:
+        return
+    pts = [(float(p[0]), float(p[1]), float(p[2])) for p in waypoints if len(p) >= 3]
+    if len(pts) >= 2 and pts[0][1] > pts[-1][1] + 1.5:
+        MINE_TRAILS.append(pts)
+        if len(MINE_TRAILS) > 6:
+            del MINE_TRAILS[:-6]
 
 
 def bare(name: object) -> str:

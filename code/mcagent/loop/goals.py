@@ -62,6 +62,7 @@ class GoalSpec:
     stage: str = "draft"                       # "draft" | "candidate" | "graduated" | "live"
     editable_files: tuple[str, ...] = ()       # GOAL_MISS 自动修复时允许改动的收窄白名单
     held_items: tuple[str, ...] = ()            # 下游所需实物，未指定时沿用 done_items
+    gather_when_blocked: bool = False          # 允许主技能先观察复用场景，无法启动时再尝试补料
 
     @property
     def args_dict(self) -> dict[str, Any]:
@@ -90,6 +91,20 @@ _STARTER_EDITABLE: tuple[str, ...] = (
     "code/mcagent/loop/starter_skills.py",
     "code/tests/test_loop_soak.py",
 )
+
+_COMBAT_EDITABLE = ("code/mcagent/skills/combat.py", "code/mcagent/skills/combat_materials.py",
+                    "code/mcagent/skills/combat_scene.py", "code/tests/test_combat.py")
+_FISHING_STOCK = ("string>=2", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2)))
+_ARROW_STOCK = ("arrow|spectral_arrow|tipped_arrow>=1", "hunt_mob",
+                (("target", "skeleton"), ("drop", "arrow"), ("count", 1)))
+
+
+def _stick_fallbacks(count: int):
+    return (
+        (f"@stick_stock:{count}>=1", "gather_wood", (("count", 2),)),
+        (f"stick>={count}", "craft_gear", (("item", "stick"),)),
+    )
+
 
 GOALS: tuple[GoalSpec, ...] = (
     # ---- 批次 0：起步木石与冶炼底座（已集成并离线+联调验证，stage="graduated"） ----
@@ -220,7 +235,7 @@ GOALS: tuple[GoalSpec, ...] = (
         budget_s=210.0,
         max_fails_per_ep=4,
         est_cost_s=60.0,
-        stage="draft",
+        stage="candidate",
         editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
@@ -231,19 +246,20 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="craft_iron_gear",
         skill_args=(("item", "iron_pickaxe"),),
         prereq_goals=("smelt_iron",),
-        prereq_items=("iron_ingot>=3",),
+        prereq_items=("iron_ingot>=3", "stick>=2"),
         done_advancements=("minecraft:story/iron_tools",),
-        done_items=("@iron_plus_pickaxe>=1",),
+        done_items=("iron_pickaxe>=1",),
         must_hold_for_children=True,
+        held_items=("@iron_plus_pickaxe>=1",),
         gather_fallbacks=(
             ("iron_ingot>=3", "smelt_iron", (("count", 3),)),
-            ("stick>=2", "gather_wood", (("count", 2),)),
+            *_stick_fallbacks(2),
         ),
         budget_s=150.0,
         max_fails_per_ep=3,
         est_cost_s=30.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
+        editable_files=("code/mcagent/skills/iron_gear.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
         id="obtain_armor",
@@ -263,7 +279,7 @@ GOALS: tuple[GoalSpec, ...] = (
         max_fails_per_ep=3,
         est_cost_s=35.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
+        editable_files=("code/mcagent/skills/iron_gear.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
         id="lava_bucket",
@@ -272,17 +288,19 @@ GOALS: tuple[GoalSpec, ...] = (
         score=15,
         skill="fill_lava_bucket",
         prereq_goals=("smelt_iron",),
+        prereq_items=("bucket>=1",),
         done_advancements=("minecraft:story/lava_bucket",),
         done_items=("lava_bucket>=1",),
         gather_fallbacks=(
             ("bucket|iron_ingot>=3", "smelt_iron", (("count", 3),)),
+            ("bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=210.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=50.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
+        editable_files=("code/mcagent/skills/iron_lava.py", "code/tests/test_iron.py"),
     ),
 
     # ---- 批次 2：顺手生存项（床、种地、繁殖） ----
@@ -299,7 +317,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=45.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_camp.py",
+                        "code/tests/test_survival.py"),
     ),
     GoalSpec(
         id="plant_seed",
@@ -314,7 +333,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=30.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_farm.py",
+                        "code/tests/test_survival.py"),
     ),
     GoalSpec(
         id="breed_an_animal",
@@ -329,7 +349,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=55.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_farm.py",
+                        "code/tests/test_survival.py"),
     ),
 
     # ---- 批次 3：战斗、盾牌与线系（合计 55 分） ----
@@ -346,7 +367,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=40.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="deflect_arrow",
@@ -361,7 +382,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=55.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="shoot_arrow",
@@ -371,12 +392,18 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="shoot_mob",
         prereq_goals=("kill_a_mob",),
         done_advancements=("minecraft:adventure/shoot_arrow",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            _ARROW_STOCK,
+            ("string>=5", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 5))),
+            *_stick_fallbacks(3),
+        ),
         budget_s=150.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=45.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="ol_betsy",
@@ -386,12 +413,18 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="fire_crossbow",
         prereq_goals=("smelt_iron", "kill_a_mob"),
         done_advancements=("minecraft:adventure/ol_betsy",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            ("arrow|spectral_arrow|tipped_arrow|firework_rocket>=1", _ARROW_STOCK[1], _ARROW_STOCK[2]),
+            ("string>=4", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 4))),
+            *_stick_fallbacks(4),
+        ),
         budget_s=150.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=50.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="fishy_business",
@@ -401,12 +434,18 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="catch_fish",
         prereq_goals=("kill_a_mob",),
         done_advancements=("minecraft:husbandry/fishy_business",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            _FISHING_STOCK,
+            *_stick_fallbacks(3),
+        ),
         budget_s=240.0,
         max_fails_per_ep=2,
         stop_loss=True,
         est_cost_s=95.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_fish.py",
+                        "code/tests/test_survival.py"),
     ),
 
     # ---- 批次 4：钻石层高分核心与下界门（shiny_gear 4 钻 60 分，性价比全表第一） ----
@@ -426,7 +465,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=150.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/diamond.py", "code/tests/test_diamond.py"),
+        editable_files=("code/mcagent/skills/diamond.py", "code/mcagent/skills/diamond_site.py",
+                        "code/tests/test_diamond.py"),
     ),
     GoalSpec(
         id="shiny_gear",
@@ -436,9 +476,9 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="craft_diamond_gear",
         skill_args=(("item", "diamond_boots"),),
         prereq_goals=("mine_diamond",),
-        prereq_items=("diamond>=4",),
         done_advancements=("minecraft:story/shiny_gear",),
         done_items=("diamond_helmet|diamond_chestplate|diamond_leggings|diamond_boots>=1",),
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("diamond>=4", "mine_diamond", (("count", 4),)),
         ),
@@ -446,7 +486,8 @@ GOALS: tuple[GoalSpec, ...] = (
         max_fails_per_ep=3,
         est_cost_s=25.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/diamond.py", "code/tests/test_diamond.py"),
+        editable_files=("code/mcagent/skills/diamond.py", "code/mcagent/skills/diamond_site.py",
+                        "code/tests/test_diamond.py"),
     ),
     GoalSpec(
         id="prep_diamond_pickaxe",
@@ -456,17 +497,19 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="craft_diamond_gear",
         skill_args=(("item", "diamond_pickaxe"),),
         prereq_goals=("mine_diamond",),
-        prereq_items=("diamond>=3",),
         done_items=("@diamond_plus_pickaxe>=1",),
         must_hold_for_children=True,
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("diamond>=3", "mine_diamond", (("count", 3),)),
+            *_stick_fallbacks(2),
         ),
         budget_s=120.0,
         max_fails_per_ep=3,
         est_cost_s=25.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/diamond.py", "code/tests/test_diamond.py"),
+        editable_files=("code/mcagent/skills/diamond.py", "code/mcagent/skills/diamond_site.py",
+                        "code/tests/test_diamond.py"),
     ),
     GoalSpec(
         id="form_obsidian",
@@ -474,22 +517,22 @@ GOALS: tuple[GoalSpec, ...] = (
         tier="T1",
         score=15,
         skill="mine_obsidian",
-        skill_args=(("count", 10),),
-        # 黑曜石只能用钻石镐采；倒水造黑曜石还要一只桶（mine_obsidian 自己去舀水）
+        skill_args=(("count", 1),),
         prereq_goals=("prep_diamond_pickaxe",),
-        prereq_items=("@diamond_plus_pickaxe>=1", "bucket|water_bucket|lava_bucket>=1"),
         done_advancements=("minecraft:story/form_obsidian",),
         done_items=("obsidian>=1",),
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("@diamond_plus_pickaxe>=1", "craft_diamond_gear", (("item", "diamond_pickaxe"),)),
-            ("bucket|water_bucket|lava_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
+            ("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=240.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=85.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/nether.py", "code/tests/test_nether.py"),
+        editable_files=("code/mcagent/skills/nether.py", "code/mcagent/skills/nether_mining.py",
+                        "code/mcagent/skills/nether_site.py", "code/tests/test_nether.py"),
     ),
     GoalSpec(
         id="enter_the_nether",
@@ -498,19 +541,72 @@ GOALS: tuple[GoalSpec, ...] = (
         score=30,
         skill="build_and_enter_portal",
         prereq_goals=("form_obsidian", "smelt_iron"),
-        # 去掉四角的最小门框 10 块黑曜石 + 打火石（1 铁锭 + 1 燧石，燧石来自挖沙砾）
-        prereq_items=("obsidian>=10", "flint_and_steel>=1"),
         done_advancements=("minecraft:story/enter_the_nether",),
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("obsidian>=10", "mine_obsidian", (("count", 10),)),
-            ("flint_and_steel>=1", "craft_flint_and_steel", ()),
+            ("flint|flint_and_steel>=1", "build_and_enter_portal", (("prepare_flint", True),)),
+            ("iron_ingot|flint_and_steel>=1", "smelt_iron", (("count", 1),)),
+            ("flint_and_steel>=1", "craft_iron_gear", (("item", "flint_and_steel"),)),
         ),
         budget_s=240.0,
         max_fails_per_ep=2,
         stop_loss=True,
         est_cost_s=95.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/nether.py", "code/tests/test_nether.py"),
+        editable_files=("code/mcagent/skills/nether.py", "code/mcagent/skills/nether_portal.py",
+                        "code/mcagent/skills/nether_mining.py", "code/mcagent/skills/nether_site.py",
+                        "code/tests/test_nether.py"),
+    ),
+    GoalSpec(
+        id="enchant_item",
+        title="附魔师（附魔一件物品）",
+        tier="T1",
+        score=30,
+        skill="enchant_item",
+        prereq_goals=("prep_wood",),
+        prereq_items=("lapis_lazuli>=1",),
+        done_advancements=("minecraft:story/enchant_item",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=("code/mcagent/skills/enchant.py", "code/tests/test_enchant.py"),
+    ),
+    GoalSpec(
+        id="use_lodestone",
+        title="天涯共此石（指南针绑定磁石）",
+        tier="T1",
+        score=15,
+        skill="attune_lodestone",
+        prereq_goals=("prep_wood",),
+        prereq_items=("compass>=1",),
+        done_advancements=("minecraft:adventure/use_lodestone",),
+        gather_fallbacks=(("compass>=1", "craft_iron_gear", (("item", "compass"),)),),
+        budget_s=320.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=("code/mcagent/skills/lodestone.py", "code/tests/test_lodestone.py"),
+    ),
+    GoalSpec(
+        id="bullseye",
+        title="正中靶心（远距离命中标靶中心）",
+        tier="T1",
+        score=15,
+        skill="hit_bullseye",
+        prereq_goals=("shoot_arrow",),
+        done_advancements=("minecraft:adventure/bullseye",),
+        gather_when_blocked=True,
+        gather_fallbacks=(_ARROW_STOCK,),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=135.0,
+        stage="draft",
+        editable_files=("code/mcagent/skills/target.py", "code/tests/test_target.py"),
     ),
 )
 
@@ -565,6 +661,10 @@ def eval_item_expr(state: State, expr: str) -> tuple[bool, int, int, str]:
         )
         cur = 1 if ready else 0
         label = "木镐所需原木/木板"
+    elif lhs.startswith("@stick_stock:"):
+        target = int(lhs.split(":", 1)[1])
+        cur = int(state.count("stick") >= target or can_afford_gear(state, "stick"))
+        label = f"已持 {target} 木棍或可继续制作"
     elif lhs.startswith("@gear_ready:"):
         gear_item = lhs.split(":", 1)[1].strip()
         cur = 1 if can_afford_gear(state, gear_item, assume_no_table=assume_no_tbl) else 0

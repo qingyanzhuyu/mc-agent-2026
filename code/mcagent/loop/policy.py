@@ -1,46 +1,37 @@
-"""规划层：按当前真实背包与环境状态派生下一技能（规则队列默认 + 可选 LLM 菜单选择）。
+"""规划层入口：`PlanDecision`、`RulePlanner`（性价比排序与战术展开器）与薄分派 `CampaignPlanner`。
 
-关键边界（评审修订 #1 & #2）：
-1. 重生后处于哪个科技阶段由本模块从 `State` 实时推导，不放在主循环/Supervisor 中硬记；
-   无论服务端 `keepInventory` 开或关，背包一刷新即自动衔接正确阶段。
-2. 仅保留两种模式：`campaign`（正式比赛跑法）与 `focus`（单技能定向回归）。
-3. 默认纯规则队列（零模型开销）；开启 `--llm` 时记录模型延迟与非法输出并自动兜底回规则队列。
+战略编排与异步预取已拆分至 `strategy.py` 与 `strategy_async.py`；`CampaignPlanner.select()` 按 `mode` 与 `strategy` 分派。
 """
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass, replace
 import math
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Collection, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
 
 from ..planner import skill_choice
-from ..planner.llm import LLMClient, LLMError
+from ..planner.llm import LLMClient
+from ..planner.objective import Objective
+from ..planner.scheduler import DecisionScheduler
 from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills.items import best_pickaxe
 from ..skills.world_memo import format_memo_summary
+from .context import DecisionContext, ObjectiveRecord
 from .goals import (
-    DEFAULT_CAMPAIGN_STAGES,
-    GOALS,
-    OFFICIAL_CAMPAIGN_STAGES,
-    STONE_OR_BETTER_PICKS,
-    GoalSpec,
-    check_item_expr,
-    diagnose_goal_gap,
-    is_goal_achieved,
-    is_goal_stopped_out,
-    is_prereq_satisfied,
-    normalize_goal_ids,
-    rank_actionable_goals,
-    resolve_active_goals,
+    DEFAULT_CAMPAIGN_STAGES, GOALS, OFFICIAL_CAMPAIGN_STAGES, STONE_OR_BETTER_PICKS, GoalSpec,
+    check_item_expr, diagnose_goal_gap, is_goal_achieved, is_goal_stopped_out,
+    is_prereq_satisfied, normalize_goal_ids, rank_actionable_goals, resolve_active_goals,
 )
-from .starter_skills import (
-    PROTECTED_ZONES,
-    can_afford_gear,
-    total_cobble,
-    total_logs,
-    total_planks,
-)
+from .reserve import ReservationBook
+from .subgoals import item_available, tool_ready
+from .starter_skills import PROTECTED_ZONES, can_afford_gear, total_cobble, total_logs, total_planks
+
+if TYPE_CHECKING:
+    from .strategy import StrategyOrchestrator
+
+STRATEGIES: tuple[str, ...] = ("legacy", "rule", "llm")
 
 
 @dataclass
@@ -55,6 +46,22 @@ class PlanDecision:
     completion_tokens: int = 0
     environment_recovery: bool = False
     stop_episode: bool = False
+    objective: Optional[Objective] = None
+    objective_source: Optional[str] = None
+    objective_trigger: Optional[str] = None
+
+
+def _material_plan(skill: Skill, state: State):
+    plan = getattr(type(skill), "material_plan", None)
+    return plan(skill.args, state) if callable(plan) else ()
+
+
+def _supplies(goal: GoalSpec, state: State):
+    for requirement, name, args in goal.gather_fallbacks:
+        if not check_item_expr(state, requirement):
+            yield requirement, name, dict(args)
+            if not goal.gather_when_blocked:
+                return
 
 
 @dataclass
@@ -68,8 +75,7 @@ class _EnvironmentBlock:
             return _inv_fingerprint(state.inventory) if not state.inventory_dirty else None
         status = state.snapshot()
         if error.wake_on in ("day", "night"):
-            is_day = status.get("is_day")
-            return is_day if isinstance(is_day, bool) else None
+            return status.get("is_day") if isinstance(status.get("is_day"), bool) else None
         pos = status.get("pos")
         if not isinstance(pos, (list, tuple)) or len(pos) != 3:
             return None
@@ -82,19 +88,16 @@ class _EnvironmentBlock:
         if current is None or current == self.observation:
             return False
         previous, self.observation = self.observation, current
-        if self.error.wake_on in ("day", "night"):
-            return current is (self.error.wake_on == "day")
-        return previous is not None
+        return (current is (self.error.wake_on == "day")) if self.error.wake_on in ("day", "night") else (previous is not None)
 
 
 def build_state_summary(state: State, *, goal_hint: str = "") -> str:
-    """给模型的一屏状态摘要（不暴露实体 id 与可编造坐标列表，遵守 J17）。"""
+    """给技能级模型选择（兼容 `--llm`）的一屏状态摘要（遵守 J17）。战略层上下文见 `loop/context.py`。"""
     st = state.snapshot()
     pick = best_pickaxe(state) or "无"
     lines = [
         f"位置={st.get('pos')} 维度={st.get('dimension', 'overworld')} 昼夜={'白天' if st.get('is_day', True) else '夜晚'}({st.get('time_of_day')})",
-        f"血量={st.get('health', 20)} 饱食={st.get('food', 20)} "
-        f"氧气={st.get('oxygen', OXYGEN_FULL)} 安全模式={state.in_safe_mode}",
+        f"血量={st.get('health', 20)} 饱食={st.get('food', 20)} 氧气={st.get('oxygen', OXYGEN_FULL)} 安全模式={state.in_safe_mode}",
         f"最近敌对={ (st.get('nearest_hostile') or {}).get('name', '无') } 距离={ (st.get('nearest_hostile') or {}).get('dist', '-') }",
         f"物资：最优镐={pick} 原木={total_logs(state)} 木板={total_planks(state)} 木棍={state.count('stick')} "
         f"工作台={state.count('crafting_table')} 圆石={total_cobble(state)} 熔炉={state.count('furnace')} 石剑={state.count('stone_sword')}",
@@ -110,7 +113,7 @@ def build_state_summary(state: State, *, goal_hint: str = "") -> str:
 
 
 class RulePlanner:
-    """基于目标台账（`goals.py`）与当拍真实 `State` 的科技树性价比派生器。"""
+    """基于目标台账（`goals.py`）与当拍真实 `State` 的科技树性价比派生器与战术展开器。"""
 
     def __init__(
         self,
@@ -120,9 +123,11 @@ class RulePlanner:
         target_goal: Optional[str] = None,
         telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
         min_verified: str = "offline",
+        reservations: Optional[ReservationBook] = None,
     ):
         self.registry = REGISTRY if registry is None else registry
         self.min_verified = min_verified
+        self.reservations = reservations
         self.ledger: tuple[GoalSpec, ...] = tuple(ledger)
         self.ledger_map: dict[str, GoalSpec] = {g.id: g for g in self.ledger}
         default_stages = OFFICIAL_CAMPAIGN_STAGES if min_verified == "live" else DEFAULT_CAMPAIGN_STAGES
@@ -214,9 +219,125 @@ class RulePlanner:
         if cls is None or not skill_choice.meets_verification(cls, self.min_verified) or cls.blocked(state):
             return None
         inst = cls(**(args or {}))
-        if self.environment_block(inst.goal) or inst.is_cooling() or not inst.can_start(state):
+        if (self.environment_block(inst.goal) or inst.is_cooling() or not inst.can_start(state)
+                or not self._materials_ready(inst, state)):
             return None
         return inst
+
+    def _materials_ready(self, inst: Skill, state: State) -> bool:
+        return self.reservations is None or self.reservations.can_reserve_plan(
+            state, f"candidate:{inst.goal}", _material_plan(inst, state),
+        )
+
+    def _diagnose_skill(self, name: str, args: Optional[dict], state: State) -> tuple[Optional[Skill], str, bool]:
+        """检查单个技能在当拍是否可启动，返回 `(实例或 None, 失败原因, 是否仅因冷却受阻)`。"""
+        cls = self.registry.get(name)
+        if cls is None:
+            return None, f"技能 {name!r} 未在 REGISTRY 注册", False
+        if not skill_choice.meets_verification(cls, self.min_verified):
+            return None, f"技能 {name} 验证等级为 {cls.verified}，低于要求 {self.min_verified}", False
+        blk = cls.blocked(state)
+        if blk:
+            return None, f"技能 {name} 前置受阻（{blk}）", False
+        bound, arg_errs = bind_args(cls, args or {})
+        if arg_errs:
+            return None, f"技能 {name} 参数非法（{' | '.join(arg_errs)}）", False
+        inst = cls(**bound)
+        env_blk = self.environment_block(inst.goal)
+        if env_blk is not None:
+            return None, f"技能目标 {inst.goal} 被环境挂起（{env_blk}）", False
+        if not inst.can_start(state):
+            return None, f"技能 {name}({bound}) 当前不可启动（can_start=False）", False
+        if inst.is_cooling():
+            return None, f"技能 {name}（{inst.goal}）处于失败冷却期", True
+        if not self._materials_ready(inst, state):
+            return None, f"技能 {name} 的物资被预留、数量不足或库存待刷新", False
+        return inst, "", False
+
+    def expand_objective_skill(self, state: State) -> tuple[Optional[Skill], str]:
+        """针对 `target_goal` 展开下一个可启动技能；无法展开时返回 `(None, 明确原因)`。"""
+        self._last_selected_goal_id = None
+        ranked = self._rank(state)
+        if not ranked:
+            if self.target_goal:
+                blocked = self.blocked_targets(state, self.target_goal, refresh=False)
+                if blocked:
+                    first_err = next(iter(blocked.values()))
+                    return None, f"目标链被环境挂起（{first_err}，唤醒={first_err.wake_on}）"
+                for g in self.active_goals:
+                    if not is_goal_achieved(g, state, self.completed_advancements) and is_goal_stopped_out(
+                        g, self.ep_goal_fails, self.ep_goal_elapsed
+                    ):
+                        return None, f"目标链节点 {g.id} 已触及本轮失败或时间止损上限"
+                return None, f"目标 {self.target_goal} 已达成或无未完成步骤"
+            return None, "当前台账无未完成目标"
+
+        reasons: list[str] = []
+        cooling_step_id: Optional[str] = None
+        for step in ranked:
+            g = step.step_goal
+            ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
+            if ready:
+                inst, why_not, cooling_only = self._diagnose_skill(g.skill, g.args_dict, state)
+                if inst is not None:
+                    self._last_selected_goal_id = g.id
+                    return inst, f"推进目标 {g.id}（{g.title}）"
+                reasons.append(f"{g.id}: {why_not}")
+                if cooling_only and cooling_step_id is None:
+                    cooling_step_id = g.id
+            if not ready or g.gather_when_blocked:
+                matched_fb = False
+                for req_expr, fb_skill, fb_args in _supplies(g, state):
+                    matched_fb = True
+                    inst, why_not, cooling_only = self._diagnose_skill(fb_skill, fb_args, state)
+                    if inst is not None:
+                        self._last_selected_goal_id = g.id
+                        return inst, f"为目标 {g.id} 补齐前置材料（{req_expr}）"
+                    reasons.append(f"{g.id}({req_expr}): {why_not}")
+                    if cooling_only and cooling_step_id is None:
+                        cooling_step_id = g.id
+                if not ready and not matched_fb:
+                    unmet = [expr for expr in g.prereq_items if not check_item_expr(state, expr)]
+                    reasons.append(f"{g.id}: 缺少前置物资 {unmet} 且无补料技能")
+
+        if cooling_step_id is not None:
+            sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
+            sc = self._try_make("scout_island", {"radius": sc_radius}, state)
+            if sc is not None:
+                return sc, f"目标 {cooling_step_id} 当前位置受阻或冷却，外迁探索"
+
+        return None, "；".join(reasons[:3]) or f"目标 {ranked[0].step_goal.id} 无可启动技能"
+
+    def choose_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
+        """在一切目标之上的生存补给与 `safe_mode` 避险处理（命中即返回，否则返回 None）。"""
+        hp = float(state.st.get("health", 20))
+        food = float(state.st.get("food", 20))
+
+        if food <= 14 or (hp < 18 and food < 20):
+            eat = self._try_make("eat_food", {}, state)
+            if eat is not None:
+                return PlanDecision(eat, "rule", f"生存补给 hp={hp} food={food}")
+
+        if state.in_safe_mode:
+            for item in ("stone_sword", "stone_pickaxe", "wooden_pickaxe"):
+                if state.count(item) < 1 and can_afford_gear(state, item, assume_no_table=True):
+                    c = self._try_make("craft_gear", {"item": item}, state)
+                    if c is not None:
+                        return PlanDecision(c, "rule", f"safe_mode 期间原地合成 {item}")
+            return PlanDecision(None, "idle", f"safe_mode 避险驻留中（剩 {state.safe_mode_remaining:.0f}s）")
+        return None
+
+    def choose_for_objective(self, state: State) -> PlanDecision:
+        """战术层入口：先处理生存补给与 `safe_mode`，再针对 `target_goal` 展开下一技能。"""
+        self._last_selected_goal_id = None
+        urgent = self.choose_survival_or_safe_mode(state)
+        if urgent is not None:
+            return urgent
+        self.refresh_environment_blocks(state)
+        inst, reason = self.expand_objective_skill(state)
+        if inst is not None:
+            return PlanDecision(inst, "rule", reason)
+        return PlanDecision(None, "idle", reason)
 
     def _rank(self, state: State):
         suspended = {g.id for g in self.active_goals if self._environment_blocks and self._block_for_goal(g, state)}
@@ -232,7 +353,7 @@ class RulePlanner:
         )
 
     def current_goal_hint(self, state: State) -> str:
-        """返回当前最高性价比目标步的一行指引与缺口诊断（无待办目标时返回空串）。"""
+        """返回当前最高性价比目标步的一行指引与缺口诊断（仅供旧 `--llm` 技能级模式兼容使用）。"""
         ranked = self._rank(state)
         if not ranked:
             return ""
@@ -291,23 +412,9 @@ class RulePlanner:
 
     def choose(self, state: State) -> PlanDecision:
         self._last_selected_goal_id = None
-        hp = float(state.st.get("health", 20))
-        food = float(state.st.get("food", 20))
-
-        # 1) 生存优先：饥饿或掉血时优先进食
-        if food <= 14 or (hp < 18 and food < 20):
-            eat = self._try_make("eat_food", {}, state)
-            if eat is not None:
-                return PlanDecision(eat, "rule", f"生存补给 hp={hp} food={food}")
-
-        # 2) safe_mode 锁存期不主动发起高风险远征，只允许进食或原地轻度合成
-        if state.in_safe_mode:
-            for item in ("stone_sword", "stone_pickaxe", "wooden_pickaxe"):
-                if state.count(item) < 1 and can_afford_gear(state, item, assume_no_table=True):
-                    c = self._try_make("craft_gear", {"item": item}, state)
-                    if c is not None:
-                        return PlanDecision(c, "rule", f"safe_mode 期间原地合成 {item}")
-            return PlanDecision(None, "idle", f"safe_mode 避险驻留中（剩 {state.safe_mode_remaining:.0f}s）")
+        urgent = self.choose_survival_or_safe_mode(state)
+        if urgent is not None:
+            return urgent
 
         # 3) 目标台账解析与按性价比顺序派发
         self.refresh_environment_blocks(state)
@@ -315,20 +422,18 @@ class RulePlanner:
         if ranked:
             for step in ranked:
                 g = step.step_goal
-                if all(check_item_expr(state, expr) for expr in g.prereq_items):
+                ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
+                if ready:
                     inst = self._try_make(g.skill, g.args_dict, state)
                     if inst is not None:
                         self._last_selected_goal_id = g.id
                         return PlanDecision(inst, "rule", f"推进目标 {g.id}（{g.title}）")
-                else:
-                    # 仅尝试首个未满足前置表达式对应的补料技能（避免缺圆石且采石冷却时盲目去砍树）
-                    for req_expr, fb_skill, fb_args in g.gather_fallbacks:
-                        if not check_item_expr(state, req_expr):
-                            inst = self._try_make(fb_skill, dict(fb_args), state)
-                            if inst is not None:
-                                self._last_selected_goal_id = g.id
-                                return PlanDecision(inst, "rule", f"为目标 {g.id} 补齐前置材料（{req_expr}）")
-                            break
+                if not ready or g.gather_when_blocked:
+                    for req_expr, fb_skill, fb_args in _supplies(g, state):
+                        inst = self._try_make(fb_skill, fb_args, state)
+                        if inst is not None:
+                            self._last_selected_goal_id = g.id
+                            return PlanDecision(inst, "rule", f"为目标 {g.id} 补齐前置材料（{req_expr}）")
 
             sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
             sc = self._try_make("scout_island", {"radius": sc_radius}, state)
@@ -368,242 +473,155 @@ class RulePlanner:
 
 
 class CampaignPlanner:
-    """统一规划入口：支持 `campaign`（默认规则 / `--llm` 混合）与 `focus` 两种模式。"""
+    """薄规划分派器：对外保持 `select()` 等接口不变，按 `strategy` 分派 `legacy` 或委托 `StrategyOrchestrator`。"""
 
     def __init__(
-        self,
-        *,
-        mode: str = "campaign",
-        focus_skill: Optional[str] = None,
-        focus_args: Optional[dict] = None,
-        use_llm: bool = False,
-        llm: Optional[LLMClient] = None,
-        min_verified: str = "offline",
-        registry: Optional[dict[str, type[Skill]]] = None,
+        self, *, mode: str = "campaign", strategy: str = "rule", focus_skill: Optional[str] = None,
+        focus_args: Optional[dict] = None, use_llm: bool = False, llm: Optional[LLMClient] = None,
+        min_verified: str = "offline", registry: Optional[dict[str, type[Skill]]] = None,
         on_llm_telemetry: Optional[Callable[[dict], None]] = None,
-        target_goal: Optional[str] = None,
-        ledger: tuple[GoalSpec, ...] = GOALS,
-        telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        on_objective_telemetry: Optional[Callable[[dict], None]] = None,
+        target_goal: Optional[str] = None, ledger: tuple[GoalSpec, ...] = GOALS,
+        include_stages: Optional[Collection[str]] = None, telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        review_interval_s: Optional[float] = None, require_iron: Optional[bool] = None, max_seconds: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
+        subgoal_provider: Optional[Callable[[State], Optional[Mapping[str, Any]]]] = None,
+        reserve_provider: Optional[Callable[[State], Any]] = None,
     ):
+        from .strategy import DEFAULT_STRATEGY_REVIEW_S, StrategyOrchestrator, env_bool, env_float
+
         if mode not in ("campaign", "focus"):
             raise ValueError(f"mode 只能是 'campaign' 或 'focus'；收到 {mode!r}")
+        if strategy not in STRATEGIES:
+            raise ValueError(f"strategy 只能是 {STRATEGIES} 之一；收到 {strategy!r}")
         if mode == "focus" and not focus_skill:
             raise ValueError("focus 模式必须指定 focus_skill")
-        self.mode = mode
-        self.focus_skill = focus_skill
-        self.focus_args = dict(focus_args or {})
-        self.use_llm = use_llm
-        self.llm = llm or (LLMClient() if use_llm else None)
-        self.min_verified = min_verified
+
+        self.mode, self.strategy = mode, strategy
+        self.use_llm = use_llm and strategy != "legacy"
+        self.focus_skill, self.focus_args = focus_skill, dict(focus_args or {})
+        self.llm = llm or (LLMClient() if (self.use_llm or strategy == "llm") else None)
+        self.min_verified, self.target_goal = min_verified, target_goal
         self.registry = REGISTRY if registry is None else registry
-        self.target_goal = target_goal
+        self.reservations = ReservationBook()
+        self._active_material_consumer: Optional[str] = None
         self.rules = RulePlanner(
-            self.registry,
-            ledger=ledger,
-            target_goal=target_goal,
-            telemetry=telemetry,
-            min_verified=min_verified,
+            self.registry, ledger=ledger, include_stages=include_stages,
+            target_goal=target_goal, telemetry=telemetry, min_verified=min_verified,
+            reservations=self.reservations,
         )
-        self.on_llm_telemetry = on_llm_telemetry
+        self.on_llm_telemetry, self.on_objective_telemetry = on_llm_telemetry, on_objective_telemetry
+        self.review_interval_s = (
+            env_float("MC_STRATEGY_REVIEW_S", DEFAULT_STRATEGY_REVIEW_S) if review_interval_s is None else max(0.0, float(review_interval_s))
+        )
+        self.require_iron = env_bool("MC_STRATEGY_REQUIRE_IRON", False) if require_iron is None else bool(require_iron)
+        self.max_seconds, self._clock = max(0.0, float(max_seconds)), clock
+        self._started_mono = self._clock()
+        self.subgoal_provider = self._subgoal_snapshot if subgoal_provider is None else subgoal_provider
+        self.reserve_provider = self._reservation_snapshot if reserve_provider is None else reserve_provider
         self._last_selected_goal_id: Optional[str] = None
+        self._strategy: StrategyOrchestrator = StrategyOrchestrator(self, clock=self._clock)
+
+    @property
+    def scheduler(self) -> Optional[DecisionScheduler]: return self._strategy.scheduler
+    @property
+    def current_objective(self) -> Optional[Objective]: return self._strategy.current_objective
+    @current_objective.setter
+    def current_objective(self, obj: Optional[Objective]) -> None: self._strategy.current_objective = obj
+    @property
+    def recent_objectives(self) -> deque[ObjectiveRecord]: return self._strategy.recent_objectives
+
+    def set_objective(self, obj: Optional[Objective], *, now: Optional[float] = None) -> None:
+        self._strategy.set_objective(obj, now=now)
+
+    def rule_objective(self, state: State, *, exclude_goals: Collection[str] = (), now: Optional[float] = None) -> Optional[Objective]:
+        return self._strategy.rule_objective(state, exclude_goals=exclude_goals, now=now)
+
+    def build_context(self, state: State, **kwargs: Any) -> DecisionContext:
+        return self._strategy.build_context(state, **kwargs)
+
+    def _subgoal_snapshot(self, state: State) -> dict[str, Any]:
+        return {
+            "item_available": {
+                item: item_available(state, item, count, allocatable=self.reservations.available(state, item))
+                for item, count in (("iron_ingot", 3), ("diamond", 4), ("wheat_seeds", 3))
+            },
+            "tool_ready": {tier: tool_ready(state, "pickaxe", tier, 1) for tier in ("iron", "diamond")},
+            **dict.fromkeys(("station_ready", "landmark_reachable", "safe_encounter", "active_portal"), "待现场观察"),
+        }
+
+    def _reservation_snapshot(self, state: State) -> dict[str, Any]:
+        return {
+            "有效": self.reservations.observe(state) and not state.inventory_dirty,
+            "账项": [f"{r.item}×{r.count}({r.mode})" for r in self.reservations.entries],
+        }
+
+    def release_skill_materials(self) -> None:
+        if self._active_material_consumer is not None:
+            self.reservations.release(self._active_material_consumer)
+            self._active_material_consumer = None
 
     def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
+        self.release_skill_materials()
         self.rules.record_environment_block(skill, error, state)
         self._last_selected_goal_id = None
 
     def blocked_targets(self, state: State, target_goals: Any, *, refresh: bool = True) -> dict[str, EnvBlocked]:
         return self.rules.blocked_targets(state, target_goals, refresh=refresh)
 
-    def record_skill_outcome(
-        self,
-        skill_name: str,
-        *,
-        ok: bool,
-        elapsed_s: float = 0.0,
-        completed_advs: Collection[str] = (),
-    ) -> None:
+    def record_skill_outcome(self, skill_name: str, *, ok: bool, elapsed_s: float = 0.0, completed_advs: Collection[str] = ()) -> None:
+        self.release_skill_materials()
         if self._last_selected_goal_id and self.rules._last_selected_goal_id is None:
             self.rules._last_selected_goal_id = self._last_selected_goal_id
-        self.rules.record_skill_outcome(
-            skill_name,
-            ok=ok,
-            elapsed_s=elapsed_s,
-            completed_advs=completed_advs,
-        )
+        self.rules.record_skill_outcome(skill_name, ok=ok, elapsed_s=elapsed_s, completed_advs=completed_advs)
+        if self.strategy != "legacy":
+            self._strategy.on_skill_outcome(skill_name, ok=ok, elapsed_s=elapsed_s)
         self._last_selected_goal_id = None
 
-    def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
-        if self.mode == "focus":
-            assert self.focus_skill is not None
-            self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
-            if state.in_safe_mode:
-                return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
-            self.rules.refresh_environment_blocks(state)
-            cls = self.registry.get(self.focus_skill)
-            if cls is not None and not skill_choice.meets_verification(cls, self.min_verified):
-                return PlanDecision(None, "idle", f"focus 技能 {self.focus_skill} 需要 verified={self.min_verified}，当前为 {cls.verified}")
-            skill = make(self.focus_skill, self.focus_args, registry=self.registry)
-            environment = self.rules.environment_block(skill.goal)
-            if environment is not None:
-                return PlanDecision(None, "idle", f"focus 技能环境挂起: {environment}")
-            reason = type(skill).blocked(state)
-            if reason:
-                return PlanDecision(None, "idle", f"focus 技能前置未满足: {reason}")
-            if skill.is_cooling():
-                return PlanDecision(None, "idle", f"focus 目标 {skill.goal} 冷却中")
-            if not skill.can_start(state):
-                return PlanDecision(None, "idle", f"focus 技能参数 {self.focus_args} 当前不可启动")
-            return PlanDecision(skill, "focus", f"定向验收 {skill}")
+    def _select_legacy_skill_llm(self, state: State, recent_failures: list[str]) -> PlanDecision:
+        from .strategy_async import select_legacy_skill_llm
+        return select_legacy_skill_llm(self, state, recent_failures)
 
-        if not self.use_llm or self.llm is None or state.in_safe_mode:
-            dec = self.rules.choose(state)
-            self._last_selected_goal_id = self.rules._last_selected_goal_id
-            return dec
+    def _select_focus(self, state: State) -> PlanDecision:
+        assert self.focus_skill is not None
+        self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
+        if state.in_safe_mode:
+            return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
         self.rules.refresh_environment_blocks(state)
-        if self.rules.targets_exhausted(state):
-            self._last_selected_goal_id = None
-            return PlanDecision(
-                None,
-                "idle",
-                f"聚焦目标 {self.target_goal} 已触及本轮止损，结束无效循环",
-                stop_episode=True,
-            )
-        ready_registry = {
-            name: cls for name, cls in self.registry.items()
-            if self.rules.environment_block(cls.goal) is None
-        }
-        if self.target_goal:
-            ranked = self.rules._rank(state)
-            if ranked:
-                top_g = ranked[0].step_goal
-                explicit_target_skills = {
-                    self.rules.ledger_map[gid].skill
-                    for gid in normalize_goal_ids(self.target_goal)
-                    if gid in self.rules.ledger_map
-                }
-                wants_wood = (
-                    "gather_wood" in explicit_target_skills
-                    or top_g.skill == "gather_wood"
-                    or any(
-                        fb_s == "gather_wood" and not check_item_expr(state, expr)
-                        for expr, fb_s, _ in top_g.gather_fallbacks
-                    )
-                )
-                wants_stone = (
-                    "mine_stone" in explicit_target_skills
-                    or top_g.skill == "mine_stone"
-                    or any(
-                        fb_s == "mine_stone" and not check_item_expr(state, expr)
-                        for expr, fb_s, _ in top_g.gather_fallbacks
-                    )
-                )
-                saturated_skills: list[str] = []
-                if not wants_wood and (total_logs(state) * 4 + total_planks(state)) >= 64:
-                    saturated_skills.append("gather_wood")
-                if not wants_stone and total_cobble(state) >= 48:
-                    saturated_skills.append("mine_stone")
-                for skill_name in saturated_skills:
-                    if skill_name in ready_registry:
-                        candidate_registry = {
-                            name: cls for name, cls in ready_registry.items()
-                            if name != skill_name
-                        }
-                        if skill_choice.has_ready_skill(state, candidate_registry, self.min_verified):
-                            ready_registry = candidate_registry
-        if not skill_choice.has_ready_skill(state, ready_registry, self.min_verified):
+        cls = self.registry.get(self.focus_skill)
+        if cls is not None and not skill_choice.meets_verification(cls, self.min_verified):
+            return PlanDecision(None, "idle", f"focus 技能 {self.focus_skill} 需要 verified={self.min_verified}，当前为 {cls.verified}")
+        skill = make(self.focus_skill, self.focus_args, registry=self.registry)
+        if (environment := self.rules.environment_block(skill.goal)) is not None:
+            return PlanDecision(None, "idle", f"focus 技能环境挂起: {environment}")
+        if reason := type(skill).blocked(state):
+            return PlanDecision(None, "idle", f"focus 技能前置未满足: {reason}")
+        if skill.is_cooling():
+            return PlanDecision(None, "idle", f"focus 目标 {skill.goal} 冷却中")
+        if not skill.can_start(state):
+            return PlanDecision(None, "idle", f"focus 技能参数 {self.focus_args} 当前不可启动")
+        return PlanDecision(skill, "focus", f"定向验收 {skill}")
+
+    def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
+        self.release_skill_materials()
+        if not self.reservations.observe(state) and not state.inventory_dirty:
+            self.reservations.reset(state)
+        choice = self._select_skill(state, recent_failures)
+        if choice.skill is None or not (plan := _material_plan(choice.skill, state)):
+            return choice
+        consumer = f"{self._last_selected_goal_id or 'skill'}:{choice.skill.goal}"
+        if not self.reservations.reserve_plan(state, consumer, plan):
+            return replace(choice, skill=None, source="idle", reason="技能所需物资不足、已被预留或库存待刷新")
+        self._active_material_consumer = consumer
+        return choice
+
+    def _select_skill(self, state: State, recent_failures: list[str]) -> PlanDecision:
+        if self.mode == "focus":
+            return self._select_focus(state)
+        if self.strategy == "legacy":
             dec = self.rules.choose(state)
             self._last_selected_goal_id = self.rules._last_selected_goal_id
             return dec
-
-        goal_hint = self.rules.current_goal_hint(state)
-        summary = build_state_summary(state, goal_hint=goal_hint)
-        fail_str = "\n".join(f"- {x}" for x in recent_failures[-5:])
-        t0 = time.monotonic()
-        errors: list[str] = []
-        used = 0
-        chosen: Optional[Skill] = None
-        usage: dict[str, int] = {}
-        try:
-            chosen, errors, used = skill_choice.choose(
-                self.llm,
-                summary,
-                state,
-                recent_failures=fail_str,
-                registry=ready_registry,
-                min_verified=self.min_verified,
-                attempts=2,
-                thinking=False,
-                total_timeout=state.config.model_timeout_s * 2,
-                usage_out=usage,
-            )
-        except LLMError as e:
-            errors = [f"LLMError: {e}"]
-            used = max(1, used)
-        if chosen is not None and self.rules.environment_block(chosen.goal):
-            errors.append(f"{chosen.goal} 环境条件尚未变化")
-            chosen = None
-        dt_ms = round((time.monotonic() - t0) * 1000.0, 1)
-        prompt_tok = int(usage.get("prompt_tokens", 0))
-        comp_tok = int(usage.get("completion_tokens", 0))
-        total_tok = int(usage.get("total_tokens", prompt_tok + comp_tok))
-        cum_prompt = int(usage.get("cumulative_prompt_tokens", self.llm.stats.get("prompt_tokens", 0)))
-        cum_comp = int(usage.get("cumulative_completion_tokens", self.llm.stats.get("completion_tokens", 0)))
-        cum_total = int(usage.get("cumulative_total_tokens", cum_prompt + cum_comp))
-
-        if self.on_llm_telemetry is not None:
-            self.on_llm_telemetry({
-                "ms": dt_ms,
-                "ok": chosen is not None,
-                "skill": chosen.name if chosen else None,
-                "args": chosen.args if chosen else None,
-                "attempts": used,
-                "errors": list(errors),
-                "prompt_tokens": prompt_tok,
-                "completion_tokens": comp_tok,
-                "total_tokens": total_tok,
-                "cumulative_prompt_tokens": cum_prompt,
-                "cumulative_completion_tokens": cum_comp,
-                "cumulative_total_tokens": cum_total,
-            })
-
-        if chosen is not None:
-            matched_gid: Optional[str] = None
-            ranked = self.rules._rank(state)
-            for step in ranked:
-                g = step.step_goal
-                if g.skill == chosen.name and (not g.args_dict or g.args_dict == chosen.args):
-                    matched_gid = g.id
-                    break
-                if any(fb_s == chosen.name for _, fb_s, _ in g.gather_fallbacks):
-                    matched_gid = g.id
-                    break
-            if matched_gid is None:
-                for g in self.rules.active_goals:
-                    if g.skill == chosen.name and not is_goal_achieved(g, state, self.rules.completed_advancements):
-                        matched_gid = g.id
-                        break
-            self._last_selected_goal_id = matched_gid
-            self.rules._last_selected_goal_id = matched_gid
-            return PlanDecision(
-                chosen, "llm", f"LLM 选择 {chosen}",
-                dt_ms, used, tuple(errors), prompt_tok, comp_tok,
-                environment_recovery=(
-                    chosen.name == "scout_island" and not ranked
-                    and bool(self.rules.blocked_targets(state, self.target_goal, refresh=False))
-                ),
-            )
-
-        fallback = self.rules.choose(state)
-        self._last_selected_goal_id = self.rules._last_selected_goal_id
-        return PlanDecision(
-            fallback.skill,
-            "llm_fallback_rule" if fallback.skill else "idle",
-            f"LLM 未产出合法选择（{'; '.join(errors[:2])}）-> 规则兜底: {fallback.reason}",
-            dt_ms,
-            used,
-            tuple(errors),
-            prompt_tok,
-            comp_tok,
-            environment_recovery=fallback.environment_recovery,
-            stop_episode=fallback.stop_episode,
-        )
+        if self.strategy == "rule" and self.use_llm:
+            return self._select_legacy_skill_llm(state, recent_failures)
+        return self._strategy.select(state, recent_failures)

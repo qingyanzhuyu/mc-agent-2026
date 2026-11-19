@@ -479,7 +479,15 @@ class WoodStoneSaturationMenuTests(unittest.TestCase):
 
         # 2) gather_fallbacks 中仍有未满足表达需要 gather_wood / mine_stone 时也保留
         fb_ledger = (
-            replace(GOAL_MAP["iron_tools"], prereq_goals=(), stage="graduated"),
+            replace(
+                GOAL_MAP["iron_tools"],
+                prereq_goals=(),
+                stage="graduated",
+                gather_fallbacks=(
+                    ("iron_ingot>=3", "smelt_iron", (("count", 3),)),
+                    ("stick>=2", "gather_wood", (("count", 1),)),
+                ),
+            ),
         )
         fb_reg = {
             "craft_iron_gear": _CraftIronGearStub,

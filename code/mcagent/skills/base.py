@@ -104,11 +104,13 @@ def rec(op: str, result: Any = None, **fields: Any) -> dict:
 
 def failure(e: BaseException) -> tuple[str, dict]:
     """从 Replan/ApiError 链上取回服务端错误码与附加信息，用来生成"最近失败原因"。"""
-    if isinstance(e, ApiError):
-        return e.code, dict(e.extra)
-    cause = e.__cause__
-    if isinstance(cause, ApiError):
-        return cause.code, dict(cause.extra)
+    seen: set[int] = set()
+    cur: Optional[BaseException] = e
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ApiError):
+            return cur.code, dict(cur.extra)
+        cur = cur.__cause__
     return type(e).__name__.lower(), {}
 
 
