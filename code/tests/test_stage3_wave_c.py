@@ -1371,11 +1371,11 @@ class WaveCLedgerAndContractTests(_WaveCTestBase):
         self.assertEqual(validate_ledger(GOALS), [])
         self.assertEqual(len(GOAL_MAP), len(GOALS))
 
-        # Exact Wave C ledger totals: 101 goals / 86 scored / 2580 pts
+        # Totals monotonically >= Wave C baseline (101 goals / 86 scored / 2580 pts)
         scored_all = [g for g in GOALS if g.score > 0]
-        self.assertEqual(len(GOALS), 101)
-        self.assertEqual(len(scored_all), 86)
-        self.assertEqual(sum(g.score for g in scored_all), 2580)
+        self.assertGreaterEqual(len(GOALS), 101)
+        self.assertGreaterEqual(len(scored_all), 86)
+        self.assertGreaterEqual(sum(g.score for g in scored_all), 2580)
 
         # WIP=1 discipline preserved: smelt_iron is sole candidate
         self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])

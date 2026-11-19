@@ -132,6 +132,10 @@ _T4_OMINOUS_EDITABLE: tuple[str, ...] = (
     "code/mcagent/skills/t4_ominous_combat.py",
     "code/tests/test_stage3_wave_c.py",
 )
+_T4_STRIDER_TRIDENT_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_strider_and_trident.py",
+    "code/tests/test_stage3_wave_d.py",
+)
 _FISHING_STOCK = ("string>=2", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2)))
 _ARROW_STOCK = ("arrow|spectral_arrow|tipped_arrow>=1", "hunt_mob",
                 (("target", "skeleton"), ("drop", "arrow"), ("count", 1)))
@@ -1811,6 +1815,54 @@ GOALS: tuple[GoalSpec, ...] = (
         stage="draft",
         editable_files=_T4_OMINOUS_EDITABLE,
     ),
+
+    # ---- Stage 3 (Wave D, T4)：炽足兽跨维度骑行与三叉戟机会投掷（3 项计分，+150 分，全部 stage="draft"） ----
+    GoalSpec(
+        id="ride_strider",
+        title="这船真长腿（骑乘炽足兽并用诡异菌钓竿加速）",
+        tier="T4",
+        score=30,
+        skill="ride_strider_boost",
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/ride_strider",),
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
+    ),
+    GoalSpec(
+        id="ride_strider_in_overworld_lava",
+        title="感觉像在家一样（在主世界岩浆骑炽足兽直线 50 格）",
+        tier="T4",
+        score=60,
+        skill="ride_strider_overworld",
+        prereq_goals=("ride_strider",),
+        done_advancements=("minecraft:nether/ride_strider_in_overworld_lava",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
+    ),
+    GoalSpec(
+        id="throw_trident",
+        title="抖包袱（被动机会持有三叉戟时投掷命中）",
+        tier="T4",
+        score=60,
+        skill="throw_opportunistic_trident",
+        prereq_goals=(),  # 被动机会钩子：持有三叉戟（试炼宝库/溺尸掉落）即解锁，无三叉戟时由 prereq_items 与 skill.blocked() 双重拦截
+        prereq_items=("trident>=1",),
+        done_advancements=("minecraft:adventure/throw_trident",),
+        budget_s=120.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=30.0,
+        stage="draft",
+        editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
+    ),
 )
 
 GOAL_MAP: dict[str, GoalSpec] = {g.id: g for g in GOALS}
@@ -2132,6 +2184,14 @@ def rank_actionable_goals(
     node_downstream_score: dict[str, int] = {}
     for g in active_goals:
         if is_goal_achieved(g, state, completed_advs):
+            continue
+        if (
+            g.id not in target_ids
+            and not g.prereq_goals
+            and g.prereq_items
+            and not g.gather_fallbacks
+            and not all(check_item_expr(state, expr) for expr in g.prereq_items)
+        ):
             continue
         chain = _unmet_chain(g)
         if not chain:
