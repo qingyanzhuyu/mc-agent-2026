@@ -1,6 +1,9 @@
 """夜间复用或建造安全床位并验证睡眠。"""
 from __future__ import annotations
 
+from dataclasses import dataclass
+import math
+
 from ..runtime import EnvBlocked, Replan
 from .base import Skill, failure, rec
 from .field import collect_drops, place_block, scan_blocks, scan_entities
@@ -17,7 +20,23 @@ from .survival import (
 
 
 _BEDS = tuple(item for item in RECIPES if item.endswith("_bed"))
-_WOOLS = tuple(item.removesuffix("_bed") + "_wool" for item in _BEDS)
+_COLORS = tuple(item.removesuffix("_bed") for item in _BEDS)
+_WOOLS = tuple(f"{color}_wool" for color in _COLORS)
+_DYE_SOURCES: dict[str, tuple[tuple[str, int], ...]] = {
+    "white_dye": (("bone_meal", 1), ("lily_of_the_valley", 1)),
+    "blue_dye": (("lapis_lazuli", 1), ("cornflower", 1)),
+    "black_dye": (("ink_sac", 1), ("wither_rose", 1)),
+    "brown_dye": (("cocoa_beans", 1),),
+    "yellow_dye": (("dandelion", 1), ("sunflower", 2)),
+    "red_dye": (("poppy", 1), ("red_tulip", 1), ("beetroot", 1), ("rose_bush", 2)),
+    "orange_dye": (("orange_tulip", 1), ("open_eyeblossom", 1), ("torchflower", 1)),
+    "magenta_dye": (("allium", 1), ("lilac", 2)),
+    "light_blue_dye": (("blue_orchid", 1),),
+    "pink_dye": (("pink_tulip", 1), ("pink_petals", 1), ("peony", 2), ("cactus_flower", 1)),
+    "gray_dye": (("closed_eyeblossom", 1),),
+    "light_gray_dye": (("azure_bluet", 1), ("oxeye_daisy", 1), ("white_tulip", 1)),
+    "cyan_dye": (("pitcher_plant", 2),),
+}
 _BED_RADIUS = 12
 _EARLY_NIGHT_START = 12542
 _NIGHT_END = 23459
@@ -76,6 +95,111 @@ def _sheared_bed(state, wool):
     if wool is None:
         return _wool_bed(state)
     return wool.removesuffix("_wool") + "_bed" if state.count(wool) >= 3 else None
+
+
+@dataclass(frozen=True)
+class _WoolDyePlan:
+    """混色羊毛染色凑床方案。"""
+
+    color: str
+    target_wool: str
+    target_bed: str
+    dye_item: str
+    dyes_needed: int
+    direct_dyes: int
+    dye_source_crafts: tuple[tuple[str, int], ...]
+    reserved_items: tuple[tuple[str, int, str], ...]
+
+
+def plan_wool_dyeing(state) -> _WoolDyePlan | None:
+    """当持有至少 3 块混色羊毛时，规划消耗染料与原材料的最小染色方案。"""
+    if _wool_bed(state) is not None:
+        return None
+    wool_counts = {w: state.count(w) for w in _WOOLS if state.count(w) > 0}
+    if sum(wool_counts.values()) < 3:
+        return None
+
+    best_key: tuple[int, int, int, int] | None = None
+    best_plan: _WoolDyePlan | None = None
+    for idx, c in enumerate(_COLORS):
+        target_wool = f"{c}_wool"
+        dye_item = f"{c}_dye"
+        owned_target = state.count(target_wool)
+        dyes_needed = 3 - owned_target
+        direct = min(dyes_needed, state.count(dye_item))
+        shortfall = dyes_needed - direct
+        source_crafts: list[tuple[str, int]] = []
+        if shortfall > 0:
+            for src_item, yield_qty in _DYE_SOURCES.get(dye_item, ()):
+                avail = state.count(src_item)
+                if avail <= 0:
+                    continue
+                batches = min(avail, math.ceil(shortfall / yield_qty))
+                if batches > 0:
+                    source_crafts.append((src_item, batches))
+                    shortfall = max(0, shortfall - batches * yield_qty)
+                if shortfall == 0:
+                    break
+        if shortfall > 0:
+            continue
+
+        reserved: list[tuple[str, int, str]] = []
+        if owned_target > 0:
+            reserved.append((target_wool, owned_target, "consume"))
+        donor_left = dyes_needed
+        for wool, qty in wool_counts.items():
+            if wool == target_wool:
+                continue
+            take = min(donor_left, qty)
+            if take > 0:
+                reserved.append((wool, take, "consume"))
+                donor_left -= take
+            if donor_left == 0:
+                break
+        if direct > 0:
+            reserved.append((dye_item, direct, "consume"))
+        for src_item, batches in source_crafts:
+            reserved.append((src_item, batches, "consume"))
+
+        rank = (dyes_needed, len(source_crafts), sum(b for _, b in source_crafts), idx)
+        if best_key is None or rank < best_key:
+            best_key = rank
+            best_plan = _WoolDyePlan(
+                color=c,
+                target_wool=target_wool,
+                target_bed=f"{c}_bed",
+                dye_item=dye_item,
+                dyes_needed=dyes_needed,
+                direct_dyes=direct,
+                dye_source_crafts=tuple(source_crafts),
+                reserved_items=tuple(reserved),
+            )
+    return best_plan
+
+
+def _craft_until(ex, state, item: str, target_qty: int, max_steps: int, fail_label: str):
+    """逐次手搓合成直到持有量达到 target_qty，严格遵守 1 阻塞动作 = 1 yield。"""
+    for _ in range(max_steps):
+        if state.count(item) >= target_qty:
+            break
+        before = state.count(item)
+        receipt = ex.craft(item, 1)
+        yield rec("craft", receipt, item=item, count=1)
+        _fresh_inventory(ex, state)
+        if state.count(item) <= before:
+            raise Replan(f"{fail_label} {item} 后背包未确认增加")
+
+
+def _dye_mixed_wool_for_bed(ex, state):
+    """按最优染色方案补齐染料并将混色羊毛逐一染成同色，返回目标床名。"""
+    plan = plan_wool_dyeing(state)
+    if plan is None:
+        return None
+    yield from _craft_until(ex, state, plan.dye_item, plan.dyes_needed, plan.dyes_needed, "合成染料")
+    yield from _craft_until(ex, state, plan.target_wool, 3, plan.dyes_needed, "染色羊毛")
+    if state.count(plan.target_wool) < 3:
+        raise Replan(f"染色后仍未凑齐 3 块 {plan.target_wool}")
+    return plan.target_bed
 
 
 def _bed_half_supported(ex, pos):
@@ -215,6 +339,8 @@ class SleepInBed(Skill):
             return ()
         if bed := _wool_bed(state):
             return ((bed.removesuffix("_bed") + "_wool", 3, "consume"), *planks)
+        if dye_plan := plan_wool_dyeing(state):
+            return (*dye_plan.reserved_items, *planks)
         if state.count("shears"):
             wool = _partial_wool(state)
             held_wool = ((wool, state.count(wool), "consume"),) if wool else ()
@@ -238,6 +364,8 @@ class SleepInBed(Skill):
                 if not _plank_plan(state, 3):
                     raise Replan("自制床缺 3 块木板，请补料或寻找可复用床")
                 bed = _wool_bed(state)
+                if bed is None and plan_wool_dyeing(state) is not None:
+                    bed = yield from _dye_mixed_wool_for_bed(ex, state)
                 if bed is None and state.count("shears"):
                     bed = yield from _shear_for_wool(ex, state, _partial_wool(state))
                 if bed is None:

@@ -17,6 +17,8 @@ from typing import Callable, Optional
 from ..client import FATAL, ApiError, Client
 from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
 from ..skills.base import Skill, failure
+from ..skills.items import bare
+from ..skills.world_memo import STRUCTURE_FINGERPRINTS, memo_for, structure_tags_for
 from .auditor import SoakObserver
 from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
 from .policy import CampaignPlanner, PlanDecision
@@ -44,10 +46,60 @@ class LoopConfig:
     async_observe_for_llm: bool = True
     checkpoint_path: Optional[str] = None
     failure_cooldown_cap_s: Optional[float] = None
+    enable_roadside_scan: bool = True
+    roadside_scan_interval_s: float = 30.0
+    roadside_scan_radius: int = 16
 
 
 # 会话级错误：交给 `_recover_session_or_respawn` 处理，而不是按瞬时故障退避
 SESSION_CODES: frozenset[str] = frozenset({"dead", "not_connected", "wrong_server", "death_loop_cooldown"})
+
+# 沿途低频增量扫描：按维度分组的结构指纹标签与高价值机会实体白名单
+_ROADSIDE_DIM_STRUCTURES: dict[str, tuple[str, ...]] = {
+    "overworld": (
+        "village", "stronghold", "ruined_portal", "bee_nest", "trial_chambers",
+        "deep_dark", "archaeology", "powder_snow", "lush_caves",
+        "amethyst_geode", "pale_garden", "pillager_outpost",
+    ),
+    "the_nether": (
+        "nether_fortress", "bastion_remnant", "ruined_portal", "dried_ghast",
+    ),
+    "the_end": (
+        "end_city",
+    ),
+}
+_ROADSIDE_OPPORTUNITY_ENTITIES: tuple[str, ...] = (
+    "wandering_trader",
+    "zombie_villager",
+    "villager",
+    "allay",
+    "axolotl",
+    "goat",
+    "tadpole",
+    "armadillo",
+    "shulker",
+    "parrot",
+    "ghast",
+)
+_ROADSIDE_OPPORTUNITY_ENTITY_SET: frozenset[str] = frozenset(_ROADSIDE_OPPORTUNITY_ENTITIES)
+
+
+def _roadside_structure_blocks(dimension: str) -> list[str]:
+    dim = bare(dimension).strip().lower() or "overworld"
+    if "nether" in dim:
+        bucket = "the_nether"
+    elif "end" in dim:
+        bucket = "the_end"
+    else:
+        bucket = "overworld"
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for tag in _ROADSIDE_DIM_STRUCTURES.get(bucket, ()):
+        for bname in STRUCTURE_FINGERPRINTS.get(tag, ()):
+            if bname not in seen:
+                seen.add(bname)
+                blocks.append(bname)
+    return blocks
 
 
 @dataclass
@@ -104,6 +156,7 @@ class MainLoop:
         self.failure_escalations: list[str] = []
         self._relocated_cells: set[tuple[str, int, int]] = set()
         self._checkpoint_achieved_goals: set[str] = set()
+        self._last_roadside_scan_at: float = float(self._clock())
 
     def _do_sleep(self, seconds: float) -> None:
         if self._custom_sleep is not None:
@@ -178,6 +231,113 @@ class MainLoop:
                 newly_achieved = True
         if force or newly_achieved:
             self._save_checkpoint_if_configured()
+
+    def _maybe_roadside_scan(self, force: bool = False) -> list[str]:
+        """技能完成边界的低频节流沿途增量扫描：探测附近结构指纹与高价值机会实体并记入台账。"""
+        if not self.config.enable_roadside_scan:
+            return []
+        if not self.state.ready or self._is_dead_now():
+            return []
+        now = float(self._clock())
+        interval_s = max(0.0, float(self.config.roadside_scan_interval_s))
+        if not force and (now - self._last_roadside_scan_at) < interval_s:
+            return []
+        self._last_roadside_scan_at = now
+
+        dim = str(self.state.st.get("dimension") or "overworld")
+        radius = max(1, int(self.config.roadside_scan_radius))
+        memo = memo_for(self.state)
+        newly_recorded: list[str] = []
+
+        find_blocks = getattr(self.client, "find_blocks", None)
+        if callable(find_blocks):
+            block_types = _roadside_structure_blocks(dim)
+            if block_types:
+                resp = None
+                try:
+                    resp = find_blocks(types=block_types, radius=radius, limit=16)
+                except ApiError as e:
+                    if e.kind == FATAL:
+                        raise
+                except Exception:
+                    resp = None
+                if isinstance(resp, dict):
+                    payload = (
+                        resp.get("result")
+                        if "blocks" not in resp and isinstance(resp.get("result"), dict)
+                        else resp
+                    )
+                    blocks = payload.get("blocks")
+                    rows: list[tuple[object, object]] = []
+                    if isinstance(blocks, list):
+                        for item in blocks:
+                            if isinstance(item, dict):
+                                rows.append((item.get("name"), item.get("pos")))
+                    elif isinstance(blocks, dict):
+                        for bname, info in blocks.items():
+                            if isinstance(info, dict):
+                                rows.append((
+                                    bname,
+                                    info.get("nearest") if info.get("nearest") is not None else info.get("pos"),
+                                ))
+                    for raw_name, raw_pos in rows:
+                        bname = bare(raw_name).strip().lower() if raw_name else ""
+                        if not bname or raw_pos is None:
+                            continue
+                        for tag in structure_tags_for((bname,)):
+                            try:
+                                if memo.record_landmark(
+                                    tag, raw_pos, dimension=dim,
+                                    meta={"block": bname, "source": "roadside_scan"},
+                                ):
+                                    newly_recorded.append(tag)
+                            except Exception:
+                                continue
+
+        get_entities = getattr(self.client, "get_entities", None)
+        if callable(get_entities):
+            resp = None
+            try:
+                resp = get_entities(radius=radius, types=list(_ROADSIDE_OPPORTUNITY_ENTITIES))
+            except ApiError as e:
+                if e.kind == FATAL:
+                    raise
+            except Exception:
+                resp = None
+            if isinstance(resp, dict):
+                payload = (
+                    resp.get("result")
+                    if "entities" not in resp and isinstance(resp.get("result"), dict)
+                    else resp
+                )
+                entities = payload.get("entities")
+                if isinstance(entities, list):
+                    for ent in entities:
+                        if not isinstance(ent, dict):
+                            continue
+                        pos = ent.get("pos")
+                        if pos is None:
+                            continue
+                        name = bare(ent.get("name")).strip().lower() if ent.get("name") else ""
+                        etype = bare(ent.get("type")).strip().lower() if ent.get("type") else ""
+                        kind = (
+                            name if name in _ROADSIDE_OPPORTUNITY_ENTITY_SET
+                            else (etype if etype in _ROADSIDE_OPPORTUNITY_ENTITY_SET else "")
+                        )
+                        if not kind:
+                            continue
+                        try:
+                            if memo.record_landmark(
+                                kind, pos, dimension=dim,
+                                meta={"entity": kind, "source": "roadside_scan"},
+                            ):
+                                newly_recorded.append(kind)
+                        except Exception:
+                            continue
+
+        if newly_recorded:
+            self.log(f"[loop] 沿途增量扫描发现新地标: {', '.join(newly_recorded)}")
+        return newly_recorded
 
     def _acknowledge_safety_intent(self, *, completed: bool) -> None:
         raw = getattr(self.state, "safety_intent", None)
@@ -855,6 +1015,8 @@ class MainLoop:
                     if target_reached and self.config.stop_on_goal:
                         stop_reason = "goal_reached"
                         goal_reached_now = True
+                    if not goal_reached_now:
+                        self._maybe_roadside_scan()
 
                 if goal_reached_now:
                     break

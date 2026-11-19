@@ -76,10 +76,15 @@ class WorldMemoModuleContractTests(unittest.TestCase):
         tags = structure_tags_for([
             "minecraft:hay_block", "bell", "stone_bricks", "crying_obsidian",
             "bee_nest", "trial_spawner", "sculk_catalyst", "suspicious_sand", "powder_snow",
+            "nether_bricks", "nether_wart", "gilded_blackstone", "purpur_block",
+            "moss_block", "amethyst_block", "creaking_heart", "white_banner", "dried_ghast",
         ])
         self.assertEqual(set(tags), set(STRUCTURE_FINGERPRINTS))
+        self.assertEqual(len(STRUCTURE_FINGERPRINTS), 16)
         self.assertEqual(tags["village"], ["hay_block", "bell"])
         self.assertEqual(tags["ruined_portal"], ["crying_obsidian"])
+        self.assertEqual(tags["nether_fortress"], ["nether_bricks", "nether_wart"])
+        self.assertEqual(tags["bastion_remnant"], ["gilded_blackstone"])
 
 
 class WorldMemoIngestAndQueryTests(unittest.TestCase):
