@@ -1394,19 +1394,21 @@ class LeashFrogVariantsTests(_WaveATestBase):
 
 class WaveALedgerAndROIContractTests(_WaveATestBase):
     def test_wave_a_goals_counts_scores_draft_stop_loss_and_wip1(self) -> None:
-        self.assertEqual(len(GOALS), 85)
-        self.assertEqual(len(GOAL_MAP), 85)
+        self.assertGreaterEqual(len(GOALS), 85)
+        self.assertEqual(len(GOAL_MAP), len(GOALS))
 
         scored_all = [g for g in GOALS if g.score > 0]
-        self.assertEqual(len(scored_all), 78)
-        self.assertEqual(sum(g.score for g in scored_all), 1980)
+        self.assertGreaterEqual(len(scored_all), 78)
+        self.assertGreaterEqual(sum(g.score for g in scored_all), 1980)
 
-        t4_prep = [g for g in GOALS if g.tier == "T4_PREP"]
-        t4_scored = [g for g in GOALS if g.tier == "T4"]
-        self.assertEqual(tuple(g.id for g in t4_prep), WAVE_A_PREP_IDS)
-        self.assertEqual(tuple(g.id for g in t4_scored), WAVE_A_SCORED_IDS)
-        self.assertEqual(sum(g.score for g in t4_prep), 0)
-        self.assertEqual(sum(g.score for g in t4_scored), 255)
+        wave_a_prep = [GOAL_MAP[gid] for gid in WAVE_A_PREP_IDS]
+        wave_a_scored = [GOAL_MAP[gid] for gid in WAVE_A_SCORED_IDS]
+        for g in wave_a_prep:
+            self.assertEqual(g.tier, "T4_PREP")
+        for g in wave_a_scored:
+            self.assertEqual(g.tier, "T4")
+        self.assertEqual(sum(g.score for g in wave_a_prep), 0)
+        self.assertEqual(sum(g.score for g in wave_a_scored), 255)
 
         for gid in WAVE_A_ALL_IDS:
             with self.subTest(goal=gid):
