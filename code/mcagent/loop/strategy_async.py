@@ -138,6 +138,15 @@ def dispatch_async_skill_fallback(orch: "StrategyOrchestrator", state: State, re
     p = orch.planner
     if orch.scheduler is None or p.llm is None:
         return False
+    # 防止无目标/战术全阻时高频狂烧 Token：遵守最小间隔并在连续无效选择时指数退避（20s->40s->80s->160s->240s）
+    now = orch.clock()
+    last_fb = getattr(orch, "_last_skill_fallback_at", None)
+    fb_fails = int(getattr(orch, "_skill_fallback_fails", 0))
+    if last_fb is not None:
+        base_iv = max(20.0, float(state.config.model_min_interval_s))
+        cooldown = min(240.0, base_iv * (2 ** min(fb_fails, 4)))
+        if (now - float(last_fb)) < cooldown:
+            return False
     ready_registry = {
         name: cls for name, cls in p.registry.items()
         if p.rules.environment_block(cls.goal) is None
@@ -175,13 +184,16 @@ def dispatch_async_skill_fallback(orch: "StrategyOrchestrator", state: State, re
             "usage": usage,
         }
 
-    return orch.scheduler.notify(
+    dispatched = orch.scheduler.notify(
         "uncovered",
         summary,
         iron_complete=orch.is_iron_complete(state),
         meta={"kind": "skill_fallback", "trigger": "no_tactical_skill"},
         ask_override=_worker_skill,
     )
+    if dispatched:
+        setattr(orch, "_last_skill_fallback_at", now)
+    return dispatched
 
 
 def poll_async_scheduler(orch: "StrategyOrchestrator", state: State, now: float) -> Optional["PlanDecision"]:
@@ -283,12 +295,16 @@ def poll_async_scheduler(orch: "StrategyOrchestrator", state: State, now: float)
                 "cumulative_total_tokens": cum_p + cum_c,
             })
         if chosen_skill is not None:
+            setattr(orch, "_skill_fallback_fails", 0)
             return PlanDecision(
                 chosen_skill, "llm", f"战术层无技能，LLM 兜底选择 {chosen_skill}",
                 dt_ms, int(payload.get("attempts") or 1), tuple(errs), p_tok, c_tok,
                 objective=orch.current_objective,
                 objective_source=orch.current_objective.source if orch.current_objective else None,
             )
+        setattr(orch, "_skill_fallback_fails", int(getattr(orch, "_skill_fallback_fails", 0)) + 1)
+    elif kind == "skill_fallback":
+        setattr(orch, "_skill_fallback_fails", int(getattr(orch, "_skill_fallback_fails", 0)) + 1)
     return None
 
 

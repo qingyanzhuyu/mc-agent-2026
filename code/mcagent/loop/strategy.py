@@ -356,13 +356,26 @@ class StrategyOrchestrator:
             if (expanded2 := self._try_expand_current(state, fired_trigger)) is not None:
                 return expanded2
 
+        base_dec = p.rules.choose(state)
+        p._last_selected_goal_id = p.rules._last_selected_goal_id
+        if base_dec.skill is not None or base_dec.stop_episode:
+            return PlanDecision(
+                base_dec.skill, base_dec.source, base_dec.reason,
+                environment_recovery=base_dec.environment_recovery,
+                stop_episode=base_dec.stop_episode,
+                objective=self.current_objective,
+                objective_source=self.current_objective.source if self.current_objective else None,
+                objective_trigger=fired_trigger,
+                cooldown_blocked=base_dec.cooldown_blocked,
+                blocked_goal_id=base_dec.blocked_goal_id,
+                safety_escape=base_dec.safety_escape,
+            )
+
         if fallback_skill_decision is not None:
             return fallback_skill_decision
         if p.strategy == "llm":
             dispatch_async_skill_fallback(self, state, recent_failures)
 
-        base_dec = p.rules.choose(state)
-        p._last_selected_goal_id = p.rules._last_selected_goal_id
         return PlanDecision(
             base_dec.skill, base_dec.source, base_dec.reason,
             environment_recovery=base_dec.environment_recovery,

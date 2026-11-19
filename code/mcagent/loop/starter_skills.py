@@ -574,8 +574,8 @@ class ScoutIsland(Skill):
         _record_scout_landmarks(memo, summary, hits, cur, dim)
 
         # 若角色刚在探矿阶梯井底受阻，先分段沿阶梯退回井口地表再外迁。
-        if MINE_TRAILS and math.dist(cur, MINE_TRAILS[-1][-1]) <= 5.0 and MINE_TRAILS[-1][0][1] > cur[1] + 2.0:
-            trail = MINE_TRAILS.pop()
+        if MINE_TRAILS and math.dist(cur, MINE_TRAILS[-1][-1]) <= 16.0 and MINE_TRAILS[-1][0][1] > cur[1] + 2.0:
+            trail = MINE_TRAILS[-1]
             indices = list(range(len(trail) - 1, -1, -10)) + ([0] if (len(trail) - 1) % 10 != 0 else [])
             for idx in indices:
                 if idx == len(trail) - 1:
@@ -591,6 +591,8 @@ class ScoutIsland(Skill):
                     break
                 yield rec("move_to", moved_up, pos=wp, fingerprints=hits)
             st, cur = _refresh_stance(ex, state)
+            if cur[1] >= trail[0][1] - 1.5 and MINE_TRAILS and MINE_TRAILS[-1] is trail:
+                MINE_TRAILS.pop()
 
         target_wood, cur_wood_dist = None, 0.0
         if total_logs(state) == 0:
@@ -644,8 +646,100 @@ class ScoutIsland(Skill):
             VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
             return True
 
+        def _try_underground_surface_escape() -> Generator[dict, None, bool]:
+            """身处地下矿坑且近场石壁全无两格净空时，优先回已知地表站点/草地，否则安全向上挖阶梯脱困。"""
+            nonlocal st, cur
+            # 1) 优先尝试回到已知地表工作站或高处草地
+            surface_targets: list[list[float]] = []
+            station_cells: list[tuple[int, int, int]] = []
+            if hasattr(memo, "stations"):
+                station_cells.extend(memo.stations(dimension=dim))
+            for kt in KNOWN_TABLES:
+                station_cells.append((math.floor(kt[0]), math.floor(kt[1]), math.floor(kt[2])))
+            seen_st: set[tuple[int, int, int]] = set()
+            for sc in station_cells:
+                if sc in seen_st or sc[1] <= cur[1] + 1.5 or _is_protected(sc):
+                    continue
+                seen_st.add(sc)
+                if eye_to_block_dist(st, sc) <= 48.0:
+                    surface_targets.append([sc[0] + 0.5, float(sc[1]), sc[2] + 0.5])
+            try:
+                grass = ex.client.find_blocks(types=["grass_block", "sand"], radius=min(max(r, 32), 48), limit=30)
+                for gb in (grass.get("blocks") or []):
+                    gp = gb.get("pos")
+                    if isinstance(gp, list) and len(gp) == 3 and gp[1] > cur[1] + 1.5 and not _is_protected(gp, radius=8.0):
+                        surface_targets.append([gp[0] + 0.5, float(gp[1] + 1), gp[2] + 0.5])
+            except ApiError:
+                pass
+            surface_targets.sort(key=lambda t: (abs(t[1] - cur[1]) > 24.0, math.hypot(t[0] - cur[0], t[2] - cur[2])))
+            for dest in surface_targets[:4]:
+                try:
+                    moved_s = _bounded_move_to(ex, dest, rng=2, timeout=30.0)
+                except Replan as e:
+                    if failure(e)[0] not in NAV_FAIL_CODES:
+                        raise
+                    yield rec("move_to", pos=dest, fingerprints=hits, error_code=failure(e)[0])
+                    st, cur = _refresh_stance(ex, state)
+                    continue
+                yield rec("move_to", moved_s, pos=dest, fingerprints=hits)
+                st, cur = _refresh_stance(ex, state)
+                VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
+                return True
+
+            # 2) 若周边全封死在地下且背包有镐，安全向上开 1~2 级 1x2 阶梯脱出矿井
+            pick = best_pickaxe(state)
+            if not pick or cur[1] >= 62.0:
+                return False
+            vc = _voxel_cache(state)
+            unsafe = {"water", "lava", "flowing_water", "flowing_lava", "bedrock", "crafting_table"}
+            falling = {"sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava"}
+            climbed = False
+            for _step in range(2):
+                ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
+                chosen_dir = None
+                for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, nz = ix + dx, iz + dz
+                    floor_n = bare(_get_block(ex, vc, [nx, fy, nz], dim).get("name", ""))
+                    if not floor_n or floor_n in AIR or floor_n in unsafe:
+                        continue
+                    roof_n = bare(_get_block(ex, vc, [nx, fy + 3, nz], dim).get("name", ""))
+                    head_n = bare(_get_block(ex, vc, [ix, fy + 2, iz], dim).get("name", ""))
+                    s1_n = bare(_get_block(ex, vc, [nx, fy + 1, nz], dim).get("name", ""))
+                    s2_n = bare(_get_block(ex, vc, [nx, fy + 2, nz], dim).get("name", ""))
+                    if roof_n in falling or any(bn in unsafe for bn in (head_n, s1_n, s2_n)):
+                        continue
+                    chosen_dir = (nx, fy, nz)
+                    break
+                if chosen_dir is None:
+                    break
+                nx, fy, nz = chosen_dir
+                if bare((state.st.get("held") or {}).get("name")) != pick:
+                    yield rec("equip", ex.equip(pick, "hand"), item=pick)
+                    st, cur = _refresh_stance(ex, state)
+                for dig_pos in ([ix, fy + 2, iz], [nx, fy + 1, nz], [nx, fy + 2, nz]):
+                    bn = bare(_get_block(ex, vc, dig_pos, dim).get("name", ""))
+                    if bn and bn not in AIR:
+                        yield from nav.dig_with_recovery(ex, state, dig_pos, collect=False)
+                        vc and vc.invalidate(dig_pos, dimension=dim)
+                up_dest = [nx + 0.5, float(fy + 1), nz + 0.5]
+                try:
+                    moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
+                except Replan as e:
+                    if failure(e)[0] not in NAV_FAIL_CODES:
+                        raise
+                    yield rec("move_to", pos=up_dest, fingerprints=hits, error_code=failure(e)[0])
+                    break
+                yield rec("move_to", moved_u, pos=up_dest, fingerprints=hits)
+                st, cur = _refresh_stance(ex, state)
+                climbed = True
+            if climbed:
+                VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
+            return climbed
+
         if not cands and not climb_cands:
             if (yield from _try_water_escape()):
+                return
+            if (yield from _try_underground_surface_escape()):
                 return
             if (yield from _recover_with_guard(list(target_wood.pos) if target_wood is not None else None)):
                 return
@@ -694,6 +788,8 @@ class ScoutIsland(Skill):
             return
 
         if (yield from _try_water_escape()):
+            return
+        if attempts == 0 and (yield from _try_underground_surface_escape()):
             return
         if not attempted_recovery:
             fallback_dest = cands[0][4] if cands else (list(target_wood.pos) if target_wood is not None else None)
@@ -932,20 +1028,60 @@ class CraftGear(Skill):
 
         nearby_resp = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5)
         memo.ingest_find_blocks(nearby_resp, dimension=dim, origin=st, category="station")
-        valid_tables = [
-            {"name": bare(b.get("name") or "crafting_table"), "pos": b["pos"], "from_memo": False}
-            for b in (nearby_resp.get("blocks") or [])
-            if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
-            and not _is_protected(b["pos"]) and not memo.is_blocked(b["pos"], dimension=dim, category="station")
-        ]
+        valid_tables: list[dict] = []
+        seen_table_cells: set[tuple[int, int, int]] = set()
+
+        def _add_table_cand(pos_raw, *, from_memo: bool) -> None:
+            if not _is_valid_pos3(pos_raw) or _is_protected(pos_raw):
+                return
+            if memo.is_blocked(pos_raw, dimension=dim, category="station"):
+                return
+            cell = (math.floor(pos_raw[0]), math.floor(pos_raw[1]), math.floor(pos_raw[2]))
+            if cell in seen_table_cells:
+                return
+            if eye_to_block_dist(st, pos_raw) > 64.0:
+                return
+            seen_table_cells.add(cell)
+            valid_tables.append({"name": "crafting_table", "pos": [cell[0], cell[1], cell[2]], "from_memo": from_memo})
+
+        for b in (nearby_resp.get("blocks") or []):
+            if isinstance(b.get("pos"), list) and len(b["pos"]) == 3 and not memo.is_blocked(b["pos"], dimension=dim, category="station"):
+                _add_table_cand(b["pos"], from_memo=False)
+        for e in memo.query("station", dimension=dim, origin=st):
+            if e.block == "crafting_table" and e.status in ("untested", "reachable"):
+                _add_table_cand(e.pos, from_memo=True)
+        if hasattr(memo, "stations"):
+            for spos in memo.stations("crafting_table", dimension=dim):
+                _add_table_cand(spos, from_memo=True)
+        for kpos in KNOWN_TABLES:
+            _add_table_cand(kpos, from_memo=True)
         valid_tables.sort(key=lambda b: eye_to_block_dist(st, b["pos"]))
-        if not valid_tables:
-            valid_tables = [
-                {"name": e.block, "pos": list(e.pos), "from_memo": True}
-                for e in memo.query("station", dimension=dim, origin=st)
-                if e.block == "crafting_table" and e.status in ("untested", "reachable")
-                and eye_to_block_dist(st, e.pos) <= 48.0 and not _is_protected(e.pos)
-            ]
+
+        cur_pos_now = st.get("pos") or state.pos
+        if (
+            valid_tables
+            and MINE_TRAILS
+            and math.dist(cur_pos_now, MINE_TRAILS[-1][-1]) <= 16.0
+            and MINE_TRAILS[-1][0][1] > cur_pos_now[1] + 2.0
+            and any(tb["pos"][1] > cur_pos_now[1] + 2.0 for tb in valid_tables)
+        ):
+            trail = MINE_TRAILS[-1]
+            for idx in list(range(len(trail) - 1, -1, -10)) + ([0] if (len(trail) - 1) % 10 != 0 else []):
+                if idx == len(trail) - 1:
+                    continue
+                wp = list(trail[idx])
+                try:
+                    moved_up = _bounded_move_to(ex, wp, rng=2, timeout=30.0)
+                except Replan as e:
+                    if failure(e)[0] not in NAV_FAIL_CODES:
+                        raise
+                    yield rec("move_to", pos=wp, error_code=failure(e)[0])
+                    break
+                yield rec("move_to", moved_up, pos=wp)
+            st, cur_pos_now = _refresh_stance(ex, state)
+            if cur_pos_now[1] >= trail[0][1] - 1.5 and MINE_TRAILS and MINE_TRAILS[-1] is trail:
+                MINE_TRAILS.pop()
+
         table_ready = False
         active_table_pos: Optional[list] = None
         for tb in valid_tables:
@@ -1203,7 +1339,14 @@ class MineStone(Skill):
                                     continue
                             raise Replan("阶梯净空发生变化，停止进入并重新观察")
                         try:
-                            yield rec("move_to", _bounded_move_to(ex, [sx + 0.5, sy, sz + 0.5], rng=1, timeout=30.0), pos=[sx + 0.5, sy, sz + 0.5])
+                            step_dest = [sx + 0.5, float(sy), sz + 0.5]
+                            yield rec("move_to", _bounded_move_to(ex, step_dest, rng=1, timeout=30.0), pos=step_dest)
+                            entry_pt = (ox + 0.5, float(ofy), oz + 0.5)
+                            step_pt = (sx + 0.5, float(sy), sz + 0.5)
+                            if MINE_TRAILS and math.dist(MINE_TRAILS[-1][-1], entry_pt) <= 6.0:
+                                MINE_TRAILS[-1].append(step_pt)
+                            else:
+                                MINE_TRAILS.append([entry_pt, step_pt])
                         except Replan as e:
                             code, _ = failure(e)
                             if code not in NAV_FAIL_CODES:

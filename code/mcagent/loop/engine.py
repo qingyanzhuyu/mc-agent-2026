@@ -637,12 +637,13 @@ class MainLoop:
                                 self.log(f"[loop] 同位冷却空转 -> Tier 3 goal_abandoned: target={target_gid} abandoned={abandoned}")
                                 self._idle_spin_count = 0
                                 self._failure_tier = 0
-                                if not abandoned:
-                                    exhausted_fn = getattr(getattr(self.planner, "rules", None), "targets_exhausted", None)
-                                    if callable(exhausted_fn) and exhausted_fn(self.state):
-                                        stop_reason = "goal_stopped_out"
-                                        break
-                                continue
+                                if abandoned:
+                                    continue
+                                exhausted_fn = getattr(getattr(self.planner, "rules", None), "targets_exhausted", None)
+                                if callable(exhausted_fn) and exhausted_fn(self.state):
+                                    stop_reason = "goal_stopped_out"
+                                    break
+                                # 无目标可放弃（target=None）：落入下方空闲退避睡眠，禁止 0ms 紧循环空转
                     else:
                         self._idle_spin_count = 0
 
