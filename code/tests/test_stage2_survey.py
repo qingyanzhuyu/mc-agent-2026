@@ -523,6 +523,21 @@ class SurveyIslandSkillTests(unittest.TestCase):
             drive(skill, ex, state)
         self.assertEqual(ex.acts, [])
 
+    def test_completed_sectors_disable_can_start_to_prevent_spam_loop(self) -> None:
+        # 复现 T4-P2 local-target 缺陷：全扇区体检完成后 can_start 若仍为 True 会触发 0 步空转刷屏。
+        world = self._build_overworld_survey_world()
+        world.items["oak_log"] = 2
+        ex, state = world.session()
+        state.refresh_inventory(ex.client)
+        skill = SurveyIsland(dimension="overworld", sectors=2, radius=32)
+        self.assertTrue(skill.can_start(state))
+        drive(skill, ex, state)
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertFalse(skill.can_start(state))
+        # 扩大扇区数后仍可继续扫描剩余扇区
+        wider = SurveyIsland(dimension="overworld", sectors=4, radius=32)
+        self.assertTrue(wider.can_start(state))
+
 
 class DiscoverStructureSkillTests(unittest.TestCase):
     def setUp(self) -> None:

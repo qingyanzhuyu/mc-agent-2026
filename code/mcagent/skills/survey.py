@@ -246,7 +246,13 @@ class SurveyIsland(Skill):
         return ""
 
     def can_start(self, state) -> bool:
-        return not self.blocked(state) and _norm_dim((state.st or {}).get("dimension")) == _norm_dim(self.args["dimension"])
+        if self.blocked(state):
+            return False
+        dim = _norm_dim(self.args["dimension"])
+        if _norm_dim((state.st or {}).get("dimension")) != dim:
+            return False
+        done = memo_for(state).done_sectors(dimension=dim)
+        return any(i not in done for i in range(self.args["sectors"]))
 
     def run(self, ex, state):
         _, dim = _require_ready_dim(ex, state, self.args["dimension"])
