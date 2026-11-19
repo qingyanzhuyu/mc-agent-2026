@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor
 from ..skills.base import Skill, failure
 from .auditor import SoakObserver
 from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
-from .policy import CampaignPlanner
+from .policy import CampaignPlanner, PlanDecision
 
 
 @dataclass
@@ -41,6 +42,8 @@ class LoopConfig:
     outage_limit_s: float = 600.0      # 连续故障超过此时长才停机；0 = 永不因此停机
     continuous_observe: bool = True
     async_observe_for_llm: bool = True
+    checkpoint_path: Optional[str] = None
+    failure_cooldown_cap_s: Optional[float] = None
 
 
 # 会话级错误：交给 `_recover_session_or_respawn` 处理，而不是按瞬时故障退避
@@ -72,7 +75,7 @@ class MainLoop:
         observer: Optional[SoakObserver] = None,
         safety: Optional[Safety] = None,
         log=print,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Optional[Callable[[float], None]] = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.client = client
@@ -87,10 +90,119 @@ class MainLoop:
         self._path_failures: dict[str, int] = {}
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
-        self._sleep = sleep
+        self._custom_sleep = sleep
+        self._sleep = self._do_sleep
         self._clock = clock
         self._outage_since: Optional[float] = None
         self.transient_faults = 0
+        # 3 层同位冷却空转脱困状态机（normal -> local_retry -> relocate -> goal_abandoned）
+        self._idle_spin_count: int = 0
+        self._idle_spin_pos: Optional[tuple[float, float, float]] = None
+        self._failure_tier: int = 0
+        self._failure_tier_pos: Optional[tuple[float, float, float]] = None
+        self.failure_tier_state: str = "normal"
+        self.failure_escalations: list[str] = []
+        self._relocated_cells: set[tuple[str, int, int]] = set()
+        self._checkpoint_achieved_goals: set[str] = set()
+
+    def _do_sleep(self, seconds: float) -> None:
+        if self._custom_sleep is not None:
+            self._custom_sleep(seconds)
+        else:
+            time.sleep(seconds)
+
+    @staticmethod
+    def _pos_tuple(state: State) -> Optional[tuple[float, float, float]]:
+        pos = state.st.get("pos")
+        if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+            try:
+                vals = (float(pos[0]), float(pos[1]), float(pos[2]))
+                if all(math.isfinite(v) for v in vals):
+                    return vals
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @classmethod
+    def _cell_key(cls, state: State) -> tuple[str, int, int]:
+        pos = cls._pos_tuple(state)
+        dim = str(state.st.get("dimension") or "overworld")
+        if pos is None:
+            return dim, 0, 0
+        return dim, math.floor(pos[0] / 4.0), math.floor(pos[2] / 4.0)
+
+    def _reset_failure_tier(self, pos: Optional[tuple[float, float, float]] = None) -> None:
+        self._idle_spin_count = 0
+        self._idle_spin_pos = pos
+        self._failure_tier = 0
+        self._failure_tier_pos = pos
+        self.failure_tier_state = "normal"
+
+    def _load_checkpoint_if_configured(self) -> None:
+        path = self.config.checkpoint_path
+        if not path:
+            return
+        try:
+            from ..skills.world_memo import memo_for
+            loader = getattr(memo_for(self.state), "load_checkpoint", None)
+            if callable(loader):
+                loader(path)
+        except Exception as e:
+            self.log(f"[loop] 加载检查点失败 ({path}): {e}")
+
+    def _save_checkpoint_if_configured(self) -> None:
+        path = self.config.checkpoint_path
+        if not path:
+            return
+        try:
+            from ..skills.world_memo import memo_for
+            saver = getattr(memo_for(self.state), "save_checkpoint", None)
+            if callable(saver):
+                saver(path)
+        except Exception as e:
+            self.log(f"[loop] 保存检查点失败 ({path}): {e}")
+
+    def _maybe_save_checkpoint_on_goal_progress(self, *, force: bool = False) -> None:
+        if not self.config.checkpoint_path:
+            return
+        completed_advs = set(self._server_advancements)
+        if self.observer is not None:
+            completed_advs.update(self.observer.server_advancements)
+        if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "completed_advancements"):
+            completed_advs.update(self.planner.rules.completed_advancements)
+        active = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()
+        newly_achieved = False
+        for g in active:
+            if g.id not in self._checkpoint_achieved_goals and is_goal_achieved(g, self.state, completed_advs):
+                self._checkpoint_achieved_goals.add(g.id)
+                newly_achieved = True
+        if force or newly_achieved:
+            self._save_checkpoint_if_configured()
+
+    def _acknowledge_safety_intent(self, *, completed: bool) -> None:
+        raw = getattr(self.state, "safety_intent", None)
+        if raw is None:
+            return
+        should_clear = completed
+        if not should_clear:
+            st = self.state.snapshot()
+            kind = (
+                str(raw.get("kind") or raw.get("intent") or "").strip().lower()
+                if isinstance(raw, dict)
+                else (raw.strip().lower() if isinstance(raw, str) else "")
+            )
+            if kind in ("escape_lava", "lava") and not st.get("in_lava"):
+                should_clear = True
+            elif kind == "douse" and not st.get("on_fire") and not st.get("in_lava"):
+                should_clear = True
+            elif kind == "surface" and not st.get("in_water") and not st.get("submerged"):
+                should_clear = True
+        if should_clear:
+            setter = getattr(self.state, "set_safety_intent", None)
+            if callable(setter):
+                setter(None)
+            else:
+                self.state.safety_intent = None
 
     def _resolve_goal_spec(self, gid: str) -> Optional[GoalSpec]:
         if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "ledger_map"):
@@ -375,6 +487,7 @@ class MainLoop:
                 self.state.invalidate_inventory()  # 留给第一拍的刷新补读
                 self._note_outage(e)
             self._seen_deaths_len = len(self.state.deaths)
+            self._load_checkpoint_if_configured()
             self.log(f"[loop] 启动完成: {self.state.summary()}")
 
             if monitor is not None:
@@ -384,8 +497,10 @@ class MainLoop:
                 if self.config.target_goal:
                     self.observer.on_progress_tick(self.state, client=self.client, force=True)
 
-            if self._sync_and_check_target_goal() and self.config.stop_on_goal:
-                stop_reason = "goal_reached"
+            if self._sync_and_check_target_goal():
+                self._maybe_save_checkpoint_on_goal_progress(force=True)
+                if self.config.stop_on_goal:
+                    stop_reason = "goal_reached"
 
             while stop_reason != "goal_reached":
                 budget = self._budget_exceeded(started_mono, steps, deaths_recovered)
@@ -426,9 +541,11 @@ class MainLoop:
                         break
                     continue
 
-                if self._sync_and_check_target_goal() and self.config.stop_on_goal:
-                    stop_reason = "goal_reached"
-                    break
+                if self._sync_and_check_target_goal():
+                    self._maybe_save_checkpoint_on_goal_progress(force=True)
+                    if self.config.stop_on_goal:
+                        stop_reason = "goal_reached"
+                        break
 
                 decision = self.planner.select(self.state, list(self.recent_failures))
                 if decision.skill is None:
@@ -438,17 +555,110 @@ class MainLoop:
                         self.log(f"[loop] 单目标止损退轮: {decision.reason}")
                         stop_reason = "goal_stopped_out"
                         break
-                    if self.config.idle_sleep_s > 0:
-                        time.sleep(self.config.idle_sleep_s)
-                    if self.observer is not None:
-                        self.observer.on_progress_tick(self.state, client=self.client)
-                    # 若在单次零等待测试中无技能可跑，防止紧凑忙等
-                    if self.config.idle_sleep_s == 0:
-                        stop_reason = f"idle:{decision.reason}"
-                        break
-                    continue
+
+                    cur_pos = self._pos_tuple(self.state)
+                    is_cooldown_idle = (
+                        not self.state.in_safe_mode
+                        and (
+                            getattr(decision, "cooldown_blocked", False)
+                            or "冷却" in (decision.reason or "")
+                        )
+                    )
+                    if is_cooldown_idle:
+                        if (
+                            self._idle_spin_pos is not None
+                            and cur_pos is not None
+                            and math.dist(cur_pos, self._idle_spin_pos) < 2.0
+                        ):
+                            self._idle_spin_count += 1
+                        else:
+                            if (
+                                self._failure_tier_pos is not None
+                                and cur_pos is not None
+                                and math.dist(cur_pos, self._failure_tier_pos) >= 2.0
+                            ):
+                                self._reset_failure_tier(cur_pos)
+                            self._idle_spin_pos = cur_pos
+                            self._idle_spin_count = 1
+
+                        if self._idle_spin_count >= 2:
+                            # 连续 >=2 拍同位冷却空转：严禁继续长睡，直接按 3 层失败状态机升级
+                            blocked_gid = getattr(decision, "blocked_goal_id", None)
+                            if self._failure_tier == 0:
+                                self._failure_tier = 1
+                                self.failure_tier_state = "local_retry"
+                                self.failure_escalations.append("local_retry")
+                                self._failure_tier_pos = cur_pos
+                                clear_fn = getattr(self.planner, "clear_tactical_cooldowns", None)
+                                cleared = clear_fn(self.state, goal_id=blocked_gid, include_relocate=False) if callable(clear_fn) else []
+                                self.log(f"[loop] 同位冷却空转 -> Tier 1 local_retry: 清除战术冷却 {cleared}")
+                                self._idle_spin_count = 0
+                                continue
+                            if self._failure_tier == 1:
+                                self._failure_tier = 2
+                                self.failure_tier_state = "relocate"
+                                self.failure_escalations.append("relocate")
+                                self._failure_tier_pos = cur_pos
+                                cell = self._cell_key(self.state)
+                                reloc_skill = None
+                                if cell not in self._relocated_cells:
+                                    self._relocated_cells.add(cell)
+                                    make_reloc = getattr(self.planner, "make_relocate_skill", None)
+                                    reloc_skill = make_reloc(self.state) if callable(make_reloc) else None
+                                if reloc_skill is not None:
+                                    self.log(f"[loop] 同位冷却空转 -> Tier 2 relocate: 派发单次脱困/外迁 {reloc_skill}")
+                                    self._idle_spin_count = 0
+                                    decision = PlanDecision(
+                                        reloc_skill,
+                                        "rule",
+                                        f"同位冷却空转 Tier 2 外迁脱困: {decision.reason}",
+                                    )
+                                else:
+                                    self._failure_tier = 2
+                            if decision.skill is None and self._failure_tier >= 2:
+                                self._failure_tier = 3
+                                self.failure_tier_state = "goal_abandoned"
+                                self.failure_escalations.append("goal_abandoned")
+                                self._failure_tier_pos = cur_pos
+                                target_gid = blocked_gid
+                                if not target_gid:
+                                    cur_obj = getattr(self.planner, "current_objective", None)
+                                    if cur_obj is not None:
+                                        target_gid = cur_obj.goal_id
+                                if not target_gid and hasattr(self.planner, "rules"):
+                                    ranked = self.planner.rules._rank(self.state)
+                                    if ranked:
+                                        target_gid = ranked[0].step_goal.id
+                                abandon_fn = getattr(self.planner, "abandon_goal", None)
+                                abandoned = abandon_fn(target_gid) if (callable(abandon_fn) and target_gid) else False
+                                clear_fn = getattr(self.planner, "clear_tactical_cooldowns", None)
+                                if callable(clear_fn):
+                                    clear_fn(self.state, include_relocate=False)
+                                self.log(f"[loop] 同位冷却空转 -> Tier 3 goal_abandoned: target={target_gid} abandoned={abandoned}")
+                                self._idle_spin_count = 0
+                                self._failure_tier = 0
+                                if not abandoned:
+                                    exhausted_fn = getattr(getattr(self.planner, "rules", None), "targets_exhausted", None)
+                                    if callable(exhausted_fn) and exhausted_fn(self.state):
+                                        stop_reason = "goal_stopped_out"
+                                        break
+                                continue
+                    else:
+                        self._idle_spin_count = 0
+
+                    if decision.skill is None:
+                        if self.config.idle_sleep_s > 0:
+                            self._do_sleep(self.config.idle_sleep_s)
+                        if self.observer is not None:
+                            self.observer.on_progress_tick(self.state, client=self.client)
+                        # 若在单次零等待测试中无技能可跑，防止紧凑忙等
+                        if self.config.idle_sleep_s == 0:
+                            stop_reason = f"idle:{decision.reason}"
+                            break
+                        continue
 
                 active_skill = decision.skill
+                skill_start_pos = self._pos_tuple(self.state)
                 self.log(f"[loop] -> {active_skill} ({decision.source}: {decision.reason})")
                 if self.observer is not None:
                     self.observer.on_skill_start(active_skill, decision.source, decision.reason, self.state)
@@ -521,6 +731,8 @@ class MainLoop:
                                     is_death_err = True
                                 else:
                                     self._note_outage(refresh_err)
+                        if failed_name == "emergency_escape" or getattr(decision, "safety_escape", False):
+                            self._acknowledge_safety_intent(completed=False)
                         environment = e if isinstance(e, EnvBlocked) and not is_death_err else None
                         if environment is not None:
                             self._path_failures.pop(active_skill.goal, None)
@@ -533,8 +745,14 @@ class MainLoop:
                             else:
                                 streak = 0
                                 self._path_failures.pop(active_skill.goal, None)
+                            cap = self.config.failure_cooldown_cap_s
                             if streak >= 3:
-                                active_skill.mark_failed(cooldown_s=3 * active_skill.cooldown_s)
+                                if cap is not None:
+                                    active_skill.mark_failed(cooldown_s=min(cap, active_skill.cooldown_s * 1.5))
+                                else:
+                                    active_skill.mark_failed(cooldown_s=3 * active_skill.cooldown_s)
+                            elif cap is not None:
+                                active_skill.mark_failed(cooldown_s=min(cap, active_skill.cooldown_s))
                             else:
                                 active_skill.mark_failed()
                         if self.observer is not None:
@@ -590,6 +808,16 @@ class MainLoop:
                     except ApiError as refresh_err:
                         if refresh_err.kind == FATAL:
                             raise
+                    if finished_name == "emergency_escape" or getattr(decision, "safety_escape", False):
+                        self._acknowledge_safety_intent(completed=True)
+                    end_pos = self._pos_tuple(self.state)
+                    moved_away = bool(
+                        skill_start_pos is not None
+                        and end_pos is not None
+                        and math.dist(skill_start_pos, end_pos) >= 2.0
+                    )
+                    if moved_away or finished_name not in ("scout_island", "emergency_escape"):
+                        self._reset_failure_tier(end_pos)
                     skills_ok += 1
                     force_tick = any(
                         g.skill == finished_name and g.done_advancements
@@ -621,7 +849,9 @@ class MainLoop:
                             elapsed_s=skill_dt,
                             completed_advs=completed_advs,
                         )
-                    if self._sync_and_check_target_goal() and self.config.stop_on_goal:
+                    target_reached = self._sync_and_check_target_goal()
+                    self._maybe_save_checkpoint_on_goal_progress(force=target_reached)
+                    if target_reached and self.config.stop_on_goal:
                         stop_reason = "goal_reached"
                         goal_reached_now = True
 
@@ -634,6 +864,7 @@ class MainLoop:
             release_materials = getattr(self.planner, "release_skill_materials", None)
             if release_materials is not None:
                 release_materials()
+            self._save_checkpoint_if_configured()
             if monitor is not None:
                 monitor.close()
             if self.observer is not None:

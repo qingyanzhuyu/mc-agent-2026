@@ -108,7 +108,12 @@ def dispatch_async_objective(
         dt_ms = round(max(0.0, orch.clock() - t0) * 1000.0, 1)
         return {
             "raw_choice": (
-                {"goal_id": chosen_obj.goal_id, "budget_s": chosen_obj.budget_s, "why": chosen_obj.why}
+                {
+                    "goal_id": chosen_obj.goal_id,
+                    "budget_s": chosen_obj.budget_s,
+                    "why": chosen_obj.why,
+                    **({"route_branch": chosen_obj.route_branch} if chosen_obj.route_branch else {}),
+                }
                 if chosen_obj is not None
                 else None
             ),
@@ -297,6 +302,9 @@ def select_legacy_skill_llm(planner: "CampaignPlanner", state: State, recent_fai
         dec = planner.rules.choose(state)
         planner._last_selected_goal_id = planner.rules._last_selected_goal_id
         return dec
+    if (urgent := planner.rules.choose_survival_or_safe_mode(state)) is not None:
+        planner._last_selected_goal_id = None
+        return urgent
     planner.rules.refresh_environment_blocks(state)
     if planner.rules.targets_exhausted(state):
         planner._last_selected_goal_id = None

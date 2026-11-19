@@ -45,6 +45,21 @@ PKG_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_ROOT = PKG_DIR / "logs"
 
 
+class _ExplicitStrategyAction(argparse.Action):
+    """记录用户是否显式传入了 `--strategy`，以支持 `--llm` 未指定策略时默认收敛为 `llm`。"""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_strategy_explicit", True)
+
+
+def resolve_cli_strategy(args: argparse.Namespace) -> str:
+    """当 `--llm` 显式开启且未指定 `--strategy` 时，默认走目标级异步战略 `llm`。"""
+    if getattr(args, "llm", False) and not getattr(args, "_strategy_explicit", False):
+        return "llm"
+    return str(getattr(args, "strategy", "rule"))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Minecraft Agent 统一比赛主循环与持续异常取证运行器")
     p.add_argument("--mode", choices=("campaign", "focus"), default="campaign", help="campaign=比赛跑法, focus=单技能定向验收")
@@ -54,13 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="聚焦推进并验收目标台账中的 goal_id；多个用逗号分隔表示同一轮一起追（如 smelt_iron,kill_a_mob）")
     p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
     p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
-    p.add_argument("--strategy", choices=("legacy", "rule", "llm"), default="rule",
-                   help="战略层目标选择实现：rule=性价比排序（默认），llm=事件驱动异步模型选目标，legacy=直调当前 RulePlanner.choose")
+    p.add_argument("--strategy", choices=("legacy", "rule", "llm"), default="rule", action=_ExplicitStrategyAction,
+                   help="战略层目标选择实现：默认 rule；若带 --llm 且未显式指定则自动收敛为 llm，显式 --strategy rule --llm 保留兼容")
+    p.set_defaults(_strategy_explicit=False)
     p.add_argument("--strategy-review-s", type=float, default=None,
                    help="战略层例行复核目标的间隔秒数（默认 600s，可由 MC_STRATEGY_REVIEW_S 覆盖）")
     p.add_argument("--require-iron", action="store_true", default=None,
                    help="铁器（smelt_iron）达成前不调用战略层模型（默认关闭）")
-    p.add_argument("--llm", action="store_true", help="开启 rule 的技能级 LLM 菜单选择（legacy 直接走规则，llm 战略自带异步兜底）")
+    p.add_argument("--llm", action="store_true", help="开启 LLM 战略目标选择（未显式指定 --strategy 时默认走 llm；显式 --strategy rule --llm 保留旧菜单）")
+    p.add_argument("--checkpoint", default=None, help="可选世界资源记忆检查点 JSON 路径（默认不落盘）")
+    p.add_argument("--failure-cooldown-cap", type=float, default=8.0,
+                   help="失败冷却上限秒数（默认 8.0s 防止长睡锁死；0 表示不额外封顶）")
     p.add_argument("--soak", action="store_true", help="挂载 SoakObserver（落盘 timeline/http_tape/progress_curve/异常包）")
     p.add_argument("--run-dir", type=Path, default=None, help="指定运行日志目录（默认 mcagent/logs/soak-YYYYmmdd-HHMMSS）")
     p.add_argument("--baseline", type=Path, default=None, help="对比上一版运行目录的 progress_curve.jsonl")
@@ -150,8 +169,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg.password = cfg.password or "localdev"
         cfg.token_file = None  # 临时测试 bot 不污染默认 .token.json
 
+    effective_strategy = resolve_cli_strategy(args)
+
     if args.dry:
-        return _run_dry(cfg, min_verified=args.min_verified or "offline", strategy=args.strategy)
+        return _run_dry(cfg, min_verified=args.min_verified or "offline", strategy=effective_strategy)
 
     official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS
     if official and not args.live:
@@ -164,9 +185,9 @@ def main(argv: list[str] | None = None) -> int:
         print("缺少 MC_USER / MC_PASS（见 mcagent/.env.example 或传 --user）", file=sys.stderr)
         return 2
 
-    use_llm = args.llm and args.strategy != "legacy"
+    use_llm = args.llm and effective_strategy != "legacy"
     llm_meta: dict = {}
-    if use_llm or args.strategy == "llm":
+    if use_llm or effective_strategy == "llm":
         try:
             prof = resolve_profile()
         except ValueError as e:
@@ -226,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             target_goal=args.goal,
             run_meta={
                 "mode": args.mode,
-                "strategy": args.strategy,
+                "strategy": effective_strategy,
                 "skill": args.skill,
                 "target_goal": args.goal,
                 "stop_on_goal": stop_on_goal,
@@ -235,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
                 "min_verified": min_ver,
                 "max_steps": args.max_steps,
                 "max_seconds": args.max_seconds,
+                "checkpoint_path": args.checkpoint,
                 "base": cfg.base,
                 "bot_user": cfg.username,
             },
@@ -242,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
 
     planner = CampaignPlanner(
         mode=args.mode,
-        strategy=args.strategy,
+        strategy=effective_strategy,
         focus_skill=args.skill,
         focus_args=focus_args,
         use_llm=use_llm,
@@ -255,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         require_iron=True if args.require_iron else None,
         max_seconds=args.max_seconds,
     )
+    cooldown_cap = float(args.failure_cooldown_cap) if (args.failure_cooldown_cap and args.failure_cooldown_cap > 0) else None
     loop_cfg = LoopConfig(
         mode=args.mode,
         max_steps=args.max_steps,
@@ -263,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         disconnect_on_exit=args.disconnect_on_exit,
         target_goal=args.goal,
         stop_on_goal=stop_on_goal,
+        checkpoint_path=args.checkpoint,
+        failure_cooldown_cap_s=cooldown_cap,
     )
     loop = MainLoop(client, state, executor, planner, config=loop_cfg, observer=observer)
     try:

@@ -35,6 +35,7 @@ OBJECTIVE_SYSTEM_PROMPT = """你是 Minecraft 8 小时生存赛的战略目标�
 - goal_id：只能从「可选目标」清单里挑选一个未达成、未挂起的目标 id，禁止自创或选择挂起目标
 - budget_s：分配给该目标的时间预算（秒，60 到 1800 之间的数字；可省略，省略时采用台账默认预算）
 - why：一句话简短理由（30 字以内），禁止包含任何坐标或实体编号
+- route_branch：可选，路线偏好标签（如 "iron_chain"、"surface_quick"、"diamond_nether"），可省略
 - 前置自动展开：选定目标后，底层战术规则器会自动按依赖链补齐未完成的前置目标与原料，无需手排步骤
 - 决策原则：综合剩余比赛时间、昼夜、当前背包物资、目标分值与预计剩余成本权衡性价比；避开近期连续失败或刚超时的目标"""
 
@@ -60,18 +61,23 @@ class Objective:
     why: str = ""
     source: str = "rule"          # "rule" | "llm"
     started_at: float = field(default_factory=time.monotonic)
+    route_branch: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.goal_id, str) or not self.goal_id.strip():
             raise ValueError("Objective.goal_id 必须是非空字符串")
         if self.source not in OBJECTIVE_SOURCES:
             raise ValueError(f"Objective.source 必须是 {OBJECTIVE_SOURCES} 之一；收到 {self.source!r}")
+        if not isinstance(self.route_branch, str):
+            raise ValueError("Objective.route_branch 必须是字符串")
         object.__setattr__(self, "budget_s", clamp_budget(self.budget_s))
+        object.__setattr__(self, "route_branch", self.route_branch.strip())
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "goal_id": self.goal_id, "budget_s": self.budget_s,
             "why": self.why, "source": self.source, "started_at": self.started_at,
+            "route_branch": self.route_branch,
         }
 
 
@@ -278,6 +284,9 @@ def resolve_objective(
         errs.append("goal_id 必须是非空字符串")
     if "why" in obj and obj["why"] is not None and not isinstance(obj["why"], str):
         errs.append("why 必须是字符串")
+    raw_route_branch = obj.get("route_branch")
+    if raw_route_branch is not None and not isinstance(raw_route_branch, str):
+        errs.append("route_branch 必须是字符串")
     raw_budget = obj.get("budget_s")
     if raw_budget is not None and not _is_finite_number(raw_budget):
         errs.append("budget_s 必须是有限数字")
@@ -323,7 +332,14 @@ def resolve_objective(
 
     budget = clamp_budget(raw_budget, default_budget_s=goal.budget_s)
     started = time.monotonic() if now is None else float(now)
-    return Objective(goal_id=goal_id, budget_s=budget, why=str(obj.get("why") or "").strip(), source=source, started_at=started), []
+    return Objective(
+        goal_id=goal_id,
+        budget_s=budget,
+        why=str(obj.get("why") or "").strip(),
+        source=source,
+        started_at=started,
+        route_branch=str(raw_route_branch or "").strip(),
+    ), []
 
 
 def validate_objective(obj: Any, state: State, **kwargs: Any) -> tuple[bool, list[str]]:

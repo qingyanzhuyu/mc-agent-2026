@@ -16,8 +16,10 @@ from ..planner.objective import Objective
 from ..planner.scheduler import DecisionScheduler
 from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint
 from ..skills import REGISTRY, Skill, bind_args, make
+from ..skills import base as skill_base
 from ..skills.items import best_pickaxe
-from ..skills.world_memo import format_memo_summary
+from ..skills.world_memo import format_memo_summary, memo_for
+from . import subgoals as subgoals_mod
 from .context import DecisionContext, ObjectiveRecord
 from .goals import (
     DEFAULT_CAMPAIGN_STAGES, GOALS, OFFICIAL_CAMPAIGN_STAGES, STONE_OR_BETTER_PICKS, GoalSpec,
@@ -26,12 +28,14 @@ from .goals import (
 )
 from .reserve import ReservationBook
 from .subgoals import item_available, tool_ready
-from .starter_skills import PROTECTED_ZONES, can_afford_gear, total_cobble, total_logs, total_planks
+from .starter_skills import PROTECTED_ZONES, can_afford_gear, has_known_table, total_cobble, total_logs, total_planks
 
 if TYPE_CHECKING:
     from .strategy import StrategyOrchestrator
 
 STRATEGIES: tuple[str, ...] = ("legacy", "rule", "llm")
+_SAFETY_INTENT_DEFAULT_TTL_S: float = 15.0
+_ESCAPE_INTENT_KINDS: frozenset[str] = frozenset({"flee", "douse", "surface", "escape_lava", "lava", "void_risk"})
 
 
 @dataclass
@@ -49,6 +53,67 @@ class PlanDecision:
     objective: Optional[Objective] = None
     objective_source: Optional[str] = None
     objective_trigger: Optional[str] = None
+    cooldown_blocked: bool = False
+    blocked_goal_id: Optional[str] = None
+    safety_escape: bool = False
+
+
+def _clear_state_safety_intent(state: State) -> None:
+    setter = getattr(state, "set_safety_intent", None)
+    if callable(setter):
+        setter(None)
+    else:
+        state.safety_intent = None
+
+
+def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
+    """提取需要立即脱险的安全意图（兼容 dict/str 格式的 `state.safety_intent` 及直读物理险情）。"""
+    st = state.snapshot()
+    raw = getattr(state, "safety_intent", None)
+    kind = ""
+    why = ""
+    if isinstance(raw, Mapping):
+        now = time.monotonic()
+        expires_at = raw.get("expires_at")
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and now >= float(expires_at):
+            _clear_state_safety_intent(state)
+            raw = None
+        else:
+            at_ts = raw.get("at")
+            if isinstance(at_ts, (int, float)) and not isinstance(at_ts, bool):
+                if now - float(at_ts) > _SAFETY_INTENT_DEFAULT_TTL_S:
+                    _clear_state_safety_intent(state)
+                    raw = None
+        if isinstance(raw, Mapping):
+            kind = str(raw.get("kind") or raw.get("intent") or "").strip().lower()
+            why = str(raw.get("why") or kind)
+    elif isinstance(raw, str):
+        kind = raw.strip().lower()
+        why = kind
+
+    if kind in _ESCAPE_INTENT_KINDS:
+        norm = "escape_lava" if kind in ("escape_lava", "lava") else ("flee" if kind == "void_risk" else kind)
+        return norm, why or norm
+    if kind == "heal":
+        hostile = st.get("nearest_hostile") or {}
+        flee_dist = float(getattr(state.config, "hostile_flee_dist", 6.0))
+        if hostile and float(hostile.get("dist", 99.0)) < flee_dist:
+            return "flee", f"{why} + {hostile.get('name')} 距离 {hostile.get('dist')}"
+
+    # 直接物理险情兜底（即使后台 monitor 未启动或尚未刷出 safety_intent）
+    if st.get("in_lava"):
+        return "escape_lava", "in_lava"
+    if st.get("on_fire") and not st.get("in_water"):
+        return "douse", "on_fire"
+    oxygen = st.get("oxygen")
+    if (st.get("in_water") or st.get("submerged")) and oxygen is not None:
+        try:
+            ox = float(oxygen)
+        except (TypeError, ValueError):
+            ox = float(OXYGEN_FULL)
+        if math.isfinite(ox) and ox <= 10.0:
+            return "surface", f"in_water oxygen={ox:g}"
+    return None
 
 
 def _material_plan(skill: Skill, state: State):
@@ -144,6 +209,11 @@ class RulePlanner:
         self.ep_goal_elapsed: dict[str, float] = {}
         self._last_selected_goal_id: Optional[str] = None
         self._environment_blocks: dict[str, _EnvironmentBlock] = {}
+        self._abandoned_goals: set[str] = set()
+        self._last_expand_cooldown_blocked: bool = False
+        self._last_expand_blocked_goal_id: Optional[str] = None
+        self._env_recovery_counts: dict[tuple[str, int, int], int] = {}
+        self._max_env_recovery_per_cell: int = 4
 
     def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
         self._environment_blocks[skill.goal] = _EnvironmentBlock(error, _EnvironmentBlock.observe(error, state))
@@ -157,6 +227,152 @@ class RulePlanner:
     def environment_block(self, goal_key: str) -> Optional[EnvBlocked]:
         block = self._environment_blocks.get(goal_key)
         return block.error if block else None
+
+    def _cell_key(self, state: State) -> tuple[str, int, int]:
+        st = state.snapshot()
+        pos = st.get("pos") or [0.0, 64.0, 0.0]
+        try:
+            cx, cz = math.floor(float(pos[0]) / 16.0), math.floor(float(pos[2]) / 16.0)
+        except (TypeError, ValueError, IndexError):
+            cx, cz = 0, 0
+        return str(st.get("dimension") or "overworld"), cx, cz
+
+    def abandon_goal(self, goal_id: Optional[str]) -> bool:
+        """将当前反复空转失败的目标在本轮标记放弃，使规划器立即切向下一个可得分目标。"""
+        if not goal_id or goal_id not in self.ledger_map:
+            return False
+        self._abandoned_goals.add(goal_id)
+        spec = self.ledger_map[goal_id]
+        if spec.max_fails_per_ep > 0:
+            self.ep_goal_fails[goal_id] = max(self.ep_goal_fails.get(goal_id, 0), spec.max_fails_per_ep)
+        if self._last_selected_goal_id == goal_id:
+            self._last_selected_goal_id = None
+        return True
+
+    def clear_tactical_cooldowns(
+        self,
+        state: State,
+        goal_id: Optional[str] = None,
+        *,
+        include_relocate: bool = False,
+    ) -> list[str]:
+        """清除导致原地冷却空转的战术技能冷却键；`include_relocate=True` 时一并解除外迁/逃生技能冷却。"""
+        relocate_skills = {"scout_island", "emergency_escape"}
+        keys: set[str] = set()
+
+        def _collect_skill_key(name: str, args: Optional[dict]) -> None:
+            if not include_relocate and name in relocate_skills:
+                return
+            cls = self.registry.get(name)
+            if cls is None:
+                return
+            bound, errs = bind_args(cls, args or {})
+            if not errs:
+                keys.add(cls.goal.format(**bound))
+
+        if goal_id and goal_id in self.ledger_map:
+            g = self.ledger_map[goal_id]
+            _collect_skill_key(g.skill, g.args_dict)
+            for _, fb_skill, fb_args in g.gather_fallbacks:
+                _collect_skill_key(fb_skill, dict(fb_args))
+
+        for step in self._rank(state):
+            g = step.step_goal
+            _collect_skill_key(g.skill, g.args_dict)
+            for _, fb_skill, fb_args in g.gather_fallbacks:
+                _collect_skill_key(fb_skill, dict(fb_args))
+
+        if include_relocate:
+            for rname in ("scout_island", "emergency_escape"):
+                cls = self.registry.get(rname)
+                if cls is not None:
+                    bound, errs = bind_args(cls, {})
+                    if not errs:
+                        keys.add(cls.goal.format(**bound))
+                    elif "{" not in cls.goal:
+                        keys.add(cls.goal)
+                    intent_param = cls.params.get("intent")
+                    if intent_param is not None and intent_param.choices:
+                        for choice in intent_param.choices:
+                            b2, e2 = bind_args(cls, {"intent": choice})
+                            if not e2:
+                                keys.add(cls.goal.format(**b2))
+
+        cleared: list[str] = []
+        for k in sorted(keys):
+            if k in skill_base._COOLDOWN:
+                skill_base._COOLDOWN.pop(k, None)
+                cleared.append(k)
+
+        if not cleared and skill_base._COOLDOWN:
+            reloc_goals: set[str] = set()
+            for rname in relocate_skills:
+                cls = self.registry.get(rname)
+                if cls is not None:
+                    if "{" not in cls.goal:
+                        reloc_goals.add(cls.goal)
+                    intent_param = cls.params.get("intent")
+                    if intent_param is not None and intent_param.choices:
+                        for choice in intent_param.choices:
+                            b2, e2 = bind_args(cls, {"intent": choice})
+                            if not e2:
+                                reloc_goals.add(cls.goal.format(**b2))
+            for k in list(skill_base._COOLDOWN):
+                if not include_relocate and k in reloc_goals:
+                    continue
+                skill_base._COOLDOWN.pop(k, None)
+                cleared.append(k)
+        return cleared
+
+    def _build_emergency_escape(self, intent: str, state: State) -> Optional[Skill]:
+        cls = self.registry.get("emergency_escape")
+        if cls is None and self.registry is REGISTRY:
+            try:
+                from ..skills import safety_escape as _safety_escape  # noqa: F401
+                cls = self.registry.get("emergency_escape")
+            except Exception:
+                cls = None
+        if cls is None or not skill_choice.meets_verification(cls, self.min_verified) or cls.blocked(state):
+            return None
+        args: dict[str, Any] = {}
+        intent_param = cls.params.get("intent")
+        if intent_param is not None:
+            choices = tuple(intent_param.choices or ())
+            if choices:
+                if intent in choices:
+                    args["intent"] = intent
+                elif intent == "escape_lava" and "douse" in choices:
+                    args["intent"] = "douse"
+                elif "flee" in choices:
+                    args["intent"] = "flee"
+            else:
+                args["intent"] = "douse" if intent == "escape_lava" else intent
+        return self._try_make("emergency_escape", args, state)
+
+    def make_relocate_skill(self, state: State) -> Optional[Skill]:
+        """构造单次外迁/脱困技能（优先 `scout_island`，缺失时退回 `emergency_escape`）。"""
+        self.clear_tactical_cooldowns(state, include_relocate=True)
+        sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
+        sc = self._try_make("scout_island", {"radius": sc_radius}, state)
+        if sc is not None:
+            return sc
+        return self._build_emergency_escape("flee", state)
+
+    def _choose_safety_escape(self, state: State) -> Optional[PlanDecision]:
+        """消费 `SafetyMonitor` 软/硬安全意图与直读物理险情，优先派发 `EmergencyEscape`，否则平稳回退 `scout_island`。"""
+        extracted = _extract_escape_intent(state)
+        if extracted is None:
+            return None
+        intent, why = extracted
+        esc = self._build_emergency_escape(intent, state)
+        if esc is not None:
+            return PlanDecision(esc, "rule", f"安全意图应急脱险 ({intent}: {why})", safety_escape=True)
+        # 窄测试注册表未注册 emergency_escape 时，平稳回退到现有 scout_island 脱困
+        radius = 16 if intent in ("surface", "douse", "escape_lava") else 24
+        sc = self._try_make("scout_island", {"radius": radius}, state)
+        if sc is not None:
+            return PlanDecision(sc, "rule", f"安全意图兜底脱险 ({intent}: {why})", safety_escape=True)
+        return None
 
     def _block_for_goal(self, goal: GoalSpec, state: State) -> Optional[EnvBlocked]:
         name, args = goal.skill, goal.args_dict
@@ -257,6 +473,8 @@ class RulePlanner:
     def expand_objective_skill(self, state: State) -> tuple[Optional[Skill], str]:
         """针对 `target_goal` 展开下一个可启动技能；无法展开时返回 `(None, 明确原因)`。"""
         self._last_selected_goal_id = None
+        self._last_expand_cooldown_blocked = False
+        self._last_expand_blocked_goal_id = None
         ranked = self._rank(state)
         if not ranked:
             if self.target_goal:
@@ -305,15 +523,23 @@ class RulePlanner:
             sc = self._try_make("scout_island", {"radius": sc_radius}, state)
             if sc is not None:
                 return sc, f"目标 {cooling_step_id} 当前位置受阻或冷却，外迁探索"
+            self._last_expand_cooldown_blocked = True
+            self._last_expand_blocked_goal_id = cooling_step_id
 
         return None, "；".join(reasons[:3]) or f"目标 {ranked[0].step_goal.id} 无可启动技能"
 
     def choose_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
-        """在一切目标之上的生存补给与 `safe_mode` 避险处理（命中即返回，否则返回 None）。"""
+        """在一切目标之上的生存补给、`safe_mode` 避险与 `SafetyMonitor` 脱险意图处理（命中即返回，否则返回 None）。"""
         hp = float(state.st.get("health", 20))
         food = float(state.st.get("food", 20))
+        raw_intent = getattr(state, "safety_intent", None)
+        intent_kind = (
+            str(raw_intent.get("kind") or raw_intent.get("intent") or "").strip().lower()
+            if isinstance(raw_intent, Mapping)
+            else (raw_intent.strip().lower() if isinstance(raw_intent, str) else "")
+        )
 
-        if food <= 14 or (hp < 18 and food < 20):
+        if food <= 14 or (hp < 18 and food < 20) or (intent_kind == "heal" and food < 20):
             eat = self._try_make("eat_food", {}, state)
             if eat is not None:
                 return PlanDecision(eat, "rule", f"生存补给 hp={hp} food={food}")
@@ -325,6 +551,10 @@ class RulePlanner:
                     if c is not None:
                         return PlanDecision(c, "rule", f"safe_mode 期间原地合成 {item}")
             return PlanDecision(None, "idle", f"safe_mode 避险驻留中（剩 {state.safe_mode_remaining:.0f}s）")
+
+        escape = self._choose_safety_escape(state)
+        if escape is not None:
+            return escape
         return None
 
     def choose_for_objective(self, state: State) -> PlanDecision:
@@ -337,10 +567,19 @@ class RulePlanner:
         inst, reason = self.expand_objective_skill(state)
         if inst is not None:
             return PlanDecision(inst, "rule", reason)
-        return PlanDecision(None, "idle", reason)
+        return PlanDecision(
+            None,
+            "idle",
+            reason,
+            cooldown_blocked=self._last_expand_cooldown_blocked,
+            blocked_goal_id=self._last_expand_blocked_goal_id,
+        )
 
     def _rank(self, state: State):
-        suspended = {g.id for g in self.active_goals if self._environment_blocks and self._block_for_goal(g, state)}
+        suspended = (
+            {g.id for g in self.active_goals if self._environment_blocks and self._block_for_goal(g, state)}
+            | set(self._abandoned_goals)
+        )
         return rank_actionable_goals(
             state,
             self.active_goals,
@@ -420,33 +659,46 @@ class RulePlanner:
         self.refresh_environment_blocks(state)
         ranked = self._rank(state)
         if ranked:
+            cooling_goal_id: Optional[str] = None
             for step in ranked:
                 g = step.step_goal
                 ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
                 if ready:
-                    inst = self._try_make(g.skill, g.args_dict, state)
+                    inst, _, cooling_only = self._diagnose_skill(g.skill, g.args_dict, state)
                     if inst is not None:
                         self._last_selected_goal_id = g.id
                         return PlanDecision(inst, "rule", f"推进目标 {g.id}（{g.title}）")
+                    if cooling_only and cooling_goal_id is None:
+                        cooling_goal_id = g.id
                 if not ready or g.gather_when_blocked:
                     for req_expr, fb_skill, fb_args in _supplies(g, state):
-                        inst = self._try_make(fb_skill, fb_args, state)
+                        inst, _, cooling_only = self._diagnose_skill(fb_skill, fb_args, state)
                         if inst is not None:
                             self._last_selected_goal_id = g.id
                             return PlanDecision(inst, "rule", f"为目标 {g.id} 补齐前置材料（{req_expr}）")
+                        if cooling_only and cooling_goal_id is None:
+                            cooling_goal_id = g.id
 
             sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
-            sc = self._try_make("scout_island", {"radius": sc_radius}, state)
+            sc, _, sc_cooling = self._diagnose_skill("scout_island", {"radius": sc_radius}, state)
             if sc is not None:
                 return PlanDecision(sc, "rule", f"目标 {ranked[0].step_goal.id} 当前位置受阻或冷却，外迁探索")
-            return PlanDecision(None, "idle",
-                                f"目标 {ranked[0].step_goal.id} 无符合 verified={self.min_verified} 且可启动的技能")
+            return PlanDecision(
+                None,
+                "idle",
+                f"目标 {ranked[0].step_goal.id} 无符合 verified={self.min_verified} 且可启动的技能",
+                cooldown_blocked=(cooling_goal_id is not None or sc_cooling),
+                blocked_goal_id=cooling_goal_id or ranked[0].step_goal.id,
+            )
 
         if self.target_goal:
             if self.blocked_targets(state, self.target_goal, refresh=False):
-                scout = self._try_make("scout_island", {"radius": 36}, state)
-                if scout is not None:
-                    return PlanDecision(scout, "rule", "聚焦目标因环境挂起，外迁重新观察", environment_recovery=True)
+                cell = self._cell_key(state)
+                if self._env_recovery_counts.get(cell, 0) < self._max_env_recovery_per_cell:
+                    scout = self._try_make("scout_island", {"radius": 36}, state)
+                    if scout is not None:
+                        self._env_recovery_counts[cell] = self._env_recovery_counts.get(cell, 0) + 1
+                        return PlanDecision(scout, "rule", "聚焦目标因环境挂起，外迁重新观察", environment_recovery=True)
                 return PlanDecision(None, "idle", "等待聚焦目标的环境条件变化")
             return PlanDecision(
                 None,
@@ -466,17 +718,22 @@ class RulePlanner:
             if ms is not None:
                 return PlanDecision(ms, "rule", "维持圆石垫块与建造库存")
 
-        sc = self._try_make("scout_island", {"radius": 36}, state)
+        sc, _, sc_cooling = self._diagnose_skill("scout_island", {"radius": 36}, state)
         if sc is not None:
             return PlanDecision(sc, "rule", "基础石器齐备，持续扫描岛屿结构与矿脉")
-        return PlanDecision(None, "idle", f"无符合 verified={self.min_verified} 且可启动的兜底技能")
+        return PlanDecision(
+            None,
+            "idle",
+            f"无符合 verified={self.min_verified} 且可启动的兜底技能",
+            cooldown_blocked=sc_cooling,
+        )
 
 
 class CampaignPlanner:
     """薄规划分派器：对外保持 `select()` 等接口不变，按 `strategy` 分派 `legacy` 或委托 `StrategyOrchestrator`。"""
 
     def __init__(
-        self, *, mode: str = "campaign", strategy: str = "rule", focus_skill: Optional[str] = None,
+        self, *, mode: str = "campaign", strategy: Optional[str] = "rule", focus_skill: Optional[str] = None,
         focus_args: Optional[dict] = None, use_llm: bool = False, llm: Optional[LLMClient] = None,
         min_verified: str = "offline", registry: Optional[dict[str, type[Skill]]] = None,
         on_llm_telemetry: Optional[Callable[[dict], None]] = None,
@@ -490,17 +747,18 @@ class CampaignPlanner:
     ):
         from .strategy import DEFAULT_STRATEGY_REVIEW_S, StrategyOrchestrator, env_bool, env_float
 
+        resolved_strategy = ("llm" if use_llm else "rule") if strategy is None else strategy
         if mode not in ("campaign", "focus"):
             raise ValueError(f"mode 只能是 'campaign' 或 'focus'；收到 {mode!r}")
-        if strategy not in STRATEGIES:
-            raise ValueError(f"strategy 只能是 {STRATEGIES} 之一；收到 {strategy!r}")
+        if resolved_strategy not in STRATEGIES:
+            raise ValueError(f"strategy 只能是 {STRATEGIES} 之一；收到 {resolved_strategy!r}")
         if mode == "focus" and not focus_skill:
             raise ValueError("focus 模式必须指定 focus_skill")
 
-        self.mode, self.strategy = mode, strategy
-        self.use_llm = use_llm and strategy != "legacy"
+        self.mode, self.strategy = mode, resolved_strategy
+        self.use_llm = use_llm and resolved_strategy != "legacy"
         self.focus_skill, self.focus_args = focus_skill, dict(focus_args or {})
-        self.llm = llm or (LLMClient() if (self.use_llm or strategy == "llm") else None)
+        self.llm = llm or (LLMClient() if (self.use_llm or resolved_strategy == "llm") else None)
         self.min_verified, self.target_goal = min_verified, target_goal
         self.registry = REGISTRY if registry is None else registry
         self.reservations = ReservationBook()
@@ -541,13 +799,58 @@ class CampaignPlanner:
         return self._strategy.build_context(state, **kwargs)
 
     def _subgoal_snapshot(self, state: State) -> dict[str, Any]:
+        eval_all = getattr(subgoals_mod, "evaluate_all_subgoals", None)
+        if callable(eval_all):
+            try:
+                evaluated = eval_all(state, reservations=self.reservations)
+            except TypeError:
+                evaluated = eval_all(state)
+            if isinstance(evaluated, Mapping):
+                return dict(evaluated)
+
+        st = state.snapshot()
+        dim = str(st.get("dimension") or "overworld")
+        memo = memo_for(state)
+        stations = memo.query("station", dimension=dim)
+        station_names = {e.block for e in stations if e.block}
+        has_table = (
+            state.count("crafting_table") > 0
+            or "crafting_table" in station_names
+            or has_known_table(st.get("pos"))
+        )
+        has_furnace = state.count("furnace") > 0 or "furnace" in station_names
+        structures = memo.query("structure", dimension=dim)
+        landmark_tags = sorted({e.tag for e in structures if e.tag})
+        has_portal = (
+            any(e.tag == "ruined_portal" for e in structures)
+            or bool(memo.query("obsidian", dimension=dim))
+        )
+        hostile = st.get("nearest_hostile")
+        if isinstance(hostile, Mapping) and hostile:
+            safe_enc = subgoals_mod.safe_encounter(
+                state,
+                hostile,
+                str(hostile.get("name") or "hostile"),
+                dimension=dim,
+                retreat_safe=not state.in_safe_mode,
+                min_health=12.0,
+            )
+        else:
+            safe_enc = bool(
+                not state.in_safe_mode
+                and float(st.get("health", 20)) >= 12.0
+                and not any(st.get(h) for h in ("in_lava", "in_water", "submerged", "on_fire"))
+            )
         return {
             "item_available": {
                 item: item_available(state, item, count, allocatable=self.reservations.available(state, item))
                 for item, count in (("iron_ingot", 3), ("diamond", 4), ("wheat_seeds", 3))
             },
             "tool_ready": {tier: tool_ready(state, "pickaxe", tier, 1) for tier in ("iron", "diamond")},
-            **dict.fromkeys(("station_ready", "landmark_reachable", "safe_encounter", "active_portal"), "待现场观察"),
+            "station_ready": {"crafting_table": has_table, "furnace": has_furnace},
+            "landmark_reachable": landmark_tags if landmark_tags else False,
+            "safe_encounter": safe_enc,
+            "active_portal": has_portal,
         }
 
     def _reservation_snapshot(self, state: State) -> dict[str, Any]:
@@ -560,6 +863,21 @@ class CampaignPlanner:
         if self._active_material_consumer is not None:
             self.reservations.release(self._active_material_consumer)
             self._active_material_consumer = None
+
+    def abandon_goal(self, goal_id: Optional[str]) -> bool:
+        abandoned = self.rules.abandon_goal(goal_id)
+        if abandoned and self.strategy != "legacy" and self.current_objective is not None:
+            if self.current_objective.goal_id == goal_id and self.scheduler is not None:
+                self.scheduler.invalidate()
+        return abandoned
+
+    def clear_tactical_cooldowns(
+        self, state: State, goal_id: Optional[str] = None, *, include_relocate: bool = False
+    ) -> list[str]:
+        return self.rules.clear_tactical_cooldowns(state, goal_id=goal_id, include_relocate=include_relocate)
+
+    def make_relocate_skill(self, state: State) -> Optional[Skill]:
+        return self.rules.make_relocate_skill(state)
 
     def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
         self.release_skill_materials()
@@ -587,6 +905,10 @@ class CampaignPlanner:
         self._last_selected_goal_id = self.target_goal if (self.target_goal in self.rules.ledger_map) else None
         if state.in_safe_mode:
             return PlanDecision(None, "idle", f"safe_mode 冷却中（{state.safe_mode_remaining:.0f}s）")
+        if getattr(state, "safety_intent", None) and "emergency_escape" in self.registry:
+            esc = self.rules._choose_safety_escape(state)
+            if esc is not None:
+                return esc
         self.rules.refresh_environment_blocks(state)
         cls = self.registry.get(self.focus_skill)
         if cls is not None and not skill_choice.meets_verification(cls, self.min_verified):
@@ -597,7 +919,10 @@ class CampaignPlanner:
         if reason := type(skill).blocked(state):
             return PlanDecision(None, "idle", f"focus 技能前置未满足: {reason}")
         if skill.is_cooling():
-            return PlanDecision(None, "idle", f"focus 目标 {skill.goal} 冷却中")
+            return PlanDecision(
+                None, "idle", f"focus 目标 {skill.goal} 冷却中",
+                cooldown_blocked=True, blocked_goal_id=self.target_goal,
+            )
         if not skill.can_start(state):
             return PlanDecision(None, "idle", f"focus 技能参数 {self.focus_args} 当前不可启动")
         return PlanDecision(skill, "focus", f"定向验收 {skill}")

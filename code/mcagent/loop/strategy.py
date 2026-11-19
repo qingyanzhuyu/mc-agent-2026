@@ -14,6 +14,7 @@ from ..planner import objective
 from ..planner.objective import Objective
 from ..planner.scheduler import DecisionScheduler
 from ..runtime import State
+from ..skills.world_memo import memo_for
 from .context import DecisionContext, ObjectiveRecord, build_decision_context, classify_failure_kind, is_daytime
 from .goals import is_goal_achieved
 from .strategy_async import (
@@ -53,9 +54,24 @@ class StrategyOrchestrator:
         self._last_failure_kind, self._last_failure_detail = {}, {}
         self._deaths_initialized, self._last_deaths_marker = False, (0, None)
         self._last_is_day, self._deferred_trigger, self._seen_failure_str = None, None, ""
+        self._landmark_initialized: bool = False
+        self._last_landmark_version: int = 0
         self.scheduler: Optional[DecisionScheduler] = (
             DecisionScheduler(lambda _s: None, require_iron=planner.require_iron, clock=self.clock) if planner.strategy == "llm" else None
         )
+
+    def _poll_landmark_version(self, state: State) -> bool:
+        """检测 `WorldResourceMemo.landmark_version` 是否递增（发现新村庄/遗迹传送门/要塞等地标）。"""
+        memo = memo_for(state)
+        cur_ver = int(getattr(memo, "landmark_version", 0) or 0)
+        if not self._landmark_initialized:
+            self._landmark_initialized = True
+            self._last_landmark_version = cur_ver
+            return False
+        if cur_ver > self._last_landmark_version:
+            self._last_landmark_version = cur_ver
+            return True
+        return False
 
     def apply_objective(self, obj: Optional[Objective], *, now: Optional[float] = None) -> None:
         self.current_objective = self._tracked_objective = obj
@@ -89,6 +105,7 @@ class StrategyOrchestrator:
         tp.completed_advancements = p.rules.completed_advancements
         tp.ep_goal_fails, tp.ep_goal_elapsed = p.rules.ep_goal_fails, p.rules.ep_goal_elapsed
         tp._environment_blocks = p.rules._environment_blocks
+        tp._abandoned_goals = p.rules._abandoned_goals
         return tp
 
     def is_iron_complete(self, state: State) -> bool:
@@ -151,7 +168,9 @@ class StrategyOrchestrator:
         p.on_objective_telemetry({
             "trigger": trigger, "source": source,
             "goal_id": obj.goal_id if obj is not None else None, "budget_s": obj.budget_s if obj is not None else None,
-            "why": obj.why if obj is not None else "", "ms": round(float(ms), 1),
+            "why": obj.why if obj is not None else "",
+            "route_branch": getattr(obj, "route_branch", "") if obj is not None else "",
+            "ms": round(float(ms), 1),
             "prompt_tokens": int(prompt_tokens), "completion_tokens": int(completion_tokens), "total_tokens": total_tok,
             "cumulative_prompt_tokens": cum_p, "cumulative_completion_tokens": cum_c, "cumulative_total_tokens": cum_p + cum_c,
             "errors": list(errors), "adopted": bool(adopted), "replaced_goal_id": replaced_goal_id,
@@ -177,7 +196,15 @@ class StrategyOrchestrator:
         elif (spec is not None and spec.skill == skill_name) or skill_name not in ("eat_food", "scout_island"):
             self._consecutive_goal_fails[gid] = 0
 
-    def _detect_trigger(self, state: State, now: float, *, died_since_last: bool, day_night_flipped: bool) -> Optional[tuple[str, str, str]]:
+    def _detect_trigger(
+        self,
+        state: State,
+        now: float,
+        *,
+        died_since_last: bool,
+        day_night_flipped: bool,
+        landmark_discovered: bool = False,
+    ) -> Optional[tuple[str, str, str]]:
         p = self.planner
         if self._deferred_trigger:
             trig, self._deferred_trigger = self._deferred_trigger, None
@@ -193,12 +220,16 @@ class StrategyOrchestrator:
             return "no_tactical_skill", "no_skill", "missing_prereq"
         if is_goal_achieved(spec, state, p.rules.completed_advancements):
             return "goal_achieved", "achieved", "none"
+        if spec.id in getattr(p.rules, "_abandoned_goals", ()):
+            return "goal_abandoned", "max_fails", self._last_failure_kind.get(spec.id, "other_replan")
         if p.rules.blocked_targets(state, spec.id, refresh=False):
             return "env_blocked", "env_blocked", "env_blocked"
         if self.current_objective_elapsed(now) >= self.current_objective.budget_s:
             return "budget_exceeded", "budget_exceeded", "timeout"
         if spec.max_fails_per_ep > 0 and self._consecutive_goal_fails.get(spec.id, 0) >= spec.max_fails_per_ep:
             return "max_fails_reached", "max_fails", self._last_failure_kind.get(spec.id, "other_replan")
+        if landmark_discovered:
+            return "landmark_opportunity", "switched", "none"
         if p.review_interval_s > 0.0 and (now - self._last_objective_decision_at) >= p.review_interval_s:
             return "periodic_review", "switched", "none"
         return None
@@ -212,8 +243,9 @@ class StrategyOrchestrator:
             detail = self._last_failure_detail.get(prev_obj.goal_id, "") if failure_kind != "none" else ""
             self.record_objective_history(prev_obj, outcome=old_outcome, failure_kind=failure_kind, now=now, detail=detail)
             spec = p.rules.ledger_map.get(prev_obj.goal_id)
-            if trigger == "max_fails_reached" and spec is not None and spec.max_fails_per_ep > 0:
-                p.rules.ep_goal_fails[spec.id] = max(p.rules.ep_goal_fails.get(spec.id, 0), spec.max_fails_per_ep)
+            if trigger in ("max_fails_reached", "goal_abandoned") and spec is not None:
+                if spec.max_fails_per_ep > 0:
+                    p.rules.ep_goal_fails[spec.id] = max(p.rules.ep_goal_fails.get(spec.id, 0), spec.max_fails_per_ep)
                 excluded.add(spec.id)
                 self._consecutive_goal_fails[spec.id] = 0
             elif trigger == "budget_exceeded" and spec is not None:
@@ -247,6 +279,7 @@ class StrategyOrchestrator:
             dec.skill, dec.source, f"[目标:{self.current_objective.goal_id}] {dec.reason}",
             environment_recovery=dec.environment_recovery, objective=self.current_objective,
             objective_source=self.current_objective.source, objective_trigger=fired_trigger,
+            safety_escape=dec.safety_escape,
         )
 
     def select(self, state: State, recent_failures: list[str]) -> "PlanDecision":
@@ -276,10 +309,14 @@ class StrategyOrchestrator:
         if cur_day is not None:
             self._last_is_day = cur_day
 
+        landmark_discovered = self._poll_landmark_version(state)
+
         if died_since_last:
             invalidate_pending_async(self, "respawn")
         elif day_night_flipped:
             invalidate_pending_async(self, "day_night_changed")
+        elif landmark_discovered:
+            invalidate_pending_async(self, "landmark_opportunity")
 
         if (urgent := p.rules.choose_survival_or_safe_mode(state)) is not None:
             if state.in_safe_mode:
@@ -288,15 +325,23 @@ class StrategyOrchestrator:
                 self._deferred_trigger = "respawn"
             elif day_night_flipped and not self._deferred_trigger:
                 self._deferred_trigger = "day_night_changed"
+            elif landmark_discovered and not self._deferred_trigger:
+                self._deferred_trigger = "landmark_opportunity"
             p._last_selected_goal_id = None
             return PlanDecision(
                 urgent.skill, urgent.source, urgent.reason, objective=self.current_objective,
                 objective_source=self.current_objective.source if self.current_objective else None,
+                safety_escape=urgent.safety_escape,
             )
 
         fallback_skill_decision = poll_async_scheduler(self, state, now)
         fired_trigger: Optional[str] = None
-        if (trig_info := self._detect_trigger(state, now, died_since_last=died_since_last, day_night_flipped=day_night_flipped)) is not None:
+        if (trig_info := self._detect_trigger(
+            state, now,
+            died_since_last=died_since_last,
+            day_night_flipped=day_night_flipped,
+            landmark_discovered=landmark_discovered,
+        )) is not None:
             fired_trigger, old_outcome, f_kind = trig_info
             self._switch_objective(state, trigger=fired_trigger, old_outcome=old_outcome, failure_kind=f_kind, now=now)
 
@@ -320,7 +365,12 @@ class StrategyOrchestrator:
         p._last_selected_goal_id = p.rules._last_selected_goal_id
         return PlanDecision(
             base_dec.skill, base_dec.source, base_dec.reason,
-            environment_recovery=base_dec.environment_recovery, objective=self.current_objective,
+            environment_recovery=base_dec.environment_recovery,
+            stop_episode=base_dec.stop_episode,
+            objective=self.current_objective,
             objective_source=self.current_objective.source if self.current_objective else None,
             objective_trigger=fired_trigger,
+            cooldown_blocked=base_dec.cooldown_blocked,
+            blocked_goal_id=base_dec.blocked_goal_id,
+            safety_escape=base_dec.safety_escape,
         )
