@@ -51,6 +51,14 @@ STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "deep_dark": ("sculk_catalyst", "sculk_shrieker"),
     "archaeology": ("suspicious_sand", "suspicious_gravel"),
     "powder_snow": ("powder_snow",),
+    "nether_fortress": ("nether_bricks", "nether_brick_fence", "nether_brick_stairs", "nether_wart"),
+    "bastion_remnant": ("polished_blackstone_bricks", "gilded_blackstone", "cracked_polished_blackstone_bricks", "chiseled_polished_blackstone"),
+    "end_city": ("purpur_block", "purpur_pillar", "end_stone_bricks"),
+    "lush_caves": ("moss_block", "clay", "azalea", "glow_berries", "cave_vines"),
+    "amethyst_geode": ("amethyst_block", "budding_amethyst", "calcite"),
+    "pale_garden": ("pale_oak_log", "pale_moss_block", "creaking_heart"),
+    "pillager_outpost": ("dark_oak_log", "white_banner"),
+    "dried_ghast": ("dried_ghast", "bone_block"),
 }
 VALID_STATUSES: tuple[str, ...] = ("untested", "reachable", "unreachable", "protected", "depleted")
 
@@ -129,6 +137,8 @@ class WorldResourceMemo:
         self._landmarks: dict[tuple[str, str], list[tuple[Cell, dict[str, Any]]]] = {}
         self._portals: dict[str, list[Cell]] = {}
         self._blocked_regions: dict[tuple[str, tuple[int, ...]], float] = {}
+        self.visited_biomes: dict[str, set[str]] = {}
+        self.survey_sectors_done: dict[str, set[int]] = {}
         self.landmark_version: int = 0
 
     def __len__(self) -> int:
@@ -142,6 +152,8 @@ class WorldResourceMemo:
             self._landmarks.clear()
             self._portals.clear()
             self._blocked_regions.clear()
+            self.visited_biomes.clear()
+            self.survey_sectors_done.clear()
             self.landmark_version = 0
 
     def _cooldown(self, override: Optional[float]) -> float:
@@ -361,6 +373,39 @@ class WorldResourceMemo:
         with self._lock:
             return bool(self._portals.get(dim))
 
+    def record_biome(self, biome: str, *, dimension: str = "overworld") -> bool:
+        """记录已访问生物群系（按维度隔离）；若为首次记录返回 `True`，空值或已存在返回 `False`。"""
+        b = bare(biome).strip().lower() if isinstance(biome, str) else ""
+        if not b:
+            return False
+        dim = _norm_dim(dimension)
+        with self._lock:
+            biomes = self.visited_biomes.setdefault(dim, set())
+            if b in biomes:
+                return False
+            biomes.add(b)
+            return True
+
+    def biomes(self, *, dimension: str = "overworld") -> set[str]:
+        """返回指定维度已访问生物群系集合的副本。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return set(self.visited_biomes.get(dim, ()))
+
+    def mark_sector_done(self, sector_idx: int, *, dimension: str = "overworld") -> None:
+        """标记指定维度的已勘查扇区索引（必须为非布尔非负整数）。"""
+        if not isinstance(sector_idx, int) or isinstance(sector_idx, bool) or sector_idx < 0:
+            raise ValueError(f"非法扇区索引: {sector_idx!r}")
+        dim = _norm_dim(dimension)
+        with self._lock:
+            self.survey_sectors_done.setdefault(dim, set()).add(int(sector_idx))
+
+    def done_sectors(self, *, dimension: str = "overworld") -> set[int]:
+        """返回指定维度已勘查扇区索引集合的副本。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return set(self.survey_sectors_done.get(dim, ()))
+
     def record_blocked_region(self, skill_name: str, chunk: tuple, *, ttl_s: float = 120.0) -> None:
         """记录指定技能在目标区块上的临时受阻标记（带 TTL 冷却）。"""
         key = (str(skill_name).strip(), tuple(int(v) for v in chunk))
@@ -474,7 +519,7 @@ class WorldResourceMemo:
                         landmark_kinds.add(e.tag)
                 else:
                     resource_counts[ecat] = resource_counts.get(ecat, 0) + 1
-            return {
+            summary: dict[str, Any] = {
                 "dimension": dim,
                 "stations_ready": stations_ready,
                 "landmarks_discovered": sorted(landmark_kinds),
@@ -482,6 +527,11 @@ class WorldResourceMemo:
                 "resource_counts": dict(sorted(resource_counts.items())),
                 "landmark_version": int(self.landmark_version),
             }
+            if bs := self.visited_biomes.get(dim):
+                summary["visited_biomes"] = sorted(bs)
+            if ss := self.survey_sectors_done.get(dim):
+                summary["survey_sectors_done"] = sorted(ss)
+            return summary
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
         """原子保存台账检查点为 UTF-8 JSON（`schema_version=1`）。"""
@@ -524,6 +574,8 @@ class WorldResourceMemo:
                 "landmarks": landmarks_out,
                 "portals": portals_out,
                 "resources": resources_out,
+                "visited_biomes": {dim: sorted(bs) for dim, bs in self.visited_biomes.items() if bs},
+                "survey_sectors_done": {dim: sorted(ss) for dim, ss in self.survey_sectors_done.items() if ss},
             }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -676,11 +728,50 @@ class WorldResourceMemo:
                     cat, bare(block).strip(), cell, dim, status, error_code, last_dist, attempts, updated_at, tag
                 )
 
+            new_biomes: dict[str, set[str]] = {}
+            if "visited_biomes" in data:
+                biomes_raw = data["visited_biomes"]
+                if not isinstance(biomes_raw, Mapping):
+                    return False
+                for raw_dim, biome_list in biomes_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(biome_list, list):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    parsed_biomes: set[str] = set()
+                    for raw_b in biome_list:
+                        if not isinstance(raw_b, str):
+                            return False
+                        b = bare(raw_b).strip().lower()
+                        if not b:
+                            return False
+                        parsed_biomes.add(b)
+                    if parsed_biomes:
+                        new_biomes.setdefault(dim, set()).update(parsed_biomes)
+
+            new_sectors: dict[str, set[int]] = {}
+            if "survey_sectors_done" in data:
+                sectors_raw = data["survey_sectors_done"]
+                if not isinstance(sectors_raw, Mapping):
+                    return False
+                for raw_dim, sector_list in sectors_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(sector_list, list):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    parsed_sectors: set[int] = set()
+                    for s in sector_list:
+                        if not isinstance(s, int) or isinstance(s, bool) or s < 0:
+                            return False
+                        parsed_sectors.add(int(s))
+                    if parsed_sectors:
+                        new_sectors.setdefault(dim, set()).update(parsed_sectors)
+
             with self._lock:
                 self._entries = new_entries
                 self._stations = new_stations
                 self._landmarks = new_landmarks
                 self._portals = new_portals
+                self.visited_biomes = new_biomes
+                self.survey_sectors_done = new_sectors
                 self.landmark_version = lv
             return True
         except Exception:
