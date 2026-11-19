@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from typing import Any
 
 from ..runtime import Executor, Replan, State
 from .base import failure, rec
 from .items import AIR, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, block_name
+from .sightline import DIG_EYE_REACH
+from .voxel_cache import voxel_cache_for
 
 PEEL_SURFACE = frozenset(("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter"))
 SOLID_SUPPORT = frozenset((
@@ -111,6 +113,7 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
                     and _same_world(start, after_err)):
                 raise MineStepUnsafe("cut", f"探矿阶梯开凿 {target} 返回 {code}，改试其他方向") from exc
             raise
+        voxel_cache_for(state).invalidate(target, dimension=str(start.get("dimension") or "overworld"))
         yield rec("dig", result, pos=target)
         after_dig_status = state.refresh_status(ex.client, max_age_s=0)
         state.refresh_inventory(ex.client)
@@ -146,3 +149,50 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
 
 def _same_world(start: dict, current: dict) -> bool:
     return current.get("alive") is not False and start.get("dimension") == current.get("dimension")
+
+
+def _candidate_pos3(entry: Any) -> tuple[float, float, float]:
+    raw = entry["pos"] if isinstance(entry, Mapping) else entry
+    return (float(raw[0]), float(raw[1]), float(raw[2]))
+
+
+def sort_ore_candidates(origin: Sequence[float], candidates: Sequence[Any], *, max_dy: int = 8) -> list:
+    """按竖直高差分层排序矿点候选：`|dy| <= max_dy` 优先，再按 `(|dy|, 欧氏距离)` 升序。"""
+    origin_3d = (float(origin[0]), float(origin[1]), float(origin[2]))
+
+    def _key(entry: Any) -> tuple[int, float, float]:
+        pos_3d = _candidate_pos3(entry)
+        abs_dy = abs(pos_3d[1] - origin_3d[1])
+        tier = 0 if abs_dy <= max_dy else 1
+        return (tier, abs_dy, math.dist(origin_3d, pos_3d))
+
+    return sorted(candidates, key=_key)
+
+
+def reach_ore(
+    ex: Executor,
+    state: State,
+    target_pos: Sequence[int],
+    *,
+    skill_name: str = "mining",
+    reach: float = DIG_EYE_REACH,
+    move_rng: int = 3,
+    move_timeout: float = 30.0,
+    max_clear: int = 2,
+    protected_fn=None,
+) -> Generator[dict, None, list[int]]:
+    """委托 `reach_and_act` 在 `reach` 眼距内抵近矿点并清理视线遮挡（保持干脚）。"""
+    from .reach import reach_and_act
+
+    return (yield from reach_and_act(
+        ex,
+        state,
+        target_pos,
+        skill_name=skill_name,
+        reach=reach,
+        move_rng=move_rng,
+        move_timeout=move_timeout,
+        max_clear=max_clear,
+        protected_fn=protected_fn,
+        settle_dry=True,
+    ))

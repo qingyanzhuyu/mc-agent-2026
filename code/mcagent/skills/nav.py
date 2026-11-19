@@ -30,6 +30,7 @@ from .items import (
     pick_placeable,
     total_placeable,
 )
+from .voxel_cache import voxel_cache_for
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -181,6 +182,10 @@ def _release_sneak(ex: "Executor") -> None:
         pass  # 收尾不能再抛：这里可能正处在抢占路径上
 
 
+def _invalidate_voxel(state: "State", pos: Pos) -> None:
+    voxel_cache_for(state).invalidate(pos, dimension=str((state.st or {}).get("dimension") or "overworld"))
+
+
 def breach_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos]) -> Iterator[dict]:
     """换上最好的镐，按顺序挖开 `blocks`（通常是挡路的上、下两格）。已是空气的格跳过。"""
     state.refresh_inventory(ex.client)
@@ -190,7 +195,9 @@ def breach_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos]) -> Iterato
     for pos in blocks:
         name = block_name(ex, pos)
         if name and name not in AIR:
-            yield rec("dig", ex.dig(pos), pos=pos)
+            res = ex.dig(pos)
+            _invalidate_voxel(state, pos)
+            yield rec("dig", res, pos=pos)
 
 
 def sneak_bridge(ex: "Executor", state: "State", blocks: Sequence[Pos],
@@ -209,7 +216,9 @@ def sneak_bridge(ex: "Executor", state: "State", blocks: Sequence[Pos],
                 ex.posture(sneak=True)
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
-            yield rec("place", ex.place(block, pos), item=block, pos=pos)
+            res = ex.place(block, pos)
+            _invalidate_voxel(state, pos)
+            yield rec("place", res, item=block, pos=pos)
     finally:
         _release_sneak(ex)
     yield {"op": "posture", "sneak": False}
@@ -233,7 +242,9 @@ def step_up_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos],
         if block_name(ex, pos) in AIR:
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
-            yield rec("place", ex.place(block, pos), item=block, pos=pos)
+            res = ex.place(block, pos)
+            _invalidate_voxel(state, pos)
+            yield rec("place", res, item=block, pos=pos)
         last = list(pos)
 
 
@@ -268,6 +279,7 @@ def recover_move(
         ):
             try:
                 res = ex.dig(pos)
+                _invalidate_voxel(state, pos)
                 yield rec("dig", res, pos=pos)
             except Replan as e:
                 if _is_preemption(e):
@@ -408,6 +420,7 @@ def recover_move(
                     dig_ok = True
                     try:
                         res = ex.dig([ax, fy, az])
+                        _invalidate_voxel(state, [ax, fy, az])
                         yield rec("dig", res, pos=[ax, fy, az])
                     except Replan as e:
                         if _is_preemption(e):

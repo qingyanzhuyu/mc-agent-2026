@@ -11,6 +11,7 @@ from .base import failure, rec
 from .items import AIR, PLACEABLE_BLOCKS, bare
 from .observations import observe_block as _observed_block
 from .sightline import API_DIG_EYE_REACH, can_reach_block
+from .voxel_cache import voxel_cache_for
 
 
 _UNSAFE_SUPPORT = AIR | {"water", "lava", "bubble_column", "fire", "soul_fire",
@@ -39,6 +40,10 @@ def _cell(value):
     return tuple(map(math.floor, _position(value)))
 
 
+def _state_dim(state) -> str:
+    return str((state.st or {}).get("dimension") or "overworld")
+
+
 def _block_matches(block, names, properties=None, mature=None):
     return (bare(block.get("name")) in names
             and all((block.get("properties") or {}).get(key) == value
@@ -58,7 +63,7 @@ def _scan_result(snapshot, observed_at, radius, key, hits, *, ready=True):
     }
 
 
-def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None):
+def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None, skill_name: str = ""):
     """§3.1、§3.3–3.4：ready=true 时复读最多 limit 个暴露候选；加载期间返回 ready=false。"""
     _bounded(radius, 1, 64, "方块搜索半径")
     _bounded(limit, 1, 64, "方块搜索条数")
@@ -67,6 +72,14 @@ def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, 
     observed_at = time.monotonic()
     if snapshot.get("ready") is False:
         return _scan_result(snapshot, observed_at, radius, "blocks", [], ready=False)
+    cache = voxel_cache_for(state)
+    dim = str(snapshot.get("dimension") or "overworld")
+    stance_cell = None
+    raw_pos = snapshot.get("pos")
+    if (isinstance(raw_pos, (list, tuple)) and len(raw_pos) == 3
+            and all(type(v) in (int, float) and math.isfinite(v) for v in raw_pos)):
+        cache.clear_stance_blacklist_if_moved(raw_pos)
+        stance_cell = _cell(raw_pos)
     try:
         found = ex.client.find_blocks(types=sorted(names) or None, radius=radius,
                                       limit=limit, properties=properties, mature=mature)
@@ -74,6 +87,7 @@ def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, 
         if exc.code in ("not_ready", "not_loaded"):
             return _scan_result(snapshot, observed_at, radius, "blocks", [], ready=False)
         raise
+    cache.ingest_find_blocks(found, dimension=dim, client=ex.client)
     blocks = found.get("blocks") or []
     if isinstance(blocks, dict):
         summaries = sorted(blocks.items(), key=lambda entry: entry[1].get("dist", math.inf))
@@ -84,9 +98,13 @@ def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, 
         if not candidate.get("pos") or not (name := bare(candidate.get("name"))):
             continue
         pos = _cell(candidate["pos"])
+        if cache.is_unreachable(skill_name, pos, dimension=dim, stance_cell=stance_cell):
+            continue
         observed = _observed_block(ex, pos)
         if _block_matches(observed, names or {name}, properties, mature):
             hits.append({**candidate, **observed, "pos": list(pos), "name": bare(observed["name"])})
+        else:
+            cache.invalidate(pos, dimension=dim)
     return _scan_result(snapshot, observed_at, radius, "blocks", hits, ready=True)
 
 
@@ -180,7 +198,9 @@ def place_block(ex, state, item, pos, *, expected_block=None, properties=None):
     x, y, z = _cell(cur)
     if abs(pos[1] - y) <= 1 and pos[0] == x and pos[2] == z:
         raise Replan(f"放置点 {pos} 与自身站位重叠")
-    yield rec("place", ex.place(item, pos=list(pos)), item=item, pos=list(pos))
+    receipt = ex.place(item, pos=list(pos))
+    voxel_cache_for(state).invalidate(pos, dimension=_state_dim(state))
+    yield rec("place", receipt, item=item, pos=list(pos))
     after = _observed_block(ex, pos)
     if not _block_matches(after, names, properties):
         raise Replan(f"放置后 {pos} 未确认 {expected_block or item} 及要求属性")
@@ -247,7 +267,7 @@ def _local_mine_target(ex, state, pos, names):
     return block if _block_matches(block, names) else {}
 
 
-def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=None, max_blocks=16):
+def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=None, max_blocks=16, skill_name: str = ""):
     """§3.2、§3.4、§4.2：眼睛 5 格内逐格复核，兼容斜下方自动贴近与 dig_unconfirmed，返回实收新增数量。"""
     _bounded(count, 1, 64, "本批采集数量")
     _bounded(max_blocks, 1, 64, "本批采集格数")
@@ -261,9 +281,13 @@ def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=N
     if tool is not None and state.count(bare(tool)) < 1:
         raise Replan(f"缺少采收工具 {tool}")
     candidates = dict.fromkeys(_cell(pos) for pos in islice(positions, max_blocks))
+    cache = voxel_cache_for(state)
+    dim = _state_dim(state)
     equipped = tool is None
     last_dig_error: Replan | None = None
     for pos in candidates:
+        if skill_name and cache.is_unreachable(skill_name, pos, dimension=dim):
+            continue
         block = _local_mine_target(ex, state, pos, names)
         if not block:
             continue
@@ -288,6 +312,7 @@ def mine_block_batch(ex, state, positions, *, block_types, drop, count=1, tool=N
                 yield rec("dig", pos=list(pos), error_code=code, error=extra)
                 continue
             raise
+        cache.invalidate(pos, dimension=_state_dim(state))
         yield rec("dig", receipt, pos=list(pos))
         state.refresh_status(ex.client, max_age_s=0)
         inv = state.refresh_inventory(ex.client)
