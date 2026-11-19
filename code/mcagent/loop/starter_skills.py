@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 import math
+import time
 from typing import TYPE_CHECKING, Generator, Iterator, Optional
 
 from ..client import ApiError
@@ -436,6 +437,23 @@ def _forget_stale_table(state: "State", table: object) -> None:
         vc.invalidate(table, dimension=dim)
 
 
+def _wait_craft_inventory_sync(
+    ex: "Executor", state: "State", item: str, before: int, *, max_polls: int = 3, sleep_s: float = 0.15,
+) -> int:
+    """实机 /craft 返回后服务端 set_slot 可能延迟 1-2 tick，短暂复查背包避免误判产出为 0。"""
+    state.invalidate_inventory()
+    state.refresh_inventory(ex.client)
+    if state.count(item) > before:
+        return state.count(item)
+    for _ in range(max_polls):
+        time.sleep(sleep_s)
+        state.invalidate_inventory()
+        state.refresh_inventory(ex.client)
+        if state.count(item) > before:
+            return state.count(item)
+    return state.count(item)
+
+
 def _craft_with_space(
     ex: "Executor", state: "State", item: str, *, table_pos: Optional[list] = None,
 ) -> Iterator[dict]:
@@ -448,6 +466,12 @@ def _craft_with_space(
         if code == "no_window":
             table = extra.get("table")
             _forget_stale_table(state, table if _is_valid_pos3(table) else table_pos)
+        if code == "bad_args" and ("updateslot" in str(e).lower() or "timeout" in str(e).lower()):
+            yield rec("craft", item=item, error_code=code)
+            if _wait_craft_inventory_sync(ex, state, item, before) > before:
+                return
+            _forget_stale_table(state, table_pos)
+            raise
         if code != "inventory_full":
             raise
         yield rec("craft", item=item, error_code=code)
@@ -484,6 +508,8 @@ def _craft_with_space(
             raise
         result = ex.craft(item, 1)
     yield rec("craft", result, item=item)
+    if state.count(item) <= before:
+        _wait_craft_inventory_sync(ex, state, item, before)
 
 
 def _prepare_recipe_planks(ex: "Executor", state: "State", needed: int, target: str) -> Iterator[dict]:
@@ -1121,18 +1147,28 @@ class MineStone(Skill):
                         stair_columns.add((sx, sz))
                         stair_steps_taken += 1
                         reobserve_stair = False
+                        dug_stair_cells: dict[int, str] = {}
                         for clear_y in (sy + 2, sy + 1, sy):
-                            bname = bare(_get_block(ex, vc, [sx, clear_y, sz], dim).get("name", ""))
+                            blk = _get_block(ex, vc, [sx, clear_y, sz], dim)
+                            bname = bare(blk.get("name", ""))
                             if bname and bname not in AIR and bname not in ("water", "lava", "crafting_table"):
                                 if bname in STONE_Targets:
                                     yield from self._prepare_pickaxe(ex, state)
-                                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                                st_now = state.refresh_status(ex.client, max_age_s=0)
+                                for _ in range(2):
+                                    if (st_now.get("on_ground") is not False or not st_now.get("alive", True)
+                                            or st_now.get("in_water") or st_now.get("in_lava")):
+                                        break
+                                    time.sleep(0.15)
+                                    st_now = state.refresh_status(ex.client, max_age_s=0)
+                                cur = st_now.get("pos") or state.pos
                                 if _is_under_feet(cur, [sx, clear_y, sz]):
                                     stair_origin, reobserve_stair = None, True
                                     break
                                 dug_res = yield from nav.dig_with_recovery(
                                     ex, state, [sx, clear_y, sz], collect=bname not in PEEL_SURFACE
                                 )
+                                dug_stair_cells[clear_y] = bname
                                 vc and vc.invalidate_radius([sx, clear_y, sz], radius=1, dimension=dim)
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
@@ -1141,8 +1177,31 @@ class MineStone(Skill):
                         if reobserve_stair:
                             continue
                         for clear_y in (sy + 2, sy + 1, sy):
-                            if bare(_get_block(ex, vc, [sx, clear_y, sz], dim, force=True).get("name", "")) not in AIR:
-                                raise Replan("阶梯净空发生变化，停止进入并重新观察")
+                            blk = _get_block(ex, vc, [sx, clear_y, sz], dim, force=True)
+                            bname = bare(blk.get("name", ""))
+                            if bname in AIR:
+                                continue
+                            # 仅对“刚刚挖过的非重力实心块”原位幽灵回滚补挖一次；
+                            # 新坠入的沙/砾石或此前为空的格被回填一律立即中止，守住坍塌安全不变量。
+                            cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                            if (
+                                bname
+                                and bname == dug_stair_cells.get(clear_y)
+                                and bname not in ("sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava", "crafting_table", "bedrock")
+                                and not _is_under_feet(cur, [sx, clear_y, sz])
+                            ):
+                                dug_res = yield from nav.dig_with_recovery(
+                                    ex, state, [sx, clear_y, sz], collect=bname not in PEEL_SURFACE
+                                )
+                                vc and vc.invalidate_radius([sx, clear_y, sz], radius=1, dimension=dim)
+                                state.refresh_inventory(ex.client)
+                                if total_cobble(state) - start_cobble >= want:
+                                    return
+                                self._check_dig_tool(state, dug_res)
+                                blk2 = _get_block(ex, vc, [sx, clear_y, sz], dim, force=True)
+                                if bare(blk2.get("name", "")) in AIR:
+                                    continue
+                            raise Replan("阶梯净空发生变化，停止进入并重新观察")
                         try:
                             yield rec("move_to", _bounded_move_to(ex, [sx + 0.5, sy, sz + 0.5], rng=1, timeout=30.0), pos=[sx + 0.5, sy, sz + 0.5])
                         except Replan as e:

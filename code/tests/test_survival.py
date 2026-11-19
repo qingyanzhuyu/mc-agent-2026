@@ -461,3 +461,105 @@ class SurvivalTests(unittest.TestCase):
         race_world.queue("get_entities", ApiError("not_ready", "dimension transition"))
         with self.assertRaisesRegex(Replan, "not_ready"):
             self.run_skill(race_world, "breed_animal")
+
+    def test_plant_blocked_accepts_raw_logs_from_prep_wood(self):
+        for items, expect_unblocked in (
+            ({"oak_log": 2}, True),
+            ({"oak_log": 1, "stick": 2}, True),
+            ({"oak_log": 1}, True),  # 1 log -> 4 planks -> 2 planks + 4 sticks
+            ({"stick": 1}, False),
+            ({}, False),
+        ):
+            with self.subTest(items=items):
+                world = SurvivalWorld(items)
+                _, state = world.session()
+                self.assertEqual(PlantSeed.blocked(state) == "", expect_unblocked)
+
+    def test_plant_crafts_planks_sticks_table_and_hoe_from_raw_logs(self):
+        table_pos = [1, 64, 0]
+        world = SurvivalWorld({"wheat_seeds": 1, "oak_log": 2}, extra={FIELD: "dirt"})
+        world.queue("advancements", progress(), progress(PLANT))
+        world.queue(
+            "find_blocks",
+            blocks((FIELD, "dirt")),      # initial _planting_site
+            blocks(),                     # craft_recipe(wooden_hoe) table check -> none
+            blocks((table_pos, "crafting_table")),  # retry craft_recipe(wooden_hoe) table check
+            blocks((FIELD, "dirt")),      # post-hoe _planting_site
+        )
+
+        def craft_step(w, *, item, count=1, **_):
+            if item == "oak_planks":
+                w.items["oak_log"] -= 1
+                w.items["oak_planks"] = w.items.get("oak_planks", 0) + 4
+            elif item == "stick":
+                w.items["oak_planks"] -= 2
+                w.items["stick"] = w.items.get("stick", 0) + 4
+            elif item == "crafting_table":
+                w.items["oak_planks"] -= 4
+                w.items["crafting_table"] = w.items.get("crafting_table", 0) + 1
+            elif item == "wooden_hoe":
+                w.items["oak_planks"] -= 2
+                w.items["stick"] -= 2
+                w.items["wooden_hoe"] = w.items.get("wooden_hoe", 0) + 1
+            return {"crafted": item}
+
+        def place_table(w, *, item, pos, **_):
+            w.items[item] -= 1
+            w.blocks[tuple(pos)] = item
+            return {"placed": item, "pos": pos}
+
+        world.queue("craft", craft_step, craft_step, craft_step, craft_step, craft_step)
+        world.queue("place", place_table)
+        world.queue("interact", till, plant)
+        actions, steps = self.run_skill(world, "plant_seed")
+        self.assertIn("place", actions)
+        self.assertEqual(actions.count("interact"), 2)
+        self.assertEqual(steps[-1]["result"], {"crop": "wheat", "advancement_confirmed": True})
+        self.assertEqual(world.items.get("wooden_hoe"), 1)
+        self.assertEqual(world.items.get("wheat_seeds"), 0)
+
+    def test_plant_allows_standing_on_passable_short_grass_and_mid_jump_landing(self):
+        from unittest import mock
+
+        grass_stand = (1, 64, 0)
+        world = SurvivalWorld(
+            {"wheat_seeds": 1},
+            extra={FIELD: "farmland", grass_stand: "short_grass"},
+        )
+        world.st["pos"] = [0.5, 64.0, 0.5]
+        world.queue("advancements", progress(), progress(PLANT))
+        world.queue("find_blocks", blocks((FIELD, "farmland")))
+
+        # Simulate mid-jump landing on first status check after move_to, then grounded on next poll
+        status_polls = {"n": 0, "target": [1.5, 64.0, 0.5]}
+        orig_status = world.status
+
+        def status_with_settle(timeout=10):
+            st = orig_status(timeout)
+            t = status_polls["target"]
+            if status_polls["n"] == 1:
+                status_polls["n"] += 1
+                return {**st, "pos": [t[0], t[1] + 0.9, t[2]], "on_ground": False}
+            if status_polls["n"] >= 2:
+                return {**st, "pos": list(t), "on_ground": True}
+            return st
+
+        world.status = status_with_settle
+
+        def move_to_grass(w, *, pos, **_):
+            status_polls["target"] = list(pos)
+            status_polls["n"] = 1
+            air_pos = [pos[0], pos[1] + 0.9, pos[2]]
+            w.st["pos"] = air_pos
+            return {"pos": air_pos}
+
+        # Put short_grass on ALL 4 neighbors of FIELD so whichever stand is chosen has short_grass!
+        for nb in ((1, 64, 0), (3, 64, 0), (2, 64, 1), (2, 64, -1)):
+            world.blocks[nb] = "short_grass"
+        world.queue("move_to", move_to_grass)
+        world.queue("interact", plant)
+        world.st["pos"] = [-2.5, 64.0, 0.5]
+        with mock.patch("mcagent.skills.field.time.sleep", return_value=None):
+            actions, steps = self.run_skill(world, "plant_seed")
+        self.assertEqual(actions, ["move_to", "interact"])
+        self.assertEqual(steps[-1]["result"], {"crop": "wheat", "advancement_confirmed": True})

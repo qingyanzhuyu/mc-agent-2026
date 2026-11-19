@@ -43,6 +43,34 @@ class FieldTests(unittest.TestCase):
         self.assertEqual([step["op"] for step in drive(collect_drops(ex, state, "arrow"), ex)], ["move_to"])
         self.assertEqual(state.count("arrow"), 1)
 
+    def test_move_local_accepts_goal_near_arrival_jitter_and_rejects_far_miss(self):
+        from mcagent.skills.field import move_local
+
+        floor = {(x, 63, z): "stone" for x in range(-4, 5) for z in range(-4, 5)}
+        world = ScriptedWorld(blocks=floor)
+        world.st["pos"] = [0.5, 64.0, 0.5]
+        # rng=1 stopping at dist=1.20 (real mineflayer GoalNear behavior) must succeed
+        def arrive_jitter(w, *, pos, **_):
+            w.st["pos"] = [pos[0] - 1.2, pos[1], pos[2]]
+            return {"pos": list(w.st["pos"])}
+
+        world.queue("move_to", arrive_jitter)
+        ex, state = world.session()
+        steps = drive(move_local(ex, state, (3.5, 64.0, 0.5), rng=1, require_move=True), ex)
+        self.assertEqual([s["op"] for s in steps], ["move_to"])
+
+        # Far miss (dist=2.2 > 1.65) must still Replan
+        world2 = ScriptedWorld(blocks=floor)
+        world2.st["pos"] = [0.5, 64.0, 0.5]
+        def arrive_far(w, *, pos, **_):
+            w.st["pos"] = [pos[0] - 2.2, pos[1], pos[2]]
+            return {"pos": list(w.st["pos"])}
+
+        world2.queue("move_to", arrive_far)
+        ex2, state2 = world2.session()
+        with self.assertRaisesRegex(Replan, "移动后未确认安全到达"):
+            drive(move_local(ex2, state2, (3.5, 64.0, 0.5), rng=1, require_move=True), ex2)
+
     def test_unknown_drop_includes_search_and_wake_fields(self):
         world = ScriptedWorld()
         world.queue("get_entities", {"entities": []})

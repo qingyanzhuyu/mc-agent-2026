@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from dataclasses import dataclass
+import time
 
 from ..client import ApiError
 from ..runtime import EnvBlocked, Executor, Replan, State
@@ -246,6 +247,14 @@ def craft_recipe(ex: Executor, state: State, item: str, *, goal_qty: int = 1) ->
         inventory = state.refresh_inventory(ex.client)
         after = state.count(item)
         expected = min(variant.output for variant, batches in capacity.items() if batches > 0)
+        if after - current < expected:
+            for _ in range(3):
+                time.sleep(0.15)
+                state.invalidate_inventory()
+                inventory = state.refresh_inventory(ex.client)
+                after = state.count(item)
+                if after - current >= expected:
+                    break
         if after - current < expected:
             raise Replan(f"合成 {item} 后背包仅增加 {after - current} 件，预期至少 {expected} 件")
         gained += after - current

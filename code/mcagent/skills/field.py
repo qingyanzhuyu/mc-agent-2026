@@ -8,7 +8,7 @@ from itertools import islice
 from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import failure, rec
-from .items import AIR, PLACEABLE_BLOCKS, bare
+from .items import AIR, PASSABLE_COVER, PLACEABLE_BLOCKS, bare
 from .observations import observe_block as _observed_block
 from .sightline import API_DIG_EYE_REACH, can_reach_block
 from .voxel_cache import voxel_cache_for
@@ -136,11 +136,14 @@ def _safe_support(ex, pos):
     return name in _KNOWN_SUPPORT or name.endswith("_ore")
 
 
+_PASSABLE = AIR | PASSABLE_COVER
+
+
 def _standable_cell(ex, pos):
     """当前可见整格站位；局部移动和撤离的前置证据。"""
     x, y, z = _cell(pos)
     return (_safe_support(ex, (x, y - 1, z))
-            and all(bare(_observed_block(ex, (x, y + dy, z)).get("name")) in AIR for dy in (0, 1)))
+            and all(bare(_observed_block(ex, (x, y + dy, z)).get("name")) in _PASSABLE for dy in (0, 1)))
 
 
 def _grounded(ex, status):
@@ -176,7 +179,17 @@ def move_local(ex, state, pos, *, rng=1, max_distance=16, require_move=False):
     after = state.refresh_status(ex.client, max_age_s=0)
     if receipt.get("dimension_changed") or after.get("dimension") != before.get("dimension"):
         raise Replan("局部移动发生维度变化，需复核落地安全")
-    if math.dist(_position(after.get("pos")), pos) > rng + 0.09 or not _grounded(ex, after):
+    # 下坡/跳跃瞬态：move_to 返回时可能尚在空中 (on_ground=False)，短暂等待重力落地再复核支撑。
+    for _ in range(3):
+        if (after.get("on_ground") is True or not after.get("alive", True)
+                or after.get("in_lava") or after.get("in_water")
+                or after.get("in_vehicle") or after.get("on_fire")):
+            break
+        time.sleep(0.15)
+        after = state.refresh_status(ex.client, max_age_s=0)
+    # 实机 mineflayer GoalNear 按格心/碰撞箱停步且 /status 保留 1 位小数，rng=1 常停在 1.1–1.4 格；
+    # 给 0.65 格到达容差，由上层调用方（如 _approach）继续按眼距与视线精确复核交互可达性。
+    if math.dist(_position(after.get("pos")), pos) > rng + 0.65 or not _grounded(ex, after):
         raise Replan(f"移动后未确认安全到达 {pos} 附近")
     return after
 

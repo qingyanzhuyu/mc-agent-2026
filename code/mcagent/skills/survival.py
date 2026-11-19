@@ -5,7 +5,7 @@ import math
 
 from ..runtime import EnvBlocked, Replan
 from .field import move_local
-from .items import AIR, PLACEABLE_BLOCKS, bare
+from .items import AIR, PASSABLE_COVER, PLACEABLE_BLOCKS, bare
 from .observations import completed_advancements, observe_block
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES
@@ -71,9 +71,12 @@ def _require_ready(status):
         raise Replan("世界区块和实体加载尚未就绪或角色未存活（not_ready），请稍后重试")
 
 
+_PASSABLE = AIR | PASSABLE_COVER
+
+
 def _standable(ex, pos):
-    return (_block(ex, _above(pos, -1)) in _SUPPORT and _block(ex, pos) in AIR
-            and _block(ex, _above(pos)) in AIR)
+    return (_block(ex, _above(pos, -1)) in _SUPPORT and _block(ex, pos) in _PASSABLE
+            and _block(ex, _above(pos)) in _PASSABLE)
 
 
 def _can_reach(source, target, reach):
@@ -89,7 +92,7 @@ def _stand_for(ex, status, target=None, reach=4, clear=None, *, block_pos=None):
     if (
         _can_reach(status, aim, reach)
         and _standable(ex, _cell(current))
-        and (block_pos is None or can_see_block(ex, status, block_pos))
+        and (block_pos is None or can_see_block(ex, status, block_pos, passable=_PASSABLE))
         and (clear is None or clear(current))
     ):
         return tuple(current)
@@ -104,7 +107,7 @@ def _stand_for(ex, status, target=None, reach=4, clear=None, *, block_pos=None):
             math.dist(current, spot) <= 16
             and _can_reach(candidate, aim, reach)
             and _standable(ex, pos)
-            and (block_pos is None or can_see_block(ex, candidate, block_pos))
+            and (block_pos is None or can_see_block(ex, candidate, block_pos, passable=_PASSABLE))
             and (clear is None or clear(spot))
         ):
             return spot
@@ -121,7 +124,7 @@ def _approach(ex, state, status, stand, target=None, reach=4, *, block_pos=None)
         or not _on_ground(fresh)
         or not _can_reach(fresh, aim, reach)
         or not _standable(ex, _cell(fresh["pos"]))
-        or (block_pos is not None and not can_see_block(ex, fresh, block_pos))
+        or (block_pos is not None and not can_see_block(ex, fresh, block_pos, passable=_PASSABLE))
     ):
         raise Replan("到点后未确认脚下支撑和交互距离，请换可达位置")
     return fresh

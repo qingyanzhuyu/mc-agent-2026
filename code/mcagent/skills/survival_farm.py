@@ -9,12 +9,13 @@ from .base import Param, Skill, failure, rec
 from .field import collect_drops, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
-from .recipes import craft_recipe
+from .recipes import RECIPES, _ingredient_items, craft_recipe
 from .registry import register
 from .sightline import ENTITY_EYE_REACH, block_center
 from .survival import (
-    _BREED_PROGRESS, _PLANT_PROGRESS, _above, _approach, _block, _can_reach,
-    _fresh_inventory, _has_progress, _plank_plan, _require_ready, _site_missing, _stand_for,
+    _BREED_PROGRESS, _PLANKS, _PLANT_PROGRESS, _SUPPORT, _above, _approach, _block,
+    _can_reach, _cell, _fresh_inventory, _has_progress, _neighbors, _plank_plan,
+    _require_ready, _site_missing, _stand_for,
 )
 
 
@@ -45,8 +46,77 @@ def _held_hoe(state):
     return next((item for item in _HOES if state.count(item)), None)
 
 
+def _total_planks(state) -> int:
+    return sum(state.count(item) for item in _PLANKS)
+
+
+def _raw_wood_plank_potential(state) -> int:
+    total = 0
+    for plank in _PLANKS:
+        recipe = RECIPES[plank]
+        for ing, needed in recipe.ingredients:
+            stock = sum(state.count(name) for name in _ingredient_items(ing))
+            total += (stock // needed) * recipe.output
+    return total
+
+
 def _has_farm_tools(state):
-    return _held_hoe(state) or (state.count("stick") >= 2 and _plank_plan(state, 2))
+    if _held_hoe(state):
+        return True
+    planks_needed = 2 + (2 if state.count("stick") < 2 else 0)
+    return (_total_planks(state) + _raw_wood_plank_potential(state)) >= planks_needed
+
+
+def _craft_planks_from_logs(ex, state, needed_planks: int):
+    while _total_planks(state) < needed_planks:
+        crafted_any = False
+        for plank in _PLANKS:
+            recipe = RECIPES[plank]
+            if all(
+                sum(state.count(name) for name in _ingredient_items(ing)) >= needed
+                for ing, needed in recipe.ingredients
+            ):
+                yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + recipe.output)
+                crafted_any = True
+                break
+        if not crafted_any:
+            break
+
+
+def _place_local_table(ex, state):
+    status = state.refresh_status(ex.client, max_age_s=0)
+    _require_ready(status)
+    self_cell = _cell(status["pos"])
+    for cand in _neighbors(self_cell):
+        if _block(ex, cand) in AIR and _block(ex, _above(cand, -1)) in _SUPPORT:
+            res = ex.place(item="crafting_table", pos=list(cand))
+            yield rec("place", res, item="crafting_table", pos=list(cand))
+            _fresh_inventory(ex, state)
+            return True
+    return False
+
+
+def _craft_wooden_hoe(ex, state):
+    planks_needed = 2 + (2 if state.count("stick") < 2 else 0)
+    if _total_planks(state) + _raw_wood_plank_potential(state) >= planks_needed:
+        yield from _craft_planks_from_logs(ex, state, planks_needed)
+        if state.count("stick") < 2 and _total_planks(state) >= 2:
+            yield from craft_recipe(ex, state, "stick", goal_qty=2)
+    try:
+        yield from craft_recipe(ex, state, "wooden_hoe", goal_qty=1)
+        return
+    except EnvBlocked as exc:
+        if exc.missing_predicate != "station_ready:crafting_table":
+            raise
+        if state.count("crafting_table") < 1:
+            if _total_planks(state) + _raw_wood_plank_potential(state) < 6:
+                raise
+            yield from _craft_planks_from_logs(ex, state, 6)
+            yield from craft_recipe(ex, state, "crafting_table", goal_qty=1)
+        placed = yield from _place_local_table(ex, state)
+        if not placed:
+            raise
+    yield from craft_recipe(ex, state, "wooden_hoe", goal_qty=1)
 
 
 def _gather_wheat(ex, state, goal_qty):
@@ -63,7 +133,10 @@ def _gather_wheat(ex, state, goal_qty):
         stand = _stand_for(ex, status, target, block_pos=pos)
         if stand is None:
             continue
-        yield from _approach(ex, state, status, stand, target, block_pos=pos)
+        try:
+            yield from _approach(ex, state, status, stand, target, block_pos=pos)
+        except Replan:
+            continue
         if _block(ex, pos) not in _GRASS:
             continue
         try:
@@ -149,7 +222,7 @@ class PlantSeed(Skill):
         if base == "farmland" and _block(ex, pos) in _TILLABLE:
             hoe = _held_hoe(state)
             if hoe is None:
-                yield from craft_recipe(ex, state, "wooden_hoe", goal_qty=1)
+                yield from _craft_wooden_hoe(ex, state)
                 hoe = "wooden_hoe"
                 base, pos, stand, status = _planting_site(ex, state, seed)
         else:
