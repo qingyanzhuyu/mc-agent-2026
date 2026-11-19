@@ -240,6 +240,25 @@ class CraftGearAndMineStoneIntegrationTests(unittest.TestCase):
         drive(make("mine_stone", {"count": 1}), ex_s, state_s)
         self.assertGreater(voxel_cache_for(state_s).stats()["hits"], 0)
 
+    def test_floating_canopy_above_real_ground_skipped_before_move_to(self):
+        # 复现 2026-11-19 local-target 实机：历史 bot 砍空树干后留下的悬空树冠 (12, 70, 0)（离草地 (12, 64, 0) 高 6 格）
+        # 应在发 move_to 前直接跳过，直接走向较远但接地的真实树干 (16, 65, 0)
+        world = IntegrationWorld(
+            pos=(0.5, 65.0, 0.5),
+            blocks={
+                (12, 64, 0): "grass_block",
+                (12, 70, 0): "birch_log",
+                (16, 64, 0): "grass_block",
+                (16, 65, 0): "oak_log",
+            },
+        )
+        ex, state = world.session()
+        steps = drive(make("gather_wood", {"count": 1}), ex, state)
+        moved_targets = [s["pos"] for s in steps if s["op"] == "move_to"]
+        self.assertNotIn([12, 70, 0], moved_targets)
+        self.assertEqual(moved_targets, [[16, 65, 0]])
+        self.assertEqual(state.count("oak_log"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

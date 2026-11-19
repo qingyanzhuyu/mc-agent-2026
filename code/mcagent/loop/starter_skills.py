@@ -291,12 +291,24 @@ def _no_wood_blocked() -> EnvBlocked:
     )
 
 
+def _is_floating_canopy_log(ex: "Executor", vc, pt: tuple[int, int, int], dim: str) -> bool:
+    """检查原木是否悬空在真实地表上方 >=4 格（树干底部已被砍空，move_to(rng=3) 必然 stalled）。"""
+    x, y, z = pt
+    for dy in (1, 2, 3, 4):
+        b = _probe_block_name(ex, [x, y - dy, z], vc=vc, dim=dim)
+        if not b or (b not in AIR and not b.endswith("_leaves")):
+            return False
+    for dy in range(5, 11):
+        b = _probe_block_name(ex, [x, y - dy, z], vc=vc, dim=dim)
+        if b and b not in AIR and not b.endswith("_leaves"):
+            return True
+    return False
+
+
 def _resolve_log_base(
     ex: "Executor", state: "State", vc, pt: tuple[int, int, int], cur: list[float], dim: str,
 ) -> tuple[tuple[int, int, int], Optional[str]]:
-    """对高于站位 1 格以上的树冠原木沿树干下探到树基，避免直接寻路高处树冠。"""
-    if pt[1] <= math.floor(cur[1]) + 1:
-        return pt, None
+    """沿树干下探到最低一节原木，避免直接寻路高处树冠。"""
     reach_mod = _reach_mod()
     if reach_mod is not None and hasattr(reach_mod, "select_column_base"):
         base = reach_mod.select_column_base(ex.client, state, pt, match_names=ALL_LOGS)
@@ -695,6 +707,16 @@ class GatherWood(Skill):
                     bad_positions.add(t_key)
                     stale_memo_skips += 1
                     continue
+
+            if (eye_to_block_dist(st, target) > DIG_EYE_REACH
+                    and _is_floating_canopy_log(ex, vc, t_key, dim)):
+                bad_positions.update((t_key[0], t_key[1] + dy, t_key[2]) for dy in range(5))
+                memo.mark_unreachable(
+                    t_key, dimension=dim, category="wood", error_code="floating_canopy", block=chosen["name"],
+                )
+                vc and vc.mark_unreachable("gather_wood", t_key, dimension=dim, stance_cell=cur_cell)
+                stale_memo_skips += 1
+                continue
 
             attempts += 1
             moved_for_target = False
