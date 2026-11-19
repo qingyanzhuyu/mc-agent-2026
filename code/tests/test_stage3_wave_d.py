@@ -232,6 +232,7 @@ class WaveDWorld(GridWorld):
         return {"completed": sorted(self.completed_advs)}
 
     def get_block(self, pos, use_cache: bool = True) -> dict:
+        self.calls.append(("get_block", {"pos": list(pos)}))
         key = tuple(pos)
         blk: dict[str, Any] = {"name": self.blocks.get(key, "air")}
         if key in self.block_props:
@@ -551,7 +552,7 @@ class RideStriderBoostTests(_WaveDTestBase):
         self.assertEqual(skill.verify_done(state), "")
         self.assertIsNone(world.st.get("in_vehicle"))
         self.assertTrue(any(op == "dismount" for op, _ in world.calls))
-        self.assertEqual(world.held["durability"], [99, 100])
+        self.assertEqual(world.held["durability"], [98, 100])
         # Verify failure rec for use_item(cannot_use) AND fallback move_to rec
         self.assertTrue(
             any(isinstance(s, dict) and s.get("op") == "use_item" and s.get("error_code") == "cannot_use" for s in steps)
@@ -561,7 +562,7 @@ class RideStriderBoostTests(_WaveDTestBase):
         )
         self.assertTrue(memo_for(state).has_landmark("saddled_strider", dimension="the_nether"))
 
-    def test_honest_b13_unsupported_failure_raises_replan_and_dismounts_safely(self) -> None:
+    def test_honest_b13_unsupported_failure_raises_replan_without_blocking_finally_dismount(self) -> None:
         for fallback_mode in ("noop_move_to", "failing_move_to"):
             with self.subTest(fallback_mode=fallback_mode):
                 reset_all_world_memos()
@@ -604,9 +605,9 @@ class RideStriderBoostTests(_WaveDTestBase):
                     drive(skill, ex, state, max_steps=40)
                 self.assertIn("api_b13_unsupported", str(cm.exception))
                 self.assertTrue(skill.verify_done(state))
-                # Safe dismount MUST execute in finally
-                self.assertTrue(any(op == "dismount" for op, _ in world.calls))
-                self.assertIsNone(world.st.get("in_vehicle"))
+                # Blocking dismount MUST NOT be invoked un-yielded in finally
+                self.assertFalse(any(op == "dismount" for op, _ in world.calls))
+                self.assertIsNotNone(world.st.get("in_vehicle"))
 
 
 # ============================================================================
@@ -678,6 +679,7 @@ class RideStriderOverworldTests(_WaveDTestBase):
             roof_y=roof_y, roof_block=roof_block,
         )
         blocks.update(tblocks)
+        blocks.update(_flat(56, 57, -1, 1, y=shore_y, block="stone"))
         stacks = [
             {"name": "warped_fungus_on_a_stick", "count": 1, "slot": 0, "durability": [100, 100]},
             {"name": "saddle", "count": 1, "slot": 1},
@@ -743,8 +745,11 @@ class RideStriderOverworldTests(_WaveDTestBase):
                 self.assertGreaterEqual(skill._net_horiz_dist, 50.0)
                 self.assertIsNone(world.st.get("in_vehicle"))
                 self.assertTrue(any(op == "dismount" for op, _ in world.calls))
+                get_blocks = [c for c in world.calls if c[0] == "get_block"]
+                self.assertLess(len(get_blocks), 25, f"unexpected get_block HTTP storm: {len(get_blocks)}")
+                self.assertTrue(any(op == "find_blocks" for op, _ in world.calls))
 
-    def test_rejects_turn_back_and_short_displacement_and_dismounts_in_finally(self) -> None:
+    def test_rejects_turn_back_and_short_displacement_without_lava_dismount(self) -> None:
         cases = (
             ("turn_back_to_net_20", [16.5, 31.5, 26.5, 21.5], 20.0),
             ("stall_at_net_49", [16.5, 31.5, 46.5, 50.5], 49.0),
@@ -769,8 +774,8 @@ class RideStriderOverworldTests(_WaveDTestBase):
                     drive(skill, ex, state, max_steps=60)
                 self.assertAlmostEqual(skill._net_horiz_dist, expected_net, places=3)
                 self.assertTrue(skill.verify_done(state))
-                self.assertTrue(any(op == "dismount" for op, _ in world.calls))
-                self.assertIsNone(world.st.get("in_vehicle"))
+                self.assertFalse(any(op == "dismount" for op, _ in world.calls))
+                self.assertIsNotNone(world.st.get("in_vehicle"))
 
     def test_rejects_flowing_lava_and_open_sky_track_without_rainproof_roof(self) -> None:
         # Case A: flowing_lava mid-track
@@ -860,6 +865,7 @@ class RideStriderOverworldTests(_WaveDTestBase):
                 ow_blocks = _flat(-2, 0, -2, 2, y=63, block="stone")
                 tblocks, _ = _lava_track(1, 64, 0, length=55, dx=1, dz=0, roof_y=67, roof_block="cobblestone")
                 ow_blocks.update(tblocks)
+                ow_blocks.update(_flat(56, 57, -1, 1, y=63, block="stone"))
 
                 world = WaveDWorld(
                     pos=(0.5, 64.0, 0.5),
@@ -907,6 +913,26 @@ class RideStriderOverworldTests(_WaveDTestBase):
                     self.assertTrue(any(op == "interact" and req["item"] == "lead" for op, req in world.calls))
                 else:
                     self.assertTrue(any(op == "equip" and req["item"] == "warped_fungus" for op, req in world.calls))
+
+        # Subtest 4: Strider too far (>3.5 blocks) from portal blocks crossing alone
+        reset_all_world_memos()
+        nether_blocks = _flat(-4, 5, -2, 2, y=63, block="netherrack")
+        nether_blocks[(4, 64, 0)] = "nether_portal"
+        w_far = WaveDWorld(
+            pos=(3.5, 64.0, 0.5),
+            dimension="the_nether",
+            blocks=nether_blocks,
+            item_stacks=[
+                {"name": "warped_fungus_on_a_stick", "count": 1, "slot": 0, "durability": [100, 100]},
+                {"name": "saddle", "count": 1, "slot": 1},
+                {"name": "lead", "count": 1, "slot": 2},
+            ],
+            entities=[{"id": 303, "name": "strider", "type": "strider", "pos": [-3.5, 64.0, 0.5], "saddled": False}],
+        )
+        ex_f, st_f = w_far.session()
+        with self.assertRaises(Replan):
+            drive(RideStriderOverworld(), ex_f, st_f, max_steps=20)
+        self.assertEqual(w_far.st["dimension"], "the_nether")
 
 
 # ============================================================================
@@ -1030,21 +1056,41 @@ class ThrowOpportunisticTridentTests(_WaveDTestBase):
         self.assertTrue(skill.verify_done(state))
 
     def test_missed_throw_raises_replan_and_verify_done_fails(self) -> None:
+        for receipt in ({"fired": True, "hit": False}, {"ok": True, "hit": False}):
+            with self.subTest(receipt=receipt):
+                world = WaveDWorld(
+                    pos=(0.5, 64.0, 0.5),
+                    blocks=_flat(-6, 8, -6, 6, y=63, block="grass_block"),
+                    item_stacks=[{"name": "trident", "count": 1, "slot": 0}],
+                    entities=[{"id": 601, "name": "cow", "type": "cow", "pos": [6.5, 64.0, 0.5], "health": 10.0}],
+                )
+                world.on_shoot = lambda w, entity_id=None, pos=None, weapon=None, charge_ms=1100, rcpt=receipt: dict(rcpt)
+                ex, state = world.session()
+                skill = ThrowOpportunisticTrident()
+                with self.assertRaises(Replan):
+                    drive(skill, ex, state, max_steps=20)
+                self.assertTrue(skill.verify_done(state))
+
+    def test_preemption_replan_during_trident_retrieval_is_not_swallowed(self) -> None:
         world = WaveDWorld(
             pos=(0.5, 64.0, 0.5),
             blocks=_flat(-6, 8, -6, 6, y=63, block="grass_block"),
             item_stacks=[{"name": "trident", "count": 1, "slot": 0}],
-            entities=[{"id": 601, "name": "cow", "type": "cow", "pos": [6.5, 64.0, 0.5], "health": 10.0}],
+            entities=[{"id": 601, "name": "cow", "type": "cow", "pos": [5.5, 64.0, 0.5], "health": 10.0}],
         )
-        world.on_shoot = lambda w, entity_id=None, pos=None, weapon=None, charge_ms=1100: {
-            "fired": True,
-            "hit": False,
-        }
+
+        def _hit_then_drop(w: WaveDWorld, entity_id=None, pos=None, weapon=None, charge_ms=1100):
+            w._consume_item("trident", 1)
+            w.entities.append({"id": 701, "name": "trident", "type": "item", "pos": [5.5, 64.0, 0.5]})
+            return {"hit": True, "entity_id": entity_id}
+
+        world.on_shoot = _hit_then_drop
+        world.on_move_to = lambda w, pos=None, **_kw: (_ for _ in ()).throw(Replan("danger: creeper_nearby"))
         ex, state = world.session()
         skill = ThrowOpportunisticTrident()
-        with self.assertRaises(Replan):
+        with self.assertRaises(Replan) as cm:
             drive(skill, ex, state, max_steps=20)
-        self.assertTrue(skill.verify_done(state))
+        self.assertIn("creeper_nearby", str(cm.exception))
 
 
 # ============================================================================

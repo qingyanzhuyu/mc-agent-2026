@@ -64,11 +64,11 @@ STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "pale_garden": ("pale_oak_log", "pale_moss_block", "creaking_heart"),
     "pillager_outpost": ("dark_oak_log", "white_banner"),
     "dried_ghast": ("dried_ghast", "bone_block"),
-    "meadow": ("cornflower", "allium", "azure_bluet", "oxeye_daisy", "emerald_ore"),
-    "swamp": ("lily_pad", "blue_orchid", "slime_block"),
+    "meadow": ("allium", "emerald_ore"),
+    "swamp": ("lily_pad", "blue_orchid"),
     "mangrove_swamp": ("mangrove_log", "mangrove_roots", "muddy_mangrove_roots", "mangrove_propagule"),
     "cold_biome": ("packed_ice", "blue_ice", "snow_block", "end_stone"),
-    "trial_vault_ominous": ("ominous_trial_spawner", "heavy_core", "chiseled_tuff_bricks"),
+    "trial_vault_ominous": ("vault", "trial_spawner", "chiseled_tuff_bricks"),
 }
 VALID_STATUSES: tuple[str, ...] = ("untested", "reachable", "unreachable", "protected", "depleted")
 

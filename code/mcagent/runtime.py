@@ -443,40 +443,88 @@ class State:
 
     @_locked
     def is_totem_trigger_armed(self) -> bool:
-        """返回受控图腾触发单次守卫是否处于已布防且尚未消耗状态。"""
+        """返回受控图腾触发守卫是否处于已布防、未失效且未超时状态。"""
         guard = self._totem_guard
-        return bool(guard and guard.get("active") and not guard.get("consumed"))
+        if not (isinstance(guard, dict) and guard.get("active") and not guard.get("consumed")):
+            return False
+        expires_at = guard.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.monotonic() > expires_at:
+            return False
+        return True
 
     @_locked
     def consume_totem_trigger_suppression(self) -> bool:
-        """锁内二次核验条件并单次消耗受控图腾触发抑制权。"""
+        """锁内二次核验条件并在受控坠落窗口内支持多拍抑制（直到落地/消耗/超时/撤防）。"""
         guard = self._totem_guard
-        if not (guard and guard.get("active") and not guard.get("consumed")):
+        if not (isinstance(guard, dict) and guard.get("active") and not guard.get("consumed")):
+            return False
+        expires_at = guard.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.monotonic() > expires_at:
+            guard["active"] = False
             return False
         st = self.st or {}
         inv = self.inventory or {}
         if self.in_safe_mode or st.get("in_lava") or st.get("submerged") or not st.get("alive", True):
             return False
+        if st.get("on_ground") is False:
+            guard["saw_airborne"] = True
+        if guard.get("saw_airborne") and st.get("on_ground") is True:
+            guard["consumed"] = True
+            guard["active"] = False
+            return False
         if not _has_offhand_totem(inv, st):
+            guard["consumed"] = True
+            guard["active"] = False
             return False
-        if not _is_armor_stripped(inv, st):
+        if guard.get("allow_armored"):
+            armor_ok, _, _, _, _ = assess_totem_armor(inv, st)
+            if not armor_ok:
+                return False
+        elif not _is_armor_stripped(inv, st):
             return False
-        guard["consumed"] = True
+        guard["suppression_count"] = int(guard.get("suppression_count", 0)) + 1
         return True
 
-    def controlled_totem_trigger(self, client: Any, *, drop_height: int = 25):
-        """受控图腾触发（Postmortal）单次安全抑制上下文管理器。"""
-        return controlled_totem_trigger(self, client, drop_height=drop_height)
+    def controlled_totem_trigger(
+        self,
+        client: Any,
+        *,
+        drop_height: int = 25,
+        landing_col: Any = None,
+        min_drop: int = 23,
+        max_duration_s: float = 3.5,
+        allow_armored: bool = False,
+    ):
+        """受控图腾触发（Postmortal）坠落全过程安全抑制上下文管理器。"""
+        return controlled_totem_trigger(
+            self,
+            client,
+            drop_height=drop_height,
+            landing_col=landing_col,
+            min_drop=min_drop,
+            max_duration_s=max_duration_s,
+            allow_armored=allow_armored,
+        )
 
 
 # ---------------------------------------------------------------- 受控图腾触发守卫
 _TOTEM_UNSAFE_LANDING_BLOCKS: frozenset[str] = frozenset({
     "lava", "flowing_lava", "water", "flowing_water", "bubble_column",
     "fire", "soul_fire", "powder_snow", "magma_block", "cobweb",
-    "slime_block", "hay_block", "sweet_berry_bush",
+    "slime_block", "hay_block", "sweet_berry_bush", "honey_block",
+})
+_TOTEM_PASSABLE_BLOCKS: frozenset[str] = frozenset({
+    "short_grass", "tall_grass", "fern", "large_fern",
+    "short_dry_grass", "tall_dry_grass", "dead_bush",
+    "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet",
+    "oxeye_daisy", "cornflower", "lily_of_the_valley",
 })
 _TOTEM_AIR_BLOCKS: frozenset[str] = frozenset({"air", "cave_air", "void_air"})
 _TOTEM_ARMOR_SLOTS: tuple[str, ...] = ("head", "chest", "legs", "feet")
+
+
+def _is_unsafe_totem_landing_block(bname: str) -> bool:
+    return bname in _TOTEM_UNSAFE_LANDING_BLOCKS or bname == "bed" or bname.endswith("_bed")
 
 
 def _is_totem_item(item: Any) -> bool:
@@ -525,15 +573,100 @@ def _is_armor_stripped(inv: Any, st: Any) -> bool:
         return False
 
 
+def _iter_piece_enchants(piece: dict[str, Any]) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    sources: list[Any] = [piece]
+    for key in ("components", "nbt", "metadata", "meta"):
+        sub = piece.get(key)
+        if isinstance(sub, dict):
+            sources.append(sub)
+    for src in sources:
+        ench = src.get("enchantments")
+        if isinstance(ench, dict):
+            for k, v in ench.items():
+                if isinstance(v, int) and not isinstance(v, bool):
+                    out.append((str(k).removeprefix("minecraft:").strip().lower(), v))
+        elif isinstance(ench, (list, tuple)):
+            for row in ench:
+                if not isinstance(row, dict):
+                    continue
+                ename = str(row.get("name") or row.get("id") or "").removeprefix("minecraft:").strip().lower()
+                lvl = row.get("level") if row.get("level") is not None else row.get("lvl", 1)
+                if ename and isinstance(lvl, int) and not isinstance(lvl, bool):
+                    out.append((ename, lvl))
+    return out
+
+
+def assess_totem_armor(inv: Any, st: Any) -> tuple[bool, str, int, int, bool]:
+    """评估当前护甲附魔与减伤情况：返回 (可否执行, 拒绝原因, 所需坠落高度, min_drop, 是否带甲)。"""
+    armor = inv.get("armor") if isinstance(inv, dict) else None
+    occupied = 0
+    prot_epf = 0
+    seen_slots: set[str] = set()
+    if isinstance(armor, dict):
+        for slot in (*_TOTEM_ARMOR_SLOTS, "torso"):
+            norm_slot = "chest" if slot == "torso" else slot
+            if norm_slot in seen_slots:
+                continue
+            piece = armor.get(slot)
+            if not isinstance(piece, dict) or not piece:
+                continue
+            if not (piece.get("name") or int(piece.get("count", 0) or 0) > 0):
+                continue
+            seen_slots.add(norm_slot)
+            occupied += 1
+            for ename, lvl in _iter_piece_enchants(piece):
+                if ename == "feather_falling" and lvl >= 1:
+                    return (
+                        False,
+                        "totem_feather_falling_armor_cannot_unequip: 穿戴摔落保护靴子且无脱甲接口，禁止受控坠落",
+                        0,
+                        0,
+                        False,
+                    )
+                if ename == "protection" and lvl >= 1:
+                    prot_epf += lvl
+
+    raw_ap = st.get("armor_points", 0) if isinstance(st, dict) else 0
+    if isinstance(raw_ap, bool):
+        return False, "护甲值 armor_points 格式无效，禁止受控坠落", 0, 0, False
+    try:
+        armor_points = float(raw_ap or 0)
+    except (TypeError, ValueError):
+        return False, "护甲值 armor_points 解析失败，禁止受控坠落", 0, 0, False
+
+    if occupied == 0 and armor_points == 0.0:
+        return True, "ok", 25, 23, False
+
+    if prot_epf >= 12:
+        return (
+            False,
+            f"totem_high_protection_armor_cannot_unequip: 护甲保护总等级过高(prot_epf={prot_epf})且无脱甲接口，禁止受控坠落",
+            0,
+            0,
+            False,
+        )
+
+    reduction = min(0.80, 0.04 * prot_epf)
+    needed_height = math.ceil(3.0 + 24.0 / (1.0 - reduction))
+    needed_height = max(needed_height, 28) if prot_epf == 0 else max(needed_height + 2, 30)
+    return True, "ok_armored", needed_height, needed_height - 2, True
+
+
 def validate_controlled_totem_conditions(
     state: State,
     client: Any,
     *,
     drop_height: int = 25,
+    landing_col: Any = None,
+    min_drop: int = 23,
+    allow_armored: bool = False,
 ) -> tuple[bool, str, Optional[dict[str, Any]]]:
-    """严格校验受控图腾触发（Postmortal）的全部 4 项安全前置条件。"""
+    """严格校验受控图腾触发（Postmortal）的全部安全前置条件与落点列连续净空。"""
     if isinstance(drop_height, bool) or not isinstance(drop_height, int) or drop_height < 1:
         return False, "drop_height 必须为正整数", None
+    if isinstance(min_drop, bool) or not isinstance(min_drop, int) or min_drop < 1:
+        return False, "min_drop 必须为正整数", None
 
     with state._lock:
         st = state.snapshot()
@@ -563,11 +696,17 @@ def validate_controlled_totem_conditions(
     if not _has_offhand_totem(inv, st):
         return False, "副手未确认持有不死图腾(totem_of_undying)", None
 
-    # (c) 全身护甲已卸下且 armor_points == 0
-    if not _is_armor_stripped(inv, st):
-        return False, "角色仍穿戴护甲或 armor_points 不为 0，必须先脱甲再触发图腾", None
+    # (c) 无护甲或满足无摔落保护/低减伤且抬高落差要求
+    if allow_armored:
+        armor_ok, armor_reason, req_height, req_min_drop, _ = assess_totem_armor(inv, st)
+        if not armor_ok:
+            return False, armor_reason, None
+        if drop_height < req_height or min_drop < req_min_drop:
+            return False, f"穿戴护甲时坠落高度不足（需 drop_height>={req_height}, min_drop>={req_min_drop}）", None
+    elif not _is_armor_stripped(inv, st):
+        return False, "角色仍穿戴护甲或 armor_points 不为 0，必须先脱甲或按护甲减伤抬高落差再触发图腾", None
 
-    # (d) 正下方 drop_height (+2 缓冲) 格内存在实心安全落点，非虚空/岩浆/水/缓冲方块
+    # (d) 落点列向下连续至少 min_drop 格空气/非致命阻挡后落到安全实心方块
     pos = st.get("pos")
     if (
         not isinstance(pos, (list, tuple))
@@ -577,33 +716,62 @@ def validate_controlled_totem_conditions(
             for v in pos[:3]
         )
     ):
-        return False, "缺少有效玩家坐标 pos，无法校验正下方安全落点", None
+        return False, "缺少有效玩家坐标 pos，无法校验安全落点", None
 
     get_block = getattr(client, "get_block", None)
     if not callable(get_block):
-        return False, "缺少 client.get_block，无法校验正下方安全落点", None
+        return False, "缺少 client.get_block，无法校验安全落点", None
 
     fx, fy, fz = math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2])
+    if landing_col is not None:
+        if (
+            not isinstance(landing_col, (list, tuple))
+            or len(landing_col) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in landing_col)
+        ):
+            return False, "landing_col 必须为有效的 (x, z) 坐标", None
+        lx, lz = math.floor(landing_col[0]), math.floor(landing_col[1])
+    else:
+        lx, lz = fx, fz
+
     supports_use_cache = _accepts_use_cache(get_block)
-    for dy in range(1, drop_height + 3):
-        probe_pos = [fx, fy - dy, fz]
+
+    def _read_bname(probe: list[int]) -> str:
+        blk = get_block(probe, use_cache=False) if supports_use_cache else get_block(probe)
+        raw = blk.get("name") if isinstance(blk, dict) else None
+        return str(raw).removeprefix("minecraft:") if isinstance(raw, str) else ""
+
+    if (lx, lz) != (fx, fz):
+        for head_dy in (0, 1):
+            try:
+                head_name = _read_bname([lx, fy + head_dy, lz])
+            except ApiError as e:
+                return False, f"查询落点列起步空间失败 ({e.code}): {e.message}", None
+            if head_name and head_name not in _TOTEM_AIR_BLOCKS and head_name not in _TOTEM_PASSABLE_BLOCKS:
+                return False, f"落点列 ({lx}, {lz}) 起步空间受阻 ({head_name})", None
+
+    max_probe = max(drop_height, min_drop) + 2
+    for dy in range(1, max_probe + 1):
+        probe_pos = [lx, fy - dy, lz]
         try:
-            block = get_block(probe_pos, use_cache=False) if supports_use_cache else get_block(probe_pos)
+            bname = _read_bname(probe_pos)
         except ApiError as e:
-            return False, f"查询正下方落点方块失败 ({e.code}): {e.message}", None
-        raw_name = block.get("name") if isinstance(block, dict) else None
-        bname = str(raw_name).removeprefix("minecraft:") if isinstance(raw_name, str) else ""
-        if not bname or bname in _TOTEM_AIR_BLOCKS:
+            return False, f"查询落点列方块失败 ({e.code}): {e.message}", None
+        if not bname or bname in _TOTEM_AIR_BLOCKS or bname in _TOTEM_PASSABLE_BLOCKS:
             continue
-        if bname in _TOTEM_UNSAFE_LANDING_BLOCKS:
-            return False, f"正下方落点存在岩浆/水/缓冲危险方块 ({bname})", None
+        if _is_unsafe_totem_landing_block(bname):
+            return False, f"落点列 ({lx}, {lz}) 存在岩浆/水/缓冲/床等危险方块 ({bname})", None
+        drop_blocks = dy - 1
+        if drop_blocks < min_drop:
+            return False, f"落点列 ({lx}, {lz}) 坠落高度不足（仅 {drop_blocks} 格 < {min_drop} 格即遇 {bname}）", None
         return True, "ok", {
             "landing_pos": probe_pos,
             "landing_block": bname,
-            "drop_blocks": dy - 1,
+            "drop_blocks": drop_blocks,
+            "landing_col": [lx, lz],
         }
 
-    return False, f"正下方 {drop_height} 格内无实心安全落点（疑似虚空）", None
+    return False, f"落点列 ({lx}, {lz}) 下方 {max(drop_height, min_drop)} 格内无实心安全落点（疑似虚空）", None
 
 
 @contextlib.contextmanager
@@ -612,18 +780,35 @@ def controlled_totem_trigger(
     client: Any,
     *,
     drop_height: int = 25,
+    landing_col: Any = None,
+    min_drop: int = 23,
+    max_duration_s: float = 3.5,
+    allow_armored: bool = False,
 ):
-    """受控图腾触发守卫：严格核验 4 项安全前置条件后单次布防，退出必恢复。"""
+    """受控图腾触发守卫：严格核验前置条件后在持续窗口内布防，退出必恢复。"""
+    if isinstance(max_duration_s, bool) or not isinstance(max_duration_s, (int, float)) or not math.isfinite(max_duration_s) or max_duration_s <= 0:
+        raise Replan("受控图腾触发守卫拒绝放行: max_duration_s 必须为正有限数")
     ok, reason, meta = validate_controlled_totem_conditions(
-        state, client, drop_height=drop_height
+        state,
+        client,
+        drop_height=drop_height,
+        landing_col=landing_col,
+        min_drop=min_drop,
+        allow_armored=allow_armored,
     )
     if not ok:
         raise Replan(f"受控图腾触发守卫拒绝放行: {reason}")
+    now = time.monotonic()
     guard: dict[str, Any] = {
         "active": True,
         "consumed": False,
+        "allow_armored": bool(allow_armored),
+        "saw_airborne": False,
+        "suppression_count": 0,
+        "max_duration_s": float(max_duration_s),
         **(meta or {}),
-        "armed_at": time.monotonic(),
+        "armed_at": now,
+        "expires_at": now + float(max_duration_s),
     }
     with state._lock:
         state._totem_guard = guard

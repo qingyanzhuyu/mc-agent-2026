@@ -249,6 +249,13 @@ class WaveBWorld(GridWorld):
             res = self.on_craft(self, item=item, count=count)
             if res is not None:
                 return res
+        if item in (_TEMPLATE, "netherite_ingot", "beacon"):
+            px, py, pz = self.st["pos"]
+            if not any(
+                b == "crafting_table" and math.dist((px, py, pz), (bx + 0.5, by + 0.5, bz + 0.5)) <= 16.0
+                for (bx, by, bz), b in self.blocks.items()
+            ):
+                raise ApiError("need_crafting_table", f"合成 {item} 需要附近有工作台")
         if item == _TEMPLATE:
             if self.items.get(_TEMPLATE, 0) < 1 or self.items.get("diamond", 0) < 7 * count or self.items.get("netherrack", 0) < count:
                 raise ApiError("missing_item", "缺少复制锻造模板材料")
@@ -334,6 +341,11 @@ class WaveBWorld(GridWorld):
 
     def window_act(self, target, ops, *, stop_on=None) -> dict:
         self.calls.append(("window_act", {"target": deepcopy(target), "ops": deepcopy(ops)}))
+        tpos = tuple(target.get("pos", ())) if isinstance(target, dict) and target.get("pos") else None
+        if tpos is not None and self.blocks.get(tpos) == "hopper":
+            for op in ops:
+                if op.get("op") == "take" and op.get("from") != "container":
+                    raise ApiError("missing_param", "hopper take requires from='container'")
         if self.on_window_act is not None:
             return self.on_window_act(self, target=target, ops=ops)
         return {"ok": True, "ops": deepcopy(ops)}
@@ -637,6 +649,23 @@ class TradeWorldHeightTests(_WaveBTestBase):
             drive(TradeWorldHeight(), ex, state)
         self.assertEqual(ctx.exception.missing_predicate, "high_altitude_merchant")
 
+    def test_blocked_low_altitude_missing_placeables_and_approach_solid_guard(self) -> None:
+        from mcagent.skills.t4_arbalistic_and_height import _approach_block
+
+        st = _state_with(
+            pos=(0.5, 64.0, 0.5),
+            dimension="overworld",
+            items=[{"name": "emerald", "count": 1}, {"name": "obsidian", "count": 10}],
+        )
+        self.assertTrue(TradeWorldHeight.blocked(st))
+
+        # High-altitude void around target block (8, 314, 0): _approach_block must raise Replan instead of walking off edge
+        world = WaveBWorld(pos=(0.5, 314.0, 0.5), dimension="overworld", blocks=_flat(-1, 1, -1, 1, y=313))
+        ex, state = world.session()
+        with self.assertRaises(Replan):
+            list(_approach_block(ex, state, (8, 314, 0), reach=3.0))
+        self.assertFalse(any(op == "move_to" for op, _ in world.calls))
+
 
 # ============================================================================
 # 3. arbalistic_trench_shot (Axial 1x1x5 Trench + Piercing IV One-Shot)
@@ -756,9 +785,10 @@ class ArbalisticTrenchShotTests(_WaveBTestBase):
         self.assertEqual(ctx.exception.missing_predicate, "mob_collection_5")
 
     def test_full_axial_1x1x5_trench_tadpole_single_tap_and_piercing_iv_shot(self) -> None:
+        blocks = {**_flat(-2, 10, -2, 2, y=62, block="stone"), **_flat(-2, 10, -2, 2, y=63, block="dirt")}
         world = WaveBWorld(
             pos=(0.5, 64.0, 0.5),
-            blocks=_flat(-2, 10, -2, 2, y=63, block="dirt"),
+            blocks=blocks,
             items={
                 "crossbow": 1,
                 "arrow": 4,
@@ -796,9 +826,9 @@ class ArbalisticTrenchShotTests(_WaveBTestBase):
         drive(skill, ex, state, max_steps=120)
 
         self.assertEqual(skill.verify_done(state), "")
-        # Exact 1x1x5 axial trench along +X at tx..tx+4, ty-1, tz = (2..6, 63, 0)
+        # Exact 1x1x5 axial trench along +X at (2..6, 63, 0) plus 1-deep firing pit (0, 63, 0)
         dug = [tuple(req["pos"]) for op, req in world.calls if op == "dig"]
-        self.assertEqual(dug, [(2, 63, 0), (3, 63, 0), (4, 63, 0), (5, 63, 0), (6, 63, 0)])
+        self.assertEqual(dug, [(2, 63, 0), (3, 63, 0), (4, 63, 0), (5, 63, 0), (6, 63, 0), (0, 63, 0)])
 
         # Released 4 fish buckets + tadpole_bucket into the trench
         released_items = [req["item"] for op, req in world.calls if op == "interact" and req["item"] != "water_bucket"]
@@ -817,14 +847,54 @@ class ArbalisticTrenchShotTests(_WaveBTestBase):
         equips_before_tap = [req["item"] for op, req in world.calls[:attack_idx] if op == "equip"]
         self.assertTrue(equips_before_tap and equips_before_tap[-1] != "crossbow")
 
-        # Axial firing endpoint [tx - 2 + 0.5, ty, tz + 0.5] = [0.5, 64.0, 0.5], look + shoot(crossbow)
-        self.assertEqual(world.st["pos"], [0.5, 64.0, 0.5])
+        # Axial level firing endpoint [tx - 2 + 0.5, ty - 1, tz + 0.5] = [0.5, 63.0, 0.5], look + shoot(crossbow)
+        self.assertEqual(world.st["pos"], [0.5, 63.0, 0.5])
         looks = [req for op, req in world.calls if op == "look"]
         shoots = [req for op, req in world.calls if op == "shoot"]
         self.assertEqual(len(shoots), 1)
         self.assertEqual(shoots[0]["weapon"], "crossbow")
         self.assertEqual(shoots[0]["pos"], [6.5, 63.5, 0.5])
         self.assertTrue(any(l["pos"] == [6.5, 63.5, 0.5] for l in looks))
+
+    def test_axolotl_bucket_and_look_unsupported_api_guard(self) -> None:
+        blocks = {**_flat(-2, 10, -2, 2, y=62, block="stone"), **_flat(-2, 10, -2, 2, y=63, block="dirt")}
+        world = WaveBWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={
+                "crossbow": 1,
+                "arrow": 2,
+                "cod_bucket": 1,
+                "salmon_bucket": 1,
+                "tropical_fish_bucket": 1,
+                "pufferfish_bucket": 1,
+                "axolotl_bucket": 1,
+                "cobblestone": 4,
+            },
+            item_meta={"crossbow": {"enchantments": {"piercing": 4}}},
+            held={"name": "crossbow", "count": 1},
+        )
+        next_eid = 200
+
+        def _release(w: WaveBWorld, pos=None, entity_id=None, item=None):
+            nonlocal next_eid
+            if item and item.endswith("_bucket") and pos is not None:
+                mob_name = item.removesuffix("_bucket")
+                w.items[item] -= 1
+                w.items["bucket"] = w.items.get("bucket", 0) + 1
+                w.blocks[tuple(pos)] = "water"
+                w.entities.append({"id": next_eid, "name": mob_name, "pos": [pos[0] + 0.5, float(pos[1]), pos[2] + 0.5]})
+                next_eid += 1
+                return {"released": mob_name}
+            return None
+
+        world.on_interact = _release
+        world.on_look = lambda w, **kw: (_ for _ in ()).throw(ApiError("unsupported_api", "look disabled"))
+        ex, state = world.session()
+        skill = ArbalisticTrenchShot()
+        drive(skill, ex, state, max_steps=120)
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertEqual(len([req for op, req in world.calls if op == "shoot"]), 1)
 
 
 # ============================================================================
@@ -869,6 +939,7 @@ class CraftNetheriteArmorSetTests(_WaveBTestBase):
         hopper_pos = (3, 64, 0)
         blocks = _flat(-2, 6, -2, 2, y=63, block="blackstone")
         blocks[chest_pos] = "chest"
+        blocks[(-2, 64, 0)] = "crafting_table"
         world = WaveBWorld(
             pos=(0.5, 64.0, 0.5),
             dimension="the_nether",
@@ -892,6 +963,7 @@ class CraftNetheriteArmorSetTests(_WaveBTestBase):
 
         def _act(w: WaveBWorld, target: dict, ops: list[dict]) -> dict:
             self.assertNotEqual(target.get("pos"), list(chest_pos), "forbidden direct window_act on bastion chest")
+            self.assertEqual(ops[0].get("from"), "container")
             if target.get("pos") == list(hopper_pos) and hopper_contents:
                 hopper_contents.clear()
                 w.items[_TEMPLATE] = w.items.get(_TEMPLATE, 0) + 1
@@ -912,6 +984,53 @@ class CraftNetheriteArmorSetTests(_WaveBTestBase):
         self.assertTrue(win_targets)
         self.assertTrue(all(t == {"pos": list(hopper_pos)} for t in win_targets))
         self.assertFalse(any(t == {"pos": list(chest_pos)} for t in win_targets))
+
+    def test_bastion_hopper_drains_junk_and_polls_for_template(self) -> None:
+        from unittest import mock
+
+        chest_pos = (3, 65, 0)
+        blocks = _flat(-2, 6, -2, 2, y=63, block="blackstone")
+        blocks[chest_pos] = "chest"
+        blocks[(-2, 64, 0)] = "crafting_table"
+        world = WaveBWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_nether",
+            blocks=blocks,
+            items={
+                "hopper": 1,
+                "diamond": 21,
+                "netherrack": 4,
+                "netherite_ingot": 4,
+                "diamond_helmet": 1,
+                "diamond_chestplate": 1,
+                "diamond_leggings": 1,
+                "diamond_boots": 1,
+            },
+        )
+        polls = [0]
+
+        def _view(w: WaveBWorld, target: dict) -> dict:
+            polls[0] += 1
+            if polls[0] == 1:
+                return {"window": "hopper", "sections": {"container": [{"name": "gold_nugget", "count": 2}]}}
+            if polls[0] == 2:
+                return {"window": "hopper", "sections": {"container": []}}
+            return {"window": "hopper", "sections": {"container": [{"name": _TEMPLATE, "count": 1}]}}
+
+        def _act(w: WaveBWorld, target: dict, ops: list[dict]) -> dict:
+            self.assertEqual(ops[0].get("from"), "container")
+            item = ops[0].get("item")
+            w.items[item] = w.items.get(item, 0) + int(ops[0].get("count", 1))
+            return {"ok": True}
+
+        world.on_window_view = _view
+        world.on_window_act = _act
+        ex, state = world.session()
+        with mock.patch("mcagent.skills.t4_nether_endgame.time.sleep"):
+            drive(CraftNetheriteArmorSet(prep_only=True), ex, state)
+        self.assertEqual(state.count(_TEMPLATE), 4)
+        self.assertEqual(state.count("gold_nugget"), 2)
+        self.assertGreaterEqual(polls[0], 3)
 
     def test_armorer_trade_and_full_smith_four_netherite_pieces_without_equipping(self) -> None:
         table_pos = (2, 64, 0)
@@ -1013,13 +1132,16 @@ class SummonAndTrapWitherTests(_WaveBTestBase):
 
         def _view(w: WaveBWorld, target: dict) -> dict:
             if target.get("pos") == [2, 64, 0]:
-                return {"window": "anvil", "sections": {"input1": [], "input2": [], "output": []}}
+                return {"window": "anvil", "sections": {"left": [], "right": [], "output": []}}
             assert prev_view is not None
             return prev_view(w, target=target)
 
+        anvil_ops: list[list[dict]] = []
+
         def _act(w: WaveBWorld, target: dict, ops: list[dict]) -> dict:
             if target.get("pos") == [2, 64, 0]:
-                if any(o.get("op") == "take" for o in ops):
+                anvil_ops.append(deepcopy(ops))
+                if any(o.get("op") == "take" and o.get("from") == "output" for o in ops):
                     w.items["enchanted_book"] = max(0, w.items.get("enchanted_book", 0) - 1)
                     w.item_meta["diamond_sword"] = {"enchantments": {"looting": 3}}
                 return {"ok": True, "ops": deepcopy(ops)}
@@ -1032,6 +1154,15 @@ class SummonAndTrapWitherTests(_WaveBTestBase):
         skill = SummonAndTrapWither(mode="prep_looting")
         drive(skill, ex, state)
         self.assertEqual(skill.verify_done(state), "")
+        self.assertEqual(len(anvil_ops), 1)
+        self.assertEqual(
+            anvil_ops[0],
+            [
+                {"op": "put", "item": "diamond_sword", "count": 1, "to": "left"},
+                {"op": "put", "item": "enchanted_book", "count": 1, "to": "right", "enchanted": True},
+                {"op": "take", "from": "output"},
+            ],
+        )
 
     def test_prep_skulls_two_block_choke_and_shield_reset_on_abort(self) -> None:
         # Happy path: places 2-block choke lintel at fy+2, raises shield, farms 3 skulls, lowers shield
@@ -1154,6 +1285,8 @@ class SummonAndTrapWitherTests(_WaveBTestBase):
             drive(SummonAndTrapWither(mode="summon_only"), ex_u, st_u, max_steps=120)
 
     def test_nether_roof_trap_full_kill_and_nether_star_pickup(self) -> None:
+        from unittest import mock
+
         world = WaveBWorld(
             pos=(0.5, 124.0, 2.5),
             dimension="the_nether",
@@ -1196,13 +1329,42 @@ class SummonAndTrapWitherTests(_WaveBTestBase):
         world.on_move_to = _on_move_to
         ex, state = world.session()
         skill = SummonAndTrapWither(mode="nether_roof_trap")
-        drive(skill, ex, state, max_steps=160)
+        with mock.patch("mcagent.skills.t4_nether_endgame.time.sleep") as m_sleep:
+            drive(skill, ex, state, max_steps=160)
 
         self.assertEqual(skill.verify_done(state), "")
         self.assertEqual(state.count("nether_star"), 1)
+        self.assertGreaterEqual(m_sleep.call_count, 1)
         self.assertTrue(any(op == "attack" and req["entity_id"] == 902 for op, req in world.calls))
         self.assertFalse(world.st.get("blocking"))
         self.assertFalse(state.st.get("blocking"))
+
+    def test_nether_roof_trap_resumes_existing_wither_without_requiring_3_skulls(self) -> None:
+        from unittest import mock
+
+        world = WaveBWorld(
+            pos=(0.5, 124.0, 2.5),
+            dimension="the_nether",
+            blocks=_nether_y127_blocks(),
+            items={"diamond_sword": 1, "shield": 1},
+            entities=[{"id": 903, "name": "wither", "pos": [0.5, 125.0, -1.5]}],
+        )
+
+        def _on_attack(w: WaveBWorld, entity_id: int, max_hits=None):
+            w.entities = [e for e in w.entities if e["id"] != entity_id]
+            w.items["nether_star"] = 1
+            return {"entity_id": entity_id, "hits": 6, "killed": True}
+
+        world.on_attack = _on_attack
+        ex, state = world.session()
+        skill = SummonAndTrapWither(mode="nether_roof_trap")
+        with mock.patch("mcagent.skills.t4_nether_endgame.time.sleep"):
+            drive(skill, ex, state, max_steps=120)
+
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertEqual(state.count("nether_star"), 1)
+        self.assertTrue(any(op == "attack" and req["entity_id"] == 903 for op, req in world.calls))
+        self.assertFalse(any(op == "place" and req["item"] == "wither_skeleton_skull" for op, req in world.calls))
 
 
 # ============================================================================
@@ -1230,10 +1392,12 @@ class ActivateBeaconTests(_WaveBTestBase):
         self.assertIn("铜块", ActivateBeacon.blocked(mixed))
 
     def test_happy_path_craft_beacon_3x3_pyramid_zero_gui_and_within_10_blocks(self) -> None:
+        blocks = _flat(-6, 6, -6, 6, y=63)
+        blocks[(-2, 64, 0)] = "crafting_table"
         world = WaveBWorld(
             pos=(0.5, 64.0, 0.5),
             dimension="overworld",
-            blocks=_flat(-6, 6, -6, 6, y=63),
+            blocks=blocks,
             items={
                 "nether_star": 1,
                 "obsidian": 3,
@@ -1282,6 +1446,20 @@ class ActivateBeaconTests(_WaveBTestBase):
         with self.assertRaises(Replan) as ctx:
             drive(ActivateBeacon(), ex, state)
         self.assertIn("基岩", str(ctx.exception))
+        self.assertFalse(any(op == "place" and req["item"] == "beacon" for op, req in world.calls))
+
+    def test_sky_column_rejects_high_opaque_ceiling_within_64_blocks(self) -> None:
+        blocks = _flat(-6, 6, -6, 6, y=63)
+        blocks.update(_flat(-6, 6, -6, 6, y=104, block="stone"))
+        world = WaveBWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="overworld",
+            blocks=blocks,
+            items={"beacon": 1, "iron_block": 9},
+        )
+        ex, state = world.session()
+        with self.assertRaises(Replan):
+            drive(ActivateBeacon(), ex, state)
         self.assertFalse(any(op == "place" and req["item"] == "beacon" for op, req in world.calls))
 
 

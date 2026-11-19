@@ -25,7 +25,7 @@ _KNOWN_STATIONS: tuple[str, ...] = (
 )
 _FURNACE_BLOCKS: tuple[str, ...] = ("furnace", "blast_furnace", "smoker")
 _ANVIL_BLOCKS: tuple[str, ...] = ("anvil", "chipped_anvil", "damaged_anvil")
-_WEAPON_EXACT: frozenset[str] = frozenset({"bow", "crossbow", "trident"})
+_WEAPON_EXACT: frozenset[str] = frozenset({"bow", "crossbow", "trident", "mace"})
 _AQUATIC_MOB_BUCKETS: tuple[str, ...] = (
     "cod_bucket",
     "salmon_bucket",
@@ -432,7 +432,16 @@ def _find_advancement_entry(source: Any, target_bare: str) -> tuple[bool, Any]:
     return False, None
 
 
+def _norm_criterion(value: Any) -> str:
+    return bare(value.strip() if isinstance(value, str) else value).strip()
+
+
 def _extract_missing_criteria(entry: Any, expected: tuple[str, ...] | None) -> tuple[str, ...]:
+    norm_expected = (
+        tuple(sorted({c for x in expected if (c := _norm_criterion(x))}))
+        if expected is not None
+        else None
+    )
     if entry is True:
         return ()
     if isinstance(entry, str) and entry.strip().lower() in ("completed", "done"):
@@ -442,20 +451,20 @@ def _extract_missing_criteria(entry: Any, expected: tuple[str, ...] | None) -> t
             return ()
         rem = entry.get("remaining") if entry.get("remaining") is not None else entry.get("criteria_missing")
         if rem is not None and isinstance(rem, Iterable) and not isinstance(rem, (str, bytes, Mapping)):
-            return tuple(sorted({str(c).strip() for c in rem if str(c).strip()}))
+            return tuple(sorted({c for item in rem if (c := _norm_criterion(item))}))
         crit = entry.get("criteria")
         if isinstance(crit, Mapping):
-            if expected is not None:
-                done_set = {str(k).strip() for k, v in crit.items() if v}
-                return tuple(sorted(c for c in expected if c not in done_set))
-            return tuple(sorted({str(k).strip() for k, v in crit.items() if not v and str(k).strip()}))
+            if norm_expected is not None:
+                done_set = {c for k, v in crit.items() if v and (c := _norm_criterion(k))}
+                return tuple(sorted(c for c in norm_expected if c not in done_set))
+            return tuple(sorted({c for k, v in crit.items() if not v and (c := _norm_criterion(k))}))
         done_raw = entry.get("completed_criteria") if entry.get("completed_criteria") is not None else entry.get("criteria_done")
         if done_raw is not None and isinstance(done_raw, Iterable) and not isinstance(done_raw, (str, bytes, Mapping)):
-            done_set = {str(c).strip() for c in done_raw if str(c).strip()}
-            if expected is not None:
-                return tuple(sorted(c for c in expected if c not in done_set))
+            done_set = {c for item in done_raw if (c := _norm_criterion(item))}
+            if norm_expected is not None:
+                return tuple(sorted(c for c in norm_expected if c not in done_set))
             return ()
-    return expected if expected is not None else ()
+    return norm_expected if norm_expected is not None else ()
 
 
 def advancement_criteria_remaining(
@@ -470,7 +479,7 @@ def advancement_criteria_remaining(
     if not target_bare:
         return ()
     expected = (
-        tuple(sorted({str(c).strip() for c in expected_criteria if str(c).strip()}))
+        tuple(sorted({c for item in expected_criteria if (c := _norm_criterion(item))}))
         if expected_criteria is not None
         else None
     )

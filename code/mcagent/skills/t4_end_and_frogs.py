@@ -21,22 +21,18 @@ from .world_memo import memo_for
 
 _FRAME_TYPES = ("item_frame", "glow_item_frame")
 _SHIP_BLOCKS = ("purpur_block", "purpur_stairs", "brewing_stand", "dragon_head")
-_FROG_ADV = "minecraft:husbandry/leash_all_frog_variants"
-_FROG_VARIANTS = ("temperate", "warm", "cold")
+_FROG_ADV, _FROG_VARIANTS = "minecraft:husbandry/leash_all_frog_variants", ("temperate", "warm", "cold")
 _COLD_BIOMES = frozenset({
-    "deep_dark", "snowy_plains", "snowy_taiga", "taiga", "old_growth_pine_taiga",
-    "old_growth_spruce_taiga", "grove", "snowy_slopes", "frozen_peaks", "jagged_peaks",
-    "frozen_river", "frozen_ocean", "deep_frozen_ocean", "ice_spikes",
-    "end_highlands", "end_midlands", "the_end", "small_end_islands", "end_barrens",
+    "deep_dark", "snowy_plains", "snowy_taiga", "taiga", "old_growth_pine_taiga", "old_growth_spruce_taiga",
+    "grove", "snowy_slopes", "frozen_peaks", "jagged_peaks", "frozen_river", "frozen_ocean", "deep_frozen_ocean",
+    "ice_spikes", "end_highlands", "end_midlands", "the_end", "small_end_islands", "end_barrens",
 })
 _WARM_BIOMES = frozenset({
-    "desert", "savanna", "savanna_plateau", "windswept_savanna", "badlands",
-    "eroded_badlands", "wooded_badlands", "mangrove_swamp", "jungle", "sparse_jungle",
-    "bamboo_jungle", "warm_ocean", "nether_wastes", "crimson_forest", "warped_forest",
-    "soul_sand_valley", "basalt_deltas",
+    "desert", "savanna", "savanna_plateau", "windswept_savanna", "badlands", "eroded_badlands", "wooded_badlands",
+    "mangrove_swamp", "jungle", "sparse_jungle", "bamboo_jungle", "warm_ocean", "nether_wastes", "crimson_forest",
+    "warped_forest", "soul_sand_valley", "basalt_deltas",
 })
 _BIOME_LANDMARKS = {"cold": ("cold_biome", "deep_dark"), "warm": ("mangrove_swamp",), "temperate": ("swamp", "meadow")}
-
 
 def _dim(src: Any) -> str:
     raw = src.get("dimension") if isinstance(src, Mapping) else (getattr(src, "st", None) or {}).get("dimension")
@@ -45,46 +41,35 @@ def _dim(src: Any) -> str:
 
 def _biome_temp(dim: str, biome: str) -> str:
     d, b = bare(dim).strip().lower(), bare(biome).strip().lower()
-    if d in ("the_end", "end") or b in _COLD_BIOMES:
-        return "cold"
-    return "warm" if (d in ("the_nether", "nether") or b in _WARM_BIOMES) else "temperate"
+    return "cold" if (d in ("the_end", "end") or b in _COLD_BIOMES) else ("warm" if (d in ("the_nether", "nether") or b in _WARM_BIOMES) else "temperate")
 
 def _is_empty_bag(state: State) -> bool:
     inv = state.inventory or {}
-    if any(isinstance(it, dict) and int(it.get("count", 0)) > 0 for it in (inv.get("items") or ())):
-        return False
+    if any(isinstance(it, dict) and int(it.get("count", 0)) > 0 for it in (inv.get("items") or ())): return False
     armor = inv.get("armor") or {}
     extras = (*(armor.values() if isinstance(armor, dict) else ()), inv.get("held"), inv.get("offhand"))
     return not any(isinstance(eq, dict) and eq.get("name") and int(eq.get("count", 1)) > 0 for eq in extras)
 
-def _is_preemption(exc: BaseException) -> bool:
-    return failure(exc)[0] in ("replan", "interrupted") or "抢占" in str(exc)
+def _is_preemption(exc: BaseException) -> bool: return failure(exc)[0] in ("replan", "interrupted") or "抢占" in str(exc)
 
 def _reset_posture(ex: Executor, state: State, *, force: bool = False) -> None:
     st = state.st or {}
     if force or st.get("sneaking") or st.get("blocking"):
-        try:
-            _clear_posture(ex, state, sneak=False, shield=False)
-        except Exception:
-            pass
+        try: _clear_posture(ex, state, sneak=False, shield=False)
+        except Exception: pass
 
 def _scan_ready(ex: Executor, state: State, types: Any, radius: int, *, entity: bool = False, limit: int = 16, skill: str = "") -> list[dict]:
     scan = scan_entities(ex, state, types, radius=radius) if entity else scan_blocks(ex, state, types, radius=radius, limit=limit, skill_name=skill)
-    if scan.get("ready") is False:
-        raise Replan("世界加载尚未就绪（ready=false）")
+    if scan.get("ready") is False: raise Replan("世界加载尚未就绪（ready=false）")
     return scan["entities" if entity else "blocks"]
 
 def _query_advancements(ex: Executor) -> dict | None:
-    fn = getattr(ex.client, "advancements", None)
-    if not callable(fn):
-        return None
-    try:
-        return fn(status="all", include_recipes=False)
+    if not callable(fn := getattr(ex.client, "advancements", None)): return None
+    try: return fn(status="all", include_recipes=False)
     except TypeError:
         try: return fn()
         except (ApiError, AttributeError): return None
-    except (ApiError, AttributeError):
-        return None
+    except (ApiError, AttributeError): return None
 
 def _criteria_remaining(state: State, adv_id: str, *, expected_criteria: Sequence[str] | None = None, advancements: Any = None) -> tuple[str, ...]:
     try:
@@ -94,22 +79,15 @@ def _criteria_remaining(state: State, adv_id: str, *, expected_criteria: Sequenc
         expected = tuple(sorted(str(c) for c in (expected_criteria or ())))
         rows = advancements.get("advancements") if isinstance(advancements, Mapping) else advancements
         row = next((r for r in rows if isinstance(r, Mapping) and bare(r.get("id")) == bare(adv_id)), None) if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)) else None
-        if row is None:
-            return expected
-        if row.get("status") == "completed" or row.get("done") is True:
-            return ()
+        if row is None: return expected
+        if row.get("status") == "completed" or row.get("done") is True: return ()
         done = {bare(str(k)) for k, v in (row.get("criteria") or {}).items() if v} if isinstance(row.get("criteria"), Mapping) else set()
         for k in ("completed_criteria", "criteria_done"):
-            if isinstance(val := row.get(k), Sequence) and not isinstance(val, (str, bytes)):
-                done.update(bare(str(c)) for c in val)
+            if isinstance(val := row.get(k), Sequence) and not isinstance(val, (str, bytes)): done.update(bare(str(c)) for c in val)
         return tuple(c for c in expected if bare(c) not in done)
 
-def _is_air(ex: Executor, cell: tuple[int, int, int]) -> bool:
-    return bare(observe_block(ex, list(cell)).get("name")) in AIR
-
-def _is_solid(ex: Executor, cell: tuple[int, int, int]) -> bool:
-    return is_safe_solid_floor(observe_block(ex, list(cell)))
-
+def _is_air(ex: Executor, cell: tuple[int, int, int]) -> bool: return bare(observe_block(ex, list(cell)).get("name")) in AIR
+def _is_solid(ex: Executor, cell: tuple[int, int, int]) -> bool: return is_safe_solid_floor(observe_block(ex, list(cell)))
 def _standable(ex: Executor, cell: tuple[int, int, int]) -> bool:
     x, y, z = cell
     return _is_solid(ex, (x, y - 1, z)) and _is_air(ex, (x, y, z)) and _is_air(ex, (x, y + 1, z))
@@ -123,9 +101,7 @@ def _standable_near(ex: Executor, target: tuple[int, int, int], st: dict, *, max
     return min(cands, key=lambda p: eye_to_point_dist(st, p), default=None)
 
 def _plan_gap_toward(ex: Executor, st: dict, target: tuple[int, int, int], *, max_len: int = 8) -> list[tuple[int, int, int]]:
-    fx, fy, fz = block_cell(feet_pos(st))
-    tx, _, tz = target
-    cx, cz, gaps = fx, fz, []
+    fx, fy, fz = block_cell(feet_pos(st)); tx, _, tz = target; cx, cz, gaps = fx, fz, []
     for _ in range(max_len + 12):
         if (cx, cz) == (tx, tz): break
         dx, dz = tx - cx, tz - cz
@@ -136,8 +112,7 @@ def _plan_gap_toward(ex: Executor, st: dict, target: tuple[int, int, int], *, ma
         elif _is_air(ex, (cx, fy - 1, cz)):
             gaps.append((cx, fy - 1, cz))
             if len(gaps) >= max_len: break
-        else:
-            break
+        else: break
     return gaps
 
 def _find_tadpole_spot(ex: Executor, state: State, st: dict, skill_name: str) -> tuple[int, int, int] | None:
@@ -148,6 +123,37 @@ def _find_tadpole_spot(ex: Executor, state: State, st: dict, skill_name: str) ->
              if (dx or dz) and _is_solid(ex, (fx + dx, fy - 1, fz + dz)) and _is_air(ex, (fx + dx, fy, fz + dz))
              and can_reach_block(ex, st, (fx + dx, fy - 1, fz + dz), reach=STATION_EYE_REACH)]
     return min(cands, key=lambda c: eye_to_block_dist(st, c), default=None)
+
+def _safe_ship_deck_pt(ex: Executor, state: State, st: dict, ship_blks: list[dict], frame_cells: set[tuple[int, int, int]]) -> list[float] | None:
+    cands = []
+    for blk in ship_blks:
+        bx, by, bz = block_cell(blk["pos"]); deck = (bx, by + 1, bz)
+        if deck not in frame_cells and _standable(ex, deck):
+            cands.append((0 if (_is_air(ex, (bx, by + 3, bz)) and _is_air(ex, (bx, by + 4, bz))) else 1, -by, eye_to_block_dist(st, deck), deck))
+    if not cands: return None
+    best = min(cands)[3]; return [best[0] + 0.5, float(best[1]), best[2] + 0.5]
+
+def _ensure_crafting_table(ex: Executor, state: State, skill_name: str, st: dict) -> Generator[dict, None, tuple[int, int, int]]:
+    if tables := _scan_ready(ex, state, "crafting_table", 16, limit=4, skill=skill_name):
+        tpos = block_cell(min(tables, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+    else:
+        if state.count("crafting_table") < 1:
+            inv = state.inventory or {}
+            planks = sum(int(r.get("count", 0)) for r in (*(inv.get("items") or ()), inv.get("held"), inv.get("offhand"))
+                         if isinstance(r, Mapping) and bare(r.get("name")).endswith("_planks"))
+            if planks >= 4: yield rec("craft", ex.craft("crafting_table", 1), item="crafting_table", count=1); refresh_inventory(ex, state)
+        if state.count("crafting_table") < 1:
+            raise EnvBlocked("合成拴绳需要工作台，附近无工作台且缺少 crafting_table 或木板", missing_predicate="crafting_table", searched_volume="半径 16 格", wake_on="chunk_moved")
+        fx, fy, fz = block_cell(feet_pos(st))
+        cands = [(fx + dx, fy + dy, fz + dz) for dy in (0, -1, 1) for dx in range(-3, 4) for dz in range(-3, 4)
+                 if (dx or dz or dy) and _standable(ex, (fx + dx, fy + dy, fz + dz)) and can_reach_block(ex, st, (fx + dx, fy + dy, fz + dz), reach=STATION_EYE_REACH)]
+        if not cands: raise EnvBlocked("附近缺少可放置工作台的平整地面", missing_predicate="crafting_table", searched_volume="玩家周边 3 格", wake_on="chunk_moved")
+        tpos = min(cands, key=lambda c: eye_to_block_dist(st, c))
+        yield rec("place", ex.place("crafting_table", list(tpos)), item="crafting_table", pos=list(tpos)); refresh_inventory(ex, state)
+    if eye_to_block_dist(state.refresh_status(ex.client, max_age_s=0), tpos) > STATION_EYE_REACH:
+        dest = _standable_near(ex, tpos, st, max_r=2, max_eye=STATION_EYE_REACH) or list(block_center(tpos))
+        yield rec("move_to", ex.move_to(pos=dest, rng=1), pos=dest)
+    return tpos
 
 
 @register
@@ -182,10 +188,11 @@ class LootEndShipElytra(Skill):
             raise Replan(reason)
 
         frames = _scan_ready(ex, state, _FRAME_TYPES, 48, entity=True)
+        ship_blks = _scan_ready(ex, state, _SHIP_BLOCKS, 48, limit=32, skill=self.name)
         dest_cell: tuple[int, int, int] | None = None
         if frames:
             dest_cell = block_cell(min(frames, key=lambda e: eye_to_point_dist(st, e["pos"]))["pos"])
-        elif ship_blks := _scan_ready(ex, state, _SHIP_BLOCKS, 48, limit=16, skill=self.name):
+        elif ship_blks:
             best = min(ship_blks, key=lambda b: eye_to_block_dist(st, b["pos"]))
             dest_cell = block_cell(best["pos"])
             memo_for(state).record_landmark("end_city", dest_cell, dimension="the_end", meta={"block": best["name"]})
@@ -205,9 +212,11 @@ class LootEndShipElytra(Skill):
             dist = eye_to_block_dist(st, dest_cell)
             needs_gap = bool(_plan_gap_toward(ex, st, dest_cell, max_len=8)) or abs(dest_cell[1] - feet_pos(st)[1]) >= 3.0
             dest_pt = list(block_center(dest_cell))
-            if needs_gap and state.count("ender_pearl") >= 1 and float(st.get("health", 20)) > 8.0 and dist > 6.0:
-                yield rec("use_item", ex.use_item("ender_pearl", target={"pos": dest_pt}),
-                          item="ender_pearl", target={"pos": dest_pt})
+            frame_cells = {block_cell(f["pos"]) for f in frames}
+            deck_pt = _safe_ship_deck_pt(ex, state, st, ship_blks, frame_cells)
+            if needs_gap and deck_pt is not None and state.count("ender_pearl") >= 1 and float(st.get("health", 20)) > 8.0 and dist > 6.0:
+                yield rec("use_item", ex.use_item("ender_pearl", target={"pos": deck_pt}),
+                          item="ender_pearl", target={"pos": deck_pt})
                 refresh_inventory(ex, state)
             elif dist > 3.2:
                 try:
@@ -306,10 +315,12 @@ class LeashFrogVariants(Skill):
         if reason := self.blocked(state):
             raise Replan(reason)
         if state.count("lead") < 1:
+            yield from _ensure_crafting_table(ex, state, self.name, st)
             yield rec("craft", ex.craft("lead", 1), item="lead", count=1)
             refresh_inventory(ex, state)
             if state.count("lead") < 1:
                 raise Replan("合成拴绳后背包仍未获得 lead")
+            st = state.refresh_status(ex.client, max_age_s=0)
 
         self._last_adv = _query_advancements(ex)
         remaining = _criteria_remaining(state, _FROG_ADV, expected_criteria=_FROG_VARIANTS, advancements=self._last_adv)
@@ -329,11 +340,21 @@ class LeashFrogVariants(Skill):
                     fresh = next((e for e in _scan_ready(ex, state, "frog", 16, entity=True) if e["id"] == frog_id), None)
                     if fresh is None or eye_to_point_dist(st, fresh["pos"]) > ENTITY_EYE_REACH:
                         raise Replan("靠近青蛙后仍超出拴绳交互距离")
-            yield rec("interact", ex.interact(entity_id=frog_id, item="lead"), entity_id=frog_id, item="lead")
+            before_rem = set(remaining)
+            rcpt = ex.interact(entity_id=frog_id, item="lead")
+            yield rec("interact", rcpt, entity_id=frog_id, item="lead")
             refresh_inventory(ex, state)
             self._last_adv = _query_advancements(ex)
-            self._leashed_variants.add(cur_temp)
-            return
+            after_rem = set(_criteria_remaining(state, _FROG_ADV, expected_criteria=_FROG_VARIANTS, advancements=self._last_adv))
+            if newly_done := (before_rem - after_rem):
+                self._leashed_variants.update(newly_done)
+                return
+            if isinstance(rcpt, Mapping) and rcpt.get("changed") is not False and (
+                rcpt.get("leashed") is True or (self._last_adv is None and rcpt.get("changed") is True)
+            ):
+                self._leashed_variants.add(cur_temp)
+                return
+            raise Replan(f"栓绳交互 {cur_temp} 青蛙后未确认进度子条件推进")
 
         if cur_temp in remaining and state.count("tadpole_bucket") >= 1:
             spot = _find_tadpole_spot(ex, state, st, self.name)
@@ -346,7 +367,7 @@ class LeashFrogVariants(Skill):
             yield rec("interact", ex.interact(pos=list(spot), item="tadpole_bucket"),
                       pos=list(spot), item="tadpole_bucket")
             refresh_inventory(ex, state)
-            return
+            raise Replan("waiting_tadpole_growth")
 
         memo = memo_for(state)
         for temp in remaining:

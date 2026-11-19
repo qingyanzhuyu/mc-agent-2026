@@ -144,7 +144,7 @@ class WaveAWorld(GridWorld):
         )
         self.entities: list[dict[str, Any]] = [deepcopy(e) for e in (entities or ())]
         self.held: dict[str, Any] | None = None
-        self.adv_snapshot: dict[str, Any] = deepcopy(adv_snapshot) if adv_snapshot is not None else {"advancements": []}
+        self.adv_snapshot: dict[str, Any] = deepcopy(adv_snapshot) if adv_snapshot is not None else {"ready": True, "advancements": []}
 
         self.on_move_to: Callable[..., dict | None] | None = None
         self.on_dig: Callable[..., dict | None] | None = None
@@ -237,6 +237,13 @@ class WaveAWorld(GridWorld):
             res = self.on_craft(self, item=item, count=count)
             if res is not None:
                 return res
+        if item in {"lead", "jukebox", "note_block", "cake", "decorated_pot"}:
+            px, py, pz = self.st["pos"]
+            if not any(
+                b == "crafting_table" and math.dist((px, py, pz), (bx + 0.5, by + 0.5, bz + 0.5)) <= 16.0
+                for (bx, by, bz), b in self.blocks.items()
+            ):
+                raise ApiError("need_crafting_table", f"合成 {item} 需要附近有工作台")
         if item == "lead":
             need = 5 * count
             if self.items.get("string", 0) < need:
@@ -315,13 +322,22 @@ class WaveAWorld(GridWorld):
         self.calls.append(("window_act", {"target": deepcopy(target), "ops": deepcopy(ops)}))
         if self.on_window_act is not None:
             return self.on_window_act(self, target=target, ops=ops)
+        grid_slots: dict[int, str] = {}
         for op in ops:
-            if op.get("op") == "put":
+            kind = op.get("op")
+            if kind == "craft_grid":
+                raise ApiError("unknown_op", "craft_grid is not supported in API v1.3.11")
+            if kind == "put":
                 item = op["item"]
                 cnt = int(op.get("count", 1))
                 if self.items.get(item, 0) < cnt:
                     raise ApiError("missing_item", f"缺少 {item}x{cnt}")
                 self.items[item] -= cnt
+                if op.get("to") == "grid" and "slot" in op:
+                    grid_slots[int(op["slot"])] = item
+            elif kind == "take" and op.get("from") == "output":
+                if len(grid_slots) == 4 and all(s in grid_slots for s in (1, 3, 5, 7)):
+                    self.items["decorated_pot"] = self.items.get("decorated_pot", 0) + 1
         return {"ok": True, "ops": deepcopy(ops)}
 
     def drop(self, item, count=1, *, stop_on=None) -> dict:
@@ -339,7 +355,9 @@ class WaveAWorld(GridWorld):
         self.calls.append(("advancements", {"status": status, "include_recipes": include_recipes}))
         if self.on_advancements is not None:
             return self.on_advancements(self, status=status, include_recipes=include_recipes)
-        return deepcopy(self.adv_snapshot)
+        snap = deepcopy(self.adv_snapshot)
+        snap.setdefault("ready", True)
+        return snap
 
 
 class _WaveATestBase(unittest.TestCase):
@@ -359,11 +377,11 @@ class Stage3BaseExtensionsTests(_WaveATestBase):
 
     def test_world_memo_five_new_fingerprints_and_structure_tags(self) -> None:
         expected_fingerprints = {
-            "meadow": "cornflower",
+            "meadow": "allium",
             "swamp": "lily_pad",
             "mangrove_swamp": "mangrove_roots",
             "cold_biome": "packed_ice",
-            "trial_vault_ominous": "ominous_trial_spawner",
+            "trial_vault_ominous": "vault",
         }
         for tag, sample_block in expected_fingerprints.items():
             with self.subTest(fingerprint=tag):
@@ -692,6 +710,10 @@ class CrafterChainTests(_WaveATestBase):
                 "lever": 1,
             },
         )
+        world.on_interact = lambda w, pos, entity_id, item: (
+            w.adv_snapshot["advancements"].append({"id": "minecraft:adventure/crafters_crafting_crafters", "status": "completed"}),
+            {"interacted": True},
+        )[1]
         ex, state = world.session()
         skill = CrafterChain()
         steps = drive(skill, ex, state)
@@ -761,7 +783,14 @@ class CrafterChainTests(_WaveATestBase):
             w.st["pos"] = [10.5, 64.0, 10.5]
             return {"dug": dug}
 
+        def _on_adv(w: WaveAWorld, status="all", include_recipes=False):
+            advs = list(w.adv_snapshot.get("advancements", []))
+            if "redstone_torch" in w.blocks.values():
+                advs.append({"id": "minecraft:adventure/crafters_crafting_crafters", "status": "completed"})
+            return {"ready": True, "advancements": advs}
+
         world.on_dig = _on_dig
+        world.on_advancements = _on_adv
         ex, state = world.session()
         skill = CrafterChain()
         drive(skill, ex, state)
@@ -834,6 +863,10 @@ class CrafterChainTests(_WaveATestBase):
 
         world.on_window_act = _on_wact
         world.on_window_view = _on_wview
+        world.on_interact = lambda w, pos, entity_id, item: (
+            w.adv_snapshot["advancements"].append({"id": "minecraft:adventure/crafters_crafting_crafters", "status": "completed"}),
+            {"interacted": True},
+        )[1]
         ex, state = world.session()
         skill = CrafterChain()
         with mock.patch("mcagent.skills.t4_quick_exploits.time.sleep") as m_sleep:
@@ -843,6 +876,30 @@ class CrafterChainTests(_WaveATestBase):
         ops_seq = [op for op, _ in world.calls if op in ("window_act", "window_view", "dig")]
         self.assertEqual(ops_seq[-1], "dig")
         self.assertEqual(ops_seq[-2], "window_view")
+
+    def test_raises_replan_when_hopper_drain_exhausted_without_digging(self) -> None:
+        from unittest import mock
+
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=_flat(-6, 6, -6, 6, y=63),
+            items={
+                "crafter": 1,
+                "hopper": 1,
+                "iron_ingot": 5,
+                "crafting_table": 1,
+                "redstone": 2,
+                "dropper": 1,
+                "lever": 1,
+            },
+        )
+        world.on_window_view = lambda w, target: {"sections": {"container": [{"name": "iron_ingot", "count": 1}]}}
+        ex, state = world.session()
+        with mock.patch("mcagent.skills.t4_quick_exploits.time.sleep"):
+            with self.assertRaises(Replan):
+                drive(CrafterChain(), ex, state)
+        self.assertFalse(any(op == "dig" for op, _ in world.calls))
+        self.assertFalse(any(op == "interact" for op, _ in world.calls))
 
 
 class DecoratedPotSherdsTests(_WaveATestBase):
@@ -880,37 +937,37 @@ class DecoratedPotSherdsTests(_WaveATestBase):
 
         wact_calls = [req for op, req in world.calls if op == "window_act"]
         self.assertEqual(len(wact_calls), 1)
-        op0 = wact_calls[0]["ops"][0]
-        self.assertEqual(op0["op"], "craft_grid")
         self.assertEqual(
-            op0["grid"],
+            wact_calls[0]["ops"],
             [
-                None, "flow_pottery_sherd", None,
-                "flow_pottery_sherd", None, "flow_pottery_sherd",
-                None, "flow_pottery_sherd", None,
+                {"op": "put", "item": "flow_pottery_sherd", "count": 1, "to": "grid", "slot": 1},
+                {"op": "put", "item": "flow_pottery_sherd", "count": 1, "to": "grid", "slot": 3},
+                {"op": "put", "item": "flow_pottery_sherd", "count": 1, "to": "grid", "slot": 5},
+                {"op": "put", "item": "flow_pottery_sherd", "count": 1, "to": "grid", "slot": 7},
+                {"op": "take", "from": "output"},
             ],
         )
 
-    def test_fallback_to_ex_craft_on_window_act_unsupported(self) -> None:
+    def test_raises_replan_without_craft_fallback_on_window_act_unsupported(self) -> None:
         blocks = _flat(-4, 4, -4, 4, y=63)
         blocks[(2, 64, 0)] = "crafting_table"
         world = WaveAWorld(
             pos=(0.5, 64.0, 0.5),
             blocks=blocks,
-            items={"arms_up_pottery_sherd": 2, "burn_pottery_sherd": 2},
+            items={"arms_up_pottery_sherd": 2, "burn_pottery_sherd": 2, "brick": 4},
         )
 
         def _fail_wact(w: WaveAWorld, target, ops):
-            raise ApiError("unsupported", "craft_grid not supported")
+            raise ApiError("unsupported", "window_act not supported")
 
         world.on_window_act = _fail_wact
         ex, state = world.session()
         skill = DecoratedPotSherds()
-        drive(skill, ex, state)
-        self.assertEqual(skill.verify_done(state), "")
+        with self.assertRaises(Replan):
+            drive(skill, ex, state)
 
         craft_calls = [req for op, req in world.calls if op == "craft"]
-        self.assertEqual(craft_calls, [{"item": "decorated_pot", "count": 1}])
+        self.assertEqual(craft_calls, [])
 
     def test_env_blocked_when_no_decorated_pots_nearby(self) -> None:
         world = WaveAWorld(pos=(0.5, 64.0, 0.5), blocks=_flat(-4, 4, -4, 4, y=63), items={"iron_pickaxe": 1})
@@ -1058,6 +1115,48 @@ class SweepOutpostCaptainTests(_WaveATestBase):
         with self.assertRaises(EnvBlocked):
             drive(SweepOutpostCaptain(), ex, state)
 
+    def test_ranged_requires_arrows_and_no_fake_sweep_without_bottle_or_adv(self) -> None:
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=_flat(-6, 6, -6, 6, y=63),
+            items={"crossbow": 1},
+            entities=[{"id": 77, "name": "pillager", "type": "hostile", "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex, state = world.session()
+        with self.assertRaises(Replan):
+            drive(SweepOutpostCaptain(), ex, state)
+
+        # Single hit without ominous_bottle gain or voluntary_exile advancement must not falsely complete
+        w2 = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=_flat(-6, 6, -6, 6, y=63),
+            items={"iron_sword": 1},
+            entities=[{"id": 77, "name": "pillager", "type": "hostile", "pos": [2.5, 64.0, 0.5]}],
+        )
+        w2.on_attack = lambda w, entity_id, max_hits: (setattr(w, "entities", []), {"hits": 1})[1]
+        ex2, st2 = w2.session()
+        s2 = SweepOutpostCaptain()
+        with self.assertRaises(Replan):
+            drive(s2, ex2, st2)
+        self.assertTrue(s2.verify_done(st2))
+
+        # voluntary_exile advancement confirms completion even before bottle pickup
+        w3 = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=_flat(-6, 6, -6, 6, y=63),
+            items={"iron_sword": 1},
+            entities=[{"id": 77, "name": "pillager", "type": "hostile", "pos": [2.5, 64.0, 0.5]}],
+        )
+        def _atk_adv(w, entity_id, max_hits):
+            w.entities = []
+            w.adv_snapshot["advancements"].append({"id": "minecraft:adventure/voluntary_exile", "status": "completed"})
+            return {"hits": 1}
+        w3.on_attack = _atk_adv
+        ex3, st3 = w3.session()
+        s3 = SweepOutpostCaptain()
+        drive(s3, ex3, st3)
+        self.assertEqual(s3.verify_done(st3), "")
+
 
 class AllayCakeBirthdayTests(_WaveATestBase):
     def test_blocked_empty_missing_cake_or_note_block_materials(self) -> None:
@@ -1069,9 +1168,11 @@ class AllayCakeBirthdayTests(_WaveATestBase):
         )
 
     def test_prep_only_villager_trade_path(self) -> None:
+        blocks = _flat(-4, 4, -4, 4, y=63)
+        blocks[(2, 64, 0)] = "crafting_table"
         world = WaveAWorld(
             pos=(0.5, 64.0, 0.5),
-            blocks=_flat(-4, 4, -4, 4, y=63),
+            blocks=blocks,
             items={"emerald": 6, "redstone": 1, "oak_planks": 8},
             entities=[{"id": 12, "name": "villager", "type": "villager", "pos": [2.0, 64.0, 0.5]}],
         )
@@ -1099,9 +1200,11 @@ class AllayCakeBirthdayTests(_WaveATestBase):
         self.assertFalse(any(op == "drop" for op, _ in world.calls))
 
     def test_prep_only_craft_cakes_and_note_block_path(self) -> None:
+        blocks = _flat(-4, 4, -4, 4, y=63)
+        blocks[(2, 64, 0)] = "crafting_table"
         world = WaveAWorld(
             pos=(0.5, 64.0, 0.5),
-            blocks=_flat(-4, 4, -4, 4, y=63),
+            blocks=blocks,
             items={
                 "wheat": 6,
                 "sugar": 4,
@@ -1120,6 +1223,23 @@ class AllayCakeBirthdayTests(_WaveATestBase):
         self.assertEqual(state.count("note_block"), 1)
         craft_items = [(req["item"], req["count"]) for op, req in world.calls if op == "craft"]
         self.assertEqual(craft_items, [("cake", 2), ("note_block", 1)])
+
+    def test_note_block_refuses_covered_cells_and_picks_open_above(self) -> None:
+        blocks = _flat(-4, 4, -4, 4, y=63)
+        for x in range(-4, 5):
+            for z in range(-4, 5):
+                if (x, z) not in ((0, 0), (0, 1)):
+                    blocks[(x, 65, z)] = "oak_planks"
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"cake": 2, "note_block": 1},
+            entities=[{"id": 55, "name": "allay", "type": "passive", "pos": [2.0, 64.0, 0.5]}],
+        )
+        ex, state = world.session()
+        drive(AllayCakeBirthday(prep_only=False), ex, state)
+        placed = [req["pos"] for op, req in world.calls if op == "place" and req["item"] == "note_block"]
+        self.assertEqual(placed, [[0, 64, 1]])
 
     def test_full_delivery_path_place_give_ring_drop_and_step_back(self) -> None:
         world = WaveAWorld(
@@ -1209,6 +1329,44 @@ class LootEndShipElytraTests(_WaveATestBase):
         self.assertTrue(any(p.get("shield") is True for p in postures))
         self.assertFalse(world.st["blocking"])
         self.assertFalse(world.st["sneaking"])
+
+    def test_pearl_targets_open_ship_deck_not_enclosed_item_frame(self) -> None:
+        blocks = {**_flat(-2, 2, -2, 2, y=63, block="end_stone"), **_flat(8, 12, -2, 2, y=67, block="purpur_block")}
+        # Enclose item_frame at (11, 68, 0) with a cabin shell at y=68..69 so throwing directly at it would hit the hull
+        for x in (10, 11, 12):
+            for z in (-1, 0, 1):
+                blocks[(x, 69, z)] = "purpur_block"
+                if (x, z) != (11, 0):
+                    blocks[(x, 68, z)] = "purpur_block"
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_end",
+            biome="end_highlands",
+            blocks=blocks,
+            items={"ender_pearl": 1},
+            entities=[{"id": 302, "name": "item_frame", "type": "entity", "pos": [11.5, 68.0, 0.5]}],
+        )
+
+        def _on_use(w: WaveAWorld, item, target):
+            w.items[item] -= 1
+            if item == "ender_pearl" and target and target.get("pos"):
+                tx, ty, tz = target["pos"]
+                w.st["pos"] = [tx + 0.5, float(ty), tz + 0.5]
+            return {"used": item}
+
+        world.on_use_item = _on_use
+        world.on_attack = lambda w, entity_id, max_hits: (w.items.__setitem__("elytra", 1), {"hits": 1})[1]
+        ex, state = world.session()
+        drive(LootEndShipElytra(), ex, state)
+
+        pearls = [req for op, req in world.calls if op == "use_item" and req["item"] == "ender_pearl"]
+        self.assertEqual(len(pearls), 1)
+        tpos = pearls[0]["target"]["pos"]
+        self.assertNotEqual(tpos, [11, 68, 0])
+        tx, ty, tz = int(tpos[0]), int(tpos[1]), int(tpos[2])
+        self.assertIn(ty, (68, 70))
+        self.assertIn((tx, ty - 1, tz), blocks)
+        self.assertNotIn((tx, ty, tz), blocks)
 
     def test_sneak_bridge_fallback_boarding_on_unreachable_move(self) -> None:
         # 3-block air gap at x=2,3,4 between island (x<=1) and ship deck (x>=5)
@@ -1334,11 +1492,13 @@ class LeashFrogVariantsTests(_WaveATestBase):
 
     def test_happy_path_craft_lead_from_five_string_and_sequential_leash_in_end_cold_biome(self) -> None:
         adv_id = "minecraft:husbandry/leash_all_frog_variants"
+        blocks = _flat(-4, 4, -4, 4, y=63, block="end_stone")
+        blocks[(2, 64, 0)] = "crafting_table"
         world = WaveAWorld(
             pos=(0.5, 64.0, 0.5),
             dimension="the_end",
             biome="end_highlands",
-            blocks=_flat(-4, 4, -4, 4, y=63, block="end_stone"),
+            blocks=blocks,
             items={"string": 5},
             entities=[{"id": 901, "name": "frog", "type": "animal", "pos": [2.0, 64.0, 0.5]}],
             adv_snapshot={
@@ -1403,7 +1563,9 @@ class LeashFrogVariantsTests(_WaveATestBase):
         world.on_interact = _on_interact
         ex, state = world.session()
         skill = LeashFrogVariants()
-        drive(skill, ex, state)
+        with self.assertRaises(Replan) as ctx:
+            drive(skill, ex, state)
+        self.assertIn("waiting_tadpole_growth", str(ctx.exception))
 
         interacts = [req for op, req in world.calls if op == "interact"]
         self.assertEqual(len(interacts), 1)
@@ -1411,6 +1573,29 @@ class LeashFrogVariantsTests(_WaveATestBase):
         self.assertEqual(interacts[0]["pos"], [2, 63, 0])
         self.assertEqual(state.count("tadpole_bucket"), 0)
         # Releasing tadpole does not falsely mark frog leashing complete
+        self.assertTrue(skill.verify_done(state))
+
+    def test_rejects_unconfirmed_leash_without_advancement_delta(self) -> None:
+        adv_id = "minecraft:husbandry/leash_all_frog_variants"
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_end",
+            biome="end_highlands",
+            blocks=_flat(-4, 4, -4, 4, y=63, block="end_stone"),
+            items={"lead": 1},
+            entities=[{"id": 901, "name": "frog", "type": "animal", "pos": [2.0, 64.0, 0.5]}],
+            adv_snapshot={
+                "ready": True,
+                "advancements": [
+                    {"id": adv_id, "status": "in_progress", "completed_criteria": ["temperate", "warm"]},
+                ],
+            },
+        )
+        world.on_interact = lambda w, pos, entity_id, item: {"leashed": False}
+        ex, state = world.session()
+        skill = LeashFrogVariants()
+        with self.assertRaises(Replan):
+            drive(skill, ex, state)
         self.assertTrue(skill.verify_done(state))
 
     def test_env_blocked_when_remaining_biome_and_entity_missing(self) -> None:

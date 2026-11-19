@@ -8,7 +8,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from mcagent.client import ApiError
 from mcagent.loop.draft_scores import ADVANCEMENT_SCORES_V2
@@ -29,6 +29,7 @@ from mcagent.runtime import (
     validate_controlled_totem_conditions,
 )
 from mcagent.skills import REGISTRY, bind_args, contract_errors
+import mcagent.skills.t4_ominous_combat as t4_ominous_combat
 from mcagent.skills.t4_ominous_combat import (
     TriggerTotemSafely,
     UnlockOminousVault,
@@ -197,6 +198,7 @@ class WaveCWorld(GridWorld):
         self.offhand: dict[str, Any] | None = deepcopy(offhand)
         self.armor: dict[str, dict[str, Any]] = deepcopy(armor or {})
         self.entities: list[dict[str, Any]] = [deepcopy(e) for e in (entities or ())]
+        self.completed_advs: list[str] = []
         self._sync_armor_points()
 
         self.on_move_to: Callable[..., dict | None] | None = None
@@ -333,14 +335,8 @@ class WaveCWorld(GridWorld):
             res = self.on_equip(self, item=item, slot=slot)
             if res is not None:
                 return res
-        if item == "" and slot in ("head", "chest", "torso", "legs", "feet"):
-            piece = self.armor.pop(slot, None)
-            if slot == "chest" and piece is None:
-                piece = self.armor.pop("torso", None)
-            if isinstance(piece, dict) and piece.get("name"):
-                self._add_item(piece["name"], int(piece.get("count", 1)))
-            self._sync_armor_points()
-            return {"unequipped": slot}
+        if not item or slot not in ("hand", "off-hand", "offhand", "head", "torso", "chest", "legs", "feet"):
+            raise ApiError("bad_args", "Invalid item or slot")
         if slot == "off-hand":
             if self.offhand and self.offhand.get("name") == item:
                 return {"equipped": item, "slot": slot}
@@ -441,16 +437,15 @@ class WaveCWorld(GridWorld):
             res = self.on_window_act(self, target=target, ops=ops)
             if res is not None:
                 return res
+        if isinstance(target, dict) and target.get("kind") == "inventory":
+            raise ApiError("bad_args", "inventory window is unsupported in API v1.3.11")
         for op in ops:
-            if op.get("op") == "unequip":
-                slot = op.get("slot")
-                piece = self.armor.pop(slot, None)
-                if slot == "chest" and piece is None:
-                    piece = self.armor.pop("torso", None)
-                if isinstance(piece, dict) and piece.get("name"):
-                    self._add_item(piece["name"], int(piece.get("count", 1)))
-        self._sync_armor_points()
+            if op.get("op") not in ("put", "take", "select", "text"):
+                raise ApiError("bad_args", f"unsupported window op: {op.get('op')}")
         return {"ok": True, "ops": deepcopy(ops)}
+
+    def advancements(self, status="completed", include_recipes=False) -> dict:
+        return {"completed": list(self.completed_advs), "in_progress": {}}
 
 
 class _WaveCTestBase(unittest.TestCase):
@@ -549,7 +544,17 @@ class ControlledTotemTriggerTests(_WaveCTestBase):
                     pass
             self.assertFalse(state.is_totem_trigger_armed())
 
-        for bad_block in ("lava", "water", "slime_block", "hay_block", "flowing_lava", "flowing_water"):
+        for bad_block in (
+            "lava",
+            "water",
+            "slime_block",
+            "hay_block",
+            "flowing_lava",
+            "flowing_water",
+            "honey_block",
+            "red_bed",
+            "white_bed",
+        ):
             with self.subTest(landing=bad_block):
                 bad_client = self._stone_floor_client(floor_y=64, block=bad_block)
                 ok, reason, _ = validate_controlled_totem_conditions(state, bad_client, drop_height=25)
@@ -559,6 +564,46 @@ class ControlledTotemTriggerTests(_WaveCTestBase):
                     with controlled_totem_trigger(state, bad_client, drop_height=25):
                         pass
                 self.assertFalse(state.is_totem_trigger_armed())
+
+    def test_rejects_pillar_top_drop_zero_and_validates_explicit_landing_col(self) -> None:
+        # Standing on pillar top (0, 88, -1) with feet at (0.5, 89.0, -0.5):
+        # Default (fx, fz) hits pillar top at dy=1 (drop_blocks=0 < min_drop=23) -> MUST reject!
+        state = self._ready_totem_state(pos=(0.5, 89.0, -0.5))
+        pillar_and_floor = {(0, 88, -1): "cobblestone", (1, 63, -1): "stone"}
+        client_ok = _BlockProbeClient(pillar_and_floor)
+        ok_default, reason_default, meta_default = validate_controlled_totem_conditions(state, client_ok, drop_height=25)
+        self.assertFalse(ok_default)
+        self.assertIsNone(meta_default)
+        self.assertIn("0", reason_default)
+
+        # Explicit landing_col=(1, -1) onto solid stone at y=63 (drop_blocks=25 >= 23) -> passes!
+        ok_col, _, meta_col = validate_controlled_totem_conditions(
+            state, client_ok, drop_height=25, landing_col=(1, -1), min_drop=23
+        )
+        self.assertTrue(ok_col)
+        self.assertEqual(meta_col["landing_block"], "stone")
+        self.assertEqual(meta_col["landing_pos"], [1, 63, -1])
+        self.assertEqual(meta_col["drop_blocks"], 25)
+        self.assertEqual(meta_col["landing_col"], [1, -1])
+
+        # Explicit landing_col over void, lava, honey_block, red_bed, or shallow ledge (< 23) -> MUST reject!
+        bad_cols = (
+            ("void", {(0, 88, -1): "cobblestone"}),
+            ("lava", {(0, 88, -1): "cobblestone", (1, 63, -1): "lava"}),
+            ("honey_block", {(0, 88, -1): "cobblestone", (1, 63, -1): "honey_block"}),
+            ("red_bed", {(0, 88, -1): "cobblestone", (1, 63, -1): "red_bed"}),
+            ("shallow_ledge_10", {(0, 88, -1): "cobblestone", (1, 78, -1): "stone"}),
+            ("head_blocked", {(0, 88, -1): "cobblestone", (1, 89, -1): "stone", (1, 63, -1): "stone"}),
+        )
+        for label, blocks in bad_cols:
+            with self.subTest(case=label):
+                bad_client = _BlockProbeClient(blocks)
+                ok, reason, meta = validate_controlled_totem_conditions(
+                    state, bad_client, drop_height=25, landing_col=(1, -1), min_drop=23
+                )
+                self.assertFalse(ok)
+                self.assertTrue(reason)
+                self.assertIsNone(meta)
 
     def test_rejects_unhealthy_unready_or_hazardous_states(self) -> None:
         client = self._stone_floor_client(floor_y=64)
@@ -581,12 +626,13 @@ class ControlledTotemTriggerTests(_WaveCTestBase):
                         pass
                 self.assertFalse(state.is_totem_trigger_armed())
 
-    def test_single_suppression_for_void_risk_and_heal_second_tick_triggers_emergency(self) -> None:
+    def test_multi_tick_fall_window_suppresses_until_landing_totem_consumed_or_expiry(self) -> None:
         for hazard_mode in ("void_risk", "heal"):
             with self.subTest(hazard=hazard_mode):
                 client = self._stone_floor_client(floor_y=64, block="stone")
                 state = self._ready_totem_state(
                     pos=(0.5, 89.0, 0.5),
+                    on_ground=False,
                     health=4.0 if hazard_mode == "heal" else 20.0,
                 )
                 if hazard_mode == "void_risk":
@@ -604,22 +650,52 @@ class ControlledTotemTriggerTests(_WaveCTestBase):
                     ex.active_action = "attack"  # elevates soft heal -> urgent
                 monitor = SafetyMonitor(client, state, ex)
 
-                with controlled_totem_trigger(state, client, drop_height=25) as meta:
+                with controlled_totem_trigger(state, client, drop_height=25, max_duration_s=3.5) as meta:
                     self.assertTrue(state.is_totem_trigger_armed())
                     self.assertEqual(meta["landing_block"], "stone")
                     self.assertEqual(meta["landing_pos"], [0, 64, 0])
 
-                    # 1st hazard tick: suppressed strictly once
-                    monitor._dispatch(reconcile=True)
-                    self.assertEqual(ex.emergency.call_count, 0)
-                    self.assertFalse(state.is_totem_trigger_armed())
+                    # Multiple airborne ticks during fall: guard remains armed and suppresses void_risk/heal
+                    for _ in range(4):
+                        monitor._dispatch(reconcile=True)
+                        self.assertEqual(ex.emergency.call_count, 0)
+                        self.assertTrue(state.is_totem_trigger_armed())
 
-                    # 2nd hazard tick: immediately triggers emergency
+                    # Landing after airborne (or totem consumption) disarms and restores emergency dispatch
+                    if hazard_mode == "void_risk":
+                        state.st["on_ground"] = True
+                    else:
+                        state.inventory["offhand"] = None
+                        state.st["offhand"] = None
                     monitor._dispatch(reconcile=True)
+                    self.assertFalse(state.is_totem_trigger_armed())
                     self.assertEqual(ex.emergency.call_count, 1)
 
                 self.assertFalse(state.is_totem_trigger_armed())
                 self.assertIsNone(state._totem_guard)
+
+        # Window expiration (max_duration_s) also disarms and triggers emergency
+        client = self._stone_floor_client(floor_y=64, block="stone")
+        state = self._ready_totem_state(pos=(0.5, 89.0, 0.5), on_ground=False)
+        state.set_support(
+            {
+                "pos": [0, 88, 0],
+                "status_pos": [0.5, 89.0, 0.5],
+                "at": time.monotonic(),
+                "risk": "脚下连续空气且正在下落",
+            }
+        )
+        ex = Executor(client, state, log=lambda *_: None)
+        ex.emergency = MagicMock(name="emergency")
+        monitor = SafetyMonitor(client, state, ex)
+        with controlled_totem_trigger(state, client, drop_height=25, max_duration_s=0.05):
+            monitor._dispatch(reconcile=True)
+            self.assertEqual(ex.emergency.call_count, 0)
+            time.sleep(0.08)
+            self.assertFalse(state.is_totem_trigger_armed())
+            monitor._dispatch(reconcile=True)
+            self.assertEqual(ex.emergency.call_count, 1)
+        self.assertIsNone(state._totem_guard)
 
     def test_never_suppresses_escape_lava_surface_or_safe_mode_while_armed(self) -> None:
         for hazard_kind in ("escape_lava", "surface", "safe_mode"):
@@ -917,7 +993,7 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
         enclosure_ring = {(4, 64, 0), (2, 64, 0), (3, 64, 1), (3, 64, -1)}
         self.assertTrue(enclosure_ring.intersection(cobble_places))
 
-        # Bed & bell placed and recorded as stations
+        # Bed & bell placed and recorded as stations; cramped 1-high alcove skipped for bed
         self.assertTrue(any(op == "place" and req["item"] == "red_bed" for op, req in world.calls))
         self.assertTrue(any(op == "place" and req["item"] == "bell" for op, req in world.calls))
         memo = memo_for(state)
@@ -931,6 +1007,25 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
         self.assertTrue(memo.has_landmark("micro_village_bunker", dimension="overworld"))
         self.assertIn((3, 64, 0), memo.landmarks("micro_village_bunker", dimension="overworld"))
 
+    def test_bed_placement_requires_two_block_clearance(self) -> None:
+        blocks = _flat(-4, 6, -4, 6, y=63, block="stone")
+        # Roof at y=65 over almost entire area except open spot at (5, 64, 0)-(6, 64, 0)
+        for x in range(-1, 5):
+            for z in range(-4, 5):
+                blocks[(x, 65, z)] = "stone"
+        world = WaveCWorld(
+            pos=(5.5, 64.0, 2.5),
+            blocks=blocks,
+            items={"cobblestone": 20, "red_bed": 1},
+            entities=[{"id": 702, "name": "villager", "type": "other", "pos": [3.5, 64.0, 0.5]}],
+        )
+        ex, state = world.session()
+        drive(WinMicroVillageRaid(prep_only=True), ex, state, max_steps=80)
+        bed_places = [tuple(req["pos"]) for op, req in world.calls if op == "place" and req["item"] == "red_bed"]
+        self.assertEqual(len(bed_places), 1)
+        bx, by, bz = bed_places[0]
+        self.assertEqual(blocks.get((bx, by + 1, bz), "air"), "air")
+
     def test_env_blocked_when_villager_and_village_landmark_missing(self) -> None:
         world = WaveCWorld(
             pos=(0.5, 64.0, 0.5),
@@ -943,7 +1038,7 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
             drive(WinMicroVillageRaid(prep_only=True), ex, state)
         self.assertEqual(ctx.exception.missing_predicate, "villager")
 
-    def test_full_raid_selects_level1_bottle_rings_bell_prioritizes_evoker_loots_totem_and_manual_kill(self) -> None:
+    def test_full_raid_multi_wave_selects_level1_bottle_prioritizes_evoker_and_wins_hero(self) -> None:
         blocks = _flat(-6, 8, -6, 8, y=63)
         blocks[(2, 64, 0)] = "bell"
         # Level 5 bottle listed BEFORE Level 1 bottle to guarantee amplifier sorting (not list order)
@@ -960,10 +1055,11 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
             entities=[],  # Raiders initially hidden until bell is rung!
         )
         bell_rung = False
+        wave_num = 0
+        polls_between_waves = 0
 
         def _on_use_item(w: WaveCWorld, item: str, target=None):
             if item == "ominous_bottle":
-                # Remove the lowest-level bottle stack
                 w.item_stacks = [
                     s for s in (w.item_stacks or [])
                     if not (s.get("name") == "ominous_bottle" and (s.get("components") or {}).get("ominous_amplifier") == 0)
@@ -973,23 +1069,42 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
             return None
 
         def _on_interact(w: WaveCWorld, pos=None, entity_id=None, item=None):
-            nonlocal bell_rung
+            nonlocal bell_rung, wave_num
             if pos == [2, 64, 0] and not bell_rung:
                 bell_rung = True
-                # Reveal closer pillager (id=801) AND farther evoker (id=802) -> evoker MUST be targeted first!
-                w.entities.extend(
-                    [
-                        {"id": 801, "name": "pillager", "type": "hostile", "pos": [2.0, 64.0, 0.5]},
-                        {"id": 802, "name": "evoker", "type": "hostile", "pos": [4.0, 64.0, 0.5]},
-                    ]
-                )
+                wave_num = 1
+                w.st["effects"] = []  # raid_omen consumed when Wave 1 starts
+                w.entities.append({"id": 800, "name": "pillager", "type": "hostile", "pos": [2.0, 64.0, 0.5]})
                 return {"rung": True}
             return {"changed": True}
+
+        orig_get_entities = world.get_entities
+
+        def _get_entities_multi_wave(radius=32, types=None):
+            nonlocal wave_num, polls_between_waves
+            res = orig_get_entities(radius=radius, types=types)
+            if bell_rung and wave_num == 1 and not res["entities"] and types and "pillager" in types:
+                polls_between_waves += 1
+                if polls_between_waves >= 2:
+                    wave_num = 2
+                    # Wave 2 reveals closer pillager (801) AND farther evoker (802) -> evoker targeted first!
+                    world.entities.extend(
+                        [
+                            {"id": 801, "name": "pillager", "type": "hostile", "pos": [2.0, 64.0, 0.5]},
+                            {"id": 802, "name": "evoker", "type": "hostile", "pos": [4.0, 64.0, 0.5]},
+                        ]
+                    )
+                    res = orig_get_entities(radius=radius, types=types)
+            return res
+
+        world.get_entities = _get_entities_multi_wave  # type: ignore[method-assign]
 
         def _on_attack(w: WaveCWorld, entity_id: int, max_hits=None):
             w.entities = [e for e in w.entities if e["id"] != entity_id]
             if entity_id == 802:
                 w.entities.append({"id": 899, "name": "totem_of_undying", "type": "item", "pos": [4.0, 64.0, 0.5]})
+            if wave_num == 2 and not any(e.get("type") == "hostile" for e in w.entities):
+                w.st["effects"] = ["hero_of_the_village"]
             return {"entity_id": entity_id, "hits": 3, "killed": True}
 
         def _on_move_to(w: WaveCWorld, pos=None, **_kw):
@@ -1007,42 +1122,110 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
         world.on_move_to = _on_move_to
 
         ex, state = world.session()
-        # Pre-mark bunker ready so full raid phase runs directly
         memo_for(state).record_landmark("micro_village_bunker", (3, 64, 0), dimension="overworld")
 
-        # Unit check on lowest bottle selector directly
         chosen = _select_lowest_ominous_bottle(state)
         self.assertIsNotNone(chosen)
         self.assertEqual((chosen.get("components") or {}).get("ominous_amplifier"), 0)
 
         skill = WinMicroVillageRaid(prep_only=False)
-        steps = drive(skill, ex, state, max_steps=60)
+        with patch.object(t4_ominous_combat, "_RAID_WAVE_POLL_S", 0.0):
+            steps = drive(skill, ex, state, max_steps=60)
 
         self.assertEqual(skill.verify_done(state), "")
         self.assertTrue(bell_rung)
+        self.assertEqual(wave_num, 2)
         self.assertTrue(skill._saw_evoker)
         self.assertTrue(skill._looted_totem)
-        self.assertGreaterEqual(skill._bot_killed_raiders, 2)
+        self.assertGreaterEqual(skill._bot_killed_raiders, 3)
         self.assertEqual(state.count("totem_of_undying"), 1)
 
-        # Level 1 (amplifier=0 -> bottle_rank=0) ominous bottle selected over Level 5
         drink_steps = [s for s in steps if s and s.get("op") == "use_item" and s.get("item") == "ominous_bottle"]
         self.assertEqual(len(drink_steps), 1)
         self.assertEqual(drink_steps[0].get("bottle_rank"), 0)
+        self.assertTrue(drink_steps[0].get("api_selects_by_name"))
 
-        # Bell rung to reveal hidden raiders
-        self.assertTrue(any(op == "interact" and req["pos"] == [2, 64, 0] for op, req in world.calls))
-
-        # Evoker (id=802) prioritized over closer pillager (id=801)
+        # Wave 1 pillager (800), then Wave 2 evoker (802) prioritized over closer pillager (801)
         attacked_ids = [req["entity_id"] for op, req in world.calls if op == "attack"]
-        self.assertEqual(attacked_ids[:2], [802, 801])
+        self.assertEqual(attacked_ids, [800, 802, 801])
 
-        # Shield posture cleanly cleared at exit
         postures = [req for op, req in world.calls if op == "posture"]
         self.assertTrue(any(p.get("shield") is True for p in postures))
         self.assertIs(postures[-1].get("shield"), False)
         self.assertFalse(state.st.get("blocking"))
         self.assertFalse(world.st.get("blocking"))
+
+    def test_wave1_clear_without_hero_does_not_false_win_and_easy_3wave_marks_landmark(self) -> None:
+        blocks = _flat(-4, 4, -4, 4, y=63)
+        # Case A: 1 wave cleared, NO hero_of_the_village, NO raid_omen -> MUST NOT false-win on Wave 1!
+        world_no_hero = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"iron_sword": 1, "shield": 1},
+            effects=[],  # active raid has no raid_omen
+            entities=[{"id": 810, "name": "pillager", "type": "hostile", "pos": [2.0, 64.0, 0.5]}],
+        )
+        # Note: blocked() requires raid_omen/bad_omen or bottle, so give bad_omen at start then clear it on attack
+        world_no_hero.st["effects"] = ["raid_omen"]
+        world_no_hero.on_attack = lambda w, entity_id, max_hits=None: (
+            w.entities.__setitem__(slice(None), [e for e in w.entities if e["id"] != entity_id]),
+            w.st.__setitem__("effects", []),
+            {"entity_id": entity_id, "hits": 1, "killed": True},
+        )[2]
+        ex1, st1 = world_no_hero.session()
+        memo_for(st1).record_landmark("micro_village_bunker", (3, 64, 0), dimension="overworld")
+        skill1 = WinMicroVillageRaid(prep_only=False)
+        with patch.object(t4_ominous_combat, "_RAID_WAVE_POLL_S", 0.0):
+            with self.assertRaises(Replan) as ctx1:
+                drive(skill1, ex1, st1, max_steps=60)
+        self.assertIn("hero_of_the_village", str(ctx1.exception))
+        self.assertFalse(skill1._won)
+        self.assertTrue(skill1.verify_done(st1))
+
+        # Case B: 3 waves cleared with 0 evokers & 0 totems -> wins and records raid_no_evoker_easy landmark
+        world_easy = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            difficulty="",  # Simulate bridge omitting difficulty from /status
+            blocks=blocks,
+            items={"iron_sword": 1, "cobblestone": 30},
+            effects=["raid_omen"],
+            entities=[{"id": 901, "name": "pillager", "type": "hostile", "pos": [2.0, 64.0, 0.5]}],
+        )
+        wave = 1
+        gap_polls = 0
+        orig_get_entities = world_easy.get_entities
+
+        def _easy_get_entities(radius=32, types=None):
+            nonlocal wave, gap_polls
+            res = orig_get_entities(radius=radius, types=types)
+            if types and "pillager" in types and not res["entities"] and wave < 3:
+                gap_polls += 1
+                if gap_polls >= 2:
+                    gap_polls = 0
+                    wave += 1
+                    world_easy.entities.append({"id": 900 + wave, "name": "pillager", "type": "hostile", "pos": [2.0, 64.0, 0.5]})
+                    res = orig_get_entities(radius=radius, types=types)
+            return res
+
+        world_easy.get_entities = _easy_get_entities  # type: ignore[method-assign]
+
+        def _easy_attack(w: WaveCWorld, entity_id: int, max_hits=None):
+            w.entities = [e for e in w.entities if e["id"] != entity_id]
+            w.st["effects"] = ["hero_of_the_village"] if wave == 3 else []
+            return {"entity_id": entity_id, "hits": 1, "killed": True}
+
+        world_easy.on_attack = _easy_attack
+        ex2, st2 = world_easy.session()
+        memo_for(st2).record_landmark("micro_village_bunker", (3, 64, 0), dimension="overworld")
+        skill2 = WinMicroVillageRaid(prep_only=False)
+        with patch.object(t4_ominous_combat, "_RAID_WAVE_POLL_S", 0.0):
+            drive(skill2, ex2, st2, max_steps=60)
+        self.assertEqual(skill2.verify_done(st2), "")
+        self.assertTrue(memo_for(st2).has_landmark("raid_no_evoker_easy", dimension="overworld"))
+        # Subsequent TriggerTotemSafely recognizes Easy fallback via landmark and raises EnvBlocked!
+        with self.assertRaises(EnvBlocked) as ctx2:
+            drive(TriggerTotemSafely(), ex2, st2)
+        self.assertEqual(ctx2.exception.missing_predicate, "totem_of_undying_or_normal_plus_difficulty")
 
     def test_zero_manual_bot_kills_raises_replan_and_fails_verify_done(self) -> None:
         # Case A: all raiders already killed by environment (0 visible even after ringing bell)
@@ -1058,8 +1241,9 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
         ex1, st1 = world_env_kills.session()
         memo_for(st1).record_landmark("micro_village_bunker", (3, 64, 0), dimension="overworld")
         skill1 = WinMicroVillageRaid(prep_only=False)
-        with self.assertRaises(Replan) as ctx1:
-            drive(skill1, ex1, st1)
+        with patch.object(t4_ominous_combat, "_RAID_WAVE_POLL_S", 0.0):
+            with self.assertRaises(Replan) as ctx1:
+                drive(skill1, ex1, st1)
         self.assertIn("亲手补刀", str(ctx1.exception))
         self.assertEqual(skill1._bot_killed_raiders, 0)
         self.assertTrue(skill1.verify_done(st1))
@@ -1080,8 +1264,9 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
         ex2, st2 = world_no_kill.session()
         memo_for(st2).record_landmark("micro_village_bunker", (3, 64, 0), dimension="overworld")
         skill2 = WinMicroVillageRaid(prep_only=False)
-        with self.assertRaises(Replan) as ctx2:
-            drive(skill2, ex2, st2, max_steps=60)
+        with patch.object(t4_ominous_combat, "_RAID_WAVE_POLL_S", 0.0):
+            with self.assertRaises(Replan) as ctx2:
+                drive(skill2, ex2, st2, max_steps=60)
         self.assertIn("亲手补刀", str(ctx2.exception))
         self.assertEqual(skill2._bot_killed_raiders, 0)
         self.assertTrue(skill2.verify_done(st2))
@@ -1171,15 +1356,15 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
                 # Must NOT search for Woodland Mansions (zero find_blocks / move_to calls)
                 self.assertEqual([c for c in world.calls if c[0] in ("find_blocks", "move_to")], [])
 
-    def test_rejects_lava_water_and_void_landing_with_replan(self) -> None:
-        # Ground-start unsafe landings
-        for bad_block in ("lava", "water", None):
+    def test_rejects_lava_water_honey_bed_and_void_landing_with_replan(self) -> None:
+        # Ground-start unsafe landings (including post-pillar actual exit column (1, -1))
+        for bad_block in ("lava", "water", "honey_block", "red_bed", None):
             with self.subTest(mode="ground", landing=bad_block or "void"):
                 blocks = _flat(-2, 2, -2, 2, y=63, block="stone")
                 if bad_block is None:
-                    blocks.pop((1, 63, 0), None)
+                    blocks.pop((1, 63, -1), None)
                 else:
-                    blocks[(1, 63, 0)] = bad_block
+                    blocks[(1, 63, -1)] = bad_block
                 world = WaveCWorld(
                     pos=(0.5, 64.0, 0.5),
                     blocks=blocks,
@@ -1191,8 +1376,8 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
                 self.assertFalse(any(op == "place" for op, _ in world.calls))
                 self.assertFalse(state.is_totem_trigger_armed())
 
-        # Elevated-start unsafe landings
-        for bad_block in ("lava", "water", None):
+        # Elevated-start unsafe landings (player at (0.5, 89.0, 0.5) on pillar top (0, 88, 0))
+        for bad_block in ("lava", "water", "honey_block", "red_bed", None):
             with self.subTest(mode="elevated", landing=bad_block or "void"):
                 blocks: dict[tuple[int, int, int], str] = {(0, 88, 0): "cobblestone"}
                 if bad_block is not None:
@@ -1209,7 +1394,110 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
                 self.assertFalse(any(op == "control" for op, _ in world.calls))
                 self.assertFalse(state.is_totem_trigger_armed())
 
-    def test_ground_start_happy_path_strips_armor_window_act_pillars_25_triggers_totem(self) -> None:
+    def test_feather_falling_and_high_protection_armor_reject_without_fake_unequip(self) -> None:
+        # Feather Falling boots -> Replan("totem_feather_falling_armor_cannot_unequip...")
+        world_ff = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            difficulty="normal",
+            blocks=_flat(-3, 3, -3, 3, y=63, block="stone"),
+            items={"totem_of_undying": 1, "cobblestone": 32},
+            armor={"feet": {"name": "diamond_boots", "count": 1, "enchantments": [{"name": "feather_falling", "level": 4}]}},
+        )
+        ex1, st1 = world_ff.session()
+        with self.assertRaises(Replan) as ctx_ff:
+            drive(TriggerTotemSafely(), ex1, st1)
+        self.assertIn("totem_feather_falling_armor_cannot_unequip", str(ctx_ff.exception))
+        self.assertFalse(any(op == "window_act" for op, _ in world_ff.calls))
+        self.assertFalse(any(op == "equip" and req.get("item") == "" for op, req in world_ff.calls))
+
+        # Full Protection IV armor -> Replan("totem_high_protection_armor_cannot_unequip...")
+        prot4 = {"enchantments": [{"name": "protection", "level": 4}]}
+        world_prot = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            difficulty="normal",
+            blocks=_flat(-3, 3, -3, 3, y=63, block="stone"),
+            items={"totem_of_undying": 1, "cobblestone": 40},
+            armor={
+                "head": {"name": "diamond_helmet", "count": 1, **prot4},
+                "chest": {"name": "diamond_chestplate", "count": 1, **prot4},
+                "legs": {"name": "diamond_leggings", "count": 1, **prot4},
+                "feet": {"name": "diamond_boots", "count": 1, **prot4},
+            },
+        )
+        ex2, st2 = world_prot.session()
+        with self.assertRaises(Replan) as ctx_prot:
+            drive(TriggerTotemSafely(), ex2, st2)
+        self.assertIn("totem_high_protection_armor_cannot_unequip", str(ctx_prot.exception))
+        self.assertFalse(any(op == "window_act" for op, _ in world_prot.calls))
+        self.assertFalse(any(op == "equip" and req.get("item") == "" for op, req in world_prot.calls))
+
+    def test_ground_start_unarmored_pillars_25_uses_actual_top_col_and_multi_poll_fall(self) -> None:
+        world = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            difficulty="normal",
+            blocks=_flat(-3, 3, -3, 3, y=63, block="stone"),
+            items={"totem_of_undying": 1, "cobblestone": 32},
+        )
+        ex, state = world.session()
+        armed_snapshots: list[bool] = []
+        poll_phase = 0
+
+        def _on_control(w: WaveCWorld, **keys):
+            nonlocal poll_phase
+            armed_snapshots.append(state.is_totem_trigger_armed())
+            # Stepping off pillar top (0, 89, -1) into mid-air over (1, *, -1)
+            w.st["pos"] = [1.5, 82.0, -0.5]
+            w.st["on_ground"] = False
+            poll_phase = 1
+            return {"ok": True, **keys}
+
+        orig_status = world.status
+
+        def _falling_status(timeout: float = 10) -> dict:
+            nonlocal poll_phase
+            if poll_phase == 1:
+                armed_snapshots.append(state.is_totem_trigger_armed())
+                world.st["pos"] = [1.5, 72.0, -0.5]
+                world.st["on_ground"] = False
+                poll_phase = 2
+            elif poll_phase == 2:
+                armed_snapshots.append(state.is_totem_trigger_armed())
+                # Impact ground at (1.5, 64.0, -0.5) and pop offhand totem
+                world.st["pos"] = [1.5, 64.0, -0.5]
+                world.st["on_ground"] = True
+                world.offhand = None
+                poll_phase = 3
+            return orig_status(timeout=timeout)
+
+        world.on_control = _on_control
+        world.status = _falling_status  # type: ignore[method-assign]
+        skill = TriggerTotemSafely()
+        with patch.object(t4_ominous_combat, "_TOTEM_FALL_POLL_S", 0.0):
+            drive(skill, ex, state, max_steps=100)
+
+        self.assertEqual(skill.verify_done(state), "")
+        # Guard stayed armed across control() AND all mid-air polling ticks
+        self.assertGreaterEqual(len(armed_snapshots), 3)
+        self.assertTrue(all(armed_snapshots))
+        self.assertFalse(state.is_totem_trigger_armed())
+        self.assertIsNone(state._totem_guard)
+        self.assertEqual(state.count("totem_of_undying"), 0)
+
+        # Never calls fake unequip APIs
+        self.assertFalse(any(op == "window_act" for op, _ in world.calls))
+        self.assertFalse(any(op == "equip" and req.get("item") == "" for op, req in world.calls))
+        # Equipped totem to off-hand
+        self.assertTrue(
+            any(op == "equip" and req["item"] == "totem_of_undying" and req["slot"] == "off-hand" for op, req in world.calls)
+        )
+        # Pillared 25 blocks; actual top cell is (0, 89, -1) and look targets (1.5, 89.0, -0.5)
+        places = [req for op, req in world.calls if op == "place"]
+        self.assertEqual(len(places), 25)
+        self.assertIn((0, 89, -1), memo_for(state).landmarks("totem_pillar", dimension="overworld"))
+        looks = [req for op, req in world.calls if op == "look"]
+        self.assertEqual(looks[-1]["pos"], [1.5, 89.0, -0.5])
+
+    def test_ordinary_unenchanted_armor_raises_pillar_height_without_unequip_api(self) -> None:
         world = WaveCWorld(
             pos=(0.5, 64.0, 0.5),
             difficulty="normal",
@@ -1221,39 +1509,27 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
             },
         )
         ex, state = world.session()
-        armed_during_fall: list[bool] = []
 
         def _on_control(w: WaveCWorld, **keys):
-            armed_during_fall.append(state.is_totem_trigger_armed())
-            # Simulate falling off the 25-block pillar onto stone and consuming offhand totem
             w.st["pos"] = [1.5, 64.0, 0.5]
+            w.st["on_ground"] = True
             w.offhand = None
             return {"ok": True, **keys}
 
         world.on_control = _on_control
         skill = TriggerTotemSafely()
-        drive(skill, ex, state, max_steps=100)
+        drive(skill, ex, state, max_steps=120)
 
         self.assertEqual(skill.verify_done(state), "")
-        self.assertEqual(armed_during_fall, [True])
+        self.assertFalse(any(op == "window_act" for op, _ in world.calls))
+        self.assertFalse(any(op == "equip" and req.get("item") == "" for op, req in world.calls))
+        # Raised pillar height to 28 blocks for ordinary unenchanted armor
+        places = [req for op, req in world.calls if op == "place"]
+        self.assertEqual(len(places), 28)
         self.assertFalse(state.is_totem_trigger_armed())
         self.assertIsNone(state._totem_guard)
-        self.assertEqual(world.armor, {})
-        self.assertEqual(state.count("totem_of_undying"), 0)
 
-        # Stripped armor via window_act unequip
-        unequips = [req for op, req in world.calls if op == "window_act"]
-        self.assertEqual(len(unequips), 2)
-        # Equipped totem to off-hand
-        self.assertTrue(
-            any(op == "equip" and req["item"] == "totem_of_undying" and req["slot"] == "off-hand" for op, req in world.calls)
-        )
-        # Pillared 25 blocks above solid ground
-        places = [req for op, req in world.calls if op == "place"]
-        self.assertEqual(len(places), 25)
-        self.assertTrue(memo_for(state).has_landmark("totem_pillar", dimension="overworld"))
-
-    def test_elevated_start_happy_path_unsupported_api_equip_fallback_and_effect_confirmation(self) -> None:
+    def test_elevated_start_happy_path_effect_confirmation(self) -> None:
         blocks = _flat(-2, 2, -2, 2, y=63, block="stone")
         blocks[(0, 88, 0)] = "cobblestone"
         world = WaveCWorld(
@@ -1262,16 +1538,9 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
             elevated_column=True,
             blocks=blocks,
             items={"totem_of_undying": 1},
-            armor={
-                "legs": {"name": "diamond_leggings", "count": 1},
-                "feet": {"name": "diamond_boots", "count": 1},
-            },
         )
         ex, state = world.session()
         armed_during_fall: list[bool] = []
-
-        def _unsupported_window_act(w: WaveCWorld, target=None, ops=None):
-            raise ApiError("unsupported_api", "inventory window_act unsupported")
 
         def _on_control(w: WaveCWorld, **keys):
             armed_during_fall.append(state.is_totem_trigger_armed())
@@ -1280,7 +1549,6 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
             w.st["effects"] = {"regeneration": 1, "absorption": 1}
             return {"ok": True, **keys}
 
-        world.on_window_act = _unsupported_window_act
         world.on_control = _on_control
 
         skill = TriggerTotemSafely()
@@ -1289,11 +1557,7 @@ class TriggerTotemSafelyTests(_WaveCTestBase):
         self.assertEqual(skill.verify_done(state), "")
         self.assertEqual(armed_during_fall, [True])
         self.assertFalse(state.is_totem_trigger_armed())
-        self.assertEqual(world.armor, {})
-        # Fallback to equip("", slot) for both armor slots
-        fallback_equips = [req["slot"] for op, req in world.calls if op == "equip" and req["item"] == ""]
-        self.assertEqual(fallback_equips, ["legs", "feet"])
-        # Already elevated -> zero pillar places
+        self.assertIsNone(state._totem_guard)
         self.assertEqual([c for c in world.calls if c[0] == "place"], [])
 
     def test_disarms_totem_guard_on_control_error_or_unconfirmed_trigger(self) -> None:

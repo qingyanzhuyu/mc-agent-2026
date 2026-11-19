@@ -18,6 +18,8 @@ from typing import Any, Collection, Mapping, Optional
 from ..runtime import State
 from ..skills import REGISTRY, bind_args
 from ..skills.items import STONE_OR_BETTER_PICKS, best_pickaxe
+from ..skills.world_memo import memo_for
+from . import subgoals
 from .starter_skills import (
     can_afford_gear,
     has_known_table,
@@ -63,6 +65,7 @@ class GoalSpec:
     editable_files: tuple[str, ...] = ()       # GOAL_MISS 自动修复时允许改动的收窄白名单
     held_items: tuple[str, ...] = ()            # 下游所需实物，未指定时沿用 done_items
     gather_when_blocked: bool = False          # 允许主技能先观察复用场景，无法启动时再尝试补料
+    done_predicates: tuple[str, ...] = ()      # 子目标/世界记忆复合达成谓词表达式
 
     @property
     def args_dict(self) -> dict[str, Any]:
@@ -1568,6 +1571,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="trade_world_height",
         skill_args=(("prep_only", True),),
         prereq_goals=("trade", "enter_the_nether"),
+        done_predicates=("landmark_reachable:high_altitude_portal",),
         budget_s=360.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1583,6 +1587,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="arbalistic_trench_shot",
         skill_args=(("prep_only", True), ("prep_mode", "crossbow")),
         prereq_goals=("trade", "enchant_item", "ol_betsy"),
+        done_predicates=("enchantment_ready:crossbow:piercing>=4",),
         budget_s=360.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1598,6 +1603,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="arbalistic_trench_shot",
         skill_args=(("prep_only", True), ("prep_mode", "mobs")),
         prereq_goals=("tactical_fishing", "tadpole_in_a_bucket"),
+        done_predicates=("mob_collection_ready>=5",),
         budget_s=300.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1613,6 +1619,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="summon_and_trap_wither",
         skill_args=(("mode", "prep_looting"),),
         prereq_goals=("trade", "enchant_item"),
+        done_predicates=("enchantment_ready:sword:looting>=3",),
         budget_s=360.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1763,6 +1770,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="win_micro_village_raid",
         skill_args=(("prep_only", True),),
         prereq_goals=("trade",),
+        done_predicates=("landmark_reachable:micro_village_bunker",),
         budget_s=300.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1942,16 +1950,61 @@ def is_goal_held_in_state(goal: GoalSpec, state: State) -> bool:
     return bool(held_items) and all(check_item_expr(state, expr) for expr in held_items)
 
 
+def _eval_done_predicate(state: State, expr: str, memo: Any = None) -> bool:
+    """求值单条子目标/世界记忆复合达成谓词。"""
+    raw = expr.strip()
+    if not raw:
+        return False
+    if ">=" in raw:
+        lhs, rhs = raw.split(">=", 1)
+        lhs = lhs.strip()
+        try:
+            threshold = int(rhs.strip())
+        except ValueError:
+            return False
+    else:
+        lhs = raw
+        threshold = 1
+
+    if lhs.startswith("enchantment_ready:"):
+        parts = lhs.split(":", 2)
+        if len(parts) != 3:
+            return False
+        _, item_tag, enchant_id = parts
+        item_tag, enchant_id = item_tag.strip(), enchant_id.strip()
+        if not item_tag or not enchant_id:
+            return False
+        return subgoals.enchantment_ready(state, item_tag, enchant_id, threshold)
+
+    if lhs == "mob_collection_ready":
+        return subgoals.mob_collection_ready(state, min_unique=threshold)
+
+    if lhs.startswith("landmark_reachable:"):
+        kind = lhs.split(":", 1)[1].strip()
+        if not kind:
+            return False
+        m = memo if memo is not None else memo_for(state)
+        return bool(hasattr(m, "has_landmark") and m.has_landmark(kind, dimension="overworld"))
+
+    return False
+
+
 def is_goal_achieved(
     goal: GoalSpec,
     state: State,
     completed_advs: Collection[str] = (),
+    *,
+    memo: Any = None,
 ) -> bool:
-    """检查某目标在本局是否已达成（服务端确认 advancement 或背包代理判据任一成立）。"""
+    """检查某目标在本局是否已达成（服务端确认 advancement、背包代理判据或复合谓词任一成立）。"""
     if goal.done_advancements and any(a in completed_advs for a in goal.done_advancements):
         return True
     if goal.done_items and all(check_item_expr(state, expr) for expr in goal.done_items):
         return True
+    if goal.done_predicates:
+        m = memo if memo is not None else memo_for(state)
+        if all(_eval_done_predicate(state, expr, m) for expr in goal.done_predicates):
+            return True
     return False
 
 
@@ -1959,11 +2012,13 @@ def is_prereq_satisfied(
     goal: GoalSpec,
     state: State,
     completed_advs: Collection[str] = (),
+    *,
+    memo: Any = None,
 ) -> bool:
     """作为下游目标前置时的满足判定：工具/工作站类前置要求当前背包确实持有（兼容 keepInventory=False）。"""
     if goal.must_hold_for_children and (goal.held_items or goal.done_items):
         return is_goal_held_in_state(goal, state)
-    return is_goal_achieved(goal, state, completed_advs)
+    return is_goal_achieved(goal, state, completed_advs, memo=memo)
 
 
 # ============================================================================
@@ -2000,10 +2055,15 @@ def validate_ledger(
     if len(candidates) > 1:
         errors.append(f"单目标晋级纪律违规：同一时刻最多允许 1 个 candidate 目标，当前有 {candidates}")
 
+    referenced_prereqs = {pid for g in ledger for pid in g.prereq_goals if pid in by_id}
     for g in ledger:
         for pid in g.prereq_goals:
             if pid not in by_id:
                 errors.append(f"{g.id}: 引用了不存在的前置目标 {pid!r}")
+        if g.id in referenced_prereqs and not (g.done_advancements or g.done_items or g.done_predicates):
+            errors.append(
+                f"{g.id}: 作为下游目标前置（prereq_goals）必须至少配置 done_advancements、done_items 或 done_predicates 之一"
+            )
 
         if g.stage in DEFAULT_CAMPAIGN_STAGES:
             cls = reg.get(g.skill)
@@ -2145,8 +2205,10 @@ def rank_actionable_goals(
     ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     suspended_goals: Collection[str] = (),
+    memo: Any = None,
 ) -> list[GoalPlanStep]:
     """对所有尚未达成且未触发止损的目标计算未满足前置链，按共享子图边际性价比降序返回可执行步列表。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
     by_id = {g.id: g for g in active_goals}
     order_idx = {g.id: idx for idx, g in enumerate(active_goals)}
     target_ids = set(normalize_goal_ids(target_goal))
@@ -2158,7 +2220,7 @@ def rank_actionable_goals(
         def _walk(node: GoalSpec, is_root: bool) -> bool:
             if node.id in seen:
                 return True
-            if not is_root and is_prereq_satisfied(node, state, completed_advs):
+            if not is_root and is_prereq_satisfied(node, state, completed_advs, memo=resolved_memo):
                 return True
             if node.id in suspended_goals:
                 return False
@@ -2183,7 +2245,7 @@ def rank_actionable_goals(
     node_dependents: dict[str, set[str]] = {}
     node_downstream_score: dict[str, int] = {}
     for g in active_goals:
-        if is_goal_achieved(g, state, completed_advs):
+        if is_goal_achieved(g, state, completed_advs, memo=resolved_memo):
             continue
         if (
             g.id not in target_ids
@@ -2207,7 +2269,7 @@ def rank_actionable_goals(
     # 第 2 遍：保留原始 path_score / path_cost / roi，同时按共享子图分摊成本计算 marginal_roi 排序
     raw_candidates: list[tuple[tuple[int, int, float, float, int], GoalPlanStep]] = []
     for g, chain in actionable_chains:
-        p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs))
+        p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs, memo=resolved_memo))
         p_cost = sum(effective_goal_cost(x, telemetry) for x in chain)
         roi = p_score / max(1.0, p_cost)
 
@@ -2257,8 +2319,11 @@ def diagnose_goal_gap(
     state: State,
     completed_advs: Collection[str] = (),
     ledger: tuple[GoalSpec, ...] = GOALS,
+    *,
+    memo: Any = None,
 ) -> dict[str, Any]:
     """诊断目标当前尚未达成的精确卡点（已完成前置、缺失前置、瓶颈目标与物资缺口）。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
     by_id = {g.id: g for g in ledger}
     ordered_prereqs: list[GoalSpec] = []
     seen: set[str] = set()
@@ -2273,8 +2338,8 @@ def diagnose_goal_gap(
             ordered_prereqs.append(p)
 
     _collect_prereqs(goal)
-    completed_prereqs = [p.id for p in ordered_prereqs if is_prereq_satisfied(p, state, completed_advs)]
-    missing_prereqs = [p.id for p in ordered_prereqs if not is_prereq_satisfied(p, state, completed_advs)]
+    completed_prereqs = [p.id for p in ordered_prereqs if is_prereq_satisfied(p, state, completed_advs, memo=resolved_memo)]
+    missing_prereqs = [p.id for p in ordered_prereqs if not is_prereq_satisfied(p, state, completed_advs, memo=resolved_memo)]
 
     bottleneck = by_id[missing_prereqs[0]] if missing_prereqs else goal
     missing_items: list[str] = []

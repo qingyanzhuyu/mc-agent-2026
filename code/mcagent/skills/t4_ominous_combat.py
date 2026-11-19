@@ -2,19 +2,19 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable, Mapping, Sequence
+import os, time
 from typing import Any, Optional
 
 from ..client import ApiError
 from ..loop.subgoals import ominous_ready
-from ..runtime import EnvBlocked, Executor, Replan, State
-from .base import Param, Skill, failure, rec
+from ..runtime import EnvBlocked, Executor, Replan, State, _is_unsafe_totem_landing_block, assess_totem_armor, controlled_totem_trigger, validate_controlled_totem_conditions
+from .base import Param, Skill, rec
 from .interaction import _clear_posture, use_item_on
 from .items import AIR, bare, is_safe_solid_floor, pick_placeable, total_placeable
 from .nav import step_up_1x2
 from .observations import observe_block, refresh_inventory
 from .registry import register
-from .sightline import (DIG_EYE_REACH, ENTITY_EYE_REACH, STATION_EYE_REACH, block_cell,
-                        can_reach_block, eye_to_block_dist, eye_to_point_dist, feet_pos)
+from .sightline import DIG_EYE_REACH, ENTITY_EYE_REACH, STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist, eye_to_point_dist, feet_pos
 from .t2_trials_oriented import _approach_block, _place_cell, clear_trial_wave
 from .world_memo import BED_BLOCKS, memo_for
 
@@ -24,12 +24,15 @@ _RAIDERS = ("pillager", "vindicator", "ravager", "evoker", "witch", "vex")
 _RAIDER_PRIO = {"evoker": 0, "witch": 1, "vindicator": 2, "pillager": 3, "ravager": 4, "vex": 5}
 _MELEE = ("netherite_sword", "diamond_sword", "iron_sword", "stone_sword", "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "mace", "wooden_sword")
 _RANGED, _ARROWS = ("crossbow", "bow"), ("arrow", "spectral_arrow", "tipped_arrow")
-_UNSUPPORTED = frozenset({"unsupported", "unsupported_api", "bad_args", "unknown_op", "invalid_op"})
+_RAID_WAVE_POLL_S, _TOTEM_FALL_POLL_S = 1.0, 0.25
 
 def _dim(state: State) -> str: return bare((state.st or {}).get("dimension")) or "overworld"
 def _is_air(ex: Executor, pos: Sequence[int]) -> bool: return bare(observe_block(ex, list(pos)).get("name")) in AIR
 def _has_floor(ex: Executor, c: tuple[int, int, int]) -> bool: return is_safe_solid_floor(observe_block(ex, [c[0], c[1] - 1, c[2]]))
-def _server_difficulty(state: State) -> str: return str((state.snapshot() or {}).get("difficulty") or "").strip().lower()
+def _server_difficulty(state: State) -> str:
+    return str((state.snapshot() or {}).get("difficulty") or os.environ.get("MC_DIFFICULTY") or getattr(getattr(state, "config", None), "difficulty", "") or "").strip().lower()
+def _is_easy_or_peaceful(state: State) -> bool:
+    return _server_difficulty(state) in ("easy", "peaceful") or memo_for(state).has_landmark("raid_no_evoker_easy", dimension=_dim(state))
 def _is_elevated(state: State) -> bool: return bool((state.st or {}).get("elevated_column") or memo_for(state).has_landmark("totem_pillar", dimension=_dim(state)))
 def _overlaps(c: tuple[int, int, int], st: Mapping[str, Any]) -> bool:
     px, py, pz = block_cell(feet_pos(st))
@@ -50,6 +53,16 @@ def _has_effect(source: Any, names: Iterable[str]) -> bool:
     if isinstance(effs, Iterable) and not isinstance(effs, (str, bytes)):
         return any((isinstance(e, str) and bare(e).strip().lower() in wanted) or (isinstance(e, Mapping) and bare(e.get("name") or e.get("id") or e.get("effect")).strip().lower() in wanted) for e in effs)
     return False
+def _won_hero(ex: Executor, st: Mapping[str, Any]) -> bool:
+    if _has_effect(st, ("hero_of_the_village",)): return True
+    if not callable(adv_fn := getattr(ex.client, "advancements", None)): return False
+    try: res = adv_fn(status="completed")
+    except ApiError: return False
+    comp = res.get("completed") if isinstance(res, Mapping) else None
+    if isinstance(comp, Mapping): return any(v not in (None, False) and bare(k).strip() == "adventure/hero_of_the_village" for k, v in comp.items())
+    if isinstance(comp, Iterable) and not isinstance(comp, (str, bytes)):
+        return any(bare(r.get("id") or r.get("name") if isinstance(r, Mapping) else r).strip() == "adventure/hero_of_the_village" for r in comp)
+    return False
 def _pick_melee(state: State) -> Optional[str]:
     return next((w for w in _MELEE if state.count(w) >= 1), None) or next(
         (n for s in _inv_stacks(state, include_armor=False) if (n := bare(s.get("name")).lower()).endswith(("_sword", "_axe")) or n == "mace"), None)
@@ -68,17 +81,12 @@ def _bottle_rank(stack: Mapping[str, Any]) -> int:
         if isinstance(v := src.get("level"), int) and not isinstance(v, bool): return v - 1
     return 99
 def _select_lowest_ominous_bottle(state: State) -> Optional[dict]:
-    """从背包中选择最低等级（优先 1 级 / amplifier=0）的不祥之瓶。"""
+    """从背包记录中选择最小等级不祥之瓶；注：/equip(\"ominous_bottle\") 按物品名称选取且不接受背包槽位参数。"""
     inv = state.inventory or {}
     cands = [dict(r) for r in (inv.get("items") or ()) if isinstance(r, Mapping) and bare(r.get("name")).lower() == "ominous_bottle" and (r.get("count", 1) or 0) >= 1]
     if not cands:
         cands = [dict(r) for k in ("held", "offhand") if isinstance(r := inv.get(k), Mapping) and bare(r.get("name")).lower() == "ominous_bottle" and (r.get("count", 1) or 0) >= 1]
     return min(cands, key=_bottle_rank) if cands else None
-def _equipped_armor_slots(state: State) -> list[str]:
-    armor = (state.inventory or {}).get("armor")
-    if not isinstance(armor, Mapping): return []
-    return list(dict.fromkeys("chest" if s == "torso" else s for s in ("head", "chest", "torso", "legs", "feet")
-                              if isinstance(p := armor.get(s), Mapping) and bare(p.get("name")) and (p.get("count", 1) or 0) >= 1))
 def _obs_call(fn, *args, **kwargs):
     try: res = fn(*args, **kwargs)
     except ApiError as exc:
@@ -96,16 +104,14 @@ def _get_entities(ex: Executor, *, radius: int = 32, types: Sequence[str] | None
     wanted = [bare(t) for t in types] if types else None
     raw = (_obs_call(ex.client.get_entities, radius=radius, types=wanted)).get("entities")
     wset = set(wanted) if wanted else None
-    return [dict(e) for e in (raw or ()) if isinstance(e, Mapping) and type(e.get("id")) is int and e.get("pos")
-            and (not wset or bare(e.get("name")) in wset or bare(e.get("type")) in wset)]
+    return [dict(e) for e in (raw or ()) if isinstance(e, Mapping) and type(e.get("id")) is int and e.get("pos") and (not wset or bare(e.get("name")) in wset or bare(e.get("type")) in wset)]
 def _is_ominous_vault(ex: Executor, blk: Mapping[str, Any]) -> bool:
     if bare(blk.get("name")) != "vault": return False
     props = blk.get("properties")
     if isinstance(props, Mapping) and "ominous" in props: return props.get("ominous") in (True, "true")
     return (observe_block(ex, list(block_cell(blk["pos"]))).get("properties") or {}).get("ominous") in (True, "true")
 def _spawner_mob(blk: Mapping[str, Any]) -> str:
-    props = blk.get("properties") if isinstance(blk.get("properties"), Mapping) else {}
-    ent = blk.get("entity") if isinstance(blk.get("entity"), Mapping) else {}
+    props, ent = (blk.get("properties") if isinstance(blk.get("properties"), Mapping) else {}), (blk.get("entity") if isinstance(blk.get("entity"), Mapping) else {})
     return bare(blk.get("mob") or blk.get("spawn_entity") or props.get("mob") or props.get("spawn_entity") or ent.get("name")).strip().lower()
 def _rank_spawners(st: Mapping[str, Any], spawners: Sequence[dict]) -> list[dict]:
     if not spawners: return []
@@ -124,11 +130,13 @@ def _reset_posture(ex: Executor, state: State) -> None:
     if any((state.st or {}).get(k) for k in ("sneaking", "blocking", "jumping")):
         _clear_posture(ex, state, sneak=False, shield=False, jump=False)
         state.st.update(sneaking=False, blocking=False, jumping=False)
-def _find_place_near(ex: Executor, st: Mapping[str, Any], anchor: tuple[int, int, int]) -> Optional[tuple[int, int, int]]:
+def _find_place_near(ex: Executor, st: Mapping[str, Any], anchor: tuple[int, int, int], *, bed_footprint: bool = False) -> Optional[tuple[int, int, int]]:
     ax, ay, az = anchor
-    cands = [(eye_to_block_dist(st, c), c) for dy in (0, -1, 1) for dx in range(-3, 4) for dz in range(-3, 4)
-             if (c := (ax + dx, ay + dy, az + dz)) != anchor and not _overlaps(c, st) and _is_air(ex, c) and _has_floor(ex, c)
-             and can_reach_block(ex, st, c, reach=DIG_EYE_REACH)]
+    def _ok(c: tuple[int, int, int]) -> bool:
+        if c == anchor or _overlaps(c, st) or not (_is_air(ex, c) and _has_floor(ex, c)) or not can_reach_block(ex, st, c, reach=DIG_EYE_REACH): return False
+        if not bed_footprint: return True
+        return _is_air(ex, (c[0], c[1] + 1, c[2])) and any((h := (c[0] + dx, c[1], c[2] + dz)) != anchor and not _overlaps(h, st) and _is_air(ex, h) and _is_air(ex, (h[0], h[1] + 1, h[2])) and _has_floor(ex, h) for dx, dz in _CARDINALS)
+    cands = [(eye_to_block_dist(st, c), c) for dy in (0, -1, 1) for dx in range(-3, 4) for dz in range(-3, 4) if _ok(c := (ax + dx, ay + dy, az + dz))]
     return min(cands)[1] if cands else None
 
 class _OminousCombatSkill(Skill):
@@ -230,7 +238,7 @@ class WinMicroVillageRaid(_OminousCombatSkill):
             if _is_air(ex, cell) and not _overlaps(cell, st) and can_reach_block(ex, st, cell, reach=DIG_EYE_REACH):
                 yield from _place_cell(ex, state, pick_placeable(state), cell); refresh_inventory(ex, state)
         st = state.refresh_status(ex.client, max_age_s=0)
-        if (bed := _find_bed(state)) and (bcell := _find_place_near(ex, st, (vx, vy, vz))):
+        if (bed := _find_bed(state)) and (bcell := _find_place_near(ex, st, (vx, vy, vz), bed_footprint=True)):
             yield from _place_cell(ex, state, bed, bcell); memo.record_station(bed, bcell, dimension=dim); refresh_inventory(ex, state)
         if state.count("bell") >= 1 and (bell_cell := _find_place_near(ex, st, (vx, vy, vz))):
             yield from _place_cell(ex, state, "bell", bell_cell); memo.record_station("bell", bell_cell, dimension=dim); refresh_inventory(ex, state)
@@ -241,7 +249,6 @@ class WinMicroVillageRaid(_OminousCombatSkill):
             yield from step_up_1x2(ex, state, tower)
             top = [tower[-1][0] + 0.5, float(tower[-1][1] + 1), tower[-1][2] + 0.5]
             yield rec("move_to", ex.move_to(pos=top, rng=1), pos=top)
-            eye_to_block_dist(state.refresh_status(ex.client, max_age_s=0), (vx, vy, vz))
         memo.record_landmark("micro_village_bunker", (vx, vy, vz), dimension=dim)
     def _run(self, ex: Executor, state: State):
         self._bunker_ready, self._bot_killed_raiders, self._saw_evoker, self._looted_totem, self._won = False, 0, False, False, False
@@ -252,22 +259,33 @@ class WinMicroVillageRaid(_OminousCombatSkill):
         st = state.refresh_status(ex.client, max_age_s=0); refresh_inventory(ex, state)
         if not _has_effect(st, ("raid_omen", "bad_omen")):
             if (bottle := _select_lowest_ominous_bottle(state)) is None: raise Replan("背包缺少不祥之瓶（ominous_bottle）且无袭击之兆效果")
+            # /equip("ominous_bottle") 与 /use_item("ominous_bottle") 均按物品名称选取，不接受背包槽位编号
             yield from _equip_slot(ex, state, "ominous_bottle", "hand")
-            yield rec("use_item", ex.use_item("ominous_bottle"), item="ominous_bottle", bottle_rank=_bottle_rank(bottle)); refresh_inventory(ex, state)
+            yield rec("use_item", ex.use_item("ominous_bottle"), item="ominous_bottle", bottle_rank=_bottle_rank(bottle), api_selects_by_name=True); refresh_inventory(ex, state)
         if not _has_weapon(state): raise Replan("背包缺少武器，无法在袭击中完成亲手补刀")
+        waves_seen, in_wave, silent_polls = 0, False, 0
         try:
             if state.count("shield") >= 1: _set_posture(ex, state, shield=True)
-            for _ in range(6):
+            for _ in range(45):
                 st = state.refresh_status(ex.client, max_age_s=0)
                 if not st.get("alive", True) or float(st.get("health", 20)) < 6.0: raise Replan("袭击防守血量过低（< 6.0），中止交战")
+                if self._bot_killed_raiders >= 1 and _won_hero(ex, st): self._won = True; break
                 raiders = _get_entities(ex, radius=48, types=_RAIDERS)
                 if not raiders:
-                    if bells := _find_blocks(ex, ["bell"], radius=24, limit=4):
+                    in_wave = False
+                    if silent_polls == 0 and (bells := _find_blocks(ex, ["bell"], radius=24, limit=4)):
                         bpos = block_cell(min(bells, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
                         if not can_reach_block(ex, st, bpos, reach=STATION_EYE_REACH): yield from _approach_block(ex, state, bpos, reach=STATION_EYE_REACH)
-                        yield rec("interact", ex.interact(pos=list(bpos)), pos=list(bpos))
-                        raiders = _get_entities(ex, radius=48, types=_RAIDERS)
-                    if not raiders: break
+                        yield rec("interact", ex.interact(pos=list(bpos)), pos=list(bpos)); raiders = _get_entities(ex, radius=48, types=_RAIDERS)
+                    if not raiders:
+                        st = state.refresh_status(ex.client, max_age_s=0)
+                        if self._bot_killed_raiders >= 1 and _won_hero(ex, st): self._won = True; break
+                        silent_polls += 1; has_omen = _has_effect(st, ("raid_omen", "bad_omen"))
+                        if (waves_seen == 0 and ((not has_omen and silent_polls >= 3) or silent_polls >= 8)) or (waves_seen >= 1 and not has_omen and silent_polls >= 15) or silent_polls >= 18: break
+                        if _RAID_WAVE_POLL_S > 0: time.sleep(_RAID_WAVE_POLL_S)
+                        yield rec("wait_raid", {"silent_polls": silent_polls, "waves_seen": waves_seen}); continue
+                if not in_wave: waves_seen += 1; in_wave = True
+                silent_polls = 0
                 if any(bare(r.get("name")) == "evoker" for r in raiders): self._saw_evoker = True
                 tgt = min(raiders, key=lambda r: (_RAIDER_PRIO.get(bare(r.get("name")), 9), eye_to_point_dist(st, r["pos"])))
                 tid, tname, tpos = tgt["id"], bare(tgt.get("name")), [float(v) for v in tgt["pos"]]
@@ -288,76 +306,72 @@ class WinMicroVillageRaid(_OminousCombatSkill):
                         lpos = [float(v) for v in min(drops, key=lambda e: eye_to_point_dist(st, e["pos"]))["pos"]] if drops else (tpos if tname == "evoker" else None)
                         if lpos is not None: yield rec("move_to", ex.move_to(pos=lpos, rng=1), pos=lpos); refresh_inventory(ex, state)
                     self._looted_totem = state.count("totem_of_undying") >= 1
-        finally:
-            _reset_posture(ex, state)
+        finally: _reset_posture(ex, state)
         if self._bot_killed_raiders < 1: raise Replan("袭击波次中 Bot 未完成至少 1 次亲手补刀，无法保证触发村庄英雄进度")
-        self._won = True
+        if not self._won and _won_hero(ex, state.refresh_status(ex.client, max_age_s=0)): self._won = True
+        if not self._won: raise Replan("袭击波次结束但未确认达成村庄英雄（hero_of_the_village）")
+        if waves_seen >= 3 and not self._saw_evoker and not self._looted_totem and state.count("totem_of_undying") < 1:
+            bpos = (memo_for(state).landmarks("micro_village_bunker", dimension=dim) or [block_cell(feet_pos(st))])[0]
+            memo_for(state).record_landmark("raid_no_evoker_easy", bpos, dimension=dim)
     def verify_done(self, state: State, before_counts: dict | None = None) -> str:
         if self.args["prep_only"]:
-            ok = getattr(self, "_bunker_ready", False) or memo_for(state).has_landmark("micro_village_bunker", dimension=_dim(state))
-            return "" if ok else "未确认微型隔离村碉堡搭建完成"
+            return "" if (getattr(self, "_bunker_ready", False) or memo_for(state).has_landmark("micro_village_bunker", dimension=_dim(state))) else "未确认微型隔离村碉堡搭建完成"
         return "" if (getattr(self, "_won", False) and getattr(self, "_bot_killed_raiders", 0) >= 1) else "尚未完成含亲手补刀的村庄袭击防守"
 
 @register
 class TriggerTotemSafely(_OminousCombatSkill):
-    name, goal, description = "trigger_totem_safely", "t4:totem_of_undying", "脱甲副手持不死图腾并受控坠落 25 格安全触发图腾复活"
+    name, goal, description = "trigger_totem_safely", "t4:totem_of_undying", "无摔落保护状态副手持不死图腾并从实心高柱受控坠落安全触发图腾复活"
     params: dict[str, Param] = {}
     @classmethod
     def blocked(cls, state: State) -> str:
         if msg := _gate_base(state, "背包为空，缺少不死图腾与垫高方块"): return msg
         if state.count("totem_of_undying") >= 1:
-            return "" if (total_placeable(state) >= 25 or _is_elevated(state)) else "背包垫高方块不足 25 个，无法搭设受控坠落高柱"
-        return "背包缺少不死图腾（totem_of_undying）" if _server_difficulty(state) not in ("easy", "peaceful") else ""
+            armor_ok, _, req_height, _, _ = assess_totem_armor(state.inventory, state.st)
+            return "" if (not armor_ok or total_placeable(state) >= req_height or _is_elevated(state)) else f"背包垫高方块不足 {req_height} 个，无法搭设受控坠落高柱"
+        return "" if _is_easy_or_peaceful(state) else "背包缺少不死图腾（totem_of_undying）"
     def _run(self, ex: Executor, state: State):
         self._triggered, st = False, self._begin(ex, state)
         if state.count("totem_of_undying") < 1:
-            if _server_difficulty(state) in ("easy", "peaceful"):
+            if _is_easy_or_peaceful(state):
                 raise EnvBlocked("服务端难度为 easy/peaceful，袭击不刷唤魔者且背包无不死图腾（禁止盲找林地府邸）",
                                  missing_predicate="totem_of_undying_or_normal_plus_difficulty", searched_volume="runtime_difficulty_guard", wake_on="inventory_changed")
             raise Replan("背包尚无不死图腾，需先通过普通及以上难度袭击击杀唤魔者获取")
-        for slot in _equipped_armor_slots(state):
-            try: receipt = ex.window_act({"kind": "inventory"}, [{"op": "unequip", "slot": slot}])
-            except (ApiError, Replan) as exc:
-                code, _ = failure(exc)
-                if code in _UNSUPPORTED:
-                    yield rec("window_act", target={"kind": "inventory"}, slot=slot, error_code=code)
-                    yield rec("equip", ex.equip("", slot), item="", slot=slot)
-                else: raise
-            else: yield rec("window_act", receipt, target={"kind": "inventory"}, action="unequip", slot=slot)
-        refresh_inventory(ex, state)
-        if _equipped_armor_slots(state): raise Replan("脱除护甲后仍检测到已穿戴护甲，禁止执行受控坠落")
+        armor_ok, armor_reason, req_height, req_min_drop, allow_armored = assess_totem_armor(state.inventory, st)
+        if not armor_ok: raise Replan(armor_reason)
         yield from _equip_slot(ex, state, "totem_of_undying", "off-hand")
         st = state.refresh_status(ex.client, max_age_s=0)
-        if bare(((state.inventory or {}).get("offhand") or {}).get("name")) != "totem_of_undying":
-            raise Replan("副手装备不死图腾未确认，禁止执行受控坠落")
+        if bare(((state.inventory or {}).get("offhand") or {}).get("name")) != "totem_of_undying": raise Replan("副手装备不死图腾未确认，禁止执行受控坠落")
         px, py, pz = block_cell(feet_pos(st))
         if not _is_elevated(state):
-            landing = observe_block(ex, [px + 1, py - 1, pz])
-            if not is_safe_solid_floor(landing):
-                raise Replan(f"落点 {[px + 1, py - 1, pz]} 非安全实心地面（{bare(landing.get('name')) or 'unknown'}），禁止受控坠落")
-            if total_placeable(state) < 25: raise Replan("背包垫高方块不足 25 个，无法安全搭设受控坠落高柱")
+            top_z_off = -(1 if (req_height - 1) % 2 == 0 else 0)
+            for chk in ([px + 1, py - 1, pz], [px + 1, py - 1, pz + top_z_off]):
+                landing = observe_block(ex, chk)
+                if not is_safe_solid_floor(landing) or _is_unsafe_totem_landing_block(bare(landing.get("name"))):
+                    raise Replan(f"落点 {chk} 非安全实心地面（{bare(landing.get('name')) or 'unknown'}），禁止受控坠落")
+            if total_placeable(state) < req_height: raise Replan(f"背包垫高方块不足 {req_height} 个，无法安全搭设受控坠落高柱")
             try:
-                pillar = [[px, py + i, pz - (1 if i % 2 == 0 else 0)] for i in range(25)]
+                pillar = [[px, py + i, pz - (1 if i % 2 == 0 else 0)] for i in range(req_height)]
                 yield from step_up_1x2(ex, state, pillar)
                 top = [pillar[-1][0] + 0.5, float(pillar[-1][1] + 1), pillar[-1][2] + 0.5]
                 yield rec("move_to", ex.move_to(pos=top, rng=1), pos=top)
-                memo_for(state).record_landmark("totem_pillar", (px, py + 25, pz), dimension=_dim(state))
-            finally:
-                _reset_posture(ex, state)
-        else:
-            hit = next((b for dy in range(1, 28) if bare((b := observe_block(ex, [px + 1, py - dy, pz])).get("name")) not in AIR), None)
-            if not hit or not is_safe_solid_floor(hit):
-                raise Replan(f"高柱侧下方非安全实心地面（{bare((hit or {}).get('name')) or 'void'}），禁止受控坠落")
+                px, py, pz = block_cell(feet_pos(state.refresh_status(ex.client, max_age_s=0)))
+                memo_for(state).record_landmark("totem_pillar", (px, py, pz), dimension=_dim(state))
+            finally: _reset_posture(ex, state)
+        landing_col = (px + 1, pz)
+        refresh_inventory(ex, state); state.refresh_status(ex.client, max_age_s=0)
+        ok, reason, _ = validate_controlled_totem_conditions(state, ex.client, drop_height=req_height, landing_col=landing_col, min_drop=req_min_drop, allow_armored=allow_armored)
+        if not ok: raise Replan(f"高柱顶安全落点校验未通过（{reason}），禁止受控坠落")
         try: ex.look(pos=[px + 1.5, float(py), pz + 0.5])
         except (ApiError, Replan): pass
-        refresh_inventory(ex, state); state.refresh_status(ex.client, max_age_s=0)
         before_totems = state.count("totem_of_undying")
-        from ..runtime import controlled_totem_trigger
-        with controlled_totem_trigger(state, ex.client, drop_height=25):
-            yield rec("control", ex.control(forward=True, ms=400), forward=True, ms=400)
-        refresh_inventory(ex, state); after_st = state.refresh_status(ex.client, max_age_s=0)
-        if state.count("totem_of_undying") < before_totems or _has_effect(after_st, ("regeneration", "absorption")):
-            self._triggered = True
-        else: raise Replan("受控坠落后未确认不死图腾消耗或再生/伤害吸收效果")
+        with controlled_totem_trigger(state, ex.client, drop_height=req_height, landing_col=landing_col, min_drop=req_min_drop, max_duration_s=3.5, allow_armored=allow_armored):
+            yield rec("control", ex.control(forward=True, ms=450), forward=True, ms=450)
+            deadline = time.monotonic() + 2.5
+            for poll_idx in range(12):
+                after_st = state.refresh_status(ex.client, max_age_s=0); refresh_inventory(ex, state)
+                if state.count("totem_of_undying") < before_totems or _has_effect(after_st, ("regeneration", "absorption")): self._triggered = True; break
+                if not after_st.get("alive", True) or after_st.get("on_ground") is True or poll_idx >= 11 or (rem := deadline - time.monotonic()) <= 0: break
+                if _TOTEM_FALL_POLL_S > 0: time.sleep(min(_TOTEM_FALL_POLL_S, rem))
+        if not self._triggered: raise Replan("受控坠落后未确认不死图腾消耗或再生/伤害吸收效果")
     def verify_done(self, state: State, before_counts: dict | None = None) -> str:
         return "" if getattr(self, "_triggered", False) else "尚未确认受控坠落触发不死图腾"
