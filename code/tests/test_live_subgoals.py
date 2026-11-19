@@ -17,9 +17,13 @@ from mcagent.loop.goals import GOALS
 from mcagent.loop.reserve import ReservationBook
 from mcagent.loop.subgoals import (
     active_portal,
+    advancement_criteria_remaining,
+    enchantment_ready,
     evaluate_all_subgoals,
     item_available,
     landmark_reachable,
+    mob_collection_ready,
+    ominous_ready,
     safe_encounter,
     station_ready,
     tool_ready,
@@ -446,26 +450,385 @@ class LiveSubgoalPredicatesTests(unittest.TestCase):
         book = ReservationBook()
         res_unreserved = evaluate_all_subgoals(self.state, memo=self.memo, reservations=book)
 
-        self.assertEqual(
-            set(res_unreserved.keys()),
-            {"item_available", "tool_ready", "station_ready", "landmark_reachable", "safe_encounter", "active_portal"},
-        )
+        expected_keys = {
+            "item_available",
+            "tool_ready",
+            "station_ready",
+            "landmark_reachable",
+            "safe_encounter",
+            "active_portal",
+            "enchantment_ready",
+            "mob_collection_ready",
+            "ominous_ready",
+            "advancement_criteria_remaining",
+        }
+        self.assertEqual(set(res_unreserved.keys()), expected_keys)
         self.assertNotIn("待现场观察", json.dumps(res_unreserved, ensure_ascii=False))
         self.assertTrue(res_unreserved["item_available"]["iron_ingot"])
         self.assertTrue(res_unreserved["tool_ready"]["stone"])
         self.assertFalse(res_unreserved["tool_ready"]["iron"])
         self.assertTrue(res_unreserved["station_ready"]["crafting_table"])
+        self.assertEqual(
+            set(res_unreserved["station_ready"].keys()),
+            {
+                "crafting_table",
+                "furnace",
+                "enchanting_table",
+                "bed",
+                "anvil",
+                "smithing_table",
+                "jukebox",
+                "note_block",
+                "crafter",
+                "beacon",
+            },
+        )
         self.assertTrue(res_unreserved["landmark_reachable"]["village"])
         self.assertTrue(res_unreserved["landmark_reachable"]["stronghold"])
         self.assertTrue(res_unreserved["landmark_reachable"]["iron"])
         self.assertTrue(res_unreserved["safe_encounter"])
         self.assertFalse(res_unreserved["active_portal"])
+        self.assertEqual(res_unreserved["enchantment_ready"], {"piercing_iv": False, "looting_iii": False})
+        self.assertFalse(res_unreserved["mob_collection_ready"])
+        self.assertEqual(res_unreserved["ominous_ready"], {"trial": False, "raid": False})
+        self.assertEqual(
+            res_unreserved["advancement_criteria_remaining"],
+            {"frog_variants": ["cold", "temperate", "warm"]},
+        )
 
         # Reserve 3 iron_ingot -> allocatable becomes 2 < 3 -> item_available["iron_ingot"] turns False
         self.assertTrue(book.reserve(self.state, "iron_pick", "iron_ingot", 3))
         res_reserved = evaluate_all_subgoals(self.state, memo=self.memo, reservations=book)
         self.assertFalse(res_reserved["item_available"]["iron_ingot"])
         self.assertNotIn("待现场观察", json.dumps(res_reserved, ensure_ascii=False))
+
+    # ---- 8. New stations & anvil variants ----
+
+    def test_station_ready_anvil_variants_and_new_stations(self) -> None:
+        for anvil_item in ("anvil", "chipped_anvil", "damaged_anvil"):
+            _stock(self.state, **{anvil_item: 1})
+            self.assertTrue(station_ready(self.state, "anvil"), msg=f"{anvil_item} in inventory")
+            self.assertTrue(station_ready(self.state), msg=f"{anvil_item} any station")
+
+        _stock(self.state)
+        self.assertFalse(station_ready(self.state, "anvil"))
+
+        for anvil_block in ("anvil", "chipped_anvil", "damaged_anvil"):
+            m = WorldResourceMemo()
+            m.record_station(anvil_block, [4, 64, 4], dimension="overworld")
+            self.assertTrue(station_ready(self.state, "anvil", memo=m), msg=f"{anvil_block} in memo")
+
+        class _QueryOnlyMemo:
+            def __init__(self, block_name: str) -> None:
+                self._block = block_name
+
+            def query(self, category: str, *, dimension: str = "overworld") -> list[object]:
+                if category == "station" and dimension == "overworld":
+                    return [type("_Entry", (), {"block": self._block})()]
+                return []
+
+        self.assertTrue(station_ready(self.state, "anvil", memo=_QueryOnlyMemo("chipped_anvil")))
+        self.assertTrue(station_ready(self.state, "anvil", memo=_QueryOnlyMemo("damaged_anvil")))
+
+        new_stations = ("smithing_table", "jukebox", "note_block", "crafter", "beacon")
+        for st_name in new_stations:
+            _stock(self.state, **{st_name: 1})
+            self.assertTrue(station_ready(self.state, st_name), msg=f"{st_name} in inventory")
+            _stock(self.state)
+            self.assertFalse(station_ready(self.state, st_name))
+
+            m = WorldResourceMemo()
+            m.record_station(st_name, [10, 64, 10], dimension="overworld")
+            self.assertTrue(station_ready(self.state, st_name, memo=m), msg=f"{st_name} in memo")
+            self.assertTrue(station_ready(self.state, memo=m), msg=f"{st_name} any in memo")
+
+    # ---- 9. enchantment_ready ----
+
+    def test_enchantment_ready_formats_matching_and_guards(self) -> None:
+        # List of dicts with name/level and id/lvl across items, held, offhand, armor
+        self.state.set_inventory({
+            "items": [
+                {
+                    "name": "minecraft:crossbow",
+                    "count": 1,
+                    "enchantments": [{"name": "minecraft:piercing", "level": 4}],
+                },
+                {
+                    "name": "diamond_sword",
+                    "count": 1,
+                    "enchantments": [{"id": "looting", "lvl": 3}],
+                },
+            ],
+            "held": {
+                "name": "enchanted_book",
+                "count": 1,
+                "enchantments": {"sharpness": 5},
+            },
+            "offhand": {
+                "name": "iron_sword",
+                "count": 1,
+                "enchantments": {"minecraft:fire_aspect": 2},
+            },
+            "armor": {
+                "feet": {
+                    "name": "diamond_boots",
+                    "count": 1,
+                    "enchantments": [{"name": "feather_falling", "level": 4}],
+                },
+            },
+        })
+        self.assertTrue(enchantment_ready(self.state, "crossbow", "piercing", 4))
+        self.assertFalse(enchantment_ready(self.state, "crossbow", "piercing", 5))
+        self.assertTrue(enchantment_ready(self.state, "sword", "looting", 3))
+        self.assertTrue(enchantment_ready(self.state, "minecraft:sword", "minecraft:looting", 2))
+        self.assertTrue(enchantment_ready(self.state, "book", "sharpness", 5))
+        self.assertTrue(enchantment_ready(self.state, "sword", "fire_aspect", 2))
+        self.assertTrue(enchantment_ready(self.state, "boots", "feather_falling", 4))
+
+        # Count == 0 or bool level must not match
+        self.state.set_inventory({
+            "items": [
+                {"name": "diamond_sword", "count": 0, "enchantments": {"looting": 3}},
+                {"name": "iron_sword", "count": 1, "enchantments": {"looting": True}},
+            ],
+        })
+        self.assertFalse(enchantment_ready(self.state, "sword", "looting", 1))
+
+        # Invalid arguments
+        self.assertFalse(enchantment_ready(self.state, "", "looting", 1))
+        self.assertFalse(enchantment_ready(self.state, "sword", "", 1))
+        self.assertFalse(enchantment_ready(self.state, "sword", "looting", 0))
+        self.assertFalse(enchantment_ready(self.state, "sword", "looting", True))  # type: ignore[arg-type]
+
+        # Dirty inventory -> False
+        self.state.set_inventory({
+            "items": [{"name": "diamond_sword", "count": 1, "enchantments": {"looting": 3}}],
+        })
+        self.state.invalidate_inventory()
+        self.assertFalse(enchantment_ready(self.state, "sword", "looting", 3))
+
+    # ---- 10. mob_collection_ready ----
+
+    def test_mob_collection_ready_buckets_entities_dedup_and_dirty(self) -> None:
+        _stock(self.state, cod_bucket=2, salmon_bucket=1, tropical_fish_bucket=1)
+        self.assertFalse(mob_collection_ready(self.state, 5))
+
+        entities = [
+            {"name": "minecraft:cow", "dist": 5.0},
+            {"name": "cow", "dist": 8.0},        # duplicate species
+            {"name": "sheep", "dist": 16.0},     # boundary <= 16 included
+            {"name": "pig", "dist": 16.1},       # > 16 ignored
+            {"name": "zombie", "dist": 3.0},     # hostile ignored
+        ]
+        # 3 buckets (cod, salmon, tropical_fish) + 2 nearby land (cow, sheep) = 5
+        self.assertTrue(mob_collection_ready(self.state, 5, entities=entities))
+        self.assertFalse(mob_collection_ready(self.state, 6, entities=entities))
+
+        # Entity without dist field still counts if in land animal set
+        self.assertTrue(mob_collection_ready(self.state, 6, entities=[*entities, {"name": "frog"}]))
+
+        # Invalid min_unique / dirty inventory
+        self.assertFalse(mob_collection_ready(self.state, 0, entities=entities))
+        self.assertFalse(mob_collection_ready(self.state, True, entities=entities))  # type: ignore[arg-type]
+        self.state.invalidate_inventory()
+        self.assertFalse(mob_collection_ready(self.state, 5, entities=entities))
+
+    # ---- 11. ominous_ready ----
+
+    def test_ominous_ready_trial_and_raid_modes_and_guards(self) -> None:
+        # Trial mode with ominous_bottle + weapon + food stock
+        st_trial = _make_state(
+            health=14.0,
+            food=8,
+            inventory={
+                "items": [
+                    {"name": "ominous_bottle", "count": 1},
+                    {"name": "iron_sword", "count": 1},
+                    {"name": "cooked_beef", "count": 4},
+                ],
+            },
+        )
+        self.assertTrue(ominous_ready(st_trial, "trial"))
+        # Raid fails without milk_bucket or armor >= 8 or 2+ armor pieces
+        self.assertFalse(ominous_ready(st_trial, "raid"))
+
+        # Active omen effect formats (list of str, list of dicts, dict) & status food >= 14
+        for effects_val in (
+            ["minecraft:trial_omen"],
+            [{"id": "bad_omen", "amplifier": 0}],
+            {"raid_omen": 0},
+        ):
+            st_eff = _make_state(
+                health=16.0,
+                food=14,
+                extra_status={"effects": effects_val},
+                inventory={"items": [{"name": "crossbow", "count": 1}]},
+            )
+            self.assertTrue(ominous_ready(st_eff, "trial"), msg=f"effects={effects_val!r}")
+
+        # Missing food stock AND low status food -> False
+        st_hungry = _make_state(
+            health=20.0,
+            food=13,
+            inventory={"items": [{"name": "ominous_bottle", "count": 1}, {"name": "iron_sword", "count": 1}]},
+        )
+        self.assertFalse(ominous_ready(st_hungry, "trial"))
+
+        # Missing weapon -> False
+        st_unarmed = _make_state(
+            health=20.0,
+            food=20,
+            inventory={"items": [{"name": "ominous_bottle", "count": 1}, {"name": "bread", "count": 3}]},
+        )
+        self.assertFalse(ominous_ready(st_unarmed, "trial"))
+
+        # Low health / safe_mode / invalid mode -> False
+        st_low_hp = _make_state(
+            health=13.5,
+            food=20,
+            inventory={"items": [{"name": "ominous_bottle", "count": 1}, {"name": "iron_sword", "count": 1}]},
+        )
+        self.assertFalse(ominous_ready(st_low_hp, "trial"))
+        self.assertFalse(ominous_ready(st_trial, "invalid"))
+
+        st_safe = _make_state(
+            health=20.0,
+            food=20,
+            inventory={"items": [{"name": "ominous_bottle", "count": 1}, {"name": "iron_sword", "count": 1}]},
+        )
+        st_safe.safe_mode_until = time.monotonic() + 30.0
+        self.assertFalse(ominous_ready(st_safe, "trial"))
+
+        # Raid satisfied by milk_bucket
+        st_raid_milk = _make_state(
+            health=18.0,
+            food=18,
+            inventory={
+                "items": [
+                    {"name": "ominous_bottle", "count": 1},
+                    {"name": "iron_axe", "count": 1},
+                    {"name": "milk_bucket", "count": 1},
+                ],
+            },
+        )
+        self.assertTrue(ominous_ready(st_raid_milk, "raid"))
+
+        # Raid satisfied by status armor_points >= 8
+        st_raid_ap = _make_state(
+            health=18.0,
+            food=18,
+            extra_status={"armor_points": 8},
+            inventory={"items": [{"name": "ominous_bottle", "count": 1}, {"name": "iron_sword", "count": 1}]},
+        )
+        self.assertTrue(ominous_ready(st_raid_ap, "raid"))
+
+        # Raid satisfied by computed diamond_chestplate (8 pts) or 2+ leather pieces
+        st_raid_diamond_chest = _make_state(
+            health=18.0,
+            food=18,
+            inventory={
+                "items": [{"name": "ominous_bottle", "count": 1}, {"name": "iron_sword", "count": 1}],
+                "armor": {"chest": {"name": "diamond_chestplate", "count": 1}},
+            },
+        )
+        self.assertTrue(ominous_ready(st_raid_diamond_chest, "raid"))
+
+        st_raid_two_pieces = _make_state(
+            health=18.0,
+            food=18,
+            inventory={
+                "items": [{"name": "ominous_bottle", "count": 1}, {"name": "iron_sword", "count": 1}],
+                "armor": {
+                    "head": {"name": "leather_helmet", "count": 1},
+                    "feet": {"name": "leather_boots", "count": 1},
+                },
+            },
+        )
+        self.assertTrue(ominous_ready(st_raid_two_pieces, "raid"))
+
+    # ---- 12. advancement_criteria_remaining ----
+
+    def test_advancement_criteria_remaining_all_response_shapes(self) -> None:
+        adv_id = "minecraft:husbandry/leash_all_frog_variants"
+        expected = ("temperate", "warm", "cold")
+
+        # Missing / None advancements -> sorted expected_criteria
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, adv_id, expected_criteria=expected),
+            ("cold", "temperate", "warm"),
+        )
+
+        # completed / in_progress shape (with unprefixed and prefixed IDs)
+        shape_split = {
+            "completed": ["minecraft:story/mine_stone"],
+            "in_progress": [
+                {"id": "husbandry/leash_all_frog_variants", "criteria": {"temperate": True, "warm": False}},
+            ],
+        }
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, adv_id, expected_criteria=expected, advancements=shape_split),
+            ("cold", "warm"),
+        )
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, "story/mine_stone", advancements=shape_split),
+            (),
+        )
+
+        # {"advancements": [...]} list shape with remaining & completed_criteria
+        shape_list = {
+            "advancements": [
+                {"name": adv_id, "remaining": ["warm", "cold"]},
+                {"id": "minecraft:nether/all_effects", "completed_criteria": ["speed"]},
+            ],
+        }
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, "husbandry/leash_all_frog_variants", advancements=shape_list),
+            ("cold", "warm"),
+        )
+        self.assertEqual(
+            advancement_criteria_remaining(
+                self.state,
+                "nether/all_effects",
+                expected_criteria=("speed", "strength"),
+                advancements=shape_list,
+            ),
+            ("strength",),
+        )
+
+        # Direct dict shape (done=True, status="completed", criteria dict without expected)
+        shape_direct = {
+            "husbandry/leash_all_frog_variants": {"done": True},
+            "minecraft:adventure/adventuring_time": {"criteria": {"plains": True, "desert": False, "taiga": False}},
+            "story/root": {"status": "completed"},
+        }
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, adv_id, expected_criteria=expected, advancements=shape_direct),
+            (),
+        )
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, "adventure/adventuring_time", advancements=shape_direct),
+            ("desert", "taiga"),
+        )
+        self.assertEqual(
+            advancement_criteria_remaining(self.state, "story/root", expected_criteria=("a",), advancements=shape_direct),
+            (),
+        )
+
+        # evaluate_all_subgoals forwards advancements & entities
+        res = evaluate_all_subgoals(
+            self.state,
+            memo=self.memo,
+            advancements={"completed": [adv_id]},
+            entities=[
+                {"name": "cow", "dist": 4},
+                {"name": "pig", "dist": 5},
+                {"name": "sheep", "dist": 6},
+                {"name": "chicken", "dist": 7},
+                {"name": "rabbit", "dist": 8},
+            ],
+        )
+        self.assertEqual(res["advancement_criteria_remaining"], {"frog_variants": []})
+        self.assertTrue(res["mob_collection_ready"])
 
 
 class LiveDecisionContextTests(unittest.TestCase):
@@ -496,7 +859,18 @@ class LiveDecisionContextTests(unittest.TestCase):
         assert ctx.subgoal_predicates is not None
         self.assertEqual(
             set(ctx.subgoal_predicates.keys()),
-            {"item_available", "tool_ready", "station_ready", "landmark_reachable", "safe_encounter", "active_portal"},
+            {
+                "item_available",
+                "tool_ready",
+                "station_ready",
+                "landmark_reachable",
+                "safe_encounter",
+                "active_portal",
+                "enchantment_ready",
+                "mob_collection_ready",
+                "ominous_ready",
+                "advancement_criteria_remaining",
+            },
         )
         self.assertTrue(ctx.subgoal_predicates["item_available"]["iron_ingot"])
         self.assertTrue(ctx.subgoal_predicates["station_ready"]["crafting_table"])
