@@ -799,6 +799,51 @@ class CrafterChainTests(_WaveATestBase):
         with self.assertRaises(EnvBlocked):
             drive(CrafterChain(), ex, state)
 
+    def test_waits_for_hopper_drain_between_batches(self) -> None:
+        from unittest import mock
+
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=_flat(-6, 6, -6, 6, y=63),
+            items={
+                "crafter": 1,
+                "hopper": 1,
+                "iron_ingot": 5,
+                "crafting_table": 1,
+                "redstone": 2,
+                "dropper": 1,
+                "lever": 1,
+            },
+        )
+        pending = [0]
+
+        def _on_wact(w: WaveAWorld, target, ops):
+            op = ops[0]
+            item, cnt = op["item"], int(op.get("count", 1))
+            w.items[item] -= cnt
+            if w.items[item] <= 0:
+                w.items.pop(item, None)
+            pending[0] = 2  # Hopper still holds items for 2 polls before draining
+            return {"ok": True}
+
+        def _on_wview(w: WaveAWorld, target):
+            if pending[0] > 0:
+                pending[0] -= 1
+                return {"sections": {"container": [{"name": "iron_ingot", "count": 1}]}}
+            return {"sections": {"container": []}}
+
+        world.on_window_act = _on_wact
+        world.on_window_view = _on_wview
+        ex, state = world.session()
+        skill = CrafterChain()
+        with mock.patch("mcagent.skills.t4_quick_exploits.time.sleep") as m_sleep:
+            drive(skill, ex, state)
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertGreaterEqual(m_sleep.call_count, 12)
+        ops_seq = [op for op, _ in world.calls if op in ("window_act", "window_view", "dig")]
+        self.assertEqual(ops_seq[-1], "dig")
+        self.assertEqual(ops_seq[-2], "window_view")
+
 
 class DecoratedPotSherdsTests(_WaveATestBase):
     def test_blocked_empty_or_no_pickaxe_when_short_of_sherds(self) -> None:
