@@ -40,7 +40,12 @@ CATEGORY_BLOCKS: dict[str, tuple[str, ...]] = {
     "coal_ore": ("coal_ore", "deepslate_coal_ore"),
     "diamond_ore": ("diamond_ore", "deepslate_diamond_ore"),
     "obsidian": ("obsidian", "crying_obsidian"),
-    "station": ("crafting_table", "furnace", "blast_furnace", "smoker", "enchanting_table", "anvil", "chipped_anvil", "damaged_anvil", *BED_BLOCKS),
+    "station": (
+        "crafting_table", "furnace", "blast_furnace", "smoker", "enchanting_table",
+        "anvil", "chipped_anvil", "damaged_anvil",
+        "smithing_table", "jukebox", "note_block", "crafter", "beacon",
+        *BED_BLOCKS,
+    ),
 }
 STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "village": ("hay_block", "bell", "composter", "lectern"),
@@ -59,6 +64,11 @@ STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "pale_garden": ("pale_oak_log", "pale_moss_block", "creaking_heart"),
     "pillager_outpost": ("dark_oak_log", "white_banner"),
     "dried_ghast": ("dried_ghast", "bone_block"),
+    "meadow": ("cornflower", "allium", "azure_bluet", "oxeye_daisy", "emerald_ore"),
+    "swamp": ("lily_pad", "blue_orchid", "slime_block"),
+    "mangrove_swamp": ("mangrove_log", "mangrove_roots", "muddy_mangrove_roots", "mangrove_propagule"),
+    "cold_biome": ("packed_ice", "blue_ice", "snow_block", "end_stone"),
+    "trial_vault_ominous": ("ominous_trial_spawner", "heavy_core", "chiseled_tuff_bricks"),
 }
 VALID_STATUSES: tuple[str, ...] = ("untested", "reachable", "unreachable", "protected", "depleted")
 
@@ -313,6 +323,7 @@ class WorldResourceMemo:
                         sk == k
                         or (k == "bed" and sk.endswith("_bed"))
                         or (k == "furnace" and sk in ("blast_furnace", "smoker"))
+                        or (k == "anvil" and sk in ("chipped_anvil", "damaged_anvil"))
                     )
                     if not matched:
                         continue

@@ -60,6 +60,11 @@ class WorldMemoModuleContractTests(unittest.TestCase):
             "crafting_table": "station",
             "enchanting_table": "station",
             "damaged_anvil": "station",
+            "smithing_table": "station",
+            "jukebox": "station",
+            "note_block": "station",
+            "crafter": "station",
+            "beacon": "station",
             "red_bed": "station",
             "minecraft:light_blue_bed": "station",
             "stone": None,
@@ -78,13 +83,27 @@ class WorldMemoModuleContractTests(unittest.TestCase):
             "bee_nest", "trial_spawner", "sculk_catalyst", "suspicious_sand", "powder_snow",
             "nether_bricks", "nether_wart", "gilded_blackstone", "purpur_block",
             "moss_block", "amethyst_block", "creaking_heart", "white_banner", "dried_ghast",
+            "cornflower", "lily_pad", "mangrove_roots", "packed_ice", "ominous_trial_spawner",
         ])
         self.assertEqual(set(tags), set(STRUCTURE_FINGERPRINTS))
-        self.assertEqual(len(STRUCTURE_FINGERPRINTS), 16)
+        self.assertEqual(len(STRUCTURE_FINGERPRINTS), 21)
         self.assertEqual(tags["village"], ["hay_block", "bell"])
         self.assertEqual(tags["ruined_portal"], ["crying_obsidian"])
         self.assertEqual(tags["nether_fortress"], ["nether_bricks", "nether_wart"])
         self.assertEqual(tags["bastion_remnant"], ["gilded_blackstone"])
+        self.assertEqual(tags["meadow"], ["cornflower"])
+        self.assertEqual(tags["swamp"], ["lily_pad"])
+        self.assertEqual(tags["mangrove_swamp"], ["mangrove_roots"])
+        self.assertEqual(tags["cold_biome"], ["packed_ice"])
+        self.assertEqual(tags["trial_vault_ominous"], ["ominous_trial_spawner"])
+
+    def test_anvil_family_matches_chipped_and_damaged(self):
+        for variant in ("chipped_anvil", "damaged_anvil"):
+            with self.subTest(variant=variant):
+                memo = WorldResourceMemo()
+                memo.record_station(variant, [1, 64, 2])
+                self.assertTrue(memo.has_station("anvil"))
+                self.assertEqual(memo.stations("anvil"), [(1, 64, 2)])
 
 
 class WorldMemoIngestAndQueryTests(unittest.TestCase):

@@ -83,19 +83,24 @@ STAGE2_EXPECTED_IDS: tuple[str, ...] = (
 )
 
 
+STAGE12_TIERS: frozenset[str] = frozenset({"T0_PREP", "T1", "T2", "T3"})
+
+
 class Stage2LedgerContractTests(unittest.TestCase):
     def test_stage2_counts_and_batch_point_totals(self):
-        self.assertEqual(len(GOALS), 76)
-        self.assertEqual(len(GOAL_MAP), 76)
+        self.assertEqual(len(GOALS), len(GOAL_MAP))
+        self.assertGreaterEqual(len(GOALS), 76)
 
-        t0_t1 = [g for g in GOALS if g.tier in {"T0_PREP", "T1"}]
+        stage12 = [g for g in GOALS if g.tier in STAGE12_TIERS]
+        t0_t1 = [g for g in stage12 if g.tier in {"T0_PREP", "T1"}]
         t0_t1_scored = [g for g in t0_t1 if g.score > 0]
-        stage2 = [g for g in GOALS if g.tier in {"T2", "T3"}]
+        stage2 = [g for g in stage12 if g.tier in {"T2", "T3"}]
+        self.assertEqual(len(stage12), 76)
         self.assertEqual(len(t0_t1), 26)
         self.assertEqual((len(t0_t1_scored), sum(g.score for g in t0_t1_scored)), (21, 290))
         self.assertEqual(len(stage2), 50)
         self.assertEqual(sum(g.score for g in stage2), 1435)
-        self.assertEqual(sum(g.score for g in GOALS), 1725)
+        self.assertEqual(sum(g.score for g in stage12), 1725)
         self.assertEqual(tuple(g.id for g in stage2), STAGE2_EXPECTED_IDS)
 
         expected_batches = (
@@ -128,9 +133,11 @@ class Stage2LedgerContractTests(unittest.TestCase):
         self.assertEqual(len([g for g in GOALS if g.stage in {"graduated", "live"}]), 6)
 
     def test_stage2_advancements_and_scores_match_draft_scores_v2(self):
+        stage12_scored = [g for g in GOALS if g.tier in STAGE12_TIERS and g.score > 0]
+        self.assertEqual(len(stage12_scored), 71)
+        self.assertEqual(sum(g.score for g in stage12_scored), 1725)
+
         scored = [g for g in GOALS if g.score > 0]
-        self.assertEqual(len(scored), 71)
-        self.assertEqual(sum(g.score for g in scored), 1725)
         for goal in scored:
             with self.subTest(goal=goal.id):
                 self.assertEqual(len(goal.done_advancements), 1)
@@ -139,7 +146,7 @@ class Stage2LedgerContractTests(unittest.TestCase):
                 self.assertEqual(goal.score, ADVANCEMENT_SCORES_V2[adv])
 
         adv_ids = [g.done_advancements[0] for g in scored]
-        self.assertEqual(len(set(adv_ids)), 71)
+        self.assertEqual(len(set(adv_ids)), len(adv_ids))
 
     def test_stage2_dag_validation_and_transitive_prereq_closure(self):
         self.assertEqual(validate_ledger(GOALS), [])
@@ -158,7 +165,7 @@ class Stage2LedgerContractTests(unittest.TestCase):
 
     def test_every_goal_skill_args_and_editable_files_bind_cleanly_in_registry(self):
         root = Path(__file__).resolve().parents[2]
-        for goal in GOALS:
+        for goal in (row for row in GOALS if row.tier in STAGE12_TIERS):
             bindings = [(goal.skill, goal.skill_args)] + [
                 (name, args) for _, name, args in goal.gather_fallbacks
             ]

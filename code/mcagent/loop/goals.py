@@ -29,7 +29,7 @@ from .starter_skills import (
 GOAL_STAGES: tuple[str, ...] = ("draft", "candidate", "graduated", "live")
 DEFAULT_CAMPAIGN_STAGES: tuple[str, ...] = ("candidate", "graduated", "live")
 OFFICIAL_CAMPAIGN_STAGES: tuple[str, ...] = ("graduated", "live")
-GOAL_TIERS: tuple[str, ...] = ("T0_PREP", "T1", "T2", "T3")
+GOAL_TIERS: tuple[str, ...] = ("T0_PREP", "T1", "T2", "T3", "T4_PREP", "T4")
 
 IRON_OR_BETTER_PICKS: frozenset[str] = frozenset({
     "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
@@ -45,7 +45,7 @@ class GoalSpec:
 
     id: str
     title: str
-    tier: str                                  # "T0_PREP" | "T1" | "T2" | "T3"
+    tier: str                                  # "T0_PREP" | "T1" | "T2" | "T3" | "T4_PREP" | "T4"
     score: int                                 # RULES v2 分值（前置准备项允许为 0）
     skill: str                                 # 达成该目标的主技能名
     skill_args: tuple[tuple[str, Any], ...] = ()
@@ -111,6 +111,14 @@ _T2_TRIALS_ORIENTED_EDITABLE: tuple[str, ...] = (
 _T3_BIOMES_EDITABLE: tuple[str, ...] = (
     "code/mcagent/skills/t3_biomes.py",
     "code/tests/test_stage2_t3_biomes.py",
+)
+_T4_QUICK_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_quick_exploits.py",
+    "code/tests/test_stage3_base_and_wave_a.py",
+)
+_T4_END_FROGS_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_end_and_frogs.py",
+    "code/tests/test_stage3_base_and_wave_a.py",
 )
 _FISHING_STOCK = ("string>=2", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2)))
 _ARROW_STOCK = ("arrow|spectral_arrow|tipped_arrow>=1", "hunt_mob",
@@ -1392,6 +1400,147 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=200.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+    ),
+
+    # ---- Stage 3 (Wave A, T4_PREP + T4)：高分收口与巧取（2 项准备 + 7 项计分，全部 stage="draft"） ----
+    GoalSpec(
+        id="prep_ominous_bottle",
+        title="预备不祥之瓶（清剿掠夺者前哨站队长）",
+        tier="T4_PREP",
+        score=0,
+        skill="sweep_outpost_captain",
+        prereq_goals=("smelt_iron",),
+        done_items=("ominous_bottle>=1",),
+        must_hold_for_children=True,
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="prep_two_cakes",
+        title="预备蛋糕与音符盒（为悦灵生日做准备）",
+        tier="T4_PREP",
+        score=0,
+        skill="allay_cake_birthday",
+        skill_args=(("prep_only", True),),
+        prereq_goals=("trade",),
+        done_items=("cake>=2", "note_block>=1"),
+        must_hold_for_children=True,
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=130.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="crafters_crafting_crafters",
+        title="合成器合成合成器",
+        tier="T4",
+        score=15,
+        skill="crafter_chain",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:adventure/crafters_crafting_crafters",),
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="craft_decorated_pot_using_only_sherds",
+        title="慎重修复（仅用陶片合成饰纹陶罐）",
+        tier="T4",
+        score=30,
+        skill="decorated_pot_sherds",
+        prereq_goals=("minecraft_trials_edition",),
+        done_advancements=("minecraft:adventure/craft_decorated_pot_using_only_sherds",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="play_jukebox_in_meadows",
+        title="草甸之声（在草甸演奏唱片机）",
+        tier="T4",
+        score=30,
+        skill="jukebox_meadow",
+        prereq_goals=("minecraft_trials_edition", "mine_diamond"),
+        done_advancements=("minecraft:adventure/play_jukebox_in_meadows",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="voluntary_exile",
+        title="自我放逐（击杀袭击队长）",
+        tier="T4",
+        score=30,
+        skill="sweep_outpost_captain",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:adventure/voluntary_exile",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="allay_deliver_cake_to_note_block",
+        title="生日快乐歌（让悦灵向音符盒递送蛋糕）",
+        tier="T4",
+        score=30,
+        skill="allay_cake_birthday",
+        prereq_goals=("allay_deliver_item_to_player", "prep_two_cakes"),
+        done_advancements=("minecraft:husbandry/allay_deliver_cake_to_note_block",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=190.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="elytra",
+        title="天空即为极限（在末地船获取鞘翅）",
+        tier="T4",
+        score=60,
+        skill="loot_end_ship_elytra",
+        prereq_goals=("find_end_city",),
+        done_advancements=("minecraft:end/elytra",),
+        done_items=("elytra>=1",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T4_END_FROGS_EDITABLE,
+    ),
+    GoalSpec(
+        id="leash_all_frog_variants",
+        title="用拴绳牵引所有青蛙变种",
+        tier="T4",
+        score=60,
+        skill="leash_frog_variants",
+        prereq_goals=("tadpole_in_a_bucket", "enter_the_end"),
+        done_advancements=("minecraft:husbandry/leash_all_frog_variants",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=300.0,
+        stage="draft",
+        editable_files=_T4_END_FROGS_EDITABLE,
     ),
 )
 
