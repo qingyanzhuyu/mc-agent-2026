@@ -1,22 +1,22 @@
 # mcagent — Minecraft Agent API 的最小骨架
 
-协议参考为[上游规范 v1.3.11](../../docs/99-原始记录/api-spec-v1.3.11.md)。比赛服官方双端点：校园网直连 `https://apiin.nmo.net.cn/api/v1`（2026-11-19 无鉴权探活长连接 RTT `4.0–4.3 ms`）与公网备用 `https://mc-api.windywindie.top/api/v1`（2026-11-19 实测 `816–973 ms`），实际部署版本与正式账号标定见[待确认 B18/C1](../../docs/04-待确认.md)。
-当前开发分支为 **`feat/arch-converge-v2-agy`（尚未合入 `main`）**，整体验证口径为 **`verified: offline`**（含队内靶场 `local-target` 冷启动复测；官方端点尚待正式账号全量标定）。
+协议参考为[上游规范 v1.3.11](../../docs/99-原始记录/api-spec-v1.3.11.md)。比赛服官方双端点：校园网直连 `https://apiin.nmo.net.cn/api/v1`（2026-11-19 官方校园网实测 `T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`）与公网备用 `https://mc-api.windywindie.top/api/v1`（2026-11-19 无鉴权探活 `816–973 ms`）。
+当前开发分支为 **`feat/arch-converge-v2-agy`（待最终合入 `main`）**，已完成官方校园网 `smoke`、`probe`、三项故障演练 3/3 PASS 与 2 小时官方长跑取证，4 项核心技能已升格 **`verified="live"`**；其余 57 项技能（含阶段二 T2/T3 技能）保持 **`verified="offline"`**（附 `local-target` 冒烟），待后续真机验收后再合入 `main`。
 目标不是"能打的 bot"，而是**把管道接对**：认证与 Token 持久化复用 / ready 状态机 / 观察 /
 可抢占串行动作 / 非幂等超时判重 / 错误分类 / 安全闸 / 赛前门禁 / 打点。
 
 ```
 client.py         HTTP 客户端：错误封装、.token.json 复用、401 单点重登、429/5xx 退避、16 RPS 三级限速、get_block 缓存、姿态合并、可选接口降级探测
 runtime.py        State（单调时钟死亡去重 + 65s safe_mode）/ Safety / 连续异步 SafetyMonitor / Executor（可抢占单飞锁 + 非幂等判重 + 有界 move_to 超时禁重试 + v1.3.11 精选恢复 + 打点）
-preflight.py      赛前切换自检：官方端点 / 账号密码 / LLM 配置与 2 路并发闸门 / 8787 网关 / 残留 soak_ctl·mcagent 进程 / 校园网 apiin.nmo.net.cn 误配 7897 代理拦截
+preflight.py      赛前切换自检（12 项静态门禁）：官方端点 / 账号密码 / LLM 配置与 2 路并发闸门 / 8787 网关 / 残留 soak_ctl·mcagent 进程 / 校园网 apiin.nmo.net.cn 误配 7897 代理拦截
 smoke.py          冒烟：登录 -> ready -> 状态 -> 背包 -> 事件
 probe.py          基线：量 T_status / T_move20 / T_dig1，落盘 json；也是 --pathfinding / --api-capabilities 的入口
 probe_path.py     寻路与手动兜底探测（跑的是 skills/nav.py 的原语）
 probe_fixture.py  寻路夹具模板与离线校验
 planner/          战略目标 objective.py + 异步预取 scheduler.py + 技能菜单 skill_choice.py + 原子动作 decision.py + llm.py（2 路 BoundedSemaphore 与双线路降级）+ llm_fault.py
-skills/           L2 空间与脱困原语（voxel_cache / reach / escape / nav / sightline / T1 公共脚本）、world_memo.py（原子 JSON 检查点）与 24 个注册 L3 技能（23 个起步/T1 模块化技能 + emergency_escape）
-loop/             比赛与取证主循环：engine.py（同格冷却自旋三级升级）、goals.py（26 项 GoalSpec 台账）、subgoals.py（6 项活谓词）、context.py（脱敏摘要）、strategy.py & strategy_async.py（--strategy llm）、policy.py、auditor.py、tape.py
-../tests/         离线故障注入、多线程抢占、L2/L3 与主循环回归单测：1,103 项（无需账号与外网）
+skills/           L2 空间与脱困原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（原子 JSON 检查点）与 61 个注册 L3 技能（4 项 verified="live" + 57 项 verified="offline"，含 emergency_escape）
+loop/             比赛与取证主循环：engine.py（同格冷却自旋三级升级 + 30s 沿路扫描）、goals.py（76 项 GoalSpec 台账：71 计分项 / 1,725 分上限，6 graduated / 1 candidate / 69 draft）、subgoals.py（6 项活谓词）、context.py（脱敏摘要）、strategy.py & strategy_async.py（--strategy llm）、policy.py、auditor.py、tape.py
+../tests/         离线故障注入、多线程抢占、L2/L3 与主循环回归单测：1,275 项（无需账号与外网；另有 ../../tools/local-api-bridge/test/ 11 项 Node 网关契约单测）
 ```
 
 分层与写技能的规则见仓库根 `AGENTS.md` §9。
@@ -34,11 +34,11 @@ loop/             比赛与取证主循环：engine.py（同格冷却自旋三�
 
 ```bash
 cp mcagent/.env.example mcagent/.env                                       # 填 MC_USER / MC_PASS（需要真机时）
-uv run python -m unittest discover -s tests -v                             # 跑离线单测：1,103 项（无需账号）
-uv run python -m mcagent.preflight                                         # 赛前静态自检（含残留进程/7897 代理/并发闸门/占位检查，不联网）
+uv run python -m unittest discover -s tests -v                             # 跑离线单测：1,275 项（无需账号）
+uv run python -m mcagent.preflight                                         # 赛前静态自检（12 项门禁：残留进程/7897 代理/并发闸门/占位检查，不联网）
 uv run python -m mcagent.client                                            # 只验端点（不需要账号）
 uv run python -m mcagent.smoke --dry                                       # 同上，输出更多
-uv run python -m mcagent.loop --dry --strategy llm --min-verified offline  # 主循环离线契约干跑（24 技能 / 26 台账项 / 目标级异步战略）
+uv run python -m mcagent.loop --dry --strategy llm --min-verified offline  # 主循环离线契约干跑（61 技能 / 76 台账项 / 目标级异步战略）
 uv run python -m mcagent.smoke                                             # 登录 + ready（需要账号，且要先在 docs/05 占位）
 uv run python -m mcagent.probe                                             # 量基线（官方端点需先占号）
 ```
@@ -47,15 +47,15 @@ uv run python -m mcagent.probe                                             # 量
 
 | 模块 | 验证等级 | 状态说明 |
 |---|---|---|
-| `client.py`（401 单点刷新 / `.token.json` 复用 / 16 RPS 三级限速 / `get_block` 代际缓存 / 姿态合并 / `chat` 防 `/` 注入 / 可选接口 `unsupported_api` 探测降级 / `ensure_connected` ≥30s） | `verified: offline` | 2026-11-19 官方双端点无鉴权探活（`apiin.nmo.net.cn` `4.0–4.3 ms`、`mc-api.windywindie.top` `816–973 ms` 均返 401）+ 离线故障注入单测全过；**官方正式账号登录待验** |
-| `runtime.py`（单调时钟死亡去重 + 65s `safe_mode` + 非幂等超时判重 + `emergency()` 抢占锁 + 连续异步 `SafetyMonitor` + 有界 `move_to` 超时禁重试 + `v1.3.11` 精选恢复） | `verified: offline` | 离线故障注入/多线程抢占单测通过 + `local-target` 实机 `void_risk` 抢占复测；**官方真机待验** |
-| `preflight.py`（官方端点 / 凭据 / `LLM_MAX_CONCURRENCY <= 2` / 8787 网关 / 残留 `soak_ctl`·`mcagent` 进程 / `apiin.nmo.net.cn` 误配 `7897` 代理拦截） | `verified: offline` | 离线单测全覆盖 |
-| `skills/`（L2 `voxel_cache` / `reach` / `escape` / `nav`（含 `v1.3.11` 精选恢复） / `sightline` + `world_memo` 原子 JSON 检查点 + 24 个注册 L3 技能含 `emergency_escape`） | `verified: offline` | 离线契约与回归单测全过 + `local-target` 2 轮 240s 冷启动清障/脱困复测；技能仍保持 `verified="offline"`，**待官方服抽测后升 `"live"`** |
-| `loop/`（`goals.py` 26 项 `GoalSpec` 台账 + `subgoals.py` 6 项活谓词 + `context.py` 脱敏摘要 + `engine.py` 同格冷却自旋三级升级 + `strategy.py`/`strategy_async.py` `--strategy llm` + `starter_skills.py` 含 `v1.3.11` 精选恢复） | `verified: offline` | 离线单测与 `--dry` 全过；`local-target` 第 2 轮 `de7_v2_test02` 0 死亡、`/dig` 33/33、`/craft` 7/7、达成 5 项台账目标拿 10 分、累计 1,746 tokens、`/get_block` 551 次（`local-target` 不入正式预算，**官方真机待验**） |
-| `planner/`（`objective.py`、`scheduler.py`、`skill_choice.py`、`decision.py`、`llm.py` 2 路 `BoundedSemaphore` 与双线路降级、`llm_fault.py`） | `verified: offline` | 离线单测全覆盖（含方法反射、强类型校验与 `Objective` 菜单校验）；`decide()` 早期真机 3/3 抽测；**赛服官方模型下 `OBJECTIVE_SYSTEM_PROMPT` 待标定** |
-| `smoke.py` / `probe.py` | `--dry` 已验 / `live` 待验 | 编译通过 + `--dry` 退 0；**官方账号登录、`probe` 三组基线与 `--api-capabilities --live` 待占号标定** |
+| `client.py`（401 单点刷新 / `.token.json` 复用 / 16 RPS 三级限速 / `get_block` 代际缓存 / 姿态合并 / `chat` 防 `/` 注入 / 可选接口 `unsupported_api` 探测降级 / `ensure_connected` ≥30s） | `verified: live` | 2026-11-19 官方校园网实测通过：0.5s 登录（TTL 24h）、`MC_MAX_RPS` 4/8/12/16 零限流、并发 401 单飞刷新 `login_calls=1`、断线 63.11s 重连与 B18/C10 接口实测 + 离线单测全绿 |
+| `runtime.py`（单调时钟死亡去重 + 65s `safe_mode` + 非幂等超时判重 + `emergency()` 抢占锁 + 连续异步 `SafetyMonitor` + 有界 `move_to` 超时禁重试 + `v1.3.11` 精选恢复） | `verified: live` | 2026-11-19 官方三项故障演练 3/3 PASS（断线重连 / `65.2s` `safe_mode` 自愈 / 并发 401）、C16 虚空保护 `0/12` 误报、2h 官方长跑 **0 死亡 0 崩溃** + 离线故障注入单测全绿 |
+| `preflight.py`（12 项门禁：官方端点 / 凭据 / `LLM_MAX_CONCURRENCY <= 2` / 8787 网关 / 残留 `soak_ctl`·`mcagent` 进程 / `apiin.nmo.net.cn` 误配 `7897` 代理拦截） | `verified: live` | 2026-11-19 官方模式 `preflight --apply --live` **15/15 全绿** + 离线单测全覆盖 |
+| `skills/`（L2 原语 + `world_memo` 原子 JSON 检查点 + `furnace_lease` + **61 个注册 L3 技能**） | **4 `live` / 57 `offline`** | 官方 2h 长跑完整跑通且 0 Bug 的 4 项技能已升格 `verified="live"`（`gather_wood`、`craft_gear`、`mine_stone`、`emergency_escape` 6/6）；其余 **57 项（含阶段二 T2/T3 技能）诚实保持 `verified="offline"`**（阶段二已在 `local-target` 冒烟，待官方服真机复测后逐项升格） |
+| `loop/`（`goals.py` **76 项 `GoalSpec` 台账** [71 计分 / 1,725 分上限，`6 graduated / 1 candidate / 69 draft`] + 共享子图 DAG ROI + 30s 沿路扫描 + `subgoals.py` + `strategy_async.py`） | 部分 `live` / 阶段二 `offline` | 官方 2h 长跑前 `124.7s` 拿下 5 项起步目标、230 条进度曲线与 `INC-005` 100% 离线 `--replay` 落地；暴露的 4 环死锁与 Token 烧爆已于 `c03c26e` 闭环修复（待新一轮官方长跑复验）；全量 `1,275` 单测与 `--dry` 全绿 |
+| `planner/`（`objective.py`、`scheduler.py`、`skill_choice.py`、`decision.py`、`llm.py` 2 路 `BoundedSemaphore` 与双线路降级、`llm_fault.py`） | `verified: live` | 2026-11-19 官方 AIA `api.nju-aia.com`（`qwen3.6-35b-a3b`）快路径 `4/4`（`p50=1652.7ms`）与长跑 1,306 次实测（`p50=3.83s`）标定通过 + 离线单测全覆盖 |
+| `smoke.py` / `probe.py` | `verified: live` | 官方校园网 `smoke`（`0.5s` 登录 `ready=True`）、`probe` 三组基线、`--api-capabilities --live`、C16 标定与三项故障演练全部实测完成并归档 `../../results/probe/` |
 
-当前分支 `feat/arch-converge-v2-agy` 尚未合入 `main`；待官方端点账号登录、基线测量与真机技能抽测跑通后，再按 `AGENTS.md` §2A.6 升格 `"live"` 并合入 `main`。
+当前分支 `feat/arch-converge-v2-agy` **尚待最终合入 `main`**（阶段二 57 项技能仍为 `verified="offline"`，待后续真机验收并完成 `main` 合并）。
 
 ## 目录约定
 

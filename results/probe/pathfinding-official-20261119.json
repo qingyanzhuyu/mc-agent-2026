@@ -1,0 +1,2175 @@
+{
+  "schema": "pathfinding-v1",
+  "source": "official",
+  "base": "https://apiin.nmo.net.cn/api/v1",
+  "max_rps": 16.0,
+  "started_at": "2026-11-19T09:36:18.997526+00:00",
+  "fixture": {
+    "purpose": "precompetition-pathfinding-only",
+    "notes": "只用于赛前已获准的测试场；每个 case 的 start/target 必须来自当前 API 观察。",
+    "cases": {
+      "move20": {
+        "start": [
+          13033.5,
+          64.0,
+          -5894.5
+        ],
+        "target": [
+          13053.5,
+          64.0,
+          -5894.5
+        ],
+        "witness_blocks": [],
+        "description": "平坦已观察通路，水平距离严格 20 格"
+      },
+      "dig1": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "可达的单块 stone，脚下及承重块除外；记录工具"
+      },
+      "wall": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "石墙两侧，witness_blocks 列出挡路的 stone；记录裸 move_to 是否绕行或挖开"
+      },
+      "gap": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "有安全底板的坑两侧，witness_blocks 列出待填的空气格；测裸 move_to 能否跨坑/垫块"
+      },
+      "pillar": {
+        "start": [
+          13033.5,
+          64.0,
+          -5894.5
+        ],
+        "target": [
+          13033.5,
+          66.0,
+          -5894.5
+        ],
+        "witness_blocks": [
+          [
+            13033,
+            64,
+            -5895
+          ],
+          [
+            13033,
+            65,
+            -5895
+          ]
+        ],
+        "description": "同 x/z 高处目标，witness_blocks 列出待搭柱空气格；测裸 move_to 能否原地搭柱"
+      },
+      "climb_y": {
+        "start": [
+          13033.5,
+          64.0,
+          -5894.5
+        ],
+        "target": [
+          13036.5,
+          65.0,
+          -5894.5
+        ],
+        "witness_blocks": [],
+        "description": "现成阶梯/坡道顶部，传 pos=[x,y,z] 带 y 爬高；与 pillar 分开测"
+      },
+      "climb_xz": {
+        "start": [
+          13033.5,
+          64.0,
+          -5894.5
+        ],
+        "target": [
+          13036.5,
+          65.0,
+          -5894.5
+        ],
+        "witness_blocks": [],
+        "description": "现成阶梯/高低差目标，仅传 (x,z) 省略 y，对比带 y 寻路行为差异"
+      },
+      "water": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "浅水池内起点到池外安全岸边；witness_blocks 含水格"
+      },
+      "manual_breach": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "手动装备镐 + 按序 dig witness_blocks 开 1x2 通道 + move_to 穿墙兜底"
+      },
+      "manual_bridge": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "手动 posture(sneak=True) + 按序向悬空侧面 place witness_blocks 搭桥 + move_to 过坑"
+      },
+      "manual_step_up": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "先测自身脚底碰撞箱 place 是否被拒，再按 witness_blocks 执行 1x2 交替垫块上高处"
+      },
+      "pearl": {
+        "start": null,
+        "target": null,
+        "witness_blocks": [],
+        "description": "可见的宽大安全落地区，目标为瞄准点；包内有 ender_pearl"
+      }
+    }
+  },
+  "cases": [
+    {
+      "case": "move20",
+      "trial": 1,
+      "status": "inconclusive",
+      "setup": {
+        "pos": [
+          13033.5,
+          64,
+          -5894.5
+        ]
+      },
+      "samples": [
+        {
+          "elapsed_s": 0.391,
+          "status": {
+            "username": "<redacted_bot>",
+            "pos": [
+              13033.5,
+              64,
+              -5894.5
+            ],
+            "yaw": -0.09,
+            "speed": 0,
+            "velocity": [
+              0,
+              0,
+              0
+            ],
+            "dimension": "overworld",
+            "gamemode": "survival",
+            "health": 20,
+            "food": 20,
+            "saturation": 5,
+            "xp_level": 0,
+            "xp_progress": 0,
+            "armor_points": 0,
+            "held": {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            },
+            "offhand": null,
+            "effects": [],
+            "on_fire": false,
+            "is_sleeping": false,
+            "in_water": false,
+            "submerged": false,
+            "in_lava": false,
+            "in_vehicle": null,
+            "sneaking": false,
+            "held_controls": null,
+            "jumping": false,
+            "blocking": false,
+            "using_item": null,
+            "time_of_day": 13829,
+            "is_day": false,
+            "raining": false,
+            "thundering": false,
+            "biome": "",
+            "on_ground": true,
+            "alive": true,
+            "ready": true,
+            "busy": null,
+            "nearest_hostile": {
+              "id": 45087,
+              "name": "zombie",
+              "dist": 3
+            }
+          },
+          "support": {},
+          "hazard": {
+            "kind": "flee",
+            "why": "zombie 距离 3",
+            "severity": "soft",
+            "hostile": "zombie",
+            "dist": 3
+          }
+        }
+      ],
+      "before": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13033.5,
+            64,
+            -5894.5
+          ],
+          "yaw": -0.09,
+          "speed": 0,
+          "velocity": [
+            0,
+            0,
+            0
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 20,
+          "food": 20,
+          "saturation": 5,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13829,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": true,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 3
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      },
+      "blocks_before": [],
+      "action": {
+        "name": "move_to",
+        "args": {
+          "pos": [
+            13053.5,
+            64.0,
+            -5894.5
+          ],
+          "rng": 1.0
+        }
+      },
+      "api_ok": false,
+      "outcome": "rejected:interrupted",
+      "error": {
+        "type": "Replan",
+        "code": "interrupted",
+        "phase": "action",
+        "extra": {
+          "from": [
+            13033.7,
+            64,
+            -5893.9
+          ],
+          "to": [
+            13053.5,
+            64,
+            -5894.5
+          ],
+          "inner_code": "path_not_found",
+          "cause": "hurt",
+          "health": 17,
+          "pos": [
+            13033.7,
+            64,
+            -5893.9
+          ],
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        },
+        "message": "interrupted (stopped because of hurt (The goal was changed before it could be completed!)) {'from': [13033.7, 64, -5893.9], 'to': [13053.5, 64, -5894.5], 'inner_code': 'path_not_found', 'cause': 'hurt', 'health': 17, 'pos': [13033.7, 64, -5893.9], 'nearest_hostile': {'id': 45087, 'name': 'zombie', 'dist': 1.9}}"
+      },
+      "elapsed_ms": 272.9,
+      "after": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13033.7,
+            64,
+            -5893.9
+          ],
+          "yaw": -2.07,
+          "speed": 3.339,
+          "velocity": [
+            0,
+            0,
+            3.339
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 17,
+          "food": 20,
+          "saturation": 5,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13849,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": true,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      },
+      "blocks_after": [],
+      "target_error_3d": 19.809088823062297,
+      "target_error_horizontal": 19.809088823062297,
+      "target_error_y": 0.0,
+      "actual_y_gain": 0,
+      "walked_horizontal": 0.6324555320342511,
+      "events": [
+        {
+          "seq": 22,
+          "t": 1795080982705,
+          "type": "hurt",
+          "health": 17,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        }
+      ],
+      "observed_events": [
+        {
+          "seq": 1,
+          "t": 1795080657998,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 2,
+          "t": 1795080658002,
+          "type": "chat",
+          "text": "<redacted_bot> (formerly known as <redacted_bot>) joined the game"
+        },
+        {
+          "seq": 3,
+          "t": 1795080658010,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 4,
+          "t": 1795080660011,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 5,
+          "t": 1795080660773,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 6,
+          "t": 1795080662539,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 7,
+          "t": 1795080737059,
+          "type": "disconnected",
+          "reason": "disconnect.quitting"
+        },
+        {
+          "seq": 8,
+          "t": 1795080799821,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 9,
+          "t": 1795080799827,
+          "type": "chat",
+          "text": "<redacted_bot> joined the game"
+        },
+        {
+          "seq": 10,
+          "t": 1795080799858,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 11,
+          "t": 1795080801860,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 12,
+          "t": 1795080801860,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 13,
+          "t": 1795080802613,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 14,
+          "t": 1795080805256,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 15,
+          "t": 1795080833004,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 16,
+          "t": 1795080834997,
+          "type": "chat",
+          "text": "<redacted_player>: 已退出服务器。"
+        },
+        {
+          "seq": 17,
+          "t": 1795080835013,
+          "type": "chat",
+          "text": "<redacted_player> left the game"
+        },
+        {
+          "seq": 18,
+          "t": 1795080838003,
+          "type": "pickup",
+          "item": "dirt",
+          "count": 1
+        },
+        {
+          "seq": 19,
+          "t": 1795080846562,
+          "type": "chat",
+          "text": "<redacted_player> joined the game"
+        },
+        {
+          "seq": 20,
+          "t": 1795080846563,
+          "type": "chat",
+          "text": "<redacted_player>: 已连接到 [survivaltest]。"
+        },
+        {
+          "seq": 21,
+          "t": 1795080932207,
+          "type": "chat",
+          "text": "<redacted_player> has made the advancement [Bee Our Guest]"
+        },
+        {
+          "seq": 22,
+          "t": 1795080982705,
+          "type": "hurt",
+          "health": 17,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        }
+      ]
+    },
+    {
+      "case": "climb_y",
+      "trial": 1,
+      "status": "observed",
+      "setup": {
+        "pos": [
+          13033.7,
+          64.6,
+          -5894.3
+        ]
+      },
+      "samples": [
+        {
+          "elapsed_s": 0.318,
+          "status": {
+            "username": "<redacted_bot>",
+            "pos": [
+              13033.7,
+              64.6,
+              -5894.4
+            ],
+            "yaw": -2.07,
+            "speed": 1.459,
+            "velocity": [
+              0,
+              -1.01,
+              -1.459
+            ],
+            "dimension": "overworld",
+            "gamemode": "survival",
+            "health": 17,
+            "food": 20,
+            "saturation": 5,
+            "xp_level": 0,
+            "xp_progress": 0,
+            "armor_points": 0,
+            "held": {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            },
+            "offhand": null,
+            "effects": [],
+            "on_fire": false,
+            "is_sleeping": false,
+            "in_water": false,
+            "submerged": false,
+            "in_lava": false,
+            "in_vehicle": null,
+            "sneaking": false,
+            "held_controls": null,
+            "jumping": false,
+            "blocking": false,
+            "using_item": null,
+            "time_of_day": 13849,
+            "is_day": false,
+            "raining": false,
+            "thundering": false,
+            "biome": "",
+            "on_ground": false,
+            "alive": true,
+            "ready": true,
+            "busy": null,
+            "nearest_hostile": {
+              "id": 45087,
+              "name": "zombie",
+              "dist": 1.7
+            }
+          },
+          "support": {},
+          "hazard": {
+            "kind": "flee",
+            "why": "zombie 距离 1.7",
+            "severity": "soft",
+            "hostile": "zombie",
+            "dist": 1.7
+          }
+        },
+        {
+          "elapsed_s": 1.136,
+          "status": {
+            "username": "<redacted_bot>",
+            "pos": [
+              13035.4,
+              65,
+              -5894.5
+            ],
+            "yaw": -1.53,
+            "speed": 5.517,
+            "velocity": [
+              5.516,
+              0,
+              -0.093
+            ],
+            "dimension": "overworld",
+            "gamemode": "survival",
+            "health": 18.5,
+            "food": 20,
+            "saturation": 4,
+            "xp_level": 0,
+            "xp_progress": 0,
+            "armor_points": 0,
+            "held": {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            },
+            "offhand": null,
+            "effects": [],
+            "on_fire": false,
+            "is_sleeping": false,
+            "in_water": false,
+            "submerged": false,
+            "in_lava": false,
+            "in_vehicle": null,
+            "sneaking": false,
+            "held_controls": null,
+            "jumping": false,
+            "blocking": false,
+            "using_item": null,
+            "time_of_day": 13869,
+            "is_day": false,
+            "raining": false,
+            "thundering": false,
+            "biome": "",
+            "on_ground": true,
+            "alive": true,
+            "ready": true,
+            "busy": null,
+            "nearest_hostile": {
+              "id": 45087,
+              "name": "zombie",
+              "dist": 2.3
+            }
+          },
+          "support": {},
+          "hazard": {
+            "kind": "flee",
+            "why": "zombie 距离 2.3",
+            "severity": "soft",
+            "hostile": "zombie",
+            "dist": 2.3
+          }
+        }
+      ],
+      "before": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13033.7,
+            64.6,
+            -5894.4
+          ],
+          "yaw": -2.07,
+          "speed": 1.459,
+          "velocity": [
+            0,
+            -1.01,
+            -1.459
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 17,
+          "food": 20,
+          "saturation": 5,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13849,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": false,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.7
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      },
+      "blocks_before": [],
+      "action": {
+        "name": "move_to",
+        "args": {
+          "pos": [
+            13036.5,
+            65.0,
+            -5894.5
+          ],
+          "rng": 1.0
+        }
+      },
+      "result": {
+        "pos": [
+          13035.4,
+          65,
+          -5894.5
+        ]
+      },
+      "api_ok": true,
+      "outcome": "ok",
+      "elapsed_ms": 756.95,
+      "after": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13035.4,
+            65,
+            -5894.5
+          ],
+          "yaw": -1.53,
+          "speed": 5.517,
+          "velocity": [
+            5.516,
+            0,
+            -0.093
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 18.5,
+          "food": 20,
+          "saturation": 4,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13869,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": true,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 2.3
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      },
+      "blocks_after": [],
+      "target_error_3d": 1.1000000000003638,
+      "target_error_horizontal": 1.1000000000003638,
+      "target_error_y": 0.0,
+      "actual_y_gain": 0.4,
+      "walked_horizontal": 1.702938636591572,
+      "events": [],
+      "observed_events": [
+        {
+          "seq": 1,
+          "t": 1795080657998,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 2,
+          "t": 1795080658002,
+          "type": "chat",
+          "text": "<redacted_bot> (formerly known as <redacted_bot>) joined the game"
+        },
+        {
+          "seq": 3,
+          "t": 1795080658010,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 4,
+          "t": 1795080660011,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 5,
+          "t": 1795080660773,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 6,
+          "t": 1795080662539,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 7,
+          "t": 1795080737059,
+          "type": "disconnected",
+          "reason": "disconnect.quitting"
+        },
+        {
+          "seq": 8,
+          "t": 1795080799821,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 9,
+          "t": 1795080799827,
+          "type": "chat",
+          "text": "<redacted_bot> joined the game"
+        },
+        {
+          "seq": 10,
+          "t": 1795080799858,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 11,
+          "t": 1795080801860,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 12,
+          "t": 1795080801860,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 13,
+          "t": 1795080802613,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 14,
+          "t": 1795080805256,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 15,
+          "t": 1795080833004,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 16,
+          "t": 1795080834997,
+          "type": "chat",
+          "text": "<redacted_player>: 已退出服务器。"
+        },
+        {
+          "seq": 17,
+          "t": 1795080835013,
+          "type": "chat",
+          "text": "<redacted_player> left the game"
+        },
+        {
+          "seq": 18,
+          "t": 1795080838003,
+          "type": "pickup",
+          "item": "dirt",
+          "count": 1
+        },
+        {
+          "seq": 19,
+          "t": 1795080846562,
+          "type": "chat",
+          "text": "<redacted_player> joined the game"
+        },
+        {
+          "seq": 20,
+          "t": 1795080846563,
+          "type": "chat",
+          "text": "<redacted_player>: 已连接到 [survivaltest]。"
+        },
+        {
+          "seq": 21,
+          "t": 1795080932207,
+          "type": "chat",
+          "text": "<redacted_player> has made the advancement [Bee Our Guest]"
+        },
+        {
+          "seq": 22,
+          "t": 1795080982705,
+          "type": "hurt",
+          "health": 17,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        }
+      ]
+    },
+    {
+      "case": "climb_xz",
+      "trial": 1,
+      "status": "inconclusive",
+      "setup": {},
+      "samples": [
+        {
+          "elapsed_s": 0.136,
+          "status": {
+            "username": "<redacted_bot>",
+            "pos": [
+              13035.4,
+              65,
+              -5894.5
+            ],
+            "yaw": -1.53,
+            "speed": 5.517,
+            "velocity": [
+              5.516,
+              0,
+              -0.093
+            ],
+            "dimension": "overworld",
+            "gamemode": "survival",
+            "health": 18.5,
+            "food": 20,
+            "saturation": 4,
+            "xp_level": 0,
+            "xp_progress": 0,
+            "armor_points": 0,
+            "held": {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            },
+            "offhand": null,
+            "effects": [],
+            "on_fire": false,
+            "is_sleeping": false,
+            "in_water": false,
+            "submerged": false,
+            "in_lava": false,
+            "in_vehicle": null,
+            "sneaking": false,
+            "held_controls": null,
+            "jumping": false,
+            "blocking": false,
+            "using_item": null,
+            "time_of_day": 13869,
+            "is_day": false,
+            "raining": false,
+            "thundering": false,
+            "biome": "",
+            "on_ground": true,
+            "alive": true,
+            "ready": true,
+            "busy": null,
+            "nearest_hostile": {
+              "id": 45087,
+              "name": "zombie",
+              "dist": 2.3
+            }
+          },
+          "support": {},
+          "hazard": {
+            "kind": "flee",
+            "why": "zombie 距离 2.3",
+            "severity": "soft",
+            "hostile": "zombie",
+            "dist": 2.3
+          }
+        }
+      ],
+      "error": {
+        "type": "Replan",
+        "code": "interrupted",
+        "phase": "setup",
+        "extra": {
+          "from": [
+            13035,
+            65,
+            -5894.9
+          ],
+          "to": [
+            13033.5,
+            64,
+            -5894.5
+          ],
+          "inner_code": "path_not_found",
+          "cause": "hurt",
+          "health": 16,
+          "pos": [
+            13035,
+            65,
+            -5894.9
+          ],
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.5
+          }
+        },
+        "message": "interrupted (stopped because of hurt (The goal was changed before it could be completed!)) {'from': [13035, 65, -5894.9], 'to': [13033.5, 64, -5894.5], 'inner_code': 'path_not_found', 'cause': 'hurt', 'health': 16, 'pos': [13035, 65, -5894.9], 'nearest_hostile': {'id': 45087, 'name': 'zombie', 'dist': 1.5}}"
+      },
+      "api_ok": false,
+      "events": [
+        {
+          "seq": 23,
+          "t": 1795080984355,
+          "type": "hurt",
+          "health": 16,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.5
+          }
+        }
+      ],
+      "observed_events": [
+        {
+          "seq": 1,
+          "t": 1795080657998,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 2,
+          "t": 1795080658002,
+          "type": "chat",
+          "text": "<redacted_bot> (formerly known as <redacted_bot>) joined the game"
+        },
+        {
+          "seq": 3,
+          "t": 1795080658010,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 4,
+          "t": 1795080660011,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 5,
+          "t": 1795080660773,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 6,
+          "t": 1795080662539,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 7,
+          "t": 1795080737059,
+          "type": "disconnected",
+          "reason": "disconnect.quitting"
+        },
+        {
+          "seq": 8,
+          "t": 1795080799821,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 9,
+          "t": 1795080799827,
+          "type": "chat",
+          "text": "<redacted_bot> joined the game"
+        },
+        {
+          "seq": 10,
+          "t": 1795080799858,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 11,
+          "t": 1795080801860,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 12,
+          "t": 1795080801860,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 13,
+          "t": 1795080802613,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 14,
+          "t": 1795080805256,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 15,
+          "t": 1795080833004,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 16,
+          "t": 1795080834997,
+          "type": "chat",
+          "text": "<redacted_player>: 已退出服务器。"
+        },
+        {
+          "seq": 17,
+          "t": 1795080835013,
+          "type": "chat",
+          "text": "<redacted_player> left the game"
+        },
+        {
+          "seq": 18,
+          "t": 1795080838003,
+          "type": "pickup",
+          "item": "dirt",
+          "count": 1
+        },
+        {
+          "seq": 19,
+          "t": 1795080846562,
+          "type": "chat",
+          "text": "<redacted_player> joined the game"
+        },
+        {
+          "seq": 20,
+          "t": 1795080846563,
+          "type": "chat",
+          "text": "<redacted_player>: 已连接到 [survivaltest]。"
+        },
+        {
+          "seq": 21,
+          "t": 1795080932207,
+          "type": "chat",
+          "text": "<redacted_player> has made the advancement [Bee Our Guest]"
+        },
+        {
+          "seq": 22,
+          "t": 1795080982705,
+          "type": "hurt",
+          "health": 17,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        },
+        {
+          "seq": 23,
+          "t": 1795080984355,
+          "type": "hurt",
+          "health": 16,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.5
+          }
+        }
+      ],
+      "after": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13035.1,
+            65.3,
+            -5895.1
+          ],
+          "yaw": 0.71,
+          "speed": 4.368,
+          "velocity": [
+            3.917,
+            5.503,
+            -1.932
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 16,
+          "food": 20,
+          "saturation": 2,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13869,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": false,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.7
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      }
+    },
+    {
+      "case": "pillar",
+      "trial": 1,
+      "status": "observed",
+      "setup": {
+        "pos": [
+          13033.4,
+          64.9,
+          -5894.3
+        ]
+      },
+      "samples": [
+        {
+          "elapsed_s": 0.346,
+          "status": {
+            "username": "<redacted_bot>",
+            "pos": [
+              13035.1,
+              65.3,
+              -5895.1
+            ],
+            "yaw": 0.71,
+            "speed": 4.368,
+            "velocity": [
+              3.917,
+              5.503,
+              -1.932
+            ],
+            "dimension": "overworld",
+            "gamemode": "survival",
+            "health": 16,
+            "food": 20,
+            "saturation": 2,
+            "xp_level": 0,
+            "xp_progress": 0,
+            "armor_points": 0,
+            "held": {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            },
+            "offhand": null,
+            "effects": [],
+            "on_fire": false,
+            "is_sleeping": false,
+            "in_water": false,
+            "submerged": false,
+            "in_lava": false,
+            "in_vehicle": null,
+            "sneaking": false,
+            "held_controls": null,
+            "jumping": false,
+            "blocking": false,
+            "using_item": null,
+            "time_of_day": 13869,
+            "is_day": false,
+            "raining": false,
+            "thundering": false,
+            "biome": "",
+            "on_ground": false,
+            "alive": true,
+            "ready": true,
+            "busy": null,
+            "nearest_hostile": {
+              "id": 45087,
+              "name": "zombie",
+              "dist": 1.7
+            }
+          },
+          "support": {
+            "pos": [
+              13035,
+              65,
+              -5896
+            ],
+            "status_pos": [
+              13035.1,
+              65.3,
+              -5895.1
+            ],
+            "block": {
+              "name": "air",
+              "pos": [
+                13035,
+                65,
+                -5896
+              ],
+              "properties": {},
+              "diggable": false,
+              "hardness": 0,
+              "harvest_tool_ok": false
+            },
+            "at": 486183.047929166
+          },
+          "hazard": {
+            "kind": "flee",
+            "why": "zombie 距离 1.7",
+            "severity": "soft",
+            "hostile": "zombie",
+            "dist": 1.7
+          }
+        },
+        {
+          "elapsed_s": 1.354,
+          "status": {
+            "username": "<redacted_bot>",
+            "pos": [
+              13033.4,
+              64.5,
+              -5894.3
+            ],
+            "yaw": -2.96,
+            "speed": 0,
+            "velocity": [
+              0,
+              -4.611,
+              0
+            ],
+            "dimension": "overworld",
+            "gamemode": "survival",
+            "health": 13.666667938232422,
+            "food": 20,
+            "saturation": 1,
+            "xp_level": 0,
+            "xp_progress": 0,
+            "armor_points": 0,
+            "held": {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            },
+            "offhand": null,
+            "effects": [],
+            "on_fire": false,
+            "is_sleeping": false,
+            "in_water": false,
+            "submerged": false,
+            "in_lava": false,
+            "in_vehicle": null,
+            "sneaking": false,
+            "held_controls": null,
+            "jumping": false,
+            "blocking": false,
+            "using_item": null,
+            "time_of_day": 13889,
+            "is_day": false,
+            "raining": false,
+            "thundering": false,
+            "biome": "",
+            "on_ground": false,
+            "alive": true,
+            "ready": true,
+            "busy": null,
+            "nearest_hostile": {
+              "id": 45087,
+              "name": "zombie",
+              "dist": 1.5
+            }
+          },
+          "support": {
+            "pos": [
+              13033,
+              64,
+              -5895
+            ],
+            "status_pos": [
+              13033.4,
+              64.5,
+              -5894.3
+            ],
+            "block": {
+              "name": "air",
+              "pos": [
+                13033,
+                64,
+                -5895
+              ],
+              "properties": {},
+              "diggable": false,
+              "hardness": 0,
+              "harvest_tool_ok": false
+            },
+            "below_checked": [
+              {
+                "pos": [
+                  13033,
+                  63,
+                  -5895
+                ],
+                "name": "grass_block"
+              }
+            ],
+            "at": 486184.105251956
+          },
+          "hazard": {
+            "kind": "flee",
+            "why": "zombie 距离 1.5",
+            "severity": "soft",
+            "hostile": "zombie",
+            "dist": 1.5
+          }
+        }
+      ],
+      "before": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13033.4,
+            64.5,
+            -5894.3
+          ],
+          "yaw": -2.96,
+          "speed": 0,
+          "velocity": [
+            0,
+            -4.611,
+            0
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 13.666667938232422,
+          "food": 20,
+          "saturation": 1,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13889,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": false,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.5
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      },
+      "blocks_before": [
+        {
+          "pos": [
+            13033,
+            64,
+            -5895
+          ],
+          "block": {
+            "name": "air",
+            "pos": [
+              13033,
+              64,
+              -5895
+            ],
+            "properties": {},
+            "diggable": false,
+            "hardness": 0,
+            "harvest_tool_ok": false
+          }
+        },
+        {
+          "pos": [
+            13033,
+            65,
+            -5895
+          ],
+          "block": {
+            "name": "air",
+            "pos": [
+              13033,
+              65,
+              -5895
+            ],
+            "properties": {},
+            "diggable": false,
+            "hardness": 0,
+            "harvest_tool_ok": false
+          }
+        }
+      ],
+      "action": {
+        "name": "move_to",
+        "args": {
+          "pos": [
+            13033.5,
+            66.0,
+            -5894.5
+          ],
+          "rng": 1.0
+        }
+      },
+      "result": {
+        "pos": [
+          13033.5,
+          64,
+          -5894.5
+        ]
+      },
+      "api_ok": true,
+      "outcome": "ok",
+      "elapsed_ms": 174.88,
+      "after": {
+        "status": {
+          "username": "<redacted_bot>",
+          "pos": [
+            13033.5,
+            64,
+            -5894.5
+          ],
+          "yaw": -0.13,
+          "speed": 3.939,
+          "velocity": [
+            0.494,
+            0,
+            -3.908
+          ],
+          "dimension": "overworld",
+          "gamemode": "survival",
+          "health": 13.833334922790527,
+          "food": 20,
+          "saturation": 1,
+          "xp_level": 0,
+          "xp_progress": 0,
+          "armor_points": 0,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "offhand": null,
+          "effects": [],
+          "on_fire": false,
+          "is_sleeping": false,
+          "in_water": false,
+          "submerged": false,
+          "in_lava": false,
+          "in_vehicle": null,
+          "sneaking": false,
+          "held_controls": null,
+          "jumping": false,
+          "blocking": false,
+          "using_item": null,
+          "time_of_day": 13909,
+          "is_day": false,
+          "raining": false,
+          "thundering": false,
+          "biome": "",
+          "on_ground": true,
+          "alive": true,
+          "ready": true,
+          "busy": null,
+          "nearest_hostile": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1
+          }
+        },
+        "inventory": {
+          "items": [
+            {
+              "name": "dirt",
+              "count": 1,
+              "slot": 36
+            }
+          ],
+          "armor": {
+            "head": null,
+            "chest": null,
+            "legs": null,
+            "feet": null
+          },
+          "offhand": null,
+          "held": {
+            "name": "dirt",
+            "count": 1,
+            "slot": 36
+          },
+          "empty_slots": 35
+        }
+      },
+      "blocks_after": [
+        {
+          "pos": [
+            13033,
+            64,
+            -5895
+          ],
+          "block": {
+            "name": "air",
+            "pos": [
+              13033,
+              64,
+              -5895
+            ],
+            "properties": {},
+            "diggable": false,
+            "hardness": 0,
+            "harvest_tool_ok": false
+          }
+        },
+        {
+          "pos": [
+            13033,
+            65,
+            -5895
+          ],
+          "block": {
+            "name": "air",
+            "pos": [
+              13033,
+              65,
+              -5895
+            ],
+            "properties": {},
+            "diggable": false,
+            "hardness": 0,
+            "harvest_tool_ok": false
+          }
+        }
+      ],
+      "target_error_3d": 2.0,
+      "target_error_horizontal": 0.0,
+      "target_error_y": -2.0,
+      "actual_y_gain": -0.5,
+      "walked_horizontal": 0.22360679774997896,
+      "events": [
+        {
+          "seq": 25,
+          "t": 1795080986117,
+          "type": "hurt",
+          "health": 10.8,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 0.6
+          }
+        }
+      ],
+      "observed_events": [
+        {
+          "seq": 1,
+          "t": 1795080657998,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 2,
+          "t": 1795080658002,
+          "type": "chat",
+          "text": "<redacted_bot> (formerly known as <redacted_bot>) joined the game"
+        },
+        {
+          "seq": 3,
+          "t": 1795080658010,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 4,
+          "t": 1795080660011,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 5,
+          "t": 1795080660773,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 6,
+          "t": 1795080662539,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 7,
+          "t": 1795080737059,
+          "type": "disconnected",
+          "reason": "disconnect.quitting"
+        },
+        {
+          "seq": 8,
+          "t": 1795080799821,
+          "type": "chat",
+          "text": "------------------------------- 欢迎来到 NMO原版群组服 ------------------------------- 你可以点击下方服务器名称切换连接的服务器。 [game][lobby][build][survival][roguelike][rpg][skyblock][survivaltest][nfcc][meeting][gametemp] ------------------------------- 你可以使用 /remember 设置默认连接服务器。 -------------------------------"
+        },
+        {
+          "seq": 9,
+          "t": 1795080799827,
+          "type": "chat",
+          "text": "<redacted_bot> joined the game"
+        },
+        {
+          "seq": 10,
+          "t": 1795080799858,
+          "type": "spawn",
+          "pos": [
+            13032.5,
+            65,
+            -5895.5
+          ]
+        },
+        {
+          "seq": 11,
+          "t": 1795080801860,
+          "type": "chat",
+          "text": "You are already connected to this server!"
+        },
+        {
+          "seq": 12,
+          "t": 1795080801860,
+          "type": "server_confirmed",
+          "server": "survivaltest",
+          "via": "rcon"
+        },
+        {
+          "seq": 13,
+          "t": 1795080802613,
+          "type": "chat",
+          "text": "欢迎 <redacted_bot> 来到NMO群组服务器！！！目前您是通过 NMO Skin 进来的，使用游戏内档案 <redacted_bot>, 您可以通过指令 /multilogin info 来查询到有关于您的更多身份信息哦~"
+        },
+        {
+          "seq": 14,
+          "t": 1795080805256,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 15,
+          "t": 1795080833004,
+          "type": "chat",
+          "text": "<redacted_player> was shot by Pillager"
+        },
+        {
+          "seq": 16,
+          "t": 1795080834997,
+          "type": "chat",
+          "text": "<redacted_player>: 已退出服务器。"
+        },
+        {
+          "seq": 17,
+          "t": 1795080835013,
+          "type": "chat",
+          "text": "<redacted_player> left the game"
+        },
+        {
+          "seq": 18,
+          "t": 1795080838003,
+          "type": "pickup",
+          "item": "dirt",
+          "count": 1
+        },
+        {
+          "seq": 19,
+          "t": 1795080846562,
+          "type": "chat",
+          "text": "<redacted_player> joined the game"
+        },
+        {
+          "seq": 20,
+          "t": 1795080846563,
+          "type": "chat",
+          "text": "<redacted_player>: 已连接到 [survivaltest]。"
+        },
+        {
+          "seq": 21,
+          "t": 1795080932207,
+          "type": "chat",
+          "text": "<redacted_player> has made the advancement [Bee Our Guest]"
+        },
+        {
+          "seq": 22,
+          "t": 1795080982705,
+          "type": "hurt",
+          "health": 17,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.9
+          }
+        },
+        {
+          "seq": 23,
+          "t": 1795080984355,
+          "type": "hurt",
+          "health": 16,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.5
+          }
+        },
+        {
+          "seq": 24,
+          "t": 1795080985405,
+          "type": "hurt",
+          "health": 13.7,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 1.6
+          }
+        },
+        {
+          "seq": 25,
+          "t": 1795080986117,
+          "type": "hurt",
+          "health": 10.8,
+          "damage": 3,
+          "source": "mob_attack",
+          "source_entity": {
+            "id": 45087,
+            "name": "zombie"
+          },
+          "likely_attacker": {
+            "id": 45087,
+            "name": "zombie",
+            "dist": 0.6
+          }
+        }
+      ]
+    }
+  ],
+  "C1": {
+    "T_status": {
+      "all_ms": [
+        6.99,
+        6.31,
+        15.01,
+        14.36,
+        7.34
+      ],
+      "p50_ms": 7.34
+    }
+  },
+  "complete": false,
+  "interpretation": "API 成功/拒绝均保留原始证据；需结合轨迹、方块前后变化与背包变化复核真实物理行为。",
+  "pearl_error": {
+    "n": 0,
+    "all_3d": [],
+    "p50_3d": null,
+    "max_3d": null
+  }
+}

@@ -29,13 +29,13 @@
 
 ```mermaid
 flowchart TD
-    S["战略层 StrategyOrchestrator<br/>--strategy llm · 8 类边界事件 · 2 路信号量"] -->|Objective 脱敏上下文 ≤2000 字| G["目标台账与规划层 loop/goals.py<br/>76 项 DAG · 共享子图边际 ROI · 物资预留 · 止损"]
-    G -->|展开确定性最近前置技能| L3["L3 意图技能层 skills/*.py<br/>61 个 @register 技能 · 仅标量参数 · 1 动作 = 1 yield"]
-    L3 -->|yield from| L2["L2 空间与战术原语<br/>sightline · voxel_cache · world_memo · reach · nav · escape · furnace_lease"]
-    L2 -->|ex.动作()| L1["L1 执行器 runtime.Executor<br/>可抢占单飞锁 · 非幂等快照判重 · 16 RPS 三级限速"]
-    M["后台看护 SafetyMonitor<br/>连续异步 status/events · C16 虚空保护 · 65s safe_mode"] -->|emergency() 抢占 /stop| L1
-    L1 -->|REST HTTP 仅认 ok 字段| API["NMO 官方 REST API (v1.3.11)"]
-    E["MainLoop 技能完成边界<br/>30s 低频沿路增量扫描"] -->|写入新地标 landmark_version++| S
+    S["战略层 StrategyOrchestrator：--strategy llm · 8 类边界事件 · 2 路信号量"] -->|"Objective 脱敏上下文 ≤2000 字"| G["目标台账与规划层 loop/goals.py：76 项 DAG · 共享子图边际 ROI · 物资预留 · 止损"]
+    G -->|"展开确定性最近前置技能"| L3["L3 意图技能层 skills/*.py：61 个 @register 技能 · 仅标量参数 · 1 动作 = 1 yield"]
+    L3 -->|"yield from"| L2["L2 空间与战术原语：sightline · voxel_cache · world_memo · reach · nav · escape · furnace_lease"]
+    L2 -->|"ex.动作()"| L1["L1 执行器 runtime.Executor：可抢占单飞锁 · 非幂等快照判重 · 16 RPS 三级限速"]
+    M["后台看护 SafetyMonitor：连续异步 status/events · C16 虚空保护 · 65s safe_mode"] -->|"emergency() 抢占 /stop"| L1
+    L1 -->|"REST HTTP 仅认 ok 字段"| API["NMO 官方 REST API (v1.3.11)"]
+    E["MainLoop 技能完成边界：30s 低频沿路增量扫描"] -->|"写入新地标 landmark_version++"| S
 ```
 
 ### 2.2 五项核心技术创新点
@@ -63,8 +63,8 @@ flowchart TD
 | **② 几何统一与 v1.3.11 对齐（11/15–11/16）** | 10+ 技能手写脚底到方块角点距离存在 ±0.87 格偏移；附魔跨窗丢失、下界 `ready=false` 抢读、钓鱼 `timeout` 三连重发 | 收口全仓至 `skills.sightline` 并写入 `AGENTS.md` §9.2；按 v1.3.11 逐节补齐可选路由 `unsupported_api` 降级与 `/stop released` 校验 | 全仓无裸脚底角点测距；`test_sightline.py`、`test_api_v1311_client.py` 与 `test_runtime_v1311_recovery.py` 全绿 |
 | **③ 53 轮冷启动归因与架构收敛（11/19 `01:55`）** | 旧自动修单分支叠加 230+ 补丁使 `starter_skills.py` 膨胀至 3,014 行，`smelt_iron` 达成率仅 `11.3%`（6/53），冷却空睡占 `59%` 时长，单轮 `/get_block` 达 `2,883` 次 | 果断止损旧膨胀并加 `--observe-only` 护栏；落地 `voxel_cache`、`reach.py`、原子 `world_memo` 检查点、同格冷却三级升级（`local_retry→relocate→goal_abandoned`）与 `--strategy llm` | `local-target` 240s 冷启动实测（`de7_v2_test02`）：0 死亡、`/dig` 33/33、`/craft` 7/7、`prep_wood` 提速 **2–3×**、`/get_block` 降 **70%+**（551 次）、Token 外推由 313% 压至 **2.5%** |
 | **④ P8 物理与同步取证修复（11/19 `04:16`）** | 靶场 HTTP 磁带暴露 `GoalNear` 抖动、`set_slot` 1-tick 延迟、滞空幽灵块回滚与悬空树冠 `stalled` | 逐条回放磁带定位 MC 1.21.11 物理同步缺陷，先红后绿补齐回归单测并关停本地桥疾跑/跑酷（`4aedb5d`） | `test_p8_log_fixes.py` + `bot_session.test.js`（11/11）全绿 |
-| **⑤ 官方 2h 长跑取证与 Token 黑洞根治（11/19 `f416d71`→`c03c26e`）** | 2h 官方连跑前 `124.7s` 拿下 5 项起步目标且 0 死亡，但后 103 分钟陷入 4 环死锁（地下未记轨 + 未复用 7 格外已知工作台 + 地下无净空 502 次 `Replan` + 战术无技能每 5s 回落旧 LLM 菜单），烧掉 **2.91M 输入 Token**（8h 外推 **166.2%**） | 离线回放 `INC-005` 精准复现；`CraftGear` 复用 `WorldResourceMemo` 已知台、`MineStone` 写 `MINE_TRAILS`、`ScoutIsland` 地下安全上挖 1×2 阶梯、`strategy.py` 战术兜底 LLM 加 `20s→240s` 指数退避 + `LLM_TOKEN_BUDGET=7500000` 护栏 | 新增 `test_official_soak_fixes.py` 8 条回归单测全绿；仅将官方实机 0 缺陷的 4 项技能升格 `verified="live"` |
-| **⑥ 阶段二三波模块化扩展（11/19 `3454a9f`）** | 台账原仅覆盖 T1 26 项（290 分），缺少结构勘探、工作站、下界核心、末地冲刺、试炼密室、群系 T3 与提速替代路线 | 在隔离 worktree 用多路严格文件互斥并行子代理分三波落地 9 个新技能文件（单文件均 ≤360 行，仅极少数已有大文件按职责增量扩展）+ 共享子图 DAG ROI + 30s 节流沿路扫描 + 5 条提速替代路线 | 台账扩至 **76 项 / 1,725 分上限**、**61 个注册技能**；全仓 **1,275/1,275** 单测全绿，`survey_island` 等已过 `local-target` 冒烟 |
+| **⑤ 官方 2h 长跑取证与 Token 黑洞根治（11/19 实测 `090a04a`→修复 `c03c26e`）** | 2h 官方连跑前 `124.7s` 拿下 5 项起步目标且 0 死亡，但后 103 分钟陷入 4 环死锁（地下未记轨 + 未复用 7 格外已知工作台 + 地下无净空 502 次 `Replan` + 战术无技能每 5s 回落旧 LLM 菜单），烧掉 **2.91M 输入 Token**（8h 外推 **166.2%**） | 离线回放 `INC-005` 精准复现；`CraftGear` 复用 `WorldResourceMemo` 已知台、`MineStone` 写 `MINE_TRAILS`、`ScoutIsland` 地下安全上挖 1×2 阶梯、`strategy.py` 战术兜底 LLM 加 `20s→240s` 指数退避 + `LLM_TOKEN_BUDGET=7500000` 护栏 | 新增 `test_official_soak_fixes.py` 8 条回归单测全绿；仅将官方实机 0 缺陷的 4 项技能升格 `verified="live"` |
+| **⑥ 阶段二三波模块化扩展（11/19 `3454a9f`）** | 台账原仅覆盖 T1 26 项（290 分），缺少结构勘探、工作站、下界核心、末地冲刺、试炼密室、群系 T3 与提速替代路线 | 在隔离 worktree 用多路严格文件互斥并行子代理分三波落地 9 个新技能文件（单文件 293–393 行（均 <400 行），仅极少数已有大文件按职责增量扩展）+ 共享子图 DAG ROI + 30s 节流沿路扫描 + 5 条提速替代路线 | 台账扩至 **76 项 / 1,725 分上限**、**61 个注册技能**；全仓 **1,275/1,275** 单测全绿，`survey_island` 等已过 `local-target` 冒烟 |
 
 ---
 
@@ -75,7 +75,7 @@ flowchart TD
 | 指标 | 本地靶场（`local-target`，`127.0.0.1:8787`） | **官方校园网（`official`，`apiin.nmo.net.cn`）** | 官方公网（`mc-api.windywindie.top`） | 原始证据 |
 |---|---:|---:|---:|---|
 | 无鉴权 `/status` RTT | ~1.5 ms | **5–11 ms** | 816–973 ms | `docs/03` §6.1 |
-| `T_status`（鉴权 p50） | 1.5 ms | **7.34 ms**（稳态）/ **74.4 ms**（首轮加载） | 500–700 ms | `results/probe/probe-official-20261119.json` |
+| `T_status`（鉴权 p50） | 1.5 ms | **7.34 ms**（稳态）/ **74.4 ms**（首轮加载） | 500–700 ms | 稳态 `7.34 ms`：`results/probe/pathfinding-official-20261119.json`；首轮 `74.4 ms`：`results/probe/probe-official-20261119.json` |
 | `find_blocks`（r=16/32/64）p50 | — | **14.8 / 25.4 / 55.9 ms** | — | `results/probe/probe-official-20261119.json` |
 | `T_move20` / `T_dig1` | 2175 ms / 1736 ms | **3648 ms**（5.5 格/秒）/ **2146 ms** | 待测 | `results/probe/probe-official-20261119.json` |
 | 单动作周期纯开销 | 7.3 ms | **202.3 ms** | ≈1200–1500 ms | `results/probe/probe-official-20261119.json` |
@@ -107,7 +107,7 @@ flowchart TD
 
 遵循 `docs/07-评审材料.md` §六的诚实边界原则，明确声明当前尚未完成的真机验证范围：
 
-1. **分级验证边界**：当前仅有 4 项基础技能（`gather_wood`、`craft_gear`、`mine_stone`、`emergency_escape`）在官方服 2h 长跑中零缺陷跑通并标为 `verified="live"`；其余 **57 个技能（含全部 37 个阶段二新技能）均如实标为 `verified="offline"`**，台账 50 项 T2/T3 目标均标为 `stage="draft"`，待靶场与官方服按 WIP=1 逐项实测后再升格并合入 `main`。
+1. **分级验证边界**：当前仅有 4 项基础技能（`gather_wood`、`craft_gear`、`mine_stone`、`emergency_escape`）在官方服 2h 长跑中零缺陷跑通并标为 `verified="live"`；其余 **57 个技能（含全部 37 个阶段二新技能）均如实标为 `verified="offline"`**。76 项目标台账当前阶段分布为 **`6 graduated / 1 candidate（smelt_iron）/ 69 draft`**（含 19 项 T0/T1 与 50 项 T2/T3），待靶场与官方服按 WIP=1 逐项实测后再升格并合入 `main`。
 2. **三项 API 未证实与物理启发式局限**：
    - `place_oriented()` 依赖服务端 `/place` 随玩家相对方位决定方块 `facing`/`axis` 的原版物理语义，需在官方服实测核对各工作方块朝向映射；
    - `SilkTouchBeeNest` 因 `/get_block` 不返回蜂巢内蜜蜂数量，当前采用夜间/雨天/近蜂保守策略；

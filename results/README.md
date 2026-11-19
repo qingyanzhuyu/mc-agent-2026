@@ -7,7 +7,8 @@
 
 | 路径 | 来源标签 | 采样时间 | 证明内容 |
 |---|---|---|---|
-| `probe/probe-official-20261119.json` | **`official`** | 2026-11-19 | 官方校园网基线：`T_status` p50 `74.4ms`（稳态 `7.34ms`）、`T_move20` `3648ms`（5.5 格/秒）、`T_dig1` `2146ms`、`find_blocks`（r=16/32/64: `14.8/25.4/55.9ms`）、动作周期 `202.3ms` |
+| `probe/probe-official-20261119.json` | **`official`** | 2026-11-19 | 官方校园网基线：首次冷启动 `T_status` p50 `74.4ms`、`T_move20` `3648ms`（5.5 格/秒）、`T_dig1` `2146ms`、`find_blocks`（r=16/32/64: `14.8/25.4/55.9ms`）、动作周期 `202.3ms`（稳态 `T_status = 7.34ms` 见 `probe/pathfinding-official-20261119.json`） |
+| `probe/pathfinding-official-20261119.json` | **`official`** | 2026-11-19 | 官方校园网稳态 `T_status` p50 `7.34ms`（`probe-official-20261119.json` 记录冷启动 `74.4ms`、`T_move20 = 3648ms`、`T_dig1 = 2146ms`）及官方寻路/越障/逃生基线采样 |
 | `probe/api-capabilities-official-20261119.json` | **`official`** | 2026-11-19 | 官方部署能力无损取证（关闭 B18）：确认 `/control` 支持（无键返 `bad_args`）、`/stop` 正常、`/status` 含 `speed`/`velocity`/`jumping` |
 | `probe/aia-llm-official-20261119.json` | **`official`** | 2026-11-19 | 官方 AIA 代理（`https://api.nju-aia.com/v1`，`model=default` → `qwen3.6-35b-a3b`）：4/4 快路径 JSON 成功、`p50=1652.7ms`，兼容多种关思考参数 |
 | `probe/official-ext-calibration-20261119.json` | **`official`** | 2026-11-19 | 扩展接口与限速标定：`/look` 支持、`/advancements` 参数校验、`MC_MAX_RPS` `4/8/12/16` 全阶梯 `0` 次 429（`12 RPS` 实得 `10.19 RPS`、`p50=96.1ms` 最优） |
@@ -34,7 +35,7 @@ uv run python -m mcagent.loop --dry --strategy llm --min-verified offline
 
 ## 三、阶段二新增技能本地靶场冒烟记录（显式标 `local-target`）
 
-> 以下为 2026-11-19 在队内本地联调网关（`127.0.0.1:8787` → `10.6.17.10:25565`，MC `1.21.11`，独立角色 `de7_s2_check`，结束自动 `/disconnect`）执行的阶段二技能冒烟记录；**仅验证接口联动与状态机闭环，不纳入官方时间预算**。
+> 以下为 2026-11-19 在队内本地联调网关（`127.0.0.1:8787` → `<local-lan-target>`，MC `1.21.11`，独立角色 `<local_test_bot>`，结束自动 `/disconnect`）执行的阶段二技能冒烟记录；**仅验证接口联动与状态机闭环，不纳入官方时间预算**。
 
 | 验证项 | 模式 / 参数 | 实测结果（`local-target`） |
 |---|---|---|

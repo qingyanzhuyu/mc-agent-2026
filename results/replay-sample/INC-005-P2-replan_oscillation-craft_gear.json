@@ -676,13 +676,13 @@
       "seq": 240,
       "t": 1795082394114,
       "type": "chat",
-      "text": "Yuzq_bot4 joined the game"
+      "text": "<redacted_player> joined the game"
     },
     {
       "seq": 241,
       "t": 1795082394116,
       "type": "chat",
-      "text": "Yuzq_bot4: 已连接到 [survivaltest]。"
+      "text": "<redacted_player>: 已连接到 [survivaltest]。"
     },
     {
       "seq": 242,
@@ -758,37 +758,37 @@
       "seq": 252,
       "t": 1795082433252,
       "type": "chat",
-      "text": "Yuzq_bot3: 已退出服务器。"
+      "text": "<redacted_player>: 已退出服务器。"
     },
     {
       "seq": 253,
       "t": 1795082433263,
       "type": "chat",
-      "text": "Yuzq_bot3 left the game"
+      "text": "<redacted_player> left the game"
     },
     {
       "seq": 254,
       "t": 1795082433701,
       "type": "chat",
-      "text": "Yuzq_bot1: 已退出服务器。"
+      "text": "<redacted_player>: 已退出服务器。"
     },
     {
       "seq": 255,
       "t": 1795082433713,
       "type": "chat",
-      "text": "Yuzq_bot1 left the game"
+      "text": "<redacted_player> left the game"
     },
     {
       "seq": 256,
       "t": 1795082462449,
       "type": "chat",
-      "text": "Yuzq: 已退出服务器。"
+      "text": "<redacted_player>: 已退出服务器。"
     },
     {
       "seq": 257,
       "t": 1795082462463,
       "type": "chat",
-      "text": "Yuzq left the game"
+      "text": "<redacted_player> left the game"
     },
     {
       "seq": 258,

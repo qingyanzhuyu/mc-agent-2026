@@ -117,13 +117,13 @@ uv run python -m mcagent.loop --replay ../results/replay-sample/INC-005-P2-repla
 
 展示三组已归档在 [`results/`](results/README.md) 中的真实数据（严守 `official` 与 `local-target` 分列）：
 
-1. **官方校园网基线（`official`，`results/probe/probe-official-20261119.json` & `aia-llm-official-20261119.json`）**：
-   - `T_status` 稳态 `7.34ms`、`T_move20` `3648ms`（5.5 格/秒）、`T_dig1` `2146ms`、动作周期纯开销 `202.3ms`；
+1. **官方校园网基线（`official`，`results/probe/pathfinding-official-20261119.json`、`probe-official-20261119.json` & `aia-llm-official-20261119.json`）**：
+   - `T_status` 稳态 `7.34ms`（`pathfinding-official-20261119.json`）、首轮加载 `74.4ms`（`probe-official-20261119.json`）；`T_move20` `3648ms`（5.5 格/秒）、`T_dig1` `2146ms`、动作周期纯开销 `202.3ms`（`probe-official-20261119.json`）；
    - `MC_MAX_RPS` `4/8/12/16` 全阶梯 **0 次 429**；C16 `--void-guard` 虚空保护 **`0/12`（0.0%）误报**；
    - 官方 AIA 模型（`default` → `qwen3.6-35b-a3b`）低频快路径 `p50=1652.7ms`（4/4 成功）。
 2. **官方 2 小时连跑（`official`，`results/official-soak-20261119/summary.md`）**：
-   - 有效运行 `6303.9s`，**0 死亡、0 崩溃**，行动 `873` 步（错误率 `5.04%`），`emergency_escape` 真机 **`6/6 (100%)`**；前 `124.7s` 拿下 5 项起步目标（服务端确认 4 项进度 / 10 分）。
-3. **阶段二技能本地靶场冒烟（`local-target`，`de7_s2_check`）**：
+   - 有效运行 `6303.9s`，**0 死亡、0 崩溃**，行动 `873` 步（错误率 `5.04%`，即 `44/873` 次失败：`/move_to` 失败 `43` 次 + `/dig` 失败 `1` 次，原始日志均记为 `path_not_found`），`emergency_escape` 真机 **`6/6 (100%)`**；前 `124.7s` 拿下 5 项起步目标（服务端确认 4 项进度 / 10 分）。
+3. **阶段二技能本地靶场冒烟（`local-target`，`<local_test_bot>`）**：
    - 空包门禁精准拦截 `survey_island`/`trade_villager`/`smelt_iron`；获木后 `survey_island` 2 步 `18.9s` 完成 2 扇区体检并写入 `44` 条暴露资源与 `1` 处地标；`discover_structure(stronghold)` 4 步有界推进无崩溃。
 
 ---
