@@ -141,6 +141,7 @@ class State:
         self._seen_death_t_ms: set[int] = set()
         self._seen_death_seqs: set[int] = set()
         self._unlinked_alive_death_mono: Optional[float] = None
+        self._totem_guard: Optional[dict[str, Any]] = None
 
     @_locked
     def _record_death(
@@ -439,6 +440,198 @@ class State:
             f"dim={st.get('dimension')} held={(st.get('held') or {}).get('name')} "
             f"nearest_hostile={st.get('nearest_hostile')}"
         )
+
+    @_locked
+    def is_totem_trigger_armed(self) -> bool:
+        """返回受控图腾触发单次守卫是否处于已布防且尚未消耗状态。"""
+        guard = self._totem_guard
+        return bool(guard and guard.get("active") and not guard.get("consumed"))
+
+    @_locked
+    def consume_totem_trigger_suppression(self) -> bool:
+        """锁内二次核验条件并单次消耗受控图腾触发抑制权。"""
+        guard = self._totem_guard
+        if not (guard and guard.get("active") and not guard.get("consumed")):
+            return False
+        st = self.st or {}
+        inv = self.inventory or {}
+        if self.in_safe_mode or st.get("in_lava") or st.get("submerged") or not st.get("alive", True):
+            return False
+        if not _has_offhand_totem(inv, st):
+            return False
+        if not _is_armor_stripped(inv, st):
+            return False
+        guard["consumed"] = True
+        return True
+
+    def controlled_totem_trigger(self, client: Any, *, drop_height: int = 25):
+        """受控图腾触发（Postmortal）单次安全抑制上下文管理器。"""
+        return controlled_totem_trigger(self, client, drop_height=drop_height)
+
+
+# ---------------------------------------------------------------- 受控图腾触发守卫
+_TOTEM_UNSAFE_LANDING_BLOCKS: frozenset[str] = frozenset({
+    "lava", "flowing_lava", "water", "flowing_water", "bubble_column",
+    "fire", "soul_fire", "powder_snow", "magma_block", "cobweb",
+    "slime_block", "hay_block", "sweet_berry_bush",
+})
+_TOTEM_AIR_BLOCKS: frozenset[str] = frozenset({"air", "cave_air", "void_air"})
+_TOTEM_ARMOR_SLOTS: tuple[str, ...] = ("head", "chest", "legs", "feet")
+
+
+def _is_totem_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    name = str(item.get("name", "")).removeprefix("minecraft:")
+    if name != "totem_of_undying":
+        return False
+    raw_count = item.get("count", 1)
+    if raw_count is None or isinstance(raw_count, bool):
+        return False
+    try:
+        return int(raw_count) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_offhand_totem(inv: Any, st: Any) -> bool:
+    inv_off = inv.get("offhand") if isinstance(inv, dict) else None
+    st_off = st.get("offhand") if isinstance(st, dict) else None
+    if isinstance(inv_off, dict) and inv_off and not _is_totem_item(inv_off):
+        return False
+    if isinstance(st_off, dict) and st_off and not _is_totem_item(st_off):
+        return False
+    return _is_totem_item(inv_off) or _is_totem_item(st_off)
+
+
+def _is_armor_stripped(inv: Any, st: Any) -> bool:
+    armor = inv.get("armor") if isinstance(inv, dict) else None
+    if isinstance(armor, dict):
+        for slot in (*_TOTEM_ARMOR_SLOTS, "torso"):
+            piece = armor.get(slot)
+            if isinstance(piece, dict):
+                if piece and (piece.get("name") or int(piece.get("count", 0) or 0) > 0):
+                    return False
+            elif piece:
+                return False
+    elif armor:
+        return False
+    raw_ap = st.get("armor_points", 0) if isinstance(st, dict) else 0
+    if isinstance(raw_ap, bool):
+        return False
+    try:
+        return float(raw_ap or 0) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_controlled_totem_conditions(
+    state: State,
+    client: Any,
+    *,
+    drop_height: int = 25,
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    """严格校验受控图腾触发（Postmortal）的全部 4 项安全前置条件。"""
+    if isinstance(drop_height, bool) or not isinstance(drop_height, int) or drop_height < 1:
+        return False, "drop_height 必须为正整数", None
+
+    with state._lock:
+        st = state.snapshot()
+        inv = copy.deepcopy(state.inventory)
+        inv_dirty = bool(state.inventory_dirty)
+        in_safe_mode = state.in_safe_mode
+
+    # (a) 存活 & 就绪 & 不在 safe_mode & 不在岩浆/水/溺水/着火中
+    if not isinstance(st, dict) or not st:
+        return False, "缺少 /status 状态快照，无法校验受控图腾触发条件", None
+    if not st.get("alive", True):
+        return False, "角色当前未存活，禁止受控图腾触发", None
+    if not st.get("ready"):
+        return False, "角色当前未就绪(ready=False)，禁止受控图腾触发", None
+    if in_safe_mode:
+        return False, "当前处于死亡循环避险冷却(safe_mode)，禁止受控图腾触发", None
+    if st.get("in_lava"):
+        return False, "角色当前处于岩浆中，禁止受控图腾触发", None
+    if st.get("in_water") or st.get("submerged"):
+        return False, "角色当前处于水中/溺水状态，禁止受控图腾触发", None
+    if st.get("on_fire"):
+        return False, "角色当前处于着火状态，禁止受控图腾触发", None
+
+    # (b) 背包快照新鲜且副手确认持有 totem_of_undying
+    if inv_dirty:
+        return False, "背包快照未刷新(inventory_dirty=True)，无法确认副手图腾与护甲状态", None
+    if not _has_offhand_totem(inv, st):
+        return False, "副手未确认持有不死图腾(totem_of_undying)", None
+
+    # (c) 全身护甲已卸下且 armor_points == 0
+    if not _is_armor_stripped(inv, st):
+        return False, "角色仍穿戴护甲或 armor_points 不为 0，必须先脱甲再触发图腾", None
+
+    # (d) 正下方 drop_height (+2 缓冲) 格内存在实心安全落点，非虚空/岩浆/水/缓冲方块
+    pos = st.get("pos")
+    if (
+        not isinstance(pos, (list, tuple))
+        or len(pos) < 3
+        or any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+            for v in pos[:3]
+        )
+    ):
+        return False, "缺少有效玩家坐标 pos，无法校验正下方安全落点", None
+
+    get_block = getattr(client, "get_block", None)
+    if not callable(get_block):
+        return False, "缺少 client.get_block，无法校验正下方安全落点", None
+
+    fx, fy, fz = math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2])
+    supports_use_cache = _accepts_use_cache(get_block)
+    for dy in range(1, drop_height + 3):
+        probe_pos = [fx, fy - dy, fz]
+        try:
+            block = get_block(probe_pos, use_cache=False) if supports_use_cache else get_block(probe_pos)
+        except ApiError as e:
+            return False, f"查询正下方落点方块失败 ({e.code}): {e.message}", None
+        raw_name = block.get("name") if isinstance(block, dict) else None
+        bname = str(raw_name).removeprefix("minecraft:") if isinstance(raw_name, str) else ""
+        if not bname or bname in _TOTEM_AIR_BLOCKS:
+            continue
+        if bname in _TOTEM_UNSAFE_LANDING_BLOCKS:
+            return False, f"正下方落点存在岩浆/水/缓冲危险方块 ({bname})", None
+        return True, "ok", {
+            "landing_pos": probe_pos,
+            "landing_block": bname,
+            "drop_blocks": dy - 1,
+        }
+
+    return False, f"正下方 {drop_height} 格内无实心安全落点（疑似虚空）", None
+
+
+@contextlib.contextmanager
+def controlled_totem_trigger(
+    state: State,
+    client: Any,
+    *,
+    drop_height: int = 25,
+):
+    """受控图腾触发守卫：严格核验 4 项安全前置条件后单次布防，退出必恢复。"""
+    ok, reason, meta = validate_controlled_totem_conditions(
+        state, client, drop_height=drop_height
+    )
+    if not ok:
+        raise Replan(f"受控图腾触发守卫拒绝放行: {reason}")
+    guard: dict[str, Any] = {
+        "active": True,
+        "consumed": False,
+        **(meta or {}),
+        "armed_at": time.monotonic(),
+    }
+    with state._lock:
+        state._totem_guard = guard
+    try:
+        yield meta
+    finally:
+        with state._lock:
+            state._totem_guard = None
 
 
 # ---------------------------------------------------------------- 安全闸
@@ -1129,6 +1322,12 @@ class SafetyMonitor:
         fresh = [h for h in urgent if h["kind"] not in self._active
                  and now - self._triggered.get(h["kind"], float("-inf")) >= self.config.stop_cooldown_s]
         if fresh:
+            if (
+                all(h["kind"] in ("void_risk", "heal") for h in fresh)
+                and self.state.is_totem_trigger_armed()
+                and self.state.consume_totem_trigger_suppression()
+            ):
+                return hazards[0] if hazards else None
             hazard = fresh[0]
             reason = "; ".join(f"{h['kind']}: {h.get('why', '')}" for h in fresh)
             def after_stop(ex):
