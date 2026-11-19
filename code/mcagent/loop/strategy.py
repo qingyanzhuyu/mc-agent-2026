@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from .policy import CampaignPlanner, PlanDecision, RulePlanner
 
 DEFAULT_STRATEGY_REVIEW_S: float = 600.0
+DEFAULT_LANDMARK_COOLDOWN_S: float = 15.0
 
 
 def env_float(name: str, default: float) -> float:
@@ -56,19 +57,27 @@ class StrategyOrchestrator:
         self._last_is_day, self._deferred_trigger, self._seen_failure_str = None, None, ""
         self._landmark_initialized: bool = False
         self._last_landmark_version: int = 0
+        self._last_landmark_trigger_at: float = float("-inf")
+        self.landmark_cooldown_s: float = env_float("MC_LANDMARK_COOLDOWN_S", DEFAULT_LANDMARK_COOLDOWN_S)
         self.scheduler: Optional[DecisionScheduler] = (
             DecisionScheduler(lambda _s: None, require_iron=planner.require_iron, clock=self.clock) if planner.strategy == "llm" else None
         )
 
-    def _poll_landmark_version(self, state: State) -> bool:
-        """检测 `WorldResourceMemo.landmark_version` 是否递增（发现新村庄/遗迹传送门/要塞等地标）。"""
+    def _poll_landmark_version(self, state: State, now: Optional[float] = None) -> bool:
+        """检测 `WorldResourceMemo.landmark_version` 是否递增（发现新村庄/遗迹传送门/要塞/机会实体等地标）。"""
         memo = memo_for(state)
         cur_ver = int(getattr(memo, "landmark_version", 0) or 0)
         if not self._landmark_initialized:
             self._landmark_initialized = True
             self._last_landmark_version = cur_ver
             return False
+        if cur_ver < self._last_landmark_version:
+            self._last_landmark_version = cur_ver
+            return False
         if cur_ver > self._last_landmark_version:
+            t_now = self.clock() if now is None else float(now)
+            if self.landmark_cooldown_s > 0.0 and (t_now - self._last_landmark_trigger_at) < self.landmark_cooldown_s:
+                return False
             self._last_landmark_version = cur_ver
             return True
         return False
@@ -257,6 +266,8 @@ class StrategyOrchestrator:
             rule_obj = self.rule_objective(state, now=now)
         self.apply_objective(rule_obj, now=now)
         self._last_objective_decision_at = now
+        if trigger == "landmark_opportunity":
+            self._last_landmark_trigger_at = now
         self.emit_objective_telemetry(
             trigger=trigger, source="rule", obj=rule_obj, ms=0.0,
             adopted=rule_obj is not None, replaced_goal_id=replaced_gid,
@@ -309,7 +320,7 @@ class StrategyOrchestrator:
         if cur_day is not None:
             self._last_is_day = cur_day
 
-        landmark_discovered = self._poll_landmark_version(state)
+        landmark_discovered = self._poll_landmark_version(state, now=now)
 
         if died_since_last:
             invalidate_pending_async(self, "respawn")

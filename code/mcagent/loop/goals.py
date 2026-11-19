@@ -79,6 +79,8 @@ class GoalPlanStep:
     path_score: int                            # 整条未完成链路合计可解锁分值
     path_cost: float                           # 整条未完成链路预计/实测耗时成本（秒）
     roi: float                                 # path_score / path_cost
+    shared_dependents: int = 1                 # 共享 step_goal 的可执行计分目标数
+    marginal_roi: Optional[float] = None       # 共享子图分摊后的边际性价比（无共享时等于 roi）
 
 
 # ============================================================================
@@ -105,6 +107,10 @@ _END_RUSH_EDITABLE: tuple[str, ...] = (
 _T2_TRIALS_ORIENTED_EDITABLE: tuple[str, ...] = (
     "code/mcagent/skills/t2_trials_oriented.py",
     "code/tests/test_stage2_trials_oriented.py",
+)
+_T3_BIOMES_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t3_biomes.py",
+    "code/tests/test_stage2_t3_biomes.py",
 )
 _FISHING_STOCK = ("string>=2", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2)))
 _ARROW_STOCK = ("arrow|spectral_arrow|tipped_arrow>=1", "hunt_mob",
@@ -1231,6 +1237,162 @@ GOALS: tuple[GoalSpec, ...] = (
         stage="draft",
         editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
     ),
+
+    # ---- Stage 2 Batch 2F：群系与生态专项 T3 线（10 goals / 270 pts） ----
+    GoalSpec(
+        id="kill_mob_near_sculk_catalyst",
+        title="它蔓延了（在幽匿催发体旁击杀生物）",
+        tier="T3",
+        score=30,
+        skill="kill_near_sculk_catalyst",
+        prereq_goals=("kill_a_mob",),
+        done_advancements=("minecraft:adventure/kill_mob_near_sculk_catalyst",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="kill_axolotl_target",
+        title="友谊的治愈力量！（协助美西螈击杀猎物）",
+        tier="T3",
+        score=30,
+        skill="assist_axolotl_hunt",
+        prereq_goals=("kill_a_mob",),
+        done_advancements=("minecraft:husbandry/kill_axolotl_target",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="remove_wolf_armor",
+        title="剪断关系（用剪刀卸下狼铠）",
+        tier="T3",
+        score=30,
+        skill="manage_wolf_armor",
+        skill_args=(("mode", "remove"),),
+        prereq_goals=("tame_an_animal",),
+        done_advancements=("minecraft:husbandry/remove_wolf_armor",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="repair_wolf_armor",
+        title="完好如初（用犰狳鳞甲修复狼铠）",
+        tier="T3",
+        score=30,
+        skill="manage_wolf_armor",
+        skill_args=(("mode", "repair"),),
+        prereq_goals=("tame_an_animal", "brush_armadillo"),
+        done_advancements=("minecraft:husbandry/repair_wolf_armor",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="allay_deliver_item_to_player",
+        title="找到一个好朋友（让悦灵递送物品）",
+        tier="T3",
+        score=30,
+        skill="allay_deliver_item",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:husbandry/allay_deliver_item_to_player",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=240.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="ride_a_boat_with_a_goat",
+        title="羊帆起航！（与山羊同乘一艘船）",
+        tier="T3",
+        score=30,
+        skill="boat_with_goat",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:husbandry/ride_a_boat_with_a_goat",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=240.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="silk_touch_nest",
+        title="举巢搬迁（用精准采集挖下蜂巢）",
+        tier="T3",
+        score=30,
+        skill="silk_touch_bee_nest",
+        prereq_goals=("enchant_item",),
+        done_advancements=("minecraft:husbandry/silk_touch_nest",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="tadpole_in_a_bucket",
+        title="呱呱坠桶（用水桶捞起蝌蚪）",
+        tier="T3",
+        score=30,
+        skill="catch_tadpole",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:husbandry/tadpole_in_a_bucket",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="spyglass_at_ghast",
+        title="那是气球吗？（用望远镜观察恶魂）",
+        tier="T3",
+        score=15,
+        skill="spyglass_observe",
+        skill_args=(("target", "ghast"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:adventure/spyglass_at_ghast",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="spyglass_at_parrot",
+        title="那是鸟吗？（用望远镜观察鹦鹉）",
+        tier="T3",
+        score=15,
+        skill="spyglass_observe",
+        skill_args=(("target", "parrot"),),
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:adventure/spyglass_at_parrot",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
 )
 
 GOAL_MAP: dict[str, GoalSpec] = {g.id: g for g in GOALS}
@@ -1499,6 +1661,10 @@ def is_goal_stopped_out(
     return False
 
 
+_SHARED_SUBGRAPH_WEIGHT: float = 0.35
+_SHARED_SUBGRAPH_CAP: int = 6
+
+
 def rank_actionable_goals(
     state: State,
     active_goals: tuple[GoalSpec, ...],
@@ -1510,7 +1676,7 @@ def rank_actionable_goals(
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     suspended_goals: Collection[str] = (),
 ) -> list[GoalPlanStep]:
-    """对所有尚未达成且未触发止损的目标计算未满足前置链，按性价比降序返回可执行步列表。"""
+    """对所有尚未达成且未触发止损的目标计算未满足前置链，按共享子图边际性价比降序返回可执行步列表。"""
     by_id = {g.id: g for g in active_goals}
     order_idx = {g.id: idx for idx, g in enumerate(active_goals)}
     target_ids = set(normalize_goal_ids(target_goal))
@@ -1542,19 +1708,45 @@ def rank_actionable_goals(
             return None
         return chain
 
-    raw_candidates: list[tuple[tuple[int, int, float, int], GoalPlanStep]] = []
+    # 第 1 遍：收集所有可执行、未达成、未止损的 (root_goal, chain)，并统计共享子图依赖度
+    actionable_chains: list[tuple[GoalSpec, list[GoalSpec]]] = []
+    node_dependents: dict[str, set[str]] = {}
+    node_downstream_score: dict[str, int] = {}
     for g in active_goals:
         if is_goal_achieved(g, state, completed_advs):
             continue
         chain = _unmet_chain(g)
         if not chain:
             continue
+        actionable_chains.append((g, chain))
+        if g.score > 0:
+            for x in chain:
+                deps = node_dependents.setdefault(x.id, set())
+                if g.id not in deps:
+                    deps.add(g.id)
+                    node_downstream_score[x.id] = node_downstream_score.get(x.id, 0) + g.score
+
+    # 第 2 遍：保留原始 path_score / path_cost / roi，同时按共享子图分摊成本计算 marginal_roi 排序
+    raw_candidates: list[tuple[tuple[int, int, float, float, int], GoalPlanStep]] = []
+    for g, chain in actionable_chains:
         p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs))
         p_cost = sum(effective_goal_cost(x, telemetry) for x in chain)
         roi = p_score / max(1.0, p_cost)
+
+        amortized_cost = 0.0
+        for x in chain:
+            raw_x_cost = effective_goal_cost(x, telemetry)
+            share_count = len(node_dependents.get(x.id, ()))
+            extra_shares = min(_SHARED_SUBGRAPH_CAP, max(0, share_count - 1))
+            amortized_cost += raw_x_cost / (1.0 + _SHARED_SUBGRAPH_WEIGHT * extra_shares)
+
+        m_roi = p_score / max(1.0, amortized_cost) if p_score > 0 else 0.0
+        step_shared = max(1, len(node_dependents.get(chain[0].id, ())))
+
         prio = (
             1 if g.id in target_ids else 0,
             1 if p_score > 0 else 0,
+            round(m_roi, 6),
             round(roi, 6),
             -order_idx[g.id],
         )
@@ -1565,6 +1757,8 @@ def rank_actionable_goals(
             path_score=p_score,
             path_cost=round(p_cost, 1),
             roi=round(roi, 4),
+            shared_dependents=step_shared,
+            marginal_roi=round(m_roi, 4),
         )
         raw_candidates.append((prio, step))
 
