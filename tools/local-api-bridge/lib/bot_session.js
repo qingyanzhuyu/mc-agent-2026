@@ -40,6 +40,25 @@ const CONTROL_KEYS = ["forward", "back", "left", "right", "jump", "sneak", "spri
 const EMPTY_POSTURE = Object.freeze({ sneak: false, shield: false, jump: false });
 const NON_ATTACKABLE = new Set(["item", "experience_orb", "arrow", "spectral_arrow", "area_effect_cloud"]);
 
+function buildPathfinderMovements(bot, MovementsCtor = Movements) {
+  const moves = new MovementsCtor(bot);
+  moves.canDig = true;
+  moves.digCost = 8;
+  moves.allow1by1towers = false;
+  // Disable sprinting & parkour in the local Mineflayer bridge to avoid MC 1.21.11
+  // sprint/sprint-jump physics discrepancies ("moved wrongly!" in narrow staircases)
+  // and gap-jump overshoots near void edges.
+  moves.allowParkour = false;
+  moves.allowSprinting = false;
+  moves.scafoldingBlocks = [];
+  for (const b of bot.registry.blocksArray) {
+    if (typeof b.hardness === "number" && b.hardness > 0.25) {
+      moves.blocksCantBreak.add(b.id);
+    }
+  }
+  return moves;
+}
+
 function meleeInterval(item) {
   const name = item?.name || "";
   if (name.endsWith("_sword")) return 625;
@@ -281,16 +300,7 @@ class BotSession {
       resetObservation();
 
       try {
-        const moves = new Movements(bot);
-        moves.canDig = true;
-        moves.digCost = 8;
-        moves.allow1by1towers = false;
-        moves.scafoldingBlocks = [];
-        for (const b of bot.registry.blocksArray) {
-          if (typeof b.hardness === "number" && b.hardness > 0.25) {
-            moves.blocksCantBreak.add(b.id);
-          }
-        }
+        const moves = buildPathfinderMovements(bot);
         bot.pathfinder.thinkTimeout = 4000;
         bot.pathfinder.setMovements(moves);
       } catch (e) {
@@ -2412,4 +2422,4 @@ class BotSession {
   }
 }
 
-module.exports = { BotSession };
+module.exports = { BotSession, buildPathfinderMovements };

@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { Vec3 } = require("vec3");
-const { BotSession } = require("../lib/bot_session");
+const { BotSession, buildPathfinderMovements } = require("../lib/bot_session");
 
 function readySession() {
   const session = new BotSession({ username: "test" });
@@ -128,4 +128,35 @@ test("attack respects max_hits and accepts an interval override", async () => {
   assert.equal(result.killed, false);
   await assert.rejects(session.attack({ entity_id: 2, max_hits: 0 }), { code: "bad_args" });
   await assert.rejects(session.attack({ entity_id: 2, interval_ms: 5001 }), { code: "bad_args" });
+});
+
+test("buildPathfinderMovements disables sprinting, parkour, towers, and hard-block breaking", () => {
+  class FakeMovements {
+    constructor() {
+      this.allowSprinting = true;
+      this.allowParkour = true;
+      this.allow1by1towers = true;
+      this.scafoldingBlocks = [1, 2];
+      this.blocksCantBreak = new Set();
+    }
+  }
+  const fakeBot = {
+    registry: {
+      blocksArray: [
+        { id: 10, name: "short_grass", hardness: 0 },
+        { id: 11, name: "oak_leaves", hardness: 0.2 },
+        { id: 12, name: "stone", hardness: 1.5 },
+      ],
+    },
+  };
+  const moves = buildPathfinderMovements(fakeBot, FakeMovements);
+  assert.equal(moves.canDig, true);
+  assert.equal(moves.digCost, 8);
+  assert.equal(moves.allow1by1towers, false);
+  assert.equal(moves.allowParkour, false);
+  assert.equal(moves.allowSprinting, false);
+  assert.deepEqual(moves.scafoldingBlocks, []);
+  assert.equal(moves.blocksCantBreak.has(10), false);
+  assert.equal(moves.blocksCantBreak.has(11), false);
+  assert.equal(moves.blocksCantBreak.has(12), true);
 });
