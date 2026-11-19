@@ -280,6 +280,20 @@ def resolve_parallel_policy(session_dir: Path, default_policy: str = "relaxed") 
     return _extract_parallel_policy(st, default_policy)
 
 
+def _validate_max_auto_commits(val: Any) -> int:
+    """校验自动修复提交数上限，必须为 >= 0 的非布尔整数（0 表示不限）。"""
+    if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+        raise ValueError(f"max_auto_commits={val!r} 非法：必须为 >= 0 的整数")
+    return int(val)
+
+
+def _auto_commit_cap_reached(st: dict[str, Any], override_cap: int = 0) -> tuple[bool, int, int]:
+    """判断是否已达到自动修复提交数上限，返回 (是否达上限, 当前提交数, 生效上限)。"""
+    cap = int(override_cap) if int(override_cap) > 0 else int(st.get("max_auto_commits") or 0)
+    committed = len(st.get("commits") or [])
+    return (cap > 0 and committed >= cap, committed, cap)
+
+
 DEFAULT_PLAYER_MODEL = "DeepSeek-V4.1-Flash"
 
 # 统一配置：一份 .env 同时装比赛服与自建测试服两套端点，每次启动选工位 A 进哪个（挂机中不切）。
@@ -762,7 +776,10 @@ def init_session(
     target_goal: str = "",
     max_goal_attempts: int = 4,
     player_model: str = DEFAULT_PLAYER_MODEL,
+    observe_only: bool = False,
+    max_auto_commits: int = 0,
 ) -> dict[str, Any]:
+    max_auto_commits = _validate_max_auto_commits(max_auto_commits)
     branch = validate_target_branch(target_branch)
     session_dir = session_dir.resolve()
     wt_root = session_dir / "worktrees"
@@ -824,6 +841,8 @@ def init_session(
                 "target_goal": norm_goal,
                 "max_goal_attempts": int(max_goal_attempts),
                 "player_model": norm_player_model,
+                "observe_only": bool(observe_only),
+                "max_auto_commits": int(max_auto_commits),
                 "episodes": [],
                 "incidents": {},
                 "commits": [],
@@ -843,6 +862,14 @@ def init_session(
                 st["max_goal_attempts"] = int(max_goal_attempts)
             if "player_model" not in st or norm_player_model != DEFAULT_PLAYER_MODEL:
                 st["player_model"] = norm_player_model
+            if observe_only:
+                st["observe_only"] = True
+            else:
+                st.setdefault("observe_only", False)
+            if max_auto_commits > 0:
+                st["max_auto_commits"] = int(max_auto_commits)
+            else:
+                st.setdefault("max_auto_commits", 0)
     write_review_report(session_dir)
     return read_state(session_dir)
 
@@ -2094,8 +2121,25 @@ def _finalize_incident_claim(
     return json.loads(json.dumps(chosen))
 
 
+def _claim_guardrail_blocks(st: dict[str, Any]) -> bool:
+    """若处于 observe-only 或已达自动提交上限，打印提示并返回 True 阻止认领。"""
+    if st.get("observe_only"):
+        print("[fixer] observe-only 模式已启用，暂停认领异常单")
+        return True
+    cap_reached, committed, cap = _auto_commit_cap_reached(st)
+    if cap_reached:
+        print(
+            f"[fixer] 已达到自动提交上限 max_auto_commits={cap}"
+            f"（当前 commits={committed}），暂停认领新异常单"
+        )
+        return True
+    return False
+
+
 def claim_next_incident(session_dir: Path) -> Optional[dict[str, Any]]:
     with locked_state(session_dir) as st:
+        if _claim_guardrail_blocks(st):
+            return None
         fixer_wt = Path(st["fixer_wt"])
         candidates = _collect_pending_candidates(st)
         if not candidates:
@@ -2118,6 +2162,8 @@ def claim_parallel_incidents(
         return []
     with locked_fixer_wt(session_dir):
         with locked_state(session_dir) as st:
+            if _claim_guardrail_blocks(st):
+                return []
             eff_policy = (
                 _validate_parallel_policy(parallel_policy)
                 if parallel_policy is not None
@@ -3383,6 +3429,16 @@ def write_review_report(session_dir: Path) -> Path:
             steps_txt = f"{int(o_steps)} 步" if o_steps is not None else "沿用启动参数"
             lines.append(f"- **每轮时长/步数热覆盖**：`{sec_txt}` / `{steps_txt}`（下一轮起生效）")
 
+    observe_only = bool(st.get("observe_only", False))
+    max_auto_commits = int(st.get("max_auto_commits", 0) or 0)
+    if observe_only or max_auto_commits > 0:
+        guardrail_parts: list[str] = []
+        if observe_only:
+            guardrail_parts.append("`observe-only`（仅采集不修单）")
+        if max_auto_commits > 0:
+            guardrail_parts.append(f"`max_auto_commits={max_auto_commits}`（已用 {len(st['commits'])}/{max_auto_commits}）")
+        lines.append(f"- **实验护栏**：{' · '.join(guardrail_parts)}")
+
     lines.extend([
         "",
         "## 一、人工验收与合并命令（跑完后由人执行）",
@@ -3549,6 +3605,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PLAYER_MODEL,
         help=f"工位 A 玩游戏的 custom 模型名（默认 {DEFAULT_PLAYER_MODEL}；传空串则沿用 .env）",
     )
+    p_init.add_argument(
+        "--observe-only",
+        action="store_true",
+        default=False,
+        help="仅采集挂机轮次、异常单与遥测报告，不启动工位 B 自动修单与提交（防实验阶段自动提交膨胀）",
+    )
+    p_init.add_argument(
+        "--max-auto-commits",
+        type=int,
+        default=0,
+        help="自动修复提交数上限（0 表示不限；>0 达到上限后暂停工位 B 认领新异常单）",
+    )
 
     p_run_ep = sub.add_parser("runner-loop", help="启动工位 A（挂机压测循环，轮间自动热切换新 commit）")
     p_run_ep.add_argument("--session-dir", required=True)
@@ -3606,6 +3674,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=PARALLEL_POLICIES,
         default=None,
         help=f"工位 B 并行认领调度策略（{' | '.join(PARALLEL_POLICIES)}，默认读取 state.json 或 relaxed）",
+    )
+    p_fix.add_argument(
+        "--max-auto-commits",
+        type=int,
+        default=0,
+        help="自动修复提交数上限（0 表示不限；>0 达到上限后暂停认领新异常单）",
     )
 
     p_dual = sub.add_parser("run", help="一键并行启动 Runner + Fixer 双工位守护")
@@ -3689,6 +3763,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_dual.add_argument("--skip-live-canary", action="store_true")
     p_dual.add_argument("--min-verified", choices=("", "offline", "live"), default="",
                         help="可选覆盖技能验证门槛（默认空=比赛服仅 live，自建服含 offline）")
+    p_dual.add_argument(
+        "--observe-only",
+        action="store_true",
+        default=False,
+        help="仅采集挂机轮次、异常单与遥测报告，不启动工位 B 自动修单与提交（防实验阶段自动提交膨胀）",
+    )
+    p_dual.add_argument(
+        "--max-auto-commits",
+        type=int,
+        default=0,
+        help="自动修复提交数上限（0 表示不限；>0 达到上限后暂停工位 B 认领新异常单）",
+    )
 
     p_set = sub.add_parser(
         "set-goal",
@@ -3777,6 +3863,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     session_dir = Path(args.session_dir).resolve()
 
     if args.cmd == "init":
+        try:
+            max_auto_commits = _validate_max_auto_commits(args.max_auto_commits)
+        except ValueError as exc:
+            print(f"[init] {exc}", file=sys.stderr)
+            return 2
         repo_root = find_repo_root()
         st = init_session(
             repo_root,
@@ -3787,6 +3878,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_goal=args.goal,
             max_goal_attempts=args.max_goal_attempts,
             player_model=args.player_model,
+            observe_only=bool(args.observe_only),
+            max_auto_commits=max_auto_commits,
         )
         print(json.dumps({
             "ok": True,
@@ -3846,6 +3939,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             except ValueError as exc:
                 print(f"[fixer-loop] {exc}", file=sys.stderr)
                 return 2
+        try:
+            max_auto_commits = _validate_max_auto_commits(args.max_auto_commits)
+        except ValueError as exc:
+            print(f"[fixer-loop] {exc}", file=sys.stderr)
+            return 2
         tmpl = args.fixer_cmd or (FIXER_PRESETS[args.fixer_preset] if args.fixer_preset else "")
         if not tmpl:
             print("错误: fixer-loop 需要传 --fixer-preset {codex,agy,claude} 或 --fixer-cmd", file=sys.stderr)
@@ -3856,8 +3954,38 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"[fixer-loop] 启动工位 B：preset={default_name} timeout={args.fixer_timeout}s poll={args.poll_s}s",
                 flush=True,
             )
+        last_pause_reason: Optional[str] = None
         while not (session_dir / "STOP").exists():
             try:
+                try:
+                    st_cur = read_state(session_dir)
+                except FileNotFoundError:
+                    st_cur = {}
+                pause_reason: Optional[str] = None
+                pause_msg = ""
+                if st_cur.get("observe_only"):
+                    pause_reason = "observe_only"
+                    pause_msg = "[fixer-loop] observe-only 模式已启用，暂停认领与自动修单"
+                else:
+                    cap_reached, committed, cap = _auto_commit_cap_reached(
+                        st_cur, override_cap=max_auto_commits
+                    )
+                    if cap_reached:
+                        pause_reason = f"max_auto_commits:{cap}:{committed}"
+                        pause_msg = (
+                            f"[fixer-loop] 已达到自动提交上限 max_auto_commits={cap}"
+                            f"（当前 commits={committed}），暂停认领新异常单"
+                        )
+                if pause_reason is not None:
+                    if pause_reason != last_pause_reason:
+                        print(pause_msg, flush=True)
+                        last_pause_reason = pause_reason
+                    if args.once:
+                        return 0
+                    time.sleep(max(0.5, args.poll_s))
+                    continue
+                last_pause_reason = None
+
                 cur_name, cur_tmpl = resolve_fixer_template(session_dir, default_name, tmpl)
                 workers = (
                     _validate_fixer_workers(args.fixer_workers)
@@ -3916,6 +4044,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             bot_user = validate_bot_user(args.bot_user)
             fixer_workers = _validate_fixer_workers(args.fixer_workers)
             fixer_parallel_policy = _validate_parallel_policy(args.fixer_parallel_policy)
+            max_auto_commits = _validate_max_auto_commits(args.max_auto_commits)
         except ValueError as exc:
             print(f"[run] {exc}", file=sys.stderr)
             return 2
@@ -3947,6 +4076,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             st_fx["official_llm"] = args.official_llm
             st_fx["fixer_workers"] = fixer_workers
             st_fx["fixer_parallel_policy"] = fixer_parallel_policy
+            st_fx["observe_only"] = bool(args.observe_only)
+            st_fx["max_auto_commits"] = max_auto_commits
             if args.fixer_cmd:
                 st_fx.pop("fixer_preset", None)
             else:
@@ -3985,19 +4116,29 @@ def main(argv: Optional[list[str]] = None) -> int:
             fixer_cmd.extend(["--fixer-workers", str(fixer_workers)])
         if args.skip_live_canary:
             fixer_cmd.append("--skip-live-canary")
+        if max_auto_commits > 0:
+            fixer_cmd.extend(["--max-auto-commits", str(max_auto_commits)])
 
         r_proc = subprocess.Popen(runner_cmd)
-        f_proc = subprocess.Popen(fixer_cmd)
+        if args.observe_only:
+            print(
+                "[run] observe-only 模式已启用：仅采集挂机轮次、异常单与遥测报告，不启动工位 B 自动修单。",
+                flush=True,
+            )
+            f_proc = None
+        else:
+            f_proc = subprocess.Popen(fixer_cmd)
         try:
             r_code = r_proc.wait()
             # Runner 跑满指定轮次后，再处理完最后一轮残余待修单即优雅收尾
             (session_dir / "STOP").write_text(_utc_now(), encoding="utf-8")
-            f_proc.wait(timeout=30)
+            if f_proc is not None:
+                f_proc.wait(timeout=30)
             return r_code
         except KeyboardInterrupt:
             (session_dir / "STOP").write_text(_utc_now(), encoding="utf-8")
             for proc in (r_proc, f_proc):
-                if proc.poll() is None:
+                if proc is not None and proc.poll() is None:
                     proc.send_signal(signal.SIGINT)
             return 130
         finally:
@@ -4044,6 +4185,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "fixer_preset": st.get("fixer_preset", ""),
             "fixer_workers": _extract_fixer_workers(st, 1),
             "fixer_parallel_policy": _extract_parallel_policy(st, "relaxed"),
+            "observe_only": bool(st.get("observe_only", False)),
+            "max_auto_commits": int(st.get("max_auto_commits", 0) or 0),
             "focus_mode": st.get("focus_mode", "together"),
             "server_target": st.get("server_target", "local"),
             "server_base": st.get("server_base", ""),

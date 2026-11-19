@@ -21,7 +21,9 @@ from .mining import (
 from .recipes import craft_recipe
 from .registry import register
 from .sightline import API_DIG_EYE_REACH, DIG_EYE_REACH, can_reach_block, eye_to_block_dist
+from .voxel_cache import voxel_cache_for
 from .windows import window_amount, window_section
+from .world_memo import memo_for
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -45,6 +47,29 @@ _SESSION_EXCLUDED = WeakKeyDictionary()
 
 def reset_iron_memo() -> None:
     _SESSION_EXCLUDED.clear()
+
+
+def _reach_mod():
+    try:
+        from . import reach
+        return reach
+    except ImportError:
+        return None
+
+
+def _bounded_move_to(ex: "Executor", pos, *, rng: int = 2, timeout: float = 30.0):
+    """Call ex.move_to with bounded timeout/retries, falling back for strict mocks."""
+    try:
+        return ex.move_to(pos=pos, rng=rng, timeout=timeout, retries=0)
+    except TypeError:
+        return ex.move_to(pos=pos, rng=rng)
+
+
+def _record_station(state: "State", kind: str, pos, dimension: str = "overworld") -> None:
+    memo = memo_for(state)
+    rec_fn = getattr(memo, "record_station", None)
+    if callable(rec_fn):
+        rec_fn(kind, pos, dimension=dimension)
 
 
 def _session_excluded_for(client: object, state: "State", status: dict) -> set[tuple[int, int, int]]:
@@ -145,10 +170,45 @@ class SmeltIron(Skill):
     def _mine(self, ex: "Executor", state: "State", pos, ores, drop: str) -> Iterator[dict]:
         status = state.refresh_status(ex.client, max_age_s=0)
         dimension = status.get("dimension")
+        dim_name = str(dimension or "overworld")
         cur = status.get("pos") or state.pos
         stance = status if status.get("pos") is not None else cur
+        reach_mod = _reach_mod()
+        equipped_pick = False
         if not can_reach_block(ex, stance, pos, reach=MINING_REACH):
-            yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
+            if (reach_mod is not None
+                    and status.get("dimension") == dimension
+                    and not under_feet(cur, pos)
+                    and eye_to_block_dist(stance, pos) <= MINING_REACH):
+                yield from prepare_mining_pick(ex, state)
+                equipped_pick = True
+                yield from reach_mod.clear_line_of_sight(
+                    ex, state, pos, max_clear=2, reach=API_DIG_EYE_REACH,
+                )
+                status = state.refresh_status(ex.client, max_age_s=0)
+                cur = status.get("pos") or state.pos
+                stance = status if status.get("pos") is not None else cur
+            if not can_reach_block(ex, stance, pos, reach=MINING_REACH):
+                yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=30.0), pos=pos)
+                status = state.refresh_status(ex.client, max_age_s=0)
+                if (reach_mod is not None and hasattr(reach_mod, "settle_dry_landing")
+                        and not status.get("on_ground")
+                        and not status.get("in_water")
+                        and not status.get("in_lava")):
+                    status = reach_mod.settle_dry_landing(ex, state)
+                cur = status.get("pos") or state.pos
+                stance = status if status.get("pos") is not None else cur
+                if (reach_mod is not None
+                        and status.get("dimension") == dimension
+                        and not under_feet(cur, pos)
+                        and not can_reach_block(ex, stance, pos, reach=MINING_REACH)
+                        and eye_to_block_dist(stance, pos) <= API_DIG_EYE_REACH):
+                    if not equipped_pick:
+                        yield from prepare_mining_pick(ex, state)
+                        equipped_pick = True
+                    yield from reach_mod.clear_line_of_sight(
+                        ex, state, pos, max_clear=2, reach=API_DIG_EYE_REACH,
+                    )
         status = state.refresh_status(ex.client, max_age_s=0)
         cur = status.get("pos") or state.pos
         stance = status if status.get("pos") is not None else cur
@@ -161,7 +221,8 @@ class SmeltIron(Skill):
         block_type = bare(ex.client.get_block(pos).get("name"))
         if block_type not in ores:
             raise Replan(f"到达 {pos} 后 get_block 未确认目标矿 {ores}")
-        yield from prepare_mining_pick(ex, state)
+        if not equipped_pick:
+            yield from prepare_mining_pick(ex, state)
         status = state.refresh_status(ex.client, max_age_s=0)
         cur = status.get("pos") or state.pos
         stance = status if status.get("pos") is not None else cur
@@ -175,6 +236,7 @@ class SmeltIron(Skill):
         before = state.count(expected_drop)
         result = ex.dig(pos, collect=True)
         yield rec("dig", result, pos=pos)
+        voxel_cache_for(state).invalidate(pos, dimension=dim_name)
         state.refresh_inventory(ex.client)
         if result.get("warning") or state.count(expected_drop) <= before:
             raise Replan(f"挖掘 {pos} 后背包 {expected_drop} 未确认增加或工具告警：{result.get('warning', '')}")
@@ -189,21 +251,32 @@ class SmeltIron(Skill):
     ) -> list:
         search_radius = math.ceil(API_DIG_EYE_REACH) if in_reach_only else radius
         limit = 16 if in_reach_only else 64
-        blocks = ex.client.find_blocks(types=list(IRON_ORES), radius=search_radius, limit=limit).get("blocks") or []
+        found = ex.client.find_blocks(types=list(IRON_ORES), radius=search_radius, limit=limit)
+        blocks = (found.get("blocks") if isinstance(found, dict) else None) or []
         status = state.refresh_status(ex.client, max_age_s=0)
         cur = status.get("pos") or state.pos
         stance = status if status.get("pos") is not None else cur
+        dim = str(status.get("dimension") or "overworld")
+        cur_cell = tuple(map(math.floor, cur))
+        vc = voxel_cache_for(state)
+        vc.ingest_find_blocks(found, dimension=dim, client=ex.client)
+        vc.clear_stance_blacklist_if_moved(cur)
         cands = [
             b["pos"] for b in blocks
             if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
             and tuple(b["pos"]) not in excluded
+            and not vc.is_unreachable("smelt_iron", b["pos"], dimension=dim, stance_cell=cur_cell)
             and (max_dy is None or abs(b["pos"][1] - cur[1]) <= max_dy)
             and not under_feet(cur, b["pos"])
             and (not in_reach_only or can_reach_block(ex, stance, b["pos"], reach=MINING_REACH))
         ]
         if not in_reach_only and len(cands) > 1:
-            # 稳定排序：优先高差 ≤12 格的地表崖壁/浅洞露矿，同档内保留原扫描近远顺序。
-            cands.sort(key=lambda p: abs(p[1] - cur[1]) > 12.0)
+            cands.sort(
+                key=lambda p: (
+                    0 if abs(p[1] - cur[1]) <= 8.0 else (1 if abs(p[1] - cur[1]) <= 12.0 else 2),
+                    eye_to_block_dist(stance, p),
+                )
+            )
         return cands
 
     @staticmethod
@@ -349,6 +422,14 @@ class SmeltIron(Skill):
                 ):
                     raise
                 excluded.add(tuple(pos))
+                err_st = state.refresh_status(ex.client, max_age_s=0)
+                err_cur = err_st.get("pos") or state.pos
+                voxel_cache_for(state).mark_unreachable(
+                    "smelt_iron",
+                    pos,
+                    dimension=str(err_st.get("dimension") or "overworld"),
+                    stance_cell=tuple(map(math.floor, err_cur)),
+                )
                 route_failures += 1
                 yield rec("ore_route_skip", pos=pos, error_code=code)
                 state.refresh_inventory(ex.client)
@@ -381,7 +462,7 @@ class SmeltIron(Skill):
                     continue
                 try:
                     if not can_reach_block(ex, stance, lpos, reach=MINING_REACH):
-                        yield rec("move_to", ex.move_to(pos=lpos, rng=3), pos=lpos)
+                        yield rec("move_to", _bounded_move_to(ex, lpos, rng=3, timeout=30.0), pos=lpos)
                     status = state.refresh_status(ex.client, max_age_s=0)
                     cur = status.get("pos") or state.pos
                     stance = status if status.get("pos") is not None else cur
@@ -421,6 +502,7 @@ class SmeltIron(Skill):
         )
 
     def _furnace(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        dim = str((state.st or {}).get("dimension") or "overworld")
         found = ex.client.find_blocks(types=["furnace"], radius=16, limit=4).get("blocks") or []
         for b in found:
             pos = b.get("pos")
@@ -428,11 +510,13 @@ class SmeltIron(Skill):
                 continue
             if bare(ex.client.get_block(pos).get("name")) != "furnace":
                 continue
-            yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
+            yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=30.0), pos=pos)
+            _record_station(state, "furnace", pos, dimension=dim)
             return pos
         if not state.count("furnace"):
             raise Replan("背包缺熔炉，find_blocks 半径 16 内也未观察到已有熔炉")
-        state.refresh_status(ex.client, max_age_s=0)
+        st = state.refresh_status(ex.client, max_age_s=0)
+        dim = str(st.get("dimension") or dim)
         x, y, z = map(math.floor, state.pos)
         valid_supports = SOLID_SUPPORT | {f"{w}_planks" for w in WOODS}
         # 先查平层与高一格台阶（适配 1x3 下行阶梯内转身往上一级台阶放炉），无需额外开凿。
@@ -450,6 +534,7 @@ class SmeltIron(Skill):
                 yield rec("place", ex.place("furnace", pos=pos), item="furnace", pos=pos)
                 if bare(ex.client.get_block(pos).get("name")) != "furnace":
                     raise Replan(f"放置后 get_block 在 {pos} 未确认熔炉")
+                _record_station(state, "furnace", pos, dimension=dim)
                 return pos
         # 地下狭窄矿井兜底：若四向皆为安全实心岩壁且有石级镐，侧向凿出 1x2 壁龛放炉。
         if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
@@ -472,6 +557,7 @@ class SmeltIron(Skill):
                     yield rec("place", ex.place("furnace", pos=pos), item="furnace", pos=pos)
                     if bare(ex.client.get_block(pos).get("name")) != "furnace":
                         raise Replan(f"放置后 get_block 在 {pos} 未确认熔炉")
+                    _record_station(state, "furnace", pos, dimension=dim)
                     return pos
         raise Replan("观察脚边四个方向的落点/净空/底板后无安全熔炉位置，环境缺安全承重落点")
 
@@ -497,6 +583,7 @@ class SmeltIron(Skill):
 
     def _recover_placed_furnace(self, ex: "Executor", state: "State") -> Iterator[dict]:
         """抢占或重连后若粗铁与熔炉均已离手，先检查附近已放熔炉回收在途铁锭，避免重复下矿。"""
+        dim = str((state.st or {}).get("dimension") or "overworld")
         found = ex.client.find_blocks(types=["furnace"], radius=16, limit=4).get("blocks") or []
         for b in found:
             pos = b.get("pos")
@@ -504,7 +591,8 @@ class SmeltIron(Skill):
                 continue
             if bare(ex.client.get_block(pos).get("name")) != "furnace":
                 continue
-            yield rec("move_to", ex.move_to(pos=pos, rng=2), pos=pos)
+            yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=30.0), pos=pos)
+            _record_station(state, "furnace", pos, dimension=dim)
             target = {"pos": pos}
             view = yield from inspect_furnace(ex, target)
             in_raw = window_amount(view, "input", "raw_iron")

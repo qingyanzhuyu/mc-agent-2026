@@ -10,21 +10,59 @@ from .diamond_site import (
     _dry_name, _in_reach, _nearby, _safe_excavation, _safe_status, _standing,
 )
 from .field import equip_item, mine_block_batch, place_block, scan_blocks
-from .items import AIR, PICKAXE_ORDER, bare, record_mine_trail
+from .items import AIR, NAV_FAIL_CODES, PICKAXE_ORDER, bare, record_mine_trail
 from .mining import MineStepUnsafe, mine_step
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
-from .sightline import STATION_EYE_REACH
+from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, eye_to_block_dist
 from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 _ARMOR = ("diamond_boots", "diamond_chestplate", "diamond_helmet", "diamond_leggings")
 _DIAMOND_PICKS = ("diamond_pickaxe", "netherite_pickaxe")
 _IRON_PICKS = tuple(pick for pick in PICKAXE_ORDER if pick in (*_DIAMOND_PICKS, "iron_pickaxe"))
+_CLEAR_FAIL_CODES = frozenset({
+    *NAV_FAIL_CODES, "out_of_reach", "dig_unconfirmed", "protected_region",
+    "not_loaded", "cannot_interact", "no_los", "los_blocked", "cannot_clear",
+    "timeout", "replan",
+})
 _MAX_DESCENT = 24
 _MAX_ORES = 16
 _MIN_Y = -54
 _SCAN_RADIUS = 16
+
+
+def _voxel_cache(state):
+    try:
+        from . import voxel_cache
+        return voxel_cache.voxel_cache_for(state)
+    except ImportError:
+        return None
+
+
+def _reach_mod():
+    try:
+        from . import reach
+        return reach
+    except ImportError:
+        return None
+
+
+def _bounded_move_to(ex, pos, *, rng=1, timeout=30.0):
+    try:
+        return ex.move_to(pos=pos, rng=rng, timeout=timeout, retries=0)
+    except TypeError:
+        return ex.move_to(pos=pos, rng=rng)
+
+
+def _record_station(state, kind: str, pos, dimension: str = "overworld") -> None:
+    try:
+        from .world_memo import memo_for
+    except ImportError:
+        return
+    fn = getattr(memo_for(state), "record_station", None)
+    if callable(fn):
+        fn(kind, pos, dimension=dimension)
 
 
 def _world_block(state) -> str:
@@ -161,20 +199,51 @@ class MineDiamond(Skill):
         visited_columns = {(path[0][0], path[0][2])}
         heading = CARDINALS[0]
         stairs = 0
+        vc = _voxel_cache(state)
+        reach_mod = _reach_mod()
         try:
             while len(tried_ores) < _MAX_ORES:
                 status = _safe_status(ex, state, "overworld")
+                if vc is not None:
+                    vc.clear_stance_blacklist_if_moved(status["pos"])
                 origin = _cell(status["pos"])
                 ores = _nearby(ex, state, DIAMOND_ORES, radius=_SCAN_RADIUS, limit=_MAX_ORES)
+                if vc is not None and ores:
+                    vc.ingest_find_blocks(
+                        {"blocks": [{"pos": list(o), "name": "diamond_ore"} for o in ores]},
+                        dimension="overworld",
+                    )
                 for ore in ores:
                     if ore in tried_ores or len(tried_ores) >= _MAX_ORES:
+                        continue
+                    if vc is not None and vc.is_unreachable("mine_diamond", ore, dimension="overworld", stance_cell=origin):
                         continue
                     # Adjacent safe stances may extend the four-block digging budget by one.
                     if math.dist(origin, ore) > 6 or not _safe_excavation(ex, origin, (ore,), path):
                         continue
                     stand = yield from _approach(ex, state, ore, status, dimension="overworld", protected=path)
                     if stand is None:
-                        continue
+                        if reach_mod is not None and eye_to_block_dist(status, ore) <= DIG_EYE_REACH:
+                            cleared = False
+                            try:
+                                yield from reach_mod.clear_line_of_sight(
+                                    ex, state, ore, max_clear=2, reach=DIG_EYE_REACH,
+                                )
+                                cleared = True
+                            except Replan as exc:
+                                code, _ = failure(exc)
+                                if (isinstance(exc, EnvBlocked) or code == "interrupted"
+                                        or "抢占" in str(exc) or code not in _CLEAR_FAIL_CODES):
+                                    raise
+                            if cleared:
+                                cand = _safe_status(ex, state, "overworld")
+                                if (_in_reach(ex, cand, ore, reach=5)
+                                        and _safe_excavation(ex, _cell(cand["pos"]), (ore,), path)):
+                                    stand = cand
+                        if stand is None:
+                            if vc is not None:
+                                vc.mark_unreachable("mine_diamond", ore, dimension="overworld", stance_cell=origin)
+                            continue
                     tried_ores.add(ore)
                     yield from _hand_pick(ex, state, 1)
                     stand = _safe_status(ex, state, "overworld")
@@ -187,10 +256,14 @@ class MineDiamond(Skill):
                     except Replan as exc:
                         code, _ = failure(exc)
                         if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                            if vc is not None:
+                                vc.mark_unreachable("mine_diamond", ore, dimension="overworld", stance_cell=origin)
                             _safe_status(ex, state, "overworld")
                             yield rec("ore_skip", pos=list(ore), error_code=code)
                             break
                         raise
+                    if vc is not None:
+                        vc.invalidate(ore, dimension="overworld")
                     _safe_status(ex, state, "overworld")
                     if state.count("diamond") >= goal_qty:
                         return
@@ -325,8 +398,12 @@ class CraftDiamondGear(Skill):
             if state.count(ingredient) < count:
                 raise Replan(f"合成 {item} 缺材料：需要 {count} 个 {ingredient}，请先补足")
         current = _safe_status(ex, state, bare(status.get("dimension")) or None)
+        dim = bare(current.get("dimension")) or "overworld"
         tables = _nearby(ex, state, ("crafting_table",), radius=4, limit=5)
-        if not any(_in_reach(ex, current, cell, reach=STATION_EYE_REACH) for cell in tables):
+        table = next((c for c in tables if _in_reach(ex, current, c, reach=STATION_EYE_REACH)), None)
+        if table is not None:
+            _record_station(state, "crafting_table", table, dimension=dim)
+        else:
             x, y, z = _cell(current["pos"])
             sites = [(x + dx, y, z + dz) for dx, dz in CARDINALS
                      if _standing(ex, (x + dx, y, z + dz))]
@@ -336,6 +413,7 @@ class CraftDiamondGear(Skill):
                                  searched_volume="半径 4 格至多 5 个暴露工作台和 4 个同层邻接放台位",
                                  wake_on="chunk_moved")
             yield from place_block(ex, state, "crafting_table", sites[0])
+            _record_station(state, "crafting_table", sites[0], dimension=dim)
             _fresh_inventory(ex, state)
         yield from craft_recipe(ex, state, item, goal_qty=1)
         if not _already_has_gear(item, state):
