@@ -8,10 +8,10 @@
 ## Step 1 · 目标（1 分钟）
 
 - **赛道与定位**：AIAMC 2026 **Harness 赛道**——面向 8 小时不补时、动作互斥阻塞、无矿透/无鞘翅、虚空岛死亡循环（60s 死 3 次下线 5 分钟）与 2 路 LLM 并发限制的高可靠 Minecraft Agent Harness。
-- **当前阶段成果（截至冻结提交）**：
-  - **76 项 `GoalSpec` 目标台账**（覆盖 71 项计分进度，理论上限 **1,725 分**，含 T1 底座 290 分 + 阶段二 T2/T3 50 项 1,435 分；其中 6 项基础目标已 `graduated`，1 项 `smelt_iron` 为唯一 `candidate`，严格遵守 WIP=1）；
-  - **61 个注册 L3 技能**（4 项已在官方服 2h 实测零缺陷晋级 `verified="live"`，57 项已完成 `verified="offline"` 故障注入单测）；
-  - **1,275 项 Python 离线单测 + 11 项联调网关契约单测全绿**；已完成**官方校园网端点基线标定、三项真机故障演练与 2 小时官方连跑取证**。
+- **当前阶段成果（截至 Stage 3 收口）**：
+  - **104 项 `GoalSpec` 目标台账**（覆盖 **89 / 99** 项计分进度，理论上限 **2,730 分 [80.6%]**，含 T1 底座 290 分 + 阶段二 T2/T3 50 项 1,435 分 + 阶段三 Wave A–D 18 项 1,005 分；其中 6 项基础目标已 `graduated`，1 项 `smelt_iron` 为唯一 `candidate`，97 项为 `draft`，严格遵守 WIP=1）；
+  - **79 个注册 L3 技能**（**4** 项已在官方服 2h 实测零缺陷晋级 `verified="live"`，**75** 项已完成 `verified="offline"` 故障注入单测，含阶段二 37 项与阶段三 Wave A–D 18 项 T4 精选技能）；
+  - **1,421 项 Python 离线单测 + 11 项联调网关契约单测全绿**；已完成**官方校园网端点基线标定、三项真机故障演练、2 小时官方连跑取证**，以及**本地靶场（`local-target`）Stage 3 `T4-P1..P4` 标定与 3/3 真进度解锁冒烟**。
 
 ---
 
@@ -21,12 +21,12 @@
 
 ```text
   [战略层] StrategyOrchestrator (--strategy llm, 仅 8 类边界事件触发, 2 路并发闸门)
-       │  输出脱敏 Objective (上下文 943–1141 字, 零裸坐标/零实体 ID)
+       │  输出脱敏 Objective (上下文 1,085–1,283 字, 零裸坐标/零实体 ID)
        ▼
-  [台账层] Goal Ledger (76 项 DAG + 共享子图边际 ROI 摊销 + 物资预留 + 止损线)
+  [台账层] Goal Ledger (104 项 DAG + 共享子图边际 ROI 摊销 + 被动机会门控 + 止损线)
        │  展开最近未满足技能 (铁器/基础链确定性推进, 不等 LLM)
        ▼
-  [L3 意图技能] 61 个 @register 技能 (仅标量参数 / 每阻塞动作立刻 yield / verify_done)
+  [L3 意图技能] 79 个 @register 技能 (4 live + 75 offline / 仅标量参数 / 1 阻塞动作 = 1 yield)
        │  yield from
        ▼
   [L2 空间与战术原语] sightline / voxel_cache / world_memo / reach / escape / nav / furnace_lease
@@ -82,12 +82,12 @@ uv run python -m mcagent.loop \
 ```bash
 cd code
 
-# 1. 干跑核验 61 技能与 76 项台账
+# 1. 干跑核验 79 技能与 104 项台账
 uv run python -m mcagent.loop --dry --strategy llm --min-verified offline
 
 # 2. 一键短任务演示（使用独立角色名，退出自动 /disconnect）
 uv run python -m mcagent.loop \
-  --local-target --user demo_stage2 \
+  --local-target --user demo_stage3 \
   --goal upgrade_tools \
   --min-verified offline \
   --max-seconds 180 \
@@ -99,10 +99,10 @@ uv run python -m mcagent.loop \
 ```bash
 cd code
 
-# 1. 现场跑全量离线单测与故障注入套件（1,275 项，约 40s）
+# 1. 现场跑全量离线单测与故障注入套件（1,421 项，约 54s）
 uv run python -m unittest discover -s tests
 
-# 2. 展示 61 技能契约 + 76 项台账 DAG + 943 字脱敏战略上下文
+# 2. 展示 79 技能契约（4 live + 75 offline）+ 104 项台账 DAG + 1,085–1,283 字脱敏战略上下文
 uv run python -m mcagent.loop --dry --strategy llm --min-verified offline
 
 # 3. 确定性离线重放 2026-11-19 官方 2h 长跑真实异常包（INC-005，2/2 磁带命中）
@@ -115,7 +115,7 @@ uv run python -m mcagent.loop --replay ../results/replay-sample/INC-005-P2-repla
 
 ## Step 5 · 实际结果（1.5 分钟）
 
-展示三组已归档在 [`results/`](results/README.md) 中的真实数据（严守 `official` 与 `local-target` 分列）：
+展示四组已归档在 [`results/`](results/README.md) 中的真实数据（严守 `official` 与 `local-target` 分列）：
 
 1. **官方校园网基线（`official`，`results/probe/pathfinding-official-20261119.json`、`probe-official-20261119.json` & `aia-llm-official-20261119.json`）**：
    - `T_status` 稳态 `7.34ms`（`pathfinding-official-20261119.json`）、首轮加载 `74.4ms`（`probe-official-20261119.json`）；`T_move20` `3648ms`（5.5 格/秒）、`T_dig1` `2146ms`、动作周期纯开销 `202.3ms`（`probe-official-20261119.json`）；
@@ -125,6 +125,9 @@ uv run python -m mcagent.loop --replay ../results/replay-sample/INC-005-P2-repla
    - 有效运行 `6303.9s`，**0 死亡、0 崩溃**，行动 `873` 步（错误率 `5.04%`，即 `44/873` 次失败：`/move_to` 失败 `43` 次 + `/dig` 失败 `1` 次，原始日志均记为 `path_not_found`），`emergency_escape` 真机 **`6/6 (100%)`**；前 `124.7s` 拿下 5 项起步目标（服务端确认 4 项进度 / 10 分）。
 3. **阶段二技能本地靶场冒烟（`local-target`，`<local_test_bot>`）**：
    - 空包门禁精准拦截 `survey_island`/`trade_villager`/`smelt_iron`；获木后 `survey_island` 2 步 `18.9s` 完成 2 扇区体检并写入 `44` 条暴露资源与 `1` 处地标；`discover_structure(stronghold)` 4 步有界推进无崩溃。
+4. **Stage 3 Wave A–D 与 `local-target` 3/3 真进度解锁冒烟（`local-target`，`results/probe/t4-p{1..4}-*.json` & `stage3-local-smoke-20261119.json`）**：
+   - Step 0 探针标定全通：`T4-P1`（`/attack(max_hits=1)` 与 `/control(hit=true)` 均一次弹出并拾取满耐久鞘翅）、`T4-P2`（确认自搭 Vanilla `1.21.11` `hard` 刷怪正常并修复 `SurveyIsland`/`ScoutIsland` 卡点）、`T4-P3`（私域下界 `Y=127` 基岩顶水平 T 形召唤凋灵零漂移稳态窒息 `-1.0 HP/s`）、`T4-P4`（B13 炽足兽 `/use_item` 触发耐久 `100->99` 条件解锁）；
+   - 实时冒烟：18 项 T4 技能空包 `blocked` **18/18 拦截**；Vanilla `1.21.11` 实跑 **`crafter_chain`**（26 步漏斗排空）、**`ride_strider_boost`**（5 步耐久 `-1`）、**`jukebox_meadow`**（2 步草甸放唱片）**3/3 解锁真实游戏进度**（严格标为 `local-target`，不混充官方预算）。
 
 ---
 
@@ -145,5 +148,5 @@ uv run python -m mcagent.loop --replay ../results/replay-sample/INC-005-P2-repla
 
 ## Step 7 · 下一步（0.5 分钟）
 
-1. **真机逐项晋级**：遵循 `AGENTS.md` §2A.6 与 WIP=1 纪律，在官方模拟服与靶场按 ROI 顺序逐项验通阶段二高分链（`smelt_iron` → `mine_diamond`/`shiny_gear` → `enter_the_nether` → 堡垒/要塞/试炼密室/末地冲刺），每项留日志后由 `verified="offline"` / `stage="draft"` 晋级为 `live` / `graduated`。
+1. **真机逐项晋级**：遵循 `AGENTS.md` §2A.6 与 WIP=1 纪律，在官方模拟服按 ROI 顺序逐项验通阶段二与 Stage 3 Wave A–D 精选高分链（`smelt_iron` → `mine_diamond`/`shiny_gear` → `enter_the_nether` → 堡垒/要塞/试炼密室/末地冲刺与 T4 `crafter_chain`/`arbalistic_trench_shot`/`summon_and_trap_wither` 等，并对 B13 `ride_strider_boost`、B19 `loot_end_ship_elytra` 与 `Y=127` 凋灵模板做官方端点 1 步复核），每项留日志后由 `verified="offline"` / `stage="draft"` 晋级为 `live` / `graduated`。
 2. **赛前 T-0 收口**：切 `.env.match`、停 `8787` 网关、固定 `LLM_MAX_CONCURRENCY=2`、`LLM_TOKEN_BUDGET=7500000`，以 `preflight --apply --live` 全绿开赛。

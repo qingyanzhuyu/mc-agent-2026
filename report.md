@@ -15,7 +15,7 @@
 | **~~J2~~ → J14 / J19** | 深度复利假设随 `RULES v2` 作废 ⇒ 计分本质是**带共享前置的加权集合覆盖**，结合 1.21.11 机制审计精选高确定性 T4 逃课路径，10 项高脆度/API 硬阻塞项明确放弃 | **已修订并落地**：主动废止 J2，重构为 **104 项 `GoalSpec` DAG 台账**（**89 / 99 计分项 / 2,730 分上限 [80.6%]**）与多目标共享子图边际 ROI 摊销排序（`rank_actionable_goals()`）及被动机会根目标门控 |
 | **J3 / J10 / J16** | 60s 死 3 次下线 5 分钟（不补时）+ 虚空岛赛制 ⇒ **稳定性与虚空防坠高于一切策略优化** | **已坐实（official）**：可抢占单飞锁 + `SafetyMonitor` C16 虚空承重保护在官方校园网实现 `0/12`（0.0%）误报；官方 2h 长跑实现 **0 死亡、0 崩溃**、`emergency_escape` **6/6 (100%)** |
 | **~~J4~~ → J13** | 书面配额（8M/1.5M）与群聊口径差异 ⇒ 模型名、并发、思考开关与 `LLM_TOKEN_BUDGET` 全部配置化 | **已坐实（official）**：2h 官方长跑验证不限流战术兜底会在 8h 外推烧至 166.2% 输入额度；已补齐指数退避与 `LLM_TOKEN_BUDGET` 软熔断护栏 |
-| **J5 / J9 / J20** | 40 分工程评审靠可追溯纪律与模块化边界拿稳；按"单技能解锁分值与复用度"排实现优先级 | **已落地**：`AGENTS.md` §2A.6/§9 强制 `verified: offline/live` 分级准入、一文件一职责（≤360 行）与零白名单 `@register` 自动发现 |
+| **J5 / J9 / J20** | 40 分工程评审靠可追溯纪律与模块化边界拿稳；按"单技能解锁分值与复用度"排实现优先级 | **已落地**：`AGENTS.md` §2A.6/§9 强制 `verified: offline/live` 分级准入、一文件一职责（<400 行）与零白名单 `@register` 自动发现 |
 | **J6 / J7 / J17** | API 已是高层语义技能库，但无矿透/无鞘翅且模型会编造坐标与实体 ID ⇒ **技能参数严禁坐标与实体 ID，执行前现场观测复核** | **已坐实（offline + official）**：`@register` 启动期强制拦截 `pos/x/y/z/entity_id` 参数；`context.py` 剥离全部裸坐标与 ID（1,085–1,283 字）；几何与射线统一收口至 `skills.sightline` |
 | **J12 / J15 / J18** | 54 项进度依赖岛上实际结构；结构类进度判据只看玩家位置 ⇒ **开局扇区岛体检 + 方块指纹驱动 + 沿路增量扫描 + 支线止损** | **已落地（offline + local-target 冒烟）**：`world_memo.py` 维护 **21 类**结构/群系指纹与原子检查点；`survey_island` 已在 `local-target` 2 步完成 2 扇区体检写入 44 条资源与 1 处地标；`MainLoop` 补齐 30s 节流沿路扫描 |
 
@@ -43,7 +43,7 @@ flowchart TD
 1. **执行-思考重叠与目标级异步战略（破解 2 路并发与重尾延迟）**：
    - `planner/llm.py` 内置 2 路 `BoundedSemaphore` 并发闸门与代理/直连双通道熔断；`loop/strategy.py` + `strategy_async.py` 仅在 `initial`/`goal_achieved`/`env_blocked`/`budget_exceeded`/`max_fails_reached`/`respawn`/`day_night_changed`/`landmark_opportunity` 等 8 类边界事件上由 `DecisionScheduler` 异步预取下一 `Objective`，当拍立即由确定性规则推进，**零阻塞等待模型**。
 2. **零裸坐标契约与统一体素视线层（根治模型坐标幻觉与几何偏移）**：
-   - `skills/registry.py` 在 `@register` 期强制禁止非标量参数与 `pos/x/y/z/entity_id` 字段；`loop/context.py` 输出严格脱敏的战略上下文（典型 **943–1,141 字**）；`skills/sightline.py` 统一封装站立眼高 `+1.62` / 潜行 `+1.27`、方块中心 `+0.5` 与 3D DDA 视线遮挡，消除手写脚底角点距离导致的最高 1.62 格高度误差与方向不对称。
+   - `skills/registry.py` 在 `@register` 期强制禁止非标量参数与 `pos/x/y/z/entity_id` 字段；`loop/context.py` 输出严格脱敏的战略上下文（典型 **1,085–1,283 字**）；`skills/sightline.py` 统一封装站立眼高 `+1.62` / 潜行 `+1.27`、方块中心 `+0.5` 与 3D DDA 视线遮挡，消除手写脚底角点距离导致的最高 1.62 格高度误差与方向不对称。
 3. **非幂等快照判重 + 可抢占单飞锁 + `v1.3.11` 精选恢复**：
    - 对 `craft`/`use_item`/`window_act` 等非幂等写动作在发包前采样背包指纹，网络或服务端 `timeout` 时先 `/stop` 再比对快照，避免重复扣料；`Condition` + 抢占代次保证 `SafetyMonitor` 遇岩浆/虚空/死亡循环立即抢占当前阻塞动作；401 单飞双检锁（`login_calls=1`）杜绝多线程并发互踢 Token。
 4. **多目标共享子图 DAG 边际 ROI + 异步熔炉租约 + 沿路增量扫描**：
@@ -61,11 +61,11 @@ flowchart TD
 |---|---|---|---|
 | **① D0 协议安全（11/13 `ec8eabb`）** | 401 重登穿透并发互踢；轮询 `last_death.t` 重复计数误触发 65s 冷却；`posture(shield=True)` 清零潜行 | 双检锁 `_refresh_token()` + `0600` `.token.json` 复用；按 `last_death.t` + `seq` 联合去重；全量合并姿态字段 | 离线故障注入 8 线程并发 401 仅登录 1 次；后续 11/19 **官方真机 3 线程演练 `login_calls=1`（428.7ms）复证** |
 | **② 几何统一与 v1.3.11 对齐（11/15–11/16）** | 10+ 技能手写脚底到方块角点距离存在 ±0.87 格偏移；附魔跨窗丢失、下界 `ready=false` 抢读、钓鱼 `timeout` 三连重发 | 收口全仓至 `skills.sightline` 并写入 `AGENTS.md` §9.2；按 v1.3.11 逐节补齐可选路由 `unsupported_api` 降级与 `/stop released` 校验 | 全仓无裸脚底角点测距；`test_sightline.py`、`test_api_v1311_client.py` 与 `test_runtime_v1311_recovery.py` 全绿 |
-| **③ 53 轮冷启动归因与架构收敛（11/19 `01:55`）** | 旧自动修单分支叠加 230+ 补丁使 `starter_skills.py` 膨胀至 3,014 行，`smelt_iron` 达成率仅 `11.3%`（6/53），冷却空睡占 `59%` 时长，单轮 `/get_block` 达 `2,883` 次 | 果断止损旧膨胀并加 `--observe-only` 护栏；落地 `voxel_cache`、`reach.py`、原子 `world_memo` 检查点、同格冷却三级升级（`local_retry→relocate→goal_abandoned`）与 `--strategy llm` | `local-target` 240s 冷启动实测（`de7_v2_test02`）：0 死亡、`/dig` 33/33、`/craft` 7/7、`prep_wood` 提速 **2–3×**、`/get_block` 降 **70%+**（551 次）、Token 外推由 313% 压至 **2.5%** |
+| **③ 53 轮冷启动归因与架构收敛（11/19 `01:55`）** | 旧自动修单分支叠加 230+ 补丁使 `starter_skills.py` 膨胀至 3,014 行，`smelt_iron` 达成率仅 `11.3%`（6/53），冷却空睡占 `59%` 时长，单轮 `/get_block` 达 `2,883` 次 | 果断止损旧膨胀并加 `--observe-only` 护栏；落地 `voxel_cache`、`reach.py`、原子 `world_memo` 检查点、同格冷却三级升级（`local_retry→relocate→goal_abandoned`）与 `--strategy llm` | `local-target` 240s 冷启动实测（`<local_test_bot>`）：0 死亡、`/dig` 33/33、`/craft` 7/7、`prep_wood` 提速 **2–3×**、`/get_block` 降 **70%+**（551 次）、Token 外推由 313% 压至 **2.5%** |
 | **④ P8 物理与同步取证修复（11/19 `04:16`）** | 靶场 HTTP 磁带暴露 `GoalNear` 抖动、`set_slot` 1-tick 延迟、滞空幽灵块回滚与悬空树冠 `stalled` | 逐条回放磁带定位 MC 1.21.11 物理同步缺陷，先红后绿补齐回归单测并关停本地桥疾跑/跑酷（`4aedb5d`） | `test_p8_log_fixes.py` + `bot_session.test.js`（11/11）全绿 |
 | **⑤ 官方 2h 长跑取证与 Token 黑洞根治（11/19 实测 `090a04a`→修复 `c03c26e`）** | 2h 官方连跑前 `124.7s` 拿下 5 项起步目标且 0 死亡，但后 103 分钟陷入 4 环死锁（地下未记轨 + 未复用 7 格外已知工作台 + 地下无净空 502 次 `Replan` + 战术无技能每 5s 回落旧 LLM 菜单），烧掉 **2.91M 输入 Token**（8h 外推 **166.2%**） | 离线回放 `INC-005` 精准复现；`CraftGear` 复用 `WorldResourceMemo` 已知台、`MineStone` 写 `MINE_TRAILS`、`ScoutIsland` 地下安全上挖 1×2 阶梯、`strategy.py` 战术兜底 LLM 加 `20s→240s` 指数退避 + `LLM_TOKEN_BUDGET=7500000` 护栏 | 新增 `test_official_soak_fixes.py` 8 条回归单测全绿；仅将官方实机 0 缺陷的 4 项技能升格 `verified="live"` |
 | **⑥ 阶段二三波模块化扩展（11/19 `3454a9f`）** | 台账原仅覆盖 T1 26 项（290 分），缺少结构勘探、工作站、下界核心、末地冲刺、试炼密室、群系 T3 与提速替代路线 | 在隔离 worktree 用多路严格文件互斥并行子代理分三波落地 9 个新技能文件（单文件 293–393 行（均 <400 行），仅极少数已有大文件按职责增量扩展）+ 共享子图 DAG ROI + 30s 节流沿路扫描 + 5 条提速替代路线 | 台账扩至 **76 项 / 1,725 分上限**、**61 个注册技能**；全仓 **1,275/1,275** 单测全绿，`survey_island` 等已过 `local-target` 冒烟 |
-| **⑦ 阶段三 1.21.11×API 交叉审计与 T4 Wave A–D 精选扩展（11/19 `61bc318`→`d746035`）** | 剩余 28 项 T4（1,660 分）含 API 缺 Crafter GUI（B11）、缺刷子长按（B12）、共享末地禁卡凋灵红线、受控自伤触图腾安全冲突与炽足兽 B13 不确定性 | Step 0 先在本地 Vanilla 1.21.11 完成 `T4-P1..P4` 机制标定并修复 `ScoutIsland`/`SurveyIsland` 真机卡点；隔离 worktree 四波并行落地 6 个 T4 技能模块（345–396 行）+ 4 项新活谓词 + 10 项 `T4_PREP` + `controlled_totem_trigger` 4 条件单次白名单 + 被动三叉戟根门控；实时冒烟进一步揪出 `crafter_chain` 漏斗排空时序并在 `d746035` 补齐 `window_view` 排空循环与回归单测 | 台账扩至 **104 项 / 89 计分项 / 2,730 分上限（80.6%）**、**79 注册技能**；全仓 **`1,397/1,397`** Python 单测 + **`11/11`** Node 单测全绿；`local-target` 18/18 空包拦截 + `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 真进度解锁 |
+| **⑦ 阶段三 1.21.11×API 交叉审计与 T4 Wave A–D 精选扩展（11/19 `61bc318`→`d746035`）** | 剩余 28 项 T4（1,660 分）含 API 缺 Crafter GUI（B11）、缺刷子长按（B12）、共享末地禁卡凋灵红线、受控自伤触图腾安全冲突与炽足兽 B13 不确定性 | Step 0 先在本地 Vanilla 1.21.11 完成 `T4-P1..P4` 机制标定并修复 `ScoutIsland`/`SurveyIsland` 真机卡点；隔离 worktree 四波并行落地 6 个 T4 技能模块（345–396 行）+ 4 项新活谓词 + 10 项 `T4_PREP` + `controlled_totem_trigger` 4 条件单次白名单 + 被动三叉戟根门控；实时冒烟进一步揪出 `crafter_chain` 漏斗排空时序并在 `d746035` 补齐 `window_view` 排空循环与回归单测 | 台账扩至 **104 项 / 89 计分项 / 2,730 分上限（80.6%）**、**79 注册技能**；全仓 **`1,421/1,421`** Python 单测 + **`11/11`** Node 单测全绿；`local-target` 18/18 空包拦截 + `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 真进度解锁（脱敏证据已归档 `results/probe/`） |
 
 ---
 
@@ -92,15 +92,16 @@ flowchart TD
 | 2. 65s `safe_mode` 冷却自愈 | 锁定 `65.0s` 冷却，实持 `65.2s` 自动解除并恢复 `gather_wood`；同步采得官方 `death_loop` 事件结构 | **PASS** |
 | 3. 3 线程并发 401 单飞刷新 | 3 线程同时遇 401 仅触发 **`login_calls=1`**（`428.7ms`），Token 落盘轮换并在 `31.98s` 完成自动重连 | **PASS** |
 
-### 4.3 全仓自动化测试与目标台账覆盖率
+### 4.3 全仓自动化测试、台账覆盖率与 Stage 3 脱敏探针
 
-| 维度 | 数量 / 状态 | 复现命令 |
+| 维度 | 数量 / 状态 | 复现命令 / 脱敏证据 |
 |---|---|---|
-| Python 离线单测（含故障注入与契约） | **`1,397 / 1,397 OK`**（0 失败 0 跳过） | `cd code && uv run python -m unittest discover -s tests` |
+| Python 离线单测（含故障注入与契约） | **`1,421 / 1,421 OK`**（0 失败 0 跳过） | `cd code && uv run python -m unittest discover -s tests` |
 | 本地联调网关契约单测（Node.js） | **`11 / 11 OK`** | `node --test tools/local-api-bridge/test/*.test.js` |
 | 官方脱敏异常包确定性离线回放 | **`INC-005` 2/2 磁带命中，`matched_original_outcome=true`** | `cd code && uv run python -m mcagent.loop --replay ../results/replay-sample/INC-005-P2-replan_oscillation-craft_gear.json` |
 | 注册技能总数 | **79 个**（**4** `verified="live"` + **75** `verified="offline"`） | `cd code && uv run python -m mcagent.loop --dry --strategy llm --min-verified offline` |
 | 目标台账覆盖 | **104 项**（**89 / 99 计分项 / 2,730 分上限 [80.6%]**：T1 290 分 + 阶段二 1,435 分 + 阶段三 Wave A–D 18 项 1,005 分） | `tests/test_stage3_wave_d.py`（18/18 OK） |
+| Stage 3 本地靶场标定与冒烟（`local-target`，与官方严格分列） | **`T4-P1..P4` 4/4 PASS** + 18 项空包拦截 + **`3/3` 真进度解锁** | `results/probe/t4-p{1..4}-*.json` 与 `results/probe/stage3-local-smoke-20261119.json` |
 
 ---
 
@@ -108,7 +109,7 @@ flowchart TD
 
 遵循 `docs/07-评审材料.md` §六的诚实边界原则，明确声明当前尚未完成的真机验证范围：
 
-1. **分级验证边界**：当前仅有 4 项基础技能（`gather_wood`、`craft_gear`、`mine_stone`、`emergency_escape`）在官方服 2h 长跑中零缺陷跑通并标为 `verified="live"`；其余 **75 个技能（含全部 37 个阶段二与 18 个阶段三 T4 新技能）均如实标为 `verified="offline"`**。104 项目标台账当前阶段分布为 **`6 graduated / 1 candidate（smelt_iron）/ 97 draft`**（含 19 项 T0/T1、50 项 T2/T3 与 28 项 T4_PREP/T4），其中 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 及 18 项空包拦截已完成 `local-target` Vanilla 1.21.11 冒烟（不计入官方预算），待官方服按 WIP=1 逐项实测后再升格并合入 `main`。
+1. **分级验证边界**：当前仅有 4 项基础技能（`gather_wood`、`craft_gear`、`mine_stone`、`emergency_escape`）在官方服 2h 长跑中零缺陷跑通并标为 `verified="live"`；其余 **75 个技能（含全部 37 个阶段二与 18 个阶段三 T4 新技能）均如实标为 `verified="offline"`**。104 项目标台账当前阶段分布为 **`6 graduated / 1 candidate（smelt_iron）/ 97 draft`**（含 19 项 T0/T1、50 项 T2/T3 与 28 项 T4_PREP/T4），其中 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 及 18 项空包拦截已完成 `local-target` Vanilla 1.21.11 冒烟（归档 `results/probe/stage3-local-smoke-20261119.json`，不计入官方预算），待官方服按 WIP=1 逐项实测后再升格并合入 `main`。
 2. **明确放弃的 10 项高风险/硬阻塞目标（655 分）与剩余待核物理语义**：
    - `place_oriented()` 依赖服务端 `/place` 随玩家相对方位决定方块 `facing`/`axis` 的原版物理语义，需在官方服实测核对；`ride_strider_boost` 的 B13 加速已在本地桥 `/use_item` 实测通过并实现 `/move_to` 降级双路径，官方端点仍需 1 步复核；
    - `SilkTouchBeeNest` 因 `/get_block` 不返回蜂巢内蜜蜂数量，当前采用夜间/雨天/近蜂保守策略；

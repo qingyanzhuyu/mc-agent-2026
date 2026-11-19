@@ -66,7 +66,7 @@ code/
     planner/         决策层：objective.py（目标级战略校验）、skill_choice.py、decision.py、llm.py（2 路 BoundedSemaphore 并发闸门）、scheduler.py
     skills/          执行层：L2 原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（21 类指纹 + 原子 JSON 检查点）、79 个注册 L3 技能（4 项 verified="live" + 75 项 verified="offline"，含 emergency_escape 及阶段三 18 项 T4 技能）
     loop/            主循环与策略：engine.py（同格冷却自旋三级升级 + 30s 沿路增量扫描）、goals.py（104 项 GoalSpec 台账：89 计分项 / 2,730 分上限 [80.6%]，6 graduated / 1 candidate / 97 draft）、subgoals.py（10 项活谓词 + 10 类工作站）、strategy.py & strategy_async.py（--strategy llm）、context.py、auditor.py、tape.py
-  tests/             离线故障注入、架构契约与集成回归单测：1,397 项 Python unittest（verified: offline）
+  tests/             离线故障注入、架构契约与集成回归单测：1,421 项 Python unittest（verified: offline）
 tools/
   local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，含 11 项 Node 网关契约单测，与比赛代码零耦合）
 ```
@@ -85,8 +85,8 @@ tools/
 - [x] 抓全公告 + 初赛细则 + 计分/判据表整理（`docs/00`、`docs/08`–`docs/13`）
 - [x] 读完接口规范 v1.3.1–v1.3.11，探通官方双端点无鉴权（2026-11-19 实测：校园网 `apiin.nmo.net.cn` 长连接 RTT `4.0–4.3 ms`，公网 `mc-api.windywindie.top` `816–973 ms`，均返 `401 unauthorized`）
 - [x] 底层容错与运行时加固（401 单点重登与 Token 持久化、16 RPS 三级限速、连续异步 `SafetyMonitor`、死亡去重与 65s 避险锁存、非幂等超时判重、有界 `move_to` 超时禁重试、`emergency()` 紧急抢占、移植 `v1.3.11` 精选恢复 4 项）
-- [x] 架构收拢至 `feat/arch-converge-v2-agy` 并合入 Stage 3（Wave A–D，**79 个注册 L3 技能**：`4` 项 `verified="live"` + `75` 项 `verified="offline"`；**104 项 `GoalSpec` 台账**：`89` 计分项 / `2,730` 分上限 [80.6%]，`6 graduated / 1 candidate / 97 draft`；10 项活谓词、21 类世界指纹、受控图腾单次安全钩子、共享子图 DAG 边际 ROI、被动机会根目标门控、30s 节流沿路扫描与 `furnace_lease` 异步租约）+ **1,397 项 Python `unittest` + 11 项 Node 网关契约单测全绿**
-- [x] 本地靶场 `local-target` 冷启动、阶段二与阶段三技能冒烟复测（2 轮 240s 冷启动验证闭环，第 2 轮 `de7_v2_test02` 0 死亡拿 10 分；阶段二 `survey_island`/`discover_structure`/`trade_villager`/`furnace_lease` 冒烟通过；阶段三 Step 0 `T4-P1..P4` 标定及 18 项空包 `blocked` 18/18 拦截 + Vanilla 1.21.11 实跑 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 解锁真实进度；**均不进入正式比赛时间预算表**）
+- [x] 架构收拢至 `feat/arch-converge-v2-agy` 并合入 Stage 3（Wave A–D，**79 个注册 L3 技能**：`4` 项 `verified="live"` + `75` 项 `verified="offline"`；**104 项 `GoalSpec` 台账**：`89` 计分项 / `2,730` 分上限 [80.6%]，`6 graduated / 1 candidate / 97 draft`；10 项活谓词、21 类世界指纹、受控图腾单次安全钩子、共享子图 DAG 边际 ROI、被动机会根目标门控、30s 节流沿路扫描与 `furnace_lease` 异步租约）+ **1,421 项 Python `unittest` + 11 项 Node 网关契约单测全绿**
+- [x] 本地靶场 `local-target` 冷启动、阶段二与阶段三技能冒烟复测（2 轮 240s 冷启动验证闭环，第 2 轮 `<local_test_bot>` 0 死亡拿 10 分；阶段二 `survey_island`/`discover_structure`/`trade_villager`/`furnace_lease` 冒烟通过；阶段三 Step 0 `T4-P1..P4` 标定及 18 项空包 `blocked` 18/18 拦截 + Vanilla 1.21.11 实跑 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 解锁真实进度；**均不进入正式比赛时间预算表**）
 - [x] **官方正式皮肤站账号登录 + `ready=True`**（校园网 `apiin.nmo.net.cn` `preflight --apply --live` 15/15 全绿、`smoke` `0.5s` 登录进服就绪，Token TTL 24h）
 - [x] **官方校园网基线 `probe` + 能力标定 + AIA 实测**（`T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`、`MC_MAX_RPS` 4/8/12/16 零限流、C16 虚空保护误报 `0/12`、官方 AIA `qwen3.6-35b-a3b` 快路径 `4/4` `p50=1652.7 ms`，已关闭 `docs/04` B18/C1 等 10 项待确认项，数据归档 `results/probe/`）
 - [x] **官方真机故障演练 3/3 PASS**（断线重连 `63.11s`、`safe_mode` `65.2s` 冷却自愈、3 线程并发 401 单飞刷新 `login_calls=1`，归档 `results/probe/fault-drills-official-20261119.json`）

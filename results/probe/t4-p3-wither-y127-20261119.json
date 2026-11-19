@@ -1,0 +1,544 @@
+{
+  "probe": "T4-P3",
+  "item": "C18",
+  "target": "local-target",
+  "scope_note": "local-target (non-official sandbox/bridge); strictly separated from official competition time budget",
+  "api_base": "http://127.0.0.1:8788/api/v1",
+  "mc_version": "1.21.11",
+  "timestamp": "2026-11-19T17:32:21Z",
+  "trials": [
+    {
+      "template": {
+        "name": "horizontal_T_y125_minimal_obsidian_y124",
+        "floor_y": 124,
+        "t_y": 125,
+        "tail_rel": [
+          0,
+          -2,
+          0
+        ],
+        "soul_sand_rel": [
+          [
+            0,
+            -2,
+            0
+          ],
+          [
+            0,
+            -2,
+            -1
+          ],
+          [
+            -1,
+            -2,
+            -1
+          ],
+          [
+            1,
+            -2,
+            -1
+          ]
+        ],
+        "skulls_rel": [
+          [
+            -1,
+            -2,
+            -2
+          ],
+          [
+            0,
+            -2,
+            -2
+          ],
+          [
+            1,
+            -2,
+            -2
+          ]
+        ],
+        "obsidian_support_rel": [
+          [
+            0,
+            -3,
+            0
+          ]
+        ],
+        "cobble_support_rel": [
+          [
+            -1,
+            -3,
+            -2
+          ],
+          [
+            0,
+            -3,
+            -2
+          ],
+          [
+            1,
+            -3,
+            -2
+          ],
+          [
+            -1,
+            -3,
+            -1
+          ],
+          [
+            0,
+            -3,
+            -1
+          ],
+          [
+            1,
+            -3,
+            -1
+          ]
+        ]
+      },
+      "actions": [
+        {
+          "op": "place_soul_sand",
+          "pos": [
+            0,
+            125,
+            0
+          ],
+          "res": {
+            "ok": true,
+            "elapsed_ms": 1106.8,
+            "result": {
+              "placed": "soul_sand",
+              "pos": [
+                0,
+                125,
+                0
+              ],
+              "sneaked": true
+            }
+          }
+        },
+        {
+          "op": "place_soul_sand",
+          "pos": [
+            0,
+            125,
+            -1
+          ],
+          "res": {
+            "ok": true,
+            "elapsed_ms": 250.1,
+            "result": {
+              "placed": "soul_sand",
+              "pos": [
+                0,
+                125,
+                -1
+              ],
+              "sneaked": true
+            }
+          }
+        },
+        {
+          "op": "place_soul_sand",
+          "pos": [
+            -1,
+            125,
+            -1
+          ],
+          "res": {
+            "ok": true,
+            "elapsed_ms": 299.5,
+            "result": {
+              "placed": "soul_sand",
+              "pos": [
+                -1,
+                125,
+                -1
+              ],
+              "sneaked": true
+            }
+          }
+        },
+        {
+          "op": "place_soul_sand",
+          "pos": [
+            1,
+            125,
+            -1
+          ],
+          "res": {
+            "ok": true,
+            "elapsed_ms": 319.8,
+            "result": {
+              "placed": "soul_sand",
+              "pos": [
+                1,
+                125,
+                -1
+              ],
+              "sneaked": true
+            }
+          }
+        },
+        {
+          "op": "move_to_skull_reach",
+          "res": {
+            "ok": false,
+            "elapsed_ms": 111.3,
+            "error": {
+              "code": "path_not_found",
+              "message": "path_not_found (Pathfinder noPath to target) {'pos': [0.5, 124, 2.4]}",
+              "extra": {
+                "pos": [
+                  0.5,
+                  124,
+                  2.4
+                ]
+              }
+            }
+          }
+        },
+        {
+          "op": "place_skull_0",
+          "pos": [
+            -1,
+            125,
+            -2
+          ],
+          "res": {
+            "ok": true,
+            "elapsed_ms": 222.2,
+            "result": {
+              "placed": "wither_skeleton_skull",
+              "pos": [
+                -1,
+                125,
+                -2
+              ],
+              "sneaked": true
+            }
+          }
+        },
+        {
+          "op": "place_skull_1",
+          "pos": [
+            0,
+            125,
+            -2
+          ],
+          "res": {
+            "ok": true,
+            "elapsed_ms": 199.9,
+            "result": {
+              "placed": "wither_skeleton_skull",
+              "pos": [
+                0,
+                125,
+                -2
+              ],
+              "sneaked": true
+            }
+          }
+        },
+        {
+          "op": "place_skull_2",
+          "pos": [
+            1,
+            125,
+            -2
+          ],
+          "res": {
+            "ok": false,
+            "elapsed_ms": 52.2,
+            "error": {
+              "code": "place_failed",
+              "message": "place_failed (Server refused to place wither_skeleton_skull at (1, 125, -2): the block is still air) {'pos': [1, 125, -2]}",
+              "extra": {
+                "pos": [
+                  1,
+                  125,
+                  -2
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "samples": [
+        {
+          "t_s": 0.0,
+          "pos": [
+            0.5,
+            125.1,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 100.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.02116524136721d, 0.5d]"
+        },
+        {
+          "t_s": 2.0,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 140.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 4.0,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 180.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 6.0,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 220.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 8.0,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 260.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 10.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 300.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 12.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 298.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 14.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 296.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 16.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 294.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 18.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 292.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 20.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 290.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 22.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 288.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        },
+        {
+          "t_s": 24.1,
+          "pos": [
+            0.5,
+            125,
+            0.5
+          ],
+          "health": null,
+          "drift_xz": 0.0,
+          "escaped": false,
+          "rcon_hp": "Wither has the following entity data: 286.0f",
+          "rcon_pos": "Wither has the following entity data: [0.5d, 125.0d, 0.5d]"
+        }
+      ],
+      "wither_seen": true,
+      "wither_id": 2279,
+      "escaped": false,
+      "max_drift_xz": 0.0,
+      "rcon_hp_series": [
+        [
+          0.0,
+          100.0
+        ],
+        [
+          2.0,
+          140.0
+        ],
+        [
+          4.0,
+          180.0
+        ],
+        [
+          6.0,
+          220.0
+        ],
+        [
+          8.0,
+          260.0
+        ],
+        [
+          10.1,
+          300.0
+        ],
+        [
+          12.1,
+          298.0
+        ],
+        [
+          14.1,
+          296.0
+        ],
+        [
+          16.1,
+          294.0
+        ],
+        [
+          18.1,
+          292.0
+        ],
+        [
+          20.1,
+          290.0
+        ],
+        [
+          22.1,
+          288.0
+        ],
+        [
+          24.1,
+          286.0
+        ]
+      ],
+      "summon_wither_advancement": true,
+      "peak_hp": 300.0,
+      "post_explosion_hp_drop": 14.0,
+      "suffocating_confirmed": true
+    }
+  ],
+  "nether_entry": {
+    "dimension": "the_nether",
+    "pos": [
+      0.5,
+      122,
+      3.5
+    ]
+  },
+  "bedrock_3x3_y127": {
+    "center": [
+      0,
+      127,
+      0
+    ],
+    "all_bedrock": true,
+    "grid": {
+      "-1,-1": "bedrock",
+      "-1,0": "bedrock",
+      "-1,1": "bedrock",
+      "0,-1": "bedrock",
+      "0,0": "bedrock",
+      "0,1": "bedrock",
+      "1,-1": "bedrock",
+      "1,0": "bedrock",
+      "1,1": "bedrock"
+    }
+  },
+  "layer_y126_cleared": {
+    "-1,-1": "air",
+    "-1,0": "air",
+    "-1,1": "air",
+    "0,-1": "air",
+    "0,0": "air",
+    "0,1": "air",
+    "1,-1": "air",
+    "1,0": "air",
+    "1,1": "air"
+  },
+  "verdict": {
+    "any_template_passed": true
+  }
+}

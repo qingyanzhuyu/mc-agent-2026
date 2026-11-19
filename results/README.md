@@ -23,13 +23,13 @@
 在仓库 `code/` 目录下执行（无需网络、无需游戏账号）：
 
 ```bash
-# 1. 全量离线单测（1,275 项）
+# 1. 全量离线单测（1,421 项）
 uv run python -m unittest discover -s tests
 
 # 2. 脱敏官方异常包确定性离线重放（零网络，2/2 磁带命中）
 uv run python -m mcagent.loop --replay ../results/replay-sample/INC-005-P2-replan_oscillation-craft_gear.json
 
-# 3. 三层技能契约 + 76 项台账 DAG + 战略上下文干跑
+# 3. 三层技能契约（79 技能：4 live + 75 offline）+ 104 项台账 DAG + 战略上下文干跑
 uv run python -m mcagent.loop --dry --strategy llm --min-verified offline
 ```
 
@@ -43,3 +43,15 @@ uv run python -m mcagent.loop --dry --strategy llm --min-verified offline
 | 起步木料 + `survey_island` | `gather_wood(2)` → `survey_island(sectors=2, radius=32)` | `gather_wood` 3 步 `12.0s` 拿 2 原木；`survey_island` 2 步 `18.9s` 完成 2 扇区体检，写入 `WorldResourceMemo` **44 条暴露资源**、**1 处地标** |
 | `trade_villager` / `furnace_lease` | `blocked()` + `best_fuel_for(1)` + `lease_book_for(state)` | 持木后 `trade_villager` 门禁放行；`best_fuel_for(1)` 命中 `('oak_log', 1)`，租约账本正常初始化 |
 | `discover_structure` | `discover_structure(structure="stronghold", radius=32)`（4 步有界） | 4 步 `34.8s` 有界探索推进正常，无卡死/崩溃，退出干净 `/disconnect` |
+
+## 四、本地靶场 Stage 3 探针与冒烟（`local-target`，与官方数据严格分列）
+
+> 以下 5 份脱敏 JSON 均采样自 2026-11-19 队内自搭 Vanilla `1.21.11` 靶场（`127.0.0.1:8787/8788` → `<local-lan-target>`，角色已脱敏为 `<local_test_bot>`），**仅作离线机制标定与本地闭环验证，严格与 `official` 官方数据分列，绝不计入官方比赛时间预算或作为官方准入结论**。
+
+| 路径 | 来源标签 | 采样时间 | 证明内容（`local-target`） |
+|---|---|---|---|
+| `probe/t4-p1-item-frame-20261119.json` | **`local-target`** | 2026-11-19 | `T4-P1`（B19 末地船展示框）：`/attack(max_hits=1)`（`64.1ms`）与 `/look + /control(hit=true)`（`61.6+56.1ms`）均一次弹出并拾取满耐久 `elytra`，空框留墙，验证 `max_hits=1` 必需性 |
+| `probe/t4-p2-local-check-20261119.json` | **`local-target`** | 2026-11-19 | `T4-P2`（自搭服难度与全链体检）：确认 Vanilla `1.21.11` `hard` 难度、50 实体正常刷怪、`keepInventory=false`；打通 `gather_wood -> mine_stone -> craft_gear -> smelt_iron` 并闭环修复 `SurveyIsland` 空循环与 `ScoutIsland` Y=67 矿坑脱困 |
+| `probe/t4-p3-wither-y127-20261119.json` | **`local-target`** | 2026-11-19 | `T4-P3`（C20 私域下界 `Y=127` 凋灵窒息模板）：`3×3` 基岩下水平 T 形召唤即时解锁 `summon_wither`（`place_skull_2` 消耗块返 `place_failed` 属正常），`300 HP` 初爆零漂移（`max_drift_xz=0.0`）且稳定 `-1.0 HP/s` 窒息 |
+| `probe/t4-p4-strider-boost-20261119.json` | **`local-target`** | 2026-11-19 | `T4-P4`（B13 炽足兽加速）：`/interact` 上鞍骑乘 + `/use_item(warped_fungus_on_a_stick)` 触发耐久 `100 -> 99`（`-1`）并即时解锁 `ride_strider`；实测与规范 §4.5 差异已标记「条件解锁、待官方 1 步复核」 |
+| `probe/stage3-local-smoke-20261119.json` | **`local-target`** | 2026-11-19 | Stage 3 实时冒烟：18 项 T4 技能空包 `blocked` **18/18 拦截**；Vanilla `1.21.11` 实跑 `crafter_chain`（26 步，漏斗排空合出 `crafter`）、`ride_strider_boost`（5 步，耐久 `-1`）、`jukebox_meadow`（2 步，草甸放唱片）**3/3 解锁真实进度** |

@@ -16,7 +16,7 @@ probe_fixture.py  寻路夹具模板与离线校验
 planner/          战略目标 objective.py + 异步预取 scheduler.py + 技能菜单 skill_choice.py + 原子动作 decision.py + llm.py（2 路 BoundedSemaphore 与双线路降级）+ llm_fault.py
 skills/           L2 空间与脱困原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（21 类指纹 + 原子 JSON 检查点）与 79 个注册 L3 技能（4 项 verified="live" + 75 项 verified="offline"，含 emergency_escape 及阶段三 18 项 T4 技能）
 loop/             比赛与取证主循环：engine.py（同格冷却自旋三级升级 + 30s 沿路扫描）、goals.py（104 项 GoalSpec 台账：89 计分项 / 2,730 分上限 [80.6%]，6 graduated / 1 candidate / 97 draft）、subgoals.py（10 项活谓词 + 10 类工作站）、context.py（脱敏摘要）、strategy.py & strategy_async.py（--strategy llm）、policy.py、auditor.py、tape.py
-../tests/         离线故障注入、多线程抢占、L2/L3 与主循环回归单测：1,397 项（无需账号与外网；另有 ../../tools/local-api-bridge/test/ 11 项 Node 网关契约单测）
+../tests/         离线故障注入、多线程抢占、L2/L3 与主循环回归单测：1,421 项（无需账号与外网；另有 ../../tools/local-api-bridge/test/ 11 项 Node 网关契约单测）
 ```
 
 分层与写技能的规则见仓库根 `AGENTS.md` §9。
@@ -34,7 +34,7 @@ loop/             比赛与取证主循环：engine.py（同格冷却自旋三�
 
 ```bash
 cp mcagent/.env.example mcagent/.env                                       # 填 MC_USER / MC_PASS（需要真机时）
-uv run python -m unittest discover -s tests -v                             # 跑离线单测：1,397 项（无需账号）
+uv run python -m unittest discover -s tests -v                             # 跑离线单测：1,421 项（无需账号）
 uv run python -m mcagent.preflight                                         # 赛前静态自检（12 项门禁：残留进程/7897 代理/并发闸门/占位检查，不联网）
 uv run python -m mcagent.client                                            # 只验端点（不需要账号）
 uv run python -m mcagent.smoke --dry                                       # 同上，输出更多
@@ -51,7 +51,7 @@ uv run python -m mcagent.probe                                             # 量
 | `runtime.py`（单调时钟死亡去重 + 65s `safe_mode` + 非幂等超时判重 + `emergency()` 抢占锁 + 连续异步 `SafetyMonitor` + 有界 `move_to` 超时禁重试 + `v1.3.11` 精选恢复） | `verified: live` | 2026-11-19 官方三项故障演练 3/3 PASS（断线重连 / `65.2s` `safe_mode` 自愈 / 并发 401）、C16 虚空保护 `0/12` 误报、2h 官方长跑 **0 死亡 0 崩溃** + 离线故障注入单测全绿 |
 | `preflight.py`（12 项门禁：官方端点 / 凭据 / `LLM_MAX_CONCURRENCY <= 2` / 8787 网关 / 残留 `soak_ctl`·`mcagent` 进程 / `apiin.nmo.net.cn` 误配 `7897` 代理拦截） | `verified: live` | 2026-11-19 官方模式 `preflight --apply --live` **15/15 全绿** + 离线单测全覆盖 |
 | `skills/`（L2 原语 + `world_memo` 21 类指纹与原子检查点 + `furnace_lease` + **79 个注册 L3 技能**） | **4 `live` / 75 `offline`** | 官方 2h 长跑完整跑通且 0 Bug 的 4 项技能已升格 `verified="live"`（`gather_wood`、`craft_gear`、`mine_stone`、`emergency_escape` 6/6）；其余 **75 项（含阶段二 37 项与阶段三 18 项 T4 技能）诚实保持 `verified="offline"`**（阶段二与阶段三 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 及 18 项空包拦截已在 `local-target` 冒烟通过，待官方服真机复测后逐项升格） |
-| `loop/`（`goals.py` **104 项 `GoalSpec` 台账** [89 计分 / 2,730 分上限，80.6%，`6 graduated / 1 candidate / 97 draft`] + 共享子图 DAG ROI + 被动机会根目标门控 + 30s 沿路扫描 + `subgoals.py` 10 项活谓词 + `strategy_async.py`） | 部分 `live` / 阶段二三 `offline` | 官方 2h 长跑前 `124.7s` 拿下 5 项起步目标、230 条进度曲线与 `INC-005` 100% 离线 `--replay` 落地；暴露的 4 环死锁与 Token 烧爆已于 `c03c26e` 闭环修复（待新一轮官方长跑复验）；全量 `1,397` 单测与 `--dry` 全绿 |
+| `loop/`（`goals.py` **104 项 `GoalSpec` 台账** [89 计分 / 2,730 分上限，80.6%，`6 graduated / 1 candidate / 97 draft`] + 共享子图 DAG ROI + 被动机会根目标门控 + 30s 沿路扫描 + `subgoals.py` 10 项活谓词 + `strategy_async.py`） | 部分 `live` / 阶段二三 `offline` | 官方 2h 长跑前 `124.7s` 拿下 5 项起步目标、230 条进度曲线与 `INC-005` 100% 离线 `--replay` 落地；暴露的 4 环死锁与 Token 烧爆已于 `c03c26e` 闭环修复（待新一轮官方长跑复验）；全量 `1,421` 单测与 `--dry` 全绿 |
 | `planner/`（`objective.py`、`scheduler.py`、`skill_choice.py`、`decision.py`、`llm.py` 2 路 `BoundedSemaphore` 与双线路降级、`llm_fault.py`） | `verified: live` | 2026-11-19 官方 AIA `api.nju-aia.com`（`qwen3.6-35b-a3b`）快路径 `4/4`（`p50=1652.7ms`）与长跑 1,306 次实测（`p50=3.83s`）标定通过 + 离线单测全覆盖 |
 | `smoke.py` / `probe.py` | `verified: live` | 官方校园网 `smoke`（`0.5s` 登录 `ready=True`）、`probe` 三组基线、`--api-capabilities --live`、C16 标定与三项故障演练全部实测完成并归档 `../../results/probe/` |
 
