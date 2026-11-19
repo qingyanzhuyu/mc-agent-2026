@@ -1,4 +1,4 @@
-"""Stage 2 Wave 1 (T2/T3) Goal Ledger contract tests."""
+"""Stage 2 (Wave 1 + Wave 2, T2/T3) Goal Ledger contract tests."""
 from __future__ import annotations
 
 import unittest
@@ -47,19 +47,42 @@ BATCH_2C_IDS: tuple[str, ...] = (
     "place_dried_ghast_in_water",
     "whos_the_pillager_now",
 )
-STAGE2_EXPECTED_IDS: tuple[str, ...] = BATCH_1_IDS + BATCH_2A_IDS + BATCH_2B_IDS + BATCH_2C_IDS
+BATCH_2D_IDS: tuple[str, ...] = (
+    "enter_the_end",
+    "enter_end_gateway",
+    "find_end_city",
+    "levitate",
+)
+BATCH_2E_IDS: tuple[str, ...] = (
+    "under_lock_and_key",
+    "who_needs_rockets",
+    "lighten_up",
+    "read_power_of_chiseled_bookshelf",
+    "heart_transplanter",
+)
+STAGE2_EXPECTED_IDS: tuple[str, ...] = (
+    BATCH_1_IDS
+    + BATCH_2A_IDS
+    + BATCH_2B_IDS
+    + BATCH_2C_IDS
+    + BATCH_2D_IDS
+    + BATCH_2E_IDS
+)
 
 
 class Stage2LedgerContractTests(unittest.TestCase):
     def test_stage2_counts_and_batch_point_totals(self):
-        self.assertEqual(len(GOALS), 57)
-        self.assertEqual(len(GOAL_MAP), 57)
+        self.assertEqual(len(GOALS), 66)
+        self.assertEqual(len(GOAL_MAP), 66)
 
         t0_t1 = [g for g in GOALS if g.tier in {"T0_PREP", "T1"}]
+        t0_t1_scored = [g for g in t0_t1 if g.score > 0]
         stage2 = [g for g in GOALS if g.tier in {"T2", "T3"}]
         self.assertEqual(len(t0_t1), 26)
-        self.assertEqual(len(stage2), 31)
-        self.assertEqual(sum(g.score for g in stage2), 835)
+        self.assertEqual((len(t0_t1_scored), sum(g.score for g in t0_t1_scored)), (21, 290))
+        self.assertEqual(len(stage2), 40)
+        self.assertEqual(sum(g.score for g in stage2), 1165)
+        self.assertEqual(sum(g.score for g in GOALS), 1455)
         self.assertEqual(tuple(g.id for g in stage2), STAGE2_EXPECTED_IDS)
 
         expected_batches = (
@@ -67,6 +90,8 @@ class Stage2LedgerContractTests(unittest.TestCase):
             ("batch_2a", BATCH_2A_IDS, 5, 180),
             ("batch_2b", BATCH_2B_IDS, 7, 230),
             ("batch_2c", BATCH_2C_IDS, 14, 260),
+            ("batch_2d", BATCH_2D_IDS, 4, 210),
+            ("batch_2e", BATCH_2E_IDS, 5, 120),
         )
         for name, ids, count, pts in expected_batches:
             with self.subTest(batch=name):
@@ -76,7 +101,7 @@ class Stage2LedgerContractTests(unittest.TestCase):
 
     def test_stage2_goals_preserve_draft_and_wip1_discipline(self):
         stage2 = [g for g in GOALS if g.tier in {"T2", "T3"}]
-        self.assertEqual(len(stage2), 31)
+        self.assertEqual(len(stage2), 40)
         for goal in stage2:
             with self.subTest(goal=goal.id):
                 self.assertEqual(goal.stage, "draft")
@@ -89,18 +114,18 @@ class Stage2LedgerContractTests(unittest.TestCase):
         self.assertEqual(len([g for g in GOALS if g.stage in {"graduated", "live"}]), 6)
 
     def test_stage2_advancements_and_scores_match_draft_scores_v2(self):
-        stage2 = [g for g in GOALS if g.tier in {"T2", "T3"}]
-        for goal in stage2:
+        scored = [g for g in GOALS if g.score > 0]
+        self.assertEqual(len(scored), 61)
+        self.assertEqual(sum(g.score for g in scored), 1455)
+        for goal in scored:
             with self.subTest(goal=goal.id):
                 self.assertEqual(len(goal.done_advancements), 1)
                 adv = goal.done_advancements[0]
                 self.assertIn(adv, ADVANCEMENT_SCORES_V2)
                 self.assertEqual(goal.score, ADVANCEMENT_SCORES_V2[adv])
 
-        scored = [g for g in GOALS if g.score > 0]
-        self.assertEqual(len(scored), 52)
         adv_ids = [g.done_advancements[0] for g in scored]
-        self.assertEqual(len(set(adv_ids)), 52)
+        self.assertEqual(len(set(adv_ids)), 61)
 
     def test_stage2_dag_validation_and_transitive_prereq_closure(self):
         self.assertEqual(validate_ledger(GOALS), [])
@@ -108,7 +133,7 @@ class Stage2LedgerContractTests(unittest.TestCase):
         def closure(goal_id: str) -> set[str]:
             return {goal_id}.union(*(closure(pid) for pid in GOAL_MAP[goal_id].prereq_goals))
 
-        for goal in (row for row in GOALS if row.tier in {"T2", "T3"}):
+        for goal in GOALS:
             with self.subTest(goal=goal.id):
                 for pid in goal.prereq_goals:
                     self.assertIn(pid, GOAL_MAP)
@@ -117,9 +142,9 @@ class Stage2LedgerContractTests(unittest.TestCase):
                 self.assertEqual({row.id for row in resolved}, expected)
                 self.assertEqual(len(resolved), len(expected))
 
-    def test_every_stage2_skill_and_args_bind_cleanly_in_registry(self):
+    def test_every_goal_skill_args_and_editable_files_bind_cleanly_in_registry(self):
         root = Path(__file__).resolve().parents[2]
-        for goal in (row for row in GOALS if row.tier in {"T2", "T3"}):
+        for goal in GOALS:
             bindings = [(goal.skill, goal.skill_args)] + [
                 (name, args) for _, name, args in goal.gather_fallbacks
             ]
