@@ -21,14 +21,60 @@ from ..planner.objective import (
 )
 from ..runtime import State, _inv_fingerprint
 from ..skills.items import best_pickaxe
+from ..skills.world_memo import memo_for
 from .goals import GOALS, GoalSpec
 from .starter_skills import best_axe, best_food, total_cobble, total_logs, total_planks
+from .subgoals import evaluate_all_subgoals
 
 if TYPE_CHECKING:
     from .reserve import ReservationBook
 
 DEFAULT_MATCH_SECONDS: float = 8 * 3600.0
 MAX_CONTEXT_CHARS: int = 2000
+
+_PENDING_STUB = "待现场观察"
+
+_STATION_LABELS: dict[str, str] = {
+    "crafting_table": "工作台",
+    "furnace": "熔炉",
+    "blast_furnace": "高炉",
+    "smoker": "烟熏炉",
+    "bed": "床",
+    "enchanting_table": "附魔台",
+    "nether_portal": "传送门",
+    "anvil": "铁砧",
+}
+_LANDMARK_LABELS: dict[str, str] = {
+    "village": "村庄",
+    "ruined_portal": "废弃传送门",
+    "stronghold": "要塞",
+    "bee_nest": "蜂巢",
+    "lava_pool": "岩浆池",
+    "water_source": "水源",
+    "cave_iron": "铁矿洞",
+    "fortress": "下界要塞",
+    "trial_chambers": "试炼密室",
+    "deep_dark": "深暗之域",
+    "archaeology": "遗迹",
+    "powder_snow": "细雪",
+}
+_RESOURCE_LABELS: dict[str, str] = {
+    "wood": "原木",
+    "water": "水源",
+    "lava": "熔岩",
+    "coal_ore": "煤矿",
+    "iron_ore": "铁矿",
+    "diamond_ore": "钻石矿",
+    "obsidian": "黑曜石",
+    "station": "工作站",
+}
+_SUBGOAL_LANDMARK_LABELS: dict[str, str] = {
+    **_LANDMARK_LABELS,
+    **_RESOURCE_LABELS,
+    "iron": "铁矿",
+    "diamond": "钻石",
+    "any": "任意",
+}
 
 _COORD_TRIPLE_RE = re.compile(
     r"[\[\(]\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*[\]\)]"
@@ -153,6 +199,82 @@ def _format_optional_mapping(label: str, data: Any) -> str:
     return f"{label}：{joined[:220]}" if joined else ""
 
 
+def _format_nested_subgoal(key: str, sub: Mapping[str, Any]) -> str:
+    if key == "station_ready":
+        active = [_STATION_LABELS.get(str(sk), scrub_sensitive_text(str(sk))) for sk, flag in sub.items() if flag]
+        return ",".join(a for a in active if a) or "无"
+    if key == "landmark_reachable":
+        specific = [sk for sk, flag in sub.items() if sk != "any" and flag]
+        keys = specific if specific else (["any"] if sub.get("any") else [])
+        active = [_SUBGOAL_LANDMARK_LABELS.get(str(sk), scrub_sensitive_text(str(sk))) for sk in keys]
+        return ",".join(a for a in active if a) or "无"
+    if all(isinstance(sv, bool) for sv in sub.values()):
+        active = [scrub_sensitive_text(str(sk)) for sk, flag in sub.items() if flag]
+        return ",".join(a for a in active if a) or "无"
+    pairs = [f"{scrub_sensitive_text(str(sk))}:{scrub_sensitive_text(str(sv))}" for sk, sv in sub.items()]
+    return ",".join(p for p in pairs if p) or "无"
+
+
+def format_subgoal_summary(predicates: Optional[Mapping[str, Any]]) -> str:
+    """将结构化或平铺的子目标谓词映射格式化为紧凑、脱敏的摘要文本（不含前缀）。"""
+    if not predicates:
+        return ""
+    parts: list[str] = []
+    for raw_k, raw_v in predicates.items():
+        if raw_v == _PENDING_STUB:
+            continue
+        k = scrub_sensitive_text(str(raw_k))
+        if not k:
+            continue
+        if isinstance(raw_v, Mapping):
+            val_str = _format_nested_subgoal(str(raw_k), raw_v)
+        elif str(raw_k) in ("safe_encounter", "active_portal") and isinstance(raw_v, bool):
+            val_str = "是" if raw_v else "否"
+        else:
+            val_str = scrub_sensitive_text(str(raw_v))
+        parts.append(f"{k}={val_str}")
+    joined = scrub_sensitive_text("; ".join(parts))
+    return joined if len(joined) <= 260 else joined[:257] + "..."
+
+
+def format_world_landmarks(world_landmarks: Optional[Mapping[str, Any]]) -> str:
+    """将世界资源与地标摘要格式化为脱敏中文单行（空世界返回空串，长度 <= 200 字符）。"""
+    if not world_landmarks or not isinstance(world_landmarks, Mapping):
+        return ""
+    portal_active = bool(world_landmarks.get("active_portal"))
+    stations = dict.fromkeys(str(s) for s in (world_landmarks.get("stations_ready") or ()) if str(s).strip())
+    landmarks = dict.fromkeys(str(lm) for lm in (world_landmarks.get("landmarks_discovered") or ()) if str(lm).strip())
+    resource_counts = world_landmarks.get("resource_counts")
+
+    parts: list[str] = []
+    for station in stations:
+        if portal_active and station == "nether_portal":
+            continue
+        label = _STATION_LABELS.get(station, scrub_sensitive_text(station))
+        if label:
+            parts.append(f"{label}=已就绪")
+    for landmark in landmarks:
+        label = _LANDMARK_LABELS.get(landmark, scrub_sensitive_text(landmark))
+        if label:
+            parts.append(f"{label}=已发现")
+    if portal_active:
+        parts.append("传送门=已激活")
+    if isinstance(resource_counts, Mapping):
+        res_parts: list[str] = []
+        for res, cnt in resource_counts.items():
+            if isinstance(cnt, (int, float)) and not isinstance(cnt, bool) and int(cnt) > 0:
+                res_label = _RESOURCE_LABELS.get(str(res), scrub_sensitive_text(str(res)))
+                if res_label:
+                    res_parts.append(f"{res_label}={int(cnt)}")
+        if res_parts:
+            parts.append(f"资源({', '.join(res_parts)})")
+
+    if not parts:
+        return ""
+    line = scrub_sensitive_text(f"已知设施与地标：{'; '.join(parts)}")
+    return line if len(line) <= 200 else line[:197] + "..."
+
+
 @dataclass(frozen=True)
 class DecisionContext:
     """组装完毕的战略层决策上下文（结构化字段 + 文本渲染）。"""
@@ -169,6 +291,8 @@ class DecisionContext:
     subgoal_predicates: Optional[Mapping[str, Any]] = None
     reservations: Optional[Any] = None
     extra_fields: Mapping[str, Any] = field(default_factory=dict)
+    world_landmarks: Optional[Mapping[str, Any]] = None
+    subgoal_summary: str = ""
 
     def render_menu(self) -> str:
         return render_objective_menu(self.eligible_goals, self.suspended_goals)
@@ -191,9 +315,20 @@ class DecisionContext:
             self.inventory_summary,
         ]
 
-        sub_line = _format_optional_mapping("子目标谓词", self.subgoal_predicates)
-        if sub_line:
+        if self.subgoal_predicates is not None:
+            sub_body = format_subgoal_summary(self.subgoal_predicates)
+        elif self.subgoal_summary:
+            sub_body = scrub_sensitive_text(self.subgoal_summary)
+        else:
+            sub_body = ""
+        if sub_body and sub_body != _PENDING_STUB:
+            sub_line = sub_body if sub_body.startswith("子目标谓词：") else f"子目标谓词：{sub_body}"
             sections.append(sub_line)
+
+        landmarks_line = format_world_landmarks(self.world_landmarks)
+        if landmarks_line:
+            sections.append(landmarks_line)
+
         res_line = _format_optional_mapping("物资预留", self.reservations)
         if res_line:
             sections.append(res_line)
@@ -242,6 +377,7 @@ def build_decision_context(
     reservations: Optional[Any] = None,
     reservation_book: Optional[ReservationBook] = None,
     extra_fields: Optional[Mapping[str, Any]] = None,
+    world_landmarks: Optional[Mapping[str, Any]] = None,
 ) -> DecisionContext:
     """由 harness 客观组装战略决策上下文（不含 current_goal_hint、科技硬编码、坐标与实体 id）。"""
     total_budget_s = float(max_match_seconds) if max_match_seconds > 0.0 else DEFAULT_MATCH_SECONDS
@@ -275,6 +411,26 @@ def build_decision_context(
         for s in suspended
     )
 
+    memo = memo_for(state)
+    dim = str((state.st or {}).get("dimension") or "overworld")
+    live_subgoals = evaluate_all_subgoals(state, memo=memo, reservations=reservation_book)
+
+    if subgoal_predicates is None:
+        resolved_subgoals: dict[str, Any] = dict(live_subgoals)
+    else:
+        resolved_subgoals = {
+            k: (live_subgoals[k] if v == _PENDING_STUB and k in live_subgoals else v)
+            for k, v in subgoal_predicates.items()
+            if not (v == _PENDING_STUB and k not in live_subgoals)
+        }
+
+    resolved_landmarks: dict[str, Any] = (
+        dict(world_landmarks)
+        if world_landmarks is not None
+        else (dict(memo.summary_for_context(dimension=dim)) if hasattr(memo, "summary_for_context") else {})
+    )
+    subgoal_summary_str = format_subgoal_summary(resolved_subgoals)
+
     return DecisionContext(
         remaining_match_s=round(remaining_s, 1),
         elapsed_match_s=round(elapsed_s, 1),
@@ -285,7 +441,9 @@ def build_decision_context(
         eligible_goals=tuple(eligible),
         suspended_goals=cleaned_suspended,
         recent_objectives=tuple(recent_objectives[-5:]),
-        subgoal_predicates=dict(subgoal_predicates) if subgoal_predicates is not None else None,
+        subgoal_predicates=resolved_subgoals,
         reservations=reservations,
         extra_fields=dict(extra_fields or {}),
+        world_landmarks=resolved_landmarks,
+        subgoal_summary=subgoal_summary_str,
     )

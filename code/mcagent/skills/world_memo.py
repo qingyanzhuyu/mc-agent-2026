@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+import json
 import math
+import os
+from pathlib import Path
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -67,6 +71,14 @@ def _finite_float(value: Any) -> Optional[float]:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
+def _parse_cell(value: Any) -> Optional[Cell]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+        return None
+    return (int(value[0]), int(value[1]), int(value[2]))
+
+
 def _origin_dist(origin: Any, cell: Cell) -> float:
     """复用 `sightline` 计算玩家/参考坐标到方块几何中心的欧氏距离。"""
     if isinstance(origin, Mapping) or hasattr(origin, "snapshot"):
@@ -113,6 +125,11 @@ class WorldResourceMemo:
         self._clock, self._max_per_bucket, self._default_cooldown_s = clock, int(max_per_bucket), float(unreachable_cooldown_s)
         self._lock = threading.RLock()
         self._entries: dict[tuple[str, str, Cell], ResourceEntry] = {}
+        self._stations: dict[tuple[str, str], list[Cell]] = {}
+        self._landmarks: dict[tuple[str, str], list[tuple[Cell, dict[str, Any]]]] = {}
+        self._portals: dict[str, list[Cell]] = {}
+        self._blocked_regions: dict[tuple[str, tuple[int, ...]], float] = {}
+        self.landmark_version: int = 0
 
     def __len__(self) -> int:
         with self._lock:
@@ -121,6 +138,11 @@ class WorldResourceMemo:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._stations.clear()
+            self._landmarks.clear()
+            self._portals.clear()
+            self._blocked_regions.clear()
+            self.landmark_version = 0
 
     def _cooldown(self, override: Optional[float]) -> float:
         return self._default_cooldown_s if override is None else float(override)
@@ -226,6 +248,137 @@ class WorldResourceMemo:
         out.sort(key=(lambda e: (_origin_dist(origin, e.pos), -e.updated_at)) if origin is not None else (lambda e: (e.last_dist if e.last_dist is not None else math.inf, -e.updated_at)))
         return out
 
+    def _record_station_locked(self, kind: str, cell: Cell, dim: str) -> None:
+        k = bare(kind).strip().lower()
+        if not k:
+            raise ValueError(f"非法工作站类型: {kind!r}")
+        cells = self._stations.setdefault((dim, k), [])
+        if any(math.dist(cell, existing) <= 1.5 for existing in cells):
+            return
+        cells.append(cell)
+
+    def _record_landmark_locked(self, kind: str, cell: Cell, dim: str, meta: Optional[Mapping[str, Any]] = None) -> bool:
+        k = bare(kind).strip().lower()
+        if not k:
+            raise ValueError(f"非法地标类型: {kind!r}")
+        items = self._landmarks.setdefault((dim, k), [])
+        for existing_cell, existing_meta in items:
+            if math.dist(cell, existing_cell) <= 8.0:
+                if isinstance(meta, Mapping):
+                    existing_meta.update(meta)
+                return False
+        items.append((cell, dict(meta) if isinstance(meta, Mapping) else {}))
+        self.landmark_version += 1
+        return True
+
+    def record_station(self, kind: str, pos: Any, *, dimension: str = "overworld") -> None:
+        """记录工作站坐标，同维度同类型 1.5 格内去重。"""
+        k = bare(kind).strip().lower()
+        if not k:
+            raise ValueError(f"非法工作站类型: {kind!r}")
+        dim, cell = _norm_dim(dimension), block_cell(pos)
+        with self._lock:
+            self._record_station_locked(k, cell, dim)
+
+    def has_station(self, kind: str, *, dimension: str = "overworld") -> bool:
+        """判断指定维度是否存在指定类型的工作站。"""
+        return bool(self.stations(kind, dimension=dimension))
+
+    def stations(self, kind: Optional[str] = None, *, dimension: str = "overworld") -> list[tuple[int, int, int]]:
+        """查询指定维度（及可选工作站类型）已记录的工作站整数格坐标列表。"""
+        dim = _norm_dim(dimension)
+        k = bare(kind).strip().lower() if kind is not None else None
+        if kind is not None and not k:
+            return []
+        with self._lock:
+            out: list[tuple[int, int, int]] = []
+            seen: set[Cell] = set()
+            for (d, sk), cells in self._stations.items():
+                if d != dim:
+                    continue
+                if k is not None:
+                    matched = (
+                        sk == k
+                        or (k == "bed" and sk.endswith("_bed"))
+                        or (k == "furnace" and sk in ("blast_furnace", "smoker"))
+                    )
+                    if not matched:
+                        continue
+                for cell in cells:
+                    if cell not in seen:
+                        seen.add(cell)
+                        out.append(tuple(cell))
+            return out
+
+    def record_landmark(self, kind: str, pos: Any, *, dimension: str = "overworld", meta: Optional[dict] = None) -> bool:
+        """记录结构/地标位置，同维度同类型 8.0 格内去重；新增时递增 `landmark_version`。"""
+        k = bare(kind).strip().lower()
+        if not k:
+            raise ValueError(f"非法地标类型: {kind!r}")
+        dim, cell = _norm_dim(dimension), block_cell(pos)
+        with self._lock:
+            return self._record_landmark_locked(k, cell, dim, meta)
+
+    def has_landmark(self, kind: Optional[str] = None, *, dimension: str = "overworld") -> bool:
+        """判断指定维度是否已记录（指定类型的）地标。"""
+        dim = _norm_dim(dimension)
+        k = bare(kind).strip().lower() if kind is not None else None
+        if kind is not None and not k:
+            return False
+        with self._lock:
+            if k is None:
+                return any(bool(items) for (d, _), items in self._landmarks.items() if d == dim)
+            return bool(self._landmarks.get((dim, k)))
+
+    def landmarks(self, kind: Optional[str] = None, *, dimension: str = "overworld") -> list[tuple[int, int, int]]:
+        """查询指定维度（及可选地标类型）已记录的地标整数格坐标列表。"""
+        dim = _norm_dim(dimension)
+        k = bare(kind).strip().lower() if kind is not None else None
+        if kind is not None and not k:
+            return []
+        with self._lock:
+            if k is None:
+                return [
+                    tuple(cell)
+                    for (d, _), items in self._landmarks.items()
+                    if d == dim
+                    for cell, _ in items
+                ]
+            return [tuple(cell) for cell, _ in self._landmarks.get((dim, k), ())]
+
+    def record_active_portal(self, pos: Any, *, dimension: str = "overworld") -> None:
+        """记录已激活传送门坐标，同维度 2.0 格内去重。"""
+        dim, cell = _norm_dim(dimension), block_cell(pos)
+        with self._lock:
+            cells = self._portals.setdefault(dim, [])
+            if any(math.dist(cell, existing) <= 2.0 for existing in cells):
+                return
+            cells.append(cell)
+
+    def has_active_portal(self, *, dimension: str = "overworld") -> bool:
+        """判断指定维度是否存在已激活传送门。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return bool(self._portals.get(dim))
+
+    def record_blocked_region(self, skill_name: str, chunk: tuple, *, ttl_s: float = 120.0) -> None:
+        """记录指定技能在目标区块上的临时受阻标记（带 TTL 冷却）。"""
+        key = (str(skill_name).strip(), tuple(int(v) for v in chunk))
+        with self._lock:
+            self._blocked_regions[key] = float(self._clock()) + max(0.0, float(ttl_s))
+
+    def is_region_blocked(self, skill_name: str, chunk: tuple) -> bool:
+        """判断指定技能在目标区块的受阻冷却是否仍有效；过期则清理并返回 `False`。"""
+        key = (str(skill_name).strip(), tuple(int(v) for v in chunk))
+        with self._lock:
+            expires_at = self._blocked_regions.get(key)
+            if expires_at is None:
+                return False
+            if float(self._clock()) >= expires_at:
+                self._blocked_regions.pop(key, None)
+                return False
+            return True
+
     def ingest_find_blocks(self, response: Any, *, dimension: str = "overworld", origin: Any = None, category: Optional[str] = None) -> int:
         """吸收 `find_blocks` 明细或摘要响应；同时记录资源分类与结构指纹标签。"""
         if not isinstance(response, Mapping):
@@ -238,6 +391,10 @@ class WorldResourceMemo:
             return 0
         dim, ingested = _norm_dim(dimension), 0
         with self._lock:
+            prot_depl_cells = {
+                ec for (ed, _, ec), e in self._entries.items()
+                if ed == dim and e.status in ("protected", "depleted")
+            }
             for raw_name, raw_pos, raw_dist in rows:
                 bname = bare(raw_name).strip()
                 try:
@@ -254,7 +411,12 @@ class WorldResourceMemo:
                 targets = ([(category, ptag if category == "structure" else None)] if category is not None
                            else ([(c, ptag)] if (c := classify_block(bname)) is not None else []) + [("structure", t) for t in tags])
                 for cat, tag in targets:
-                    self._upsert_seen(cat, bname, cell, dim, dist_val, tag, "untested", False)
+                    saved = self._upsert_seen(cat, bname, cell, dim, dist_val, tag, "untested", False)
+                    if saved.status not in ("protected", "depleted") and cell not in prot_depl_cells:
+                        if cat == "station":
+                            self._record_station_locked(bname, cell, dim)
+                        elif cat == "structure" and tag:
+                            self._record_landmark_locked(tag, cell, dim, {"block": bname})
                 if targets:
                     self._entries.pop((dim, _FALLBACK_CAT, cell), None)
                     ingested += 1
@@ -284,6 +446,245 @@ class WorldResourceMemo:
                 name = f"{e.tag}({e.block or cat})" if (cat == "structure" and e.tag) else (e.block or cat)
                 segments.append(f"{label}: {name}{dist_part}({_STATUS_LABELS.get(e.status, e.status)})")
         return " | ".join(segments)
+
+    def summary_for_context(self, *, dimension: str = "overworld") -> dict[str, Any]:
+        """生成绝对不含坐标与实体 ID 的上下文摘要字典。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            now = float(self._clock())
+            cd = self._default_cooldown_s
+            stations_ready = sorted({
+                ("bed" if sk.endswith("_bed") else sk)
+                for (d, sk), cells in self._stations.items()
+                if d == dim and cells
+            })
+            landmark_kinds: set[str] = {
+                lk for (d, lk), items in self._landmarks.items()
+                if d == dim and items
+            }
+            resource_counts: dict[str, int] = {}
+            for (edim, ecat, cell), e in self._entries.items():
+                if edim != dim or ecat == _FALLBACK_CAT:
+                    continue
+                fb = self._entries.get((dim, _FALLBACK_CAT, cell))
+                if self._is_entry_blocked(e, now, cd) or (fb is not None and self._is_entry_blocked(fb, now, cd)):
+                    continue
+                if ecat == "structure":
+                    if e.tag:
+                        landmark_kinds.add(e.tag)
+                else:
+                    resource_counts[ecat] = resource_counts.get(ecat, 0) + 1
+            return {
+                "dimension": dim,
+                "stations_ready": stations_ready,
+                "landmarks_discovered": sorted(landmark_kinds),
+                "active_portal": bool(self._portals.get(dim)),
+                "resource_counts": dict(sorted(resource_counts.items())),
+                "landmark_version": int(self.landmark_version),
+            }
+
+    def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
+        """原子保存台账检查点为 UTF-8 JSON（`schema_version=1`）。"""
+        target = Path(path)
+        with self._lock:
+            stations_out: dict[str, dict[str, list[list[int]]]] = {}
+            for (dim, kind), cells in self._stations.items():
+                if cells:
+                    stations_out.setdefault(dim, {})[kind] = [list(c) for c in cells]
+            landmarks_out: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            for (dim, kind), items in self._landmarks.items():
+                if items:
+                    landmarks_out.setdefault(dim, {})[kind] = [
+                        {"pos": list(cell), "meta": dict(meta)} for cell, meta in items
+                    ]
+            portals_out: dict[str, list[list[int]]] = {
+                dim: [list(c) for c in cells]
+                for dim, cells in self._portals.items()
+                if cells
+            }
+            resources_out = [
+                {
+                    "category": e.category,
+                    "block": e.block,
+                    "pos": list(e.pos),
+                    "dimension": e.dimension,
+                    "status": e.status,
+                    "error_code": e.error_code,
+                    "last_dist": e.last_dist,
+                    "attempts": e.attempts,
+                    "updated_at": e.updated_at,
+                    "tag": e.tag,
+                }
+                for e in self._entries.values()
+            ]
+            payload = {
+                "schema_version": 1,
+                "landmark_version": int(self.landmark_version),
+                "stations": stations_out,
+                "landmarks": landmarks_out,
+                "portals": portals_out,
+                "resources": resources_out,
+            }
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(target.parent),
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                tmp_path = fh.name
+                fh.write(serialized)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, target)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def load_checkpoint(self, path: str | os.PathLike[str]) -> bool:
+        """安全读取并校验 JSON 检查点（`schema_version=1`），成功则原子替换内部状态。"""
+        try:
+            target = Path(path)
+            raw = target.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, Mapping):
+                return False
+            schema_ver = data.get("schema_version")
+            if isinstance(schema_ver, bool) or schema_ver != 1:
+                return False
+            lv = data.get("landmark_version")
+            if not isinstance(lv, int) or isinstance(lv, bool) or lv < 0:
+                return False
+
+            stations_raw = data.get("stations")
+            landmarks_raw = data.get("landmarks")
+            portals_raw = data.get("portals")
+            resources_raw = data.get("resources")
+            if not (
+                isinstance(stations_raw, Mapping)
+                and isinstance(landmarks_raw, Mapping)
+                and isinstance(portals_raw, Mapping)
+                and isinstance(resources_raw, list)
+            ):
+                return False
+
+            new_stations: dict[tuple[str, str], list[Cell]] = {}
+            for raw_dim, kind_map in stations_raw.items():
+                if not isinstance(raw_dim, str) or not isinstance(kind_map, Mapping):
+                    return False
+                dim = _norm_dim(raw_dim)
+                for raw_kind, cells_raw in kind_map.items():
+                    if not isinstance(raw_kind, str) or not isinstance(cells_raw, list):
+                        return False
+                    k = bare(raw_kind).strip().lower()
+                    if not k:
+                        return False
+                    parsed_cells: list[Cell] = []
+                    for c in cells_raw:
+                        cell = _parse_cell(c)
+                        if cell is None:
+                            return False
+                        parsed_cells.append(cell)
+                    if parsed_cells:
+                        new_stations[(dim, k)] = parsed_cells
+
+            new_landmarks: dict[tuple[str, str], list[tuple[Cell, dict[str, Any]]]] = {}
+            for raw_dim, kind_map in landmarks_raw.items():
+                if not isinstance(raw_dim, str) or not isinstance(kind_map, Mapping):
+                    return False
+                dim = _norm_dim(raw_dim)
+                for raw_kind, items_raw in kind_map.items():
+                    if not isinstance(raw_kind, str) or not isinstance(items_raw, list):
+                        return False
+                    k = bare(raw_kind).strip().lower()
+                    if not k:
+                        return False
+                    parsed_items: list[tuple[Cell, dict[str, Any]]] = []
+                    for item in items_raw:
+                        if not isinstance(item, Mapping):
+                            return False
+                        cell = _parse_cell(item.get("pos"))
+                        if cell is None:
+                            return False
+                        meta = item.get("meta", {})
+                        if not isinstance(meta, Mapping):
+                            return False
+                        parsed_items.append((cell, dict(meta)))
+                    if parsed_items:
+                        new_landmarks[(dim, k)] = parsed_items
+
+            new_portals: dict[str, list[Cell]] = {}
+            for raw_dim, cells_raw in portals_raw.items():
+                if not isinstance(raw_dim, str) or not isinstance(cells_raw, list):
+                    return False
+                dim = _norm_dim(raw_dim)
+                parsed_cells = []
+                for c in cells_raw:
+                    cell = _parse_cell(c)
+                    if cell is None:
+                        return False
+                    parsed_cells.append(cell)
+                if parsed_cells:
+                    new_portals[dim] = parsed_cells
+
+            new_entries: dict[tuple[str, str, Cell], ResourceEntry] = {}
+            for item in resources_raw:
+                if not isinstance(item, Mapping):
+                    return False
+                cat = item.get("category")
+                if not isinstance(cat, str) or not cat.strip():
+                    return False
+                block = item.get("block", "")
+                if not isinstance(block, str):
+                    return False
+                cell = _parse_cell(item.get("pos"))
+                if cell is None:
+                    return False
+                raw_dim = item.get("dimension", "overworld")
+                if not isinstance(raw_dim, str):
+                    return False
+                dim = _norm_dim(raw_dim)
+                status = item.get("status", "untested")
+                if status not in VALID_STATUSES:
+                    return False
+                error_code = item.get("error_code", "")
+                if not isinstance(error_code, str):
+                    return False
+                last_dist_raw = item.get("last_dist")
+                last_dist = None if last_dist_raw is None else _finite_float(last_dist_raw)
+                if last_dist_raw is not None and last_dist is None:
+                    return False
+                attempts = item.get("attempts", 0)
+                if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+                    return False
+                updated_at = _finite_float(item.get("updated_at", 0.0))
+                if updated_at is None:
+                    return False
+                tag = item.get("tag")
+                if tag is not None and not isinstance(tag, str):
+                    return False
+                new_entries[(dim, cat, cell)] = ResourceEntry(
+                    cat, bare(block).strip(), cell, dim, status, error_code, last_dist, attempts, updated_at, tag
+                )
+
+            with self._lock:
+                self._entries = new_entries
+                self._stations = new_stations
+                self._landmarks = new_landmarks
+                self._portals = new_portals
+                self.landmark_version = lv
+            return True
+        except Exception:
+            return False
 
 
 _STATE_MEMOS: weakref.WeakKeyDictionary[Any, WorldResourceMemo] = weakref.WeakKeyDictionary()
