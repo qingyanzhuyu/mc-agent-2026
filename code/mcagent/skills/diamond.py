@@ -1,6 +1,7 @@
 """Diamond collection and equipment entry points for the T1 harness."""
 from __future__ import annotations
 
+from collections.abc import Generator
 import math
 
 from ..runtime import EnvBlocked, Replan
@@ -10,8 +11,8 @@ from .diamond_site import (
     _dry_name, _in_reach, _nearby, _safe_excavation, _safe_status, _standing,
 )
 from .field import equip_item, mine_block_batch, place_block, scan_blocks
-from .items import AIR, NAV_FAIL_CODES, PICKAXE_ORDER, bare, record_mine_trail
-from .mining import MineStepUnsafe, mine_step
+from .items import AIR, NAV_FAIL_CODES, PICKAXE_ORDER, PLACEABLE_BLOCKS, bare, record_mine_trail
+from .mining import SOLID_SUPPORT, MineStepUnsafe, mine_step
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
@@ -31,11 +32,32 @@ _MAX_ORES = 16
 _MIN_Y = -54
 _SCAN_RADIUS = 16
 
+LAPIS_ORES = frozenset(("lapis_ore", "deepslate_lapis_ore"))
+REDSTONE_ORES = frozenset(("redstone_ore", "deepslate_redstone_ore"))
+BONUS_ORES = LAPIS_ORES | REDSTONE_ORES
+_BONUS_ORE_INFO = {
+    "lapis_ore": ("lapis_ore", LAPIS_ORES, "lapis_lazuli"),
+    "deepslate_lapis_ore": ("lapis_ore", LAPIS_ORES, "lapis_lazuli"),
+    "redstone_ore": ("redstone_ore", REDSTONE_ORES, "redstone"),
+    "deepslate_redstone_ore": ("redstone_ore", REDSTONE_ORES, "redstone"),
+}
+_BONUS_STABLE = SOLID_SUPPORT | frozenset(PLACEABLE_BLOCKS) | DIAMOND_ORES | BONUS_ORES | {"bedrock", "obsidian"}
+_FACES = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+_MAX_BONUS_ORES = 4
+
 
 def _voxel_cache(state):
     try:
         from . import voxel_cache
         return voxel_cache.voxel_cache_for(state)
+    except ImportError:
+        return None
+
+
+def _world_memo(state):
+    try:
+        from .world_memo import memo_for
+        return memo_for(state)
     except ImportError:
         return None
 
@@ -63,6 +85,24 @@ def _record_station(state, kind: str, pos, dimension: str = "overworld") -> None
     fn = getattr(memo_for(state), "record_station", None)
     if callable(fn):
         fn(kind, pos, dimension=dimension)
+
+
+def _safe_bonus_excavation(ex, origin, ore, protected) -> bool:
+    """Verify stance support, dry neighbors, and non-preserved target for bonus ore digging."""
+    if not _standing(ex, origin):
+        return False
+    if protected and not all(_standing(ex, cell) for cell in protected[-2:]):
+        return False
+    preserved = {_above(cell, dy) for cell in {origin, *protected} for dy in (-1, 0, 1)}
+    if ore in preserved:
+        return False
+    x, y, z = ore
+    if _dry_name(_block(ex, _above(ore, 1))) not in _BONUS_STABLE | AIR:
+        return False
+    if not all(_dry_name(_block(ex, (x + dx, y + dy, z + dz))) for dx, dy, dz in _FACES):
+        return False
+    block = _block(ex, ore)
+    return _dry_name(block) in BONUS_ORES and block.get("diggable") is not False
 
 
 def _world_block(state) -> str:
@@ -152,6 +192,110 @@ def _nearby_loot(ex, state, names, goal_qty: int, status):
                 view = taken["view"]
 
 
+def collect_bonus_ores(
+    ex,
+    state,
+    *,
+    protected=(),
+    tried=None,
+    max_blocks: int = 2,
+    radius: int = 6,
+    observed=None,
+) -> Generator[dict, None, int]:
+    """Opportunistically record and safely mine reachable lapis/redstone ores at Y <= 0."""
+    status = _safe_status(ex, state, "overworld")
+    origin = _cell(status["pos"])
+    if origin[1] > 0 or max_blocks <= 0:
+        return 0
+    if observed is not None:
+        raw_blocks = observed.get("blocks") or ()
+    else:
+        scan = scan_blocks(ex, state, list(BONUS_ORES), radius=radius, limit=max(4, max_blocks * 2))
+        raw_blocks = scan.get("blocks") or ()
+    candidates: list[tuple[tuple[int, int, int], str]] = []
+    seen_pos: set[tuple[int, int, int]] = set()
+    for block in raw_blocks:
+        bname = bare(block.get("name"))
+        raw_pos = block.get("pos")
+        if bname not in BONUS_ORES or not raw_pos or len(raw_pos) != 3:
+            continue
+        pos = _cell(raw_pos)
+        if pos not in seen_pos:
+            seen_pos.add(pos)
+            candidates.append((pos, bname))
+    if not candidates:
+        return 0
+    memo = _world_memo(state)
+    if memo is not None:
+        for pos, bname in candidates:
+            category, _, _ = _BONUS_ORE_INFO[bname]
+            memo.record_seen(
+                category,
+                bname,
+                pos,
+                dimension="overworld",
+                dist=eye_to_block_dist(status, pos),
+            )
+    candidates.sort(key=lambda item: (eye_to_block_dist(status, item[0]), item[0]))
+    if _pick(_fresh_inventory(ex, state), _IRON_PICKS, 1) is None:
+        return 0
+    tried_set = tried if tried is not None else set()
+    vc = _voxel_cache(state)
+    mined = 0
+    for pos, bname in candidates:
+        if mined >= max_blocks:
+            break
+        if pos in tried_set:
+            continue
+        if vc is not None and vc.is_unreachable("mine_diamond", pos, dimension="overworld", stance_cell=origin):
+            continue
+        if not (_in_reach(ex, status, pos, reach=DIG_EYE_REACH)
+                and _safe_bonus_excavation(ex, origin, pos, protected)):
+            continue
+        if mined > 0 and _pick(_fresh_inventory(ex, state), _IRON_PICKS, 1) is None:
+            break
+        tried_set.add(pos)
+        yield from _hand_pick(ex, state, 1)
+        stand = _safe_status(ex, state, "overworld")
+        stand_cell = _cell(stand["pos"])
+        if not (_in_reach(ex, stand, pos, reach=DIG_EYE_REACH)
+                and _safe_bonus_excavation(ex, stand_cell, pos, protected)):
+            status = stand
+            origin = stand_cell
+            continue
+        category, family, drop_item = _BONUS_ORE_INFO[bname]
+        try:
+            yield from mine_block_batch(
+                ex,
+                state,
+                (pos,),
+                block_types=family,
+                drop=drop_item,
+                count=1,
+                max_blocks=1,
+            )
+        except Replan as exc:
+            code, _ = failure(exc)
+            if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
+                if vc is not None:
+                    vc.mark_unreachable("mine_diamond", pos, dimension="overworld", stance_cell=stand_cell)
+                if memo is not None:
+                    memo.mark_unreachable(pos, dimension="overworld", category=category, error_code=code, block=bname)
+                status = _safe_status(ex, state, "overworld")
+                origin = _cell(status["pos"])
+                yield rec("bonus_ore_skip", pos=list(pos), error_code=code)
+                continue
+            raise
+        if vc is not None:
+            vc.invalidate(pos, dimension="overworld")
+        if memo is not None:
+            memo.mark_depleted(pos, dimension="overworld", category=category)
+        mined += 1
+        status = _safe_status(ex, state, "overworld")
+        origin = _cell(status["pos"])
+    return mined
+
+
 @register
 class MineDiamond(Skill):
     name = "mine_diamond"
@@ -196,6 +340,8 @@ class MineDiamond(Skill):
         path = [_cell(start["pos"])]
         waypoints = [start["pos"]]
         tried_ores = set()
+        tried_bonus: set = set()
+        bonus_mined = 0
         visited_columns = {(path[0][0], path[0][2])}
         heading = CARDINALS[0]
         stairs = 0
@@ -264,11 +410,29 @@ class MineDiamond(Skill):
                         raise
                     if vc is not None:
                         vc.invalidate(ore, dimension="overworld")
-                    _safe_status(ex, state, "overworld")
+                    after_mine = _safe_status(ex, state, "overworld")
                     if state.count("diamond") >= goal_qty:
+                        if _cell(after_mine["pos"])[1] <= 0 and bonus_mined < _MAX_BONUS_ORES:
+                            bonus_mined += yield from collect_bonus_ores(
+                                ex,
+                                state,
+                                protected=path,
+                                tried=tried_bonus,
+                                max_blocks=min(2, _MAX_BONUS_ORES - bonus_mined),
+                            )
                         return
                     break
                 else:
+                    if origin[1] <= 0 and bonus_mined < _MAX_BONUS_ORES:
+                        bonus_mined += yield from collect_bonus_ores(
+                            ex,
+                            state,
+                            protected=path,
+                            tried=tried_bonus,
+                            max_blocks=min(2, _MAX_BONUS_ORES - bonus_mined),
+                        )
+                        status = _safe_status(ex, state, "overworld")
+                        origin = _cell(status["pos"])
                     if (_cell(status["pos"]) != path[-1] or stairs >= _MAX_DESCENT or origin[1] <= _MIN_Y):
                         break
                     step = yield from self._down_step(ex, state, origin, path, visited_columns, heading)
@@ -282,11 +446,21 @@ class MineDiamond(Skill):
                     stairs += 1
                     if stairs % 4 == 0:
                         minerals = ["lapis_ore", "deepslate_lapis_ore", "iron_ore", "deepslate_iron_ore"]
-                        if path[-1][1] < 0:
+                        if path[-1][1] <= 0:
                             minerals += ["redstone_ore", "deepslate_redstone_ore"]
                         observed = scan_blocks(ex, state, minerals, radius=8, limit=6)
                         if observed["blocks"]:
                             yield rec("diamond_prospect", observed)
+                            if (path[-1][1] <= 0 and bonus_mined < _MAX_BONUS_ORES
+                                    and any(bare(b.get("name")) in BONUS_ORES for b in observed["blocks"])):
+                                bonus_mined += yield from collect_bonus_ores(
+                                    ex,
+                                    state,
+                                    protected=path,
+                                    tried=tried_bonus,
+                                    max_blocks=min(2, _MAX_BONUS_ORES - bonus_mined),
+                                    observed=observed,
+                                )
         except Replan:
             collected = state.count("diamond")
             if initial < collected < goal_qty:

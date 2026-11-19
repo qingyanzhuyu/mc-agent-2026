@@ -13,6 +13,10 @@ from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
 from .field import move_local
 from .furnace import collect_furnace, inspect_furnace, load_furnace
+from .furnace_lease import (
+    EXTENDED_FUEL_BURNS, FurnaceLease, SMELTING_STATIONS, best_fuel_for,
+    collect_leased, lease_book_for, load_and_lease, smelt_seconds_per_item,
+)
 from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe, record_mine_trail
 from .mining import (
     SOLID_SUPPORT, MineStepUnsafe, mine_step, prepare_mining_pick, safe_mine_column,
@@ -20,9 +24,11 @@ from .mining import (
 )
 from .recipes import craft_recipe
 from .registry import register
-from .sightline import API_DIG_EYE_REACH, DIG_EYE_REACH, can_reach_block, eye_to_block_dist
+from .sightline import (
+    API_DIG_EYE_REACH, DIG_EYE_REACH, STATION_EYE_REACH, can_reach_block, eye_to_block_dist,
+)
 from .voxel_cache import voxel_cache_for
-from .windows import window_amount, window_section
+from .windows import window_amount, window_section, window_view
 from .world_memo import memo_for
 
 if TYPE_CHECKING:
@@ -30,10 +36,30 @@ if TYPE_CHECKING:
 
 IRON_ORES = ("iron_ore", "deepslate_iron_ore", "raw_iron_block")
 WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "mangrove", "pale_oak")
+_BLAST_INPUTS = frozenset({
+    "raw_iron", "iron_ore", "deepslate_iron_ore",
+    "raw_gold", "gold_ore", "deepslate_gold_ore", "nether_gold_ore",
+    "raw_copper", "copper_ore", "deepslate_copper_ore",
+    "ancient_debris",
+})
+_SMOKER_INPUTS = frozenset({
+    "beef", "porkchop", "chicken", "mutton", "rabbit",
+    "cod", "salmon", "potato", "kelp",
+})
+
+
+def _fuel_units(item: str) -> int:
+    return int(round(EXTENDED_FUEL_BURNS[item] * 2))
+
+
 # 半个冶炼单位：煤/木炭 8 个，木板/原木 1.5 个；退役木镐 1 个、木棍 0.5 个仅作兜底。
-BASE_FUELS = (("coal", 16), ("charcoal", 16)) + tuple(
-    (f"{w}_{suffix}", 3) for suffix in ("planks", "log") for w in WOODS
+_BASE_FUEL_NAMES = (
+    "coal", "charcoal", "coal_block", "dried_kelp_block", "blaze_rod",
+    *(f"{w}_planks" for w in WOODS),
+    "bamboo_planks", "bamboo_mosaic", "bamboo_block",
+    *(f"{w}_log" for w in WOODS),
 )
+BASE_FUELS = tuple((name, _fuel_units(name)) for name in _BASE_FUEL_NAMES)
 RADIUS = 32
 MINING_REACH = DIG_EYE_REACH
 PROSPECT_STEPS = 6
@@ -47,6 +73,16 @@ _SESSION_EXCLUDED = WeakKeyDictionary()
 
 def reset_iron_memo() -> None:
     _SESSION_EXCLUDED.clear()
+
+
+def stations_for_item(item: str) -> tuple[str, ...]:
+    """Return preferred smelting station kinds for `item` in priority order."""
+    name = bare(item).strip()
+    if name in _BLAST_INPUTS:
+        return ("blast_furnace", "furnace")
+    if name in _SMOKER_INPUTS:
+        return ("smoker", "furnace")
+    return ("furnace",)
 
 
 def _reach_mod():
@@ -63,6 +99,109 @@ def _bounded_move_to(ex: "Executor", pos, *, rng: int = 2, timeout: float = 30.0
         return ex.move_to(pos=pos, rng=rng, timeout=timeout, retries=0)
     except TypeError:
         return ex.move_to(pos=pos, rng=rng)
+
+
+def start_smelt_lease(
+    ex: "Executor",
+    state: "State",
+    pos,
+    *,
+    input_item: str = "raw_iron",
+    count: int,
+    fuel_item: str,
+    fuel_count: int = 1,
+    station_kind: str = "furnace",
+    expected_output: Optional[str] = None,
+    consumer: str = "smelt_iron",
+    reservation_book=None,
+) -> Iterator[dict]:
+    """Load a smelting station and register a non-blocking `FurnaceLease`."""
+    return (
+        yield from load_and_lease(
+            ex,
+            state,
+            pos,
+            input_item=input_item,
+            count=count,
+            fuel_item=fuel_item,
+            fuel_count=fuel_count,
+            station_kind=station_kind,
+            expected_output=expected_output,
+            consumer=consumer,
+            reservation_book=reservation_book,
+        )
+    )
+
+
+def collect_smelt_lease(ex: "Executor", state: "State", lease: FurnaceLease) -> Iterator[dict]:
+    """Move into station reach if needed and collect output/bucket for `lease`."""
+    status = state.refresh_status(ex.client, max_age_s=0)
+    stance = status if status.get("pos") is not None else (
+        state.st if (state.st or {}).get("pos") is not None else state.pos
+    )
+    if not can_reach_block(ex, stance, lease.pos, reach=STATION_EYE_REACH):
+        yield rec("move_to", _bounded_move_to(ex, list(lease.pos), rng=2, timeout=30.0), pos=list(lease.pos))
+    return (yield from collect_leased(ex, state, lease))
+
+
+def _inspect_station(ex: "Executor", target: dict, station_kind: str = "furnace") -> Iterator[dict]:
+    """Inspect a smelting station window, preserving `furnace` error messages."""
+    kind = bare(station_kind).strip() or "furnace"
+    if kind == "furnace":
+        return (yield from inspect_furnace(ex, target))
+    view = yield from window_view(ex, target)
+    win = bare(view.get("window")).strip()
+    if win != kind and win not in SMELTING_STATIONS:
+        raise Replan(f"目标窗口未确认是 {kind}")
+    return view
+
+
+def _collect_station(
+    ex: "Executor",
+    state: "State",
+    target: dict,
+    *,
+    item: str,
+    section: str = "output",
+    view: Optional[dict] = None,
+    station_kind: str = "furnace",
+    inspect_after: bool = True,
+    require_empty: bool = False,
+) -> Iterator[dict]:
+    """Collect from any smelting station window (`furnace`, `blast_furnace`, `smoker`)."""
+    kind = bare(station_kind).strip() or "furnace"
+    if kind == "furnace":
+        return (
+            yield from collect_furnace(
+                ex,
+                state,
+                target,
+                item=item,
+                section=section,
+                view=view,
+                inspect_after=inspect_after,
+                require_empty=require_empty,
+            )
+        )
+    if view is None:
+        view = yield from _inspect_station(ex, target, station_kind=kind)
+    result = yield from collect_furnace(
+        ex,
+        state,
+        target,
+        item=item,
+        section=section,
+        view=view,
+        inspect_after=False,
+        require_empty=False,
+    )
+    after = None
+    if inspect_after or require_empty:
+        after = yield from _inspect_station(ex, target, station_kind=kind)
+        if require_empty and window_section(after, section):
+            raise Replan(f"熔炉 {target.get('pos')} 取出后 {section} 仍有剩余产物：{after}")
+    result["view"] = after
+    return result
 
 
 def _record_station(state: "State", kind: str, pos, dimension: str = "overworld") -> None:
@@ -88,7 +227,9 @@ def _fuels_for(state: "State") -> tuple[tuple[str, int], ...]:
     extra: list[tuple[str, int]] = []
     if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
         extra.append(("wooden_pickaxe", 2))
-    extra.append(("stick", 1))
+    extra.append(("stick", _fuel_units("stick")))
+    extra.append(("leaf_litter", _fuel_units("leaf_litter")))
+    extra.append(("lava_bucket", _fuel_units("lava_bucket")))
     return BASE_FUELS + tuple(extra)
 
 
@@ -123,7 +264,10 @@ def _fuel_batches(stock, fuels, remaining: int) -> tuple[list[tuple[str, int, in
 class SmeltIron(Skill):
     name = "smelt_iron"
     description = "采集暴露铁矿，缺矿时有界阶梯探矿，再安全熔炼取出铁锭"
-    params = {"count": Param(int, "期望新增铁锭数（粗铁用完即止）", default=3, min=1, max=16)}
+    params = {
+        "count": Param(int, "期望新增铁锭数（粗铁用完即止）", default=3, min=1, max=16),
+        "async_lease": Param(bool, "是否采用非阻塞租约模式（装料登记后立即返回或回收就绪租约）", default=False),
+    }
     goal = "acq:iron_ingot"
     verified = "offline"
 
@@ -501,19 +645,28 @@ class SmeltIron(Skill):
             f"缺 {remaining} 个冶炼单位（至少 {math.ceil(remaining / 1.5)} 块木板）"
         )
 
-    def _furnace(self, ex: "Executor", state: "State") -> Iterator[dict]:
+    def _furnace(self, ex: "Executor", state: "State", *, item: str = "raw_iron") -> Iterator[dict]:
+        valid_stations = stations_for_item(item)
         dim = str((state.st or {}).get("dimension") or "overworld")
-        found = ex.client.find_blocks(types=["furnace"], radius=16, limit=4).get("blocks") or []
+        stance = state.st if (state.st or {}).get("pos") is not None else state.pos
+        found = ex.client.find_blocks(types=list(valid_stations), radius=16, limit=8).get("blocks") or []
+        observed: list[tuple[str, list]] = []
         for b in found:
             pos = b.get("pos")
             if not isinstance(pos, list) or len(pos) != 3:
                 continue
-            if bare(ex.client.get_block(pos).get("name")) != "furnace":
-                continue
+            block_name = bare(ex.client.get_block(pos).get("name"))
+            if block_name in valid_stations:
+                observed.append((block_name, pos))
+        if observed:
+            observed.sort(key=lambda entry: (valid_stations.index(entry[0]), eye_to_block_dist(stance, entry[1])))
+            block_name, pos = observed[0]
             yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=30.0), pos=pos)
-            _record_station(state, "furnace", pos, dimension=dim)
+            _record_station(state, block_name, pos, dimension=dim)
+            self._station_kind = block_name
             return pos
-        if not state.count("furnace"):
+        station_item = next((kind for kind in valid_stations if state.count(kind) >= 1), None)
+        if station_item is None:
             raise Replan("背包缺熔炉，find_blocks 半径 16 内也未观察到已有熔炉")
         st = state.refresh_status(ex.client, max_age_s=0)
         dim = str(st.get("dimension") or dim)
@@ -531,10 +684,11 @@ class SmeltIron(Skill):
                     continue
                 if bare(ex.client.get_block([pos[0], py + 1, pos[2]]).get("name")) not in AIR:
                     continue
-                yield rec("place", ex.place("furnace", pos=pos), item="furnace", pos=pos)
-                if bare(ex.client.get_block(pos).get("name")) != "furnace":
+                yield rec("place", ex.place(station_item, pos=pos), item=station_item, pos=pos)
+                if bare(ex.client.get_block(pos).get("name")) != station_item:
                     raise Replan(f"放置后 get_block 在 {pos} 未确认熔炉")
-                _record_station(state, "furnace", pos, dimension=dim)
+                _record_station(state, station_item, pos, dimension=dim)
+                self._station_kind = station_item
                 return pos
         # 地下狭窄矿井兜底：若四向皆为安全实心岩壁且有石级镐，侧向凿出 1x2 壁龛放炉。
         if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
@@ -554,20 +708,34 @@ class SmeltIron(Skill):
                         yield rec("dig", ex.dig(cell, collect=True), pos=cell)
                 if (bare(ex.client.get_block([pos[0], y - 1, pos[2]]).get("name")) in SOLID_SUPPORT
                         and all(bare(ex.client.get_block([pos[0], y + k, pos[2]]).get("name")) in AIR for k in (0, 1))):
-                    yield rec("place", ex.place("furnace", pos=pos), item="furnace", pos=pos)
-                    if bare(ex.client.get_block(pos).get("name")) != "furnace":
+                    yield rec("place", ex.place(station_item, pos=pos), item=station_item, pos=pos)
+                    if bare(ex.client.get_block(pos).get("name")) != station_item:
                         raise Replan(f"放置后 get_block 在 {pos} 未确认熔炉")
-                    _record_station(state, "furnace", pos, dimension=dim)
+                    _record_station(state, station_item, pos, dimension=dim)
+                    self._station_kind = station_item
                     return pos
         raise Replan("观察脚边四个方向的落点/净空/底板后无安全熔炉位置，环境缺安全承重落点")
 
-    def _poll_and_take(self, ex: "Executor", state: "State", pos, target: dict, batch: int) -> Iterator[dict]:
-        deadline = time.monotonic() + 10 * batch + 20
+    def _poll_and_take(
+        self,
+        ex: "Executor",
+        state: "State",
+        pos,
+        target: dict,
+        batch: int,
+        *,
+        station_kind: Optional[str] = None,
+    ) -> Iterator[dict]:
+        kind = station_kind or getattr(self, "_station_kind", "furnace")
+        sec = smelt_seconds_per_item(kind)
+        wait_limit = int(sec * batch + 20)
+        deadline = time.monotonic() + sec * batch + 20
+        max_polls = int(sec / POLL_SECONDS * batch) + 11
         view = {}
-        for poll in range(5 * batch + 11):
+        for poll in range(max_polls):
             if poll:
                 time.sleep(POLL_SECONDS)
-            view = yield from inspect_furnace(ex, target)
+            view = yield from _inspect_station(ex, target, station_kind=kind)
             if not window_section(view, "input") and window_amount(view, "output", "iron_ingot") >= batch:
                 break
             if time.monotonic() >= deadline:
@@ -575,26 +743,35 @@ class SmeltIron(Skill):
         else:
             raise Replan(f"观察熔炉 {pos} 超过轮询上限，冶炼 {batch} 个铁超时：{view}")
         if window_section(view, "input") or window_amount(view, "output", "iron_ingot") < batch:
-            raise Replan(f"观察熔炉 {pos} 等待 {10 * batch + 20}s 后铁未烧完，检查燃料/原料：{view}")
-        result = yield from collect_furnace(
-            ex, state, target, item="iron_ingot", view=view, require_empty=True,
+            raise Replan(f"观察熔炉 {pos} 等待 {wait_limit}s 后铁未烧完，检查燃料/原料：{view}")
+        result = yield from _collect_station(
+            ex,
+            state,
+            target,
+            item="iron_ingot",
+            view=view,
+            station_kind=kind,
+            require_empty=True,
         )
         return result["view"]
 
     def _recover_placed_furnace(self, ex: "Executor", state: "State") -> Iterator[dict]:
         """抢占或重连后若粗铁与熔炉均已离手，先检查附近已放熔炉回收在途铁锭，避免重复下矿。"""
         dim = str((state.st or {}).get("dimension") or "overworld")
-        found = ex.client.find_blocks(types=["furnace"], radius=16, limit=4).get("blocks") or []
+        valid_stations = stations_for_item("raw_iron")
+        found = ex.client.find_blocks(types=list(valid_stations), radius=16, limit=8).get("blocks") or []
         for b in found:
             pos = b.get("pos")
             if not (isinstance(pos, list) and len(pos) == 3):
                 continue
-            if bare(ex.client.get_block(pos).get("name")) != "furnace":
+            block_name = bare(ex.client.get_block(pos).get("name"))
+            if block_name not in valid_stations:
                 continue
             yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=30.0), pos=pos)
-            _record_station(state, "furnace", pos, dimension=dim)
+            _record_station(state, block_name, pos, dimension=dim)
+            self._station_kind = block_name
             target = {"pos": pos}
-            view = yield from inspect_furnace(ex, target)
+            view = yield from _inspect_station(ex, target, station_kind=block_name)
             in_raw = window_amount(view, "input", "raw_iron")
             out_ingot = window_amount(view, "output", "iron_ingot")
             if in_raw > 0:
@@ -602,18 +779,46 @@ class SmeltIron(Skill):
                     yield from self._prepare_fuel(ex, state, in_raw)
                     fuel, fuel_count, _ = self._fuel_plan(state, in_raw)[0]
                     yield from load_furnace(ex, state, target, fuel_item=fuel, fuel_count=fuel_count, view=view)
-                yield from self._poll_and_take(ex, state, pos, target, in_raw + out_ingot)
+                view = yield from self._poll_and_take(
+                    ex, state, pos, target, in_raw + out_ingot, station_kind=block_name,
+                )
+                if view and window_amount(view, "fuel", "bucket") > 0:
+                    yield from _collect_station(
+                        ex, state, target, item="bucket", section="fuel", view=view,
+                        station_kind=block_name, inspect_after=False, require_empty=False,
+                    )
                 return
             if out_ingot > 0 and not window_section(view, "input"):
-                yield from collect_furnace(ex, state, target, item="iron_ingot",
-                                           view=view, inspect_after=False)
+                yield from _collect_station(
+                    ex, state, target, item="iron_ingot", view=view,
+                    station_kind=block_name, inspect_after=False,
+                )
+                if window_amount(view, "fuel", "bucket") > 0:
+                    yield from _collect_station(
+                        ex, state, target, item="bucket", section="fuel", view=view,
+                        station_kind=block_name, inspect_after=False, require_empty=False,
+                    )
                 return
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.invalidate_inventory()
         state.refresh_inventory(ex.client)
         start_ingots = state.count("iron_ingot")
-        if state.count("raw_iron") < 1 and state.count("raw_iron_block") < 1 and state.count("furnace") < 1:
+        if self.args.get("async_lease"):
+            dim = str((state.st or {}).get("dimension") or "overworld")
+            book = lease_book_for(state)
+            ready_iron = [
+                lease for lease in book.ready_leases(dimension=dim)
+                if lease.expected_output == "iron_ingot"
+            ]
+            for lease in ready_iron:
+                yield from collect_smelt_lease(ex, state, lease)
+                if state.count("iron_ingot") - start_ingots >= self.args["count"]:
+                    return
+            if state.count("iron_ingot") > start_ingots:
+                return
+        if (state.count("raw_iron") < 1 and state.count("raw_iron_block") < 1
+                and not any(state.count(s) >= 1 for s in stations_for_item("raw_iron"))):
             yield from self._recover_placed_furnace(ex, state)
             if state.count("iron_ingot") - start_ingots >= self.args["count"]:
                 return
@@ -638,19 +843,65 @@ class SmeltIron(Skill):
                 if (state.count("coal") + state.count("charcoal")) * 8 >= count:
                     break
         yield from self._prepare_fuel(ex, state, count)
+        if self.args.get("async_lease"):
+            best = best_fuel_for(state, count)
+            if best is not None:
+                fuel, fuel_count = best
+                batch = count
+            else:
+                fuel, fuel_count, batch = self._fuel_plan(state, count)[0]
+            pos = yield from self._furnace(ex, state)
+            station_kind = getattr(self, "_station_kind", "furnace")
+            lease = yield from start_smelt_lease(
+                ex,
+                state,
+                pos,
+                input_item="raw_iron",
+                count=batch,
+                fuel_item=fuel,
+                fuel_count=fuel_count,
+                station_kind=station_kind,
+                expected_output="iron_ingot",
+                consumer="smelt_iron",
+            )
+            yield rec(
+                "smelt_lease_started",
+                {
+                    "pos": list(lease.pos),
+                    "station_kind": lease.station_kind,
+                    "count": lease.count,
+                    "ready_at": lease.ready_at,
+                    "returns_empty_bucket": lease.returns_empty_bucket,
+                },
+            )
+            return
         plan = self._fuel_plan(state, count)
         pos = yield from self._furnace(ex, state)
         target = {"pos": pos}
-        view = yield from inspect_furnace(ex, target)
+        station_kind = getattr(self, "_station_kind", "furnace")
+        view = yield from _inspect_station(ex, target, station_kind=station_kind)
         # 每次只放当前批次原料，避免剩余燃烧时间提前吃掉下一批材料。
         for fuel, fuel_count, batch in plan:
             yield from load_furnace(
                 ex, state, target, raw_item="raw_iron", raw_count=batch, fuel_item=fuel,
                 fuel_count=fuel_count, view=view, replace_fuel=True, output_item="iron_ingot",
             )
-            view = yield from self._poll_and_take(ex, state, pos, target, batch)
+            view = yield from self._poll_and_take(
+                ex, state, pos, target, batch, station_kind=station_kind,
+            )
+            if fuel == "lava_bucket" and view and window_amount(view, "fuel", "bucket") > 0:
+                bucket_res = yield from _collect_station(
+                    ex, state, target, item="bucket", section="fuel", view=view,
+                    station_kind=station_kind, inspect_after=False, require_empty=False,
+                )
+                if bucket_res.get("view") is not None:
+                    view = bucket_res["view"]
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
-        if state.count("iron_ingot") <= before_counts.get("iron_ingot", 0):
-            return "smelt_iron 结束但背包铁锭未增加"
-        return ""
+        if state.count("iron_ingot") > before_counts.get("iron_ingot", 0):
+            return ""
+        if self.args.get("async_lease") and any(
+            lease.expected_output == "iron_ingot" for lease in lease_book_for(state).active_leases()
+        ):
+            return ""
+        return "smelt_iron 结束但背包铁锭未增加"

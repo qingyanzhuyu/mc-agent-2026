@@ -8,13 +8,15 @@ from dataclasses import dataclass
 from ..runtime import EnvBlocked, Replan
 from .base import Skill, failure, rec
 from .encounter import _completed, _retreat_clear
-from .field import _cell, _grounded, _observed_block, _standable_cell, move_local, place_block, scan_blocks
+from .field import (
+    _cell, _grounded, _observed_block, _standable_cell, equip_item, move_local, place_block, scan_blocks,
+)
 from .items import bare
 from .recipes import RECIPES, craft_recipe
 from .registry import register
 from .sightline import STATION_EYE_REACH, can_reach_block
 from .windows import (
-    _receipt_inventory_full, apply_window_ops, take_container_item, window_section, window_view,
+    _receipt_inventory_full, apply_window_ops, take_container_item, window_amount, window_section, window_view,
 )
 
 
@@ -26,6 +28,11 @@ _NEAR_LIMIT = 5
 _REACH = STATION_EYE_REACH
 _ENCHANTABLE = frozenset({"bow", "crossbow", "fishing_rod", "trident", "mace"})
 _GEAR_SUFFIXES = ("_sword", "_pickaxe", "_axe", "_shovel", "_hoe", "_helmet", "_chestplate", "_leggings", "_boots")
+_CURSES = frozenset({"binding_curse", "vanishing_curse"})
+_AXES = ("netherite_axe", "diamond_axe", "iron_axe", "copper_axe", "stone_axe", "wooden_axe", "golden_axe")
+_BOOKSHELF_SKIP_CODES = frozenset({
+    "dig_unconfirmed", "out_of_reach", "protected_region", "path_not_found", "unreachable", "move_timeout", "stalled",
+})
 
 
 @dataclass(frozen=True)
@@ -136,16 +143,72 @@ def _place_checked(ex, state, item, pos):
     return (yield from _approach_block(ex, state, (pos, item, None)))
 
 
+def _norm_ench_name(raw_name: object) -> str:
+    return bare(str(raw_name or "").strip().lower())
+
+
+def _entry_enchantment_names(entry) -> list[str]:
+    if not isinstance(entry, dict):
+        return []
+    components = entry.get("components")
+    stored_comp = components.get("minecraft:stored_enchantments") if isinstance(components, dict) else None
+    sources = (entry.get("enchantments"), entry.get("stored_enchantments"), stored_comp)
+    names: list[str] = []
+    for raw in sources:
+        if isinstance(raw, dict):
+            level_map = raw.get("levels") if isinstance(raw.get("levels"), dict) else raw
+            for key, lvl in level_map.items():
+                if type(lvl) is int and lvl > 0:
+                    name = _norm_ench_name(key)
+                    if name:
+                        names.append(name)
+        elif isinstance(raw, (list, tuple)):
+            for ench in raw:
+                if not isinstance(ench, dict):
+                    continue
+                lvl = ench.get("level", ench.get("lvl"))
+                name = _norm_ench_name(ench.get("name") or ench.get("id"))
+                if name and type(lvl) is int and lvl > 0:
+                    names.append(name)
+    return names
+
+
+def _has_curse(entry) -> bool:
+    return any(name in _CURSES for name in _entry_enchantment_names(entry))
+
+
+def _has_silk_touch(entry) -> bool:
+    return "silk_touch" in _entry_enchantment_names(entry)
+
+
 def _is_enchanted(entry):
-    return any(isinstance(ench, dict) and bare(ench.get("name"))
-               and type(ench.get("level")) is int and ench["level"] > 0
-               for ench in (entry.get("enchantments") or ()))
+    return bool(_entry_enchantment_names(entry))
 
 
 def _inventory_rows(inventory):
     armor = inventory.get("armor") or {}
     return [row for row in (*(inventory.get("items") or ()), inventory.get("held"),
                             inventory.get("offhand"), *armor.values()) if isinstance(row, dict)]
+
+
+def _disenchantable_book(inventory) -> dict | None:
+    for row in inventory.get("items") or ():
+        if isinstance(row, dict) and bare(row.get("name")) == "enchanted_book" and not _has_curse(row):
+            return row
+    return None
+
+
+def _non_silk_axe(inventory) -> str | None:
+    rows = [row for row in (inventory.get("items") or ()) if isinstance(row, dict)]
+    for axe in _AXES:
+        if any(bare(row.get("name")) == axe and not _has_silk_touch(row) for row in rows):
+            return axe
+    return None
+
+
+def _non_book_enchanted_in_bag(inventory) -> bool:
+    return any(bare(row.get("name")) != "enchanted_book" and _is_enchanted(row)
+               for row in _inventory_rows(inventory))
 
 
 def _enchantable(inventory):
@@ -272,6 +335,128 @@ def _enchant_once(ex, state, pos, item):
               advancement_confirmed=_completed(ex, _ADVANCEMENT))
 
 
+def mine_bookshelf_for_books(ex, state, needed=1):
+    """无甘蔗补书路径 A：就近采挖已观察书架（避开 silk_touch 精准采集工具）。"""
+    state.refresh_inventory(ex.client)
+    if needed <= 0 or state.count("book") >= needed:
+        return 0
+    candidates = _nearby_blocks(ex, state, ("bookshelf",))
+    if not candidates:
+        return 0
+    gained_total = 0
+    for candidate in candidates:
+        if state.count("book") >= needed:
+            break
+        try:
+            pos = yield from _approach_block(ex, state, candidate)
+            inventory = state.refresh_inventory(ex.client)
+            held = inventory.get("held") or {}
+            held_name = bare(held.get("name"))
+            axe = _non_silk_axe(inventory)
+            if axe is not None and (held_name != axe or _has_silk_touch(held)):
+                yield from equip_item(ex, state, axe)
+                inventory = state.refresh_inventory(ex.client)
+                held = inventory.get("held") or {}
+            if _has_silk_touch(held):
+                non_silk = next(
+                    (bare(row.get("name")) for row in (inventory.get("items") or ())
+                     if isinstance(row, dict) and bare(row.get("name")) and not _has_silk_touch(row)
+                     and bare(row.get("name")) != bare(held.get("name"))),
+                    None,
+                )
+                if non_silk is not None:
+                    yield from equip_item(ex, state, non_silk)
+                    inventory = state.refresh_inventory(ex.client)
+                    held = inventory.get("held") or {}
+                if _has_silk_touch(held):
+                    yield rec("bookshelf_skip", pos=list(candidate[0]), error_code="silk_touch_held")
+                    return gained_total
+            status = _site_state(ex, state)
+            if not _face_reachable(ex, status, tuple(pos)):
+                yield rec("bookshelf_skip", pos=list(candidate[0]), error_code="out_of_reach")
+                continue
+            if bare(_observed_block(ex, pos).get("name")) != "bookshelf":
+                yield rec("bookshelf_skip", pos=list(candidate[0]), error_code="block_changed")
+                continue
+            before = state.count("book")
+            result = ex.dig(pos, collect=True)
+            yield rec("dig", result, pos=pos)
+            state.refresh_inventory(ex.client)
+            delta = state.count("book") - before
+            if delta > 0:
+                gained_total += delta
+                if state.count("book") >= needed:
+                    break
+        except Replan as exc:
+            code, _ = failure(exc)
+            if code in _BOOKSHELF_SKIP_CODES:
+                state.refresh_status(ex.client, max_age_s=0)
+                state.refresh_inventory(ex.client)
+                yield rec("bookshelf_skip", pos=list(candidate[0]), error_code=code)
+                continue
+            raise
+    return gained_total
+
+
+def disenchant_book_at_grindstone(ex, state, needed=1):
+    """无甘蔗补书路径 B：在砂轮祛除无诅咒闲置附魔书以换取普通书。"""
+    inventory = state.refresh_inventory(ex.client)
+    if needed <= 0 or state.count("book") >= needed or _disenchantable_book(inventory) is None:
+        return 0
+    candidates = _nearby_blocks(ex, state, ("grindstone",))
+    if not candidates:
+        return 0
+    pos = yield from _approach_block(ex, state, candidates[0])
+    target = {"pos": pos}
+    view = yield from window_view(ex, target)
+    sections = view.get("sections") or {}
+    input_sec = "input" if "input" in sections else ("top" if "top" in sections else ("inputs" if "inputs" in sections else None))
+    output_sec = "output" if "output" in sections else ("result" if "result" in sections else None)
+    if (bare(view.get("window")) != "grindstone"
+            or input_sec is None or output_sec is None
+            or not isinstance(sections.get(input_sec), list)
+            or not isinstance(sections.get(output_sec), list)):
+        raise Replan("砂轮窗口缺少可核实的输入/输出分区，需核对 grindstone 快照")
+    if any(window_section(view, sec) for sec in ("input", "inputs", "top", "bottom", "output", "result")):
+        raise Replan("现场砂轮窗口已有物品，请先核对并收回原有物品")
+    gained = 0
+    while state.count("book") < needed and _disenchantable_book(state.refresh_inventory(ex.client)) is not None:
+        before = state.count("book")
+        receipt = yield from apply_window_ops(
+            ex,
+            state,
+            target,
+            [
+                {"op": "put", "item": "enchanted_book", "count": 1, "to": input_sec},
+                {"op": "take", "from": output_sec, "item": "book", "count": 1},
+            ],
+        )
+        state.refresh_inventory(ex.client)
+        delta = state.count("book") - before
+        if delta <= 0:
+            end_window = receipt.get("window")
+            end_view = end_window if isinstance(end_window, dict) and isinstance(end_window.get("sections"), dict) else None
+            if end_view is not None and window_amount(end_view, output_sec, "book") >= 1:
+                yield from take_container_item(ex, state, target, output_sec, "book", 1, view=end_view)
+                state.refresh_inventory(ex.client)
+                delta = state.count("book") - before
+            if delta <= 0:
+                raise Replan("砂轮祛魔后背包未确认获得普通书")
+        gained += delta
+    return gained
+
+
+def acquire_books_without_sugarcane(ex, state, needed=1):
+    """无甘蔗补书总调度：先采挖近场书架，仍不足再尝试砂轮祛魔无诅咒附魔书。"""
+    state.refresh_inventory(ex.client)
+    if needed <= 0 or state.count("book") >= needed:
+        return 0
+    gained = yield from mine_bookshelf_for_books(ex, state, needed=needed)
+    if state.count("book") < needed and _disenchantable_book(state.inventory) is not None:
+        gained += yield from disenchant_book_at_grindstone(ex, state, needed=needed)
+    return gained
+
+
 def _enchant_crafts(state, item):
     requirements = {_STATION: 1}
     if item == "book":
@@ -317,18 +502,50 @@ class EnchantItem(Skill):
             return
         state.invalidate_inventory()
         inventory = state.refresh_inventory(ex.client)
-        if _enchanted_in_bag(inventory):
+        if _non_book_enchanted_in_bag(inventory):
             yield rec("enchantment_evidence", None, held_product=True, advancement_confirmed=False)
             return
+        if _enchanted_in_bag(inventory):
+            can_disenchant_for_book = (
+                _disenchantable_book(inventory) is not None
+                and state.count("lapis_lazuli") >= 1
+                and (state.snapshot().get("xp_level") or 0) >= 1
+                and state.count("book") == 0
+                and (state.count(_STATION) >= 1 or (state.count("diamond") >= 2 and state.count("obsidian") >= 4))
+            )
+            if not can_disenchant_for_book:
+                yield rec("enchantment_evidence", None, held_product=True, advancement_confirmed=False)
+                return
         _site_state(ex, state)
         if reason := self.blocked(state):
             raise Replan(reason)
         item = _enchantable(inventory)
+        if item is None:
+            if (_disenchantable_book(inventory) is not None
+                    and state.count("lapis_lazuli") >= 1
+                    and (state.snapshot().get("xp_level") or 0) >= 1):
+                yield from disenchant_book_at_grindstone(ex, state, needed=1)
+                inventory = state.refresh_inventory(ex.client)
+                item = _enchantable(inventory)
+            if item is None:
+                if _enchanted_in_bag(inventory):
+                    yield rec("enchantment_evidence", None, held_product=True, advancement_confirmed=False)
+                    return
+                raise Replan("缺少未附魔的书或装备")
         candidates = _nearby_blocks(ex, state, (_STATION,))
         if candidates:
             pos = yield from _approach_block(ex, state, candidates[0])
         else:
             craft = _enchant_crafts(state, item)
+            books_needed = (1 if state.count(_STATION) == 0 else 0) + (1 if item == "book" else 0)
+            if (state.count("book") < books_needed
+                    and state.count(_STATION) == 0
+                    and state.count("diamond") >= 2
+                    and state.count("obsidian") >= 4):
+                yield from acquire_books_without_sugarcane(ex, state, needed=books_needed)
+                inventory = state.refresh_inventory(ex.client)
+                item = _enchantable(inventory) or item
+                craft = _enchant_crafts(state, item)
             sites = _placement_sites(ex, state)
             if craft.missing or not sites:
                 raise EnvBlocked("8 格内未确认可达附魔台，需安全落点和足够配方材料",
