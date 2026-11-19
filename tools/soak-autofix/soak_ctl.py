@@ -1916,6 +1916,66 @@ def _scopes_conflict(a: frozenset[str], b: frozenset[str]) -> bool:
     return "*" in a or "*" in b or bool(a & b)
 
 
+def _relaxed_base_scope(inc_rec: dict[str, Any]) -> frozenset[str]:
+    """计算 relaxed 策略下无冲突历史时的基础领域冲突集。"""
+    if not isinstance(inc_rec, dict):
+        return frozenset({"*"})
+    code = str(inc_rec.get("code") or "").strip()
+    skill = str(inc_rec.get("skill") or "").strip()
+    goal_id = str(inc_rec.get("goal_id") or "").strip()
+    if code == "API_BOTTLENECK_SLOW":
+        return frozenset({
+            f"domain:api_bottleneck_slow:{skill}"
+            if skill and skill != "session"
+            else "domain:api_bottleneck_slow"
+        })
+    if code == "LLM_INVALID_OR_TIMEOUT":
+        return frozenset({"domain:llm_session"})
+    if code == "COMBAT_OR_MOB_DEATH":
+        return frozenset({"domain:combat_session"})
+    if code == "GOAL_MISS":
+        if not _effective_goal_narrow_files(inc_rec):
+            return frozenset({"*"})
+        return frozenset(
+            ({f"goal:{goal_id}"} if goal_id else {str(inc_rec.get("fingerprint") or "*")})
+            | ({f"skill:{skill}"} if skill else set())
+        )
+    if code in _DOMAIN_SCOPED_INCIDENT_CODES:
+        if code == "DISPATCH_STARVATION":
+            return frozenset(
+                {"domain:dispatch"}
+                | ({f"skill:{skill}"} if skill else set())
+                | ({f"goal:{goal_id}"} if goal_id else set())
+            )
+        if skill in SKILL_CONFLICT_DOMAIN:
+            return frozenset({f"skill:{skill}"})
+        if goal_id in GOAL_CONFLICT_DOMAIN:
+            return frozenset({f"goal:{goal_id}"})
+        return _incident_edit_scope(inc_rec)
+    return frozenset({"*"})
+
+
+def _expand_strict_files_with_relaxed_tokens(
+    inc_rec: dict[str, Any],
+    strict_scope: frozenset[str],
+) -> frozenset[str]:
+    """将 strict 文件作用域扩展为包含对应 relaxed 领域令牌的冲突集。"""
+    if "*" in strict_scope:
+        return frozenset({"*"})
+    tokens: set[str] = set(strict_scope) | set(_relaxed_base_scope(inc_rec))
+    for sk, domain_files in SKILL_CONFLICT_DOMAIN.items():
+        if set(domain_files) & strict_scope:
+            tokens.add(f"skill:{sk}")
+    for gid, domain_files in GOAL_CONFLICT_DOMAIN.items():
+        if set(domain_files) & strict_scope:
+            tokens.add(f"goal:{gid}")
+    if {"code/mcagent/loop/policy.py", "code/mcagent/loop/goals.py"} & strict_scope:
+        tokens.update({"domain:dispatch", "domain:llm_session"})
+    if {"code/mcagent/skills/combat.py", "code/mcagent/skills/survival.py"} & strict_scope:
+        tokens.add("domain:combat_session")
+    return frozenset({"*"}) if "*" in tokens else frozenset(tokens)
+
+
 def _claim_parallel_scope(
     inc_rec: dict[str, Any],
     *,
@@ -1958,40 +2018,9 @@ def _claim_parallel_scope(
     if conflict_count >= 2:
         return frozenset({"*"})
     if conflict_count == 1:
-        return _claim_parallel_scope(inc_rec, parallel_policy="strict")
-
-    skill = str(inc_rec.get("skill") or "").strip()
-    goal_id = str(inc_rec.get("goal_id") or "").strip()
-    if code == "API_BOTTLENECK_SLOW":
-        return frozenset({
-            f"domain:api_bottleneck_slow:{skill}"
-            if skill and skill != "session"
-            else "domain:api_bottleneck_slow"
-        })
-    if code == "LLM_INVALID_OR_TIMEOUT":
-        return frozenset({"domain:llm_session"})
-    if code == "COMBAT_OR_MOB_DEATH":
-        return frozenset({"domain:combat_session"})
-    if code == "GOAL_MISS":
-        if not _effective_goal_narrow_files(inc_rec):
-            return frozenset({"*"})
-        return frozenset(
-            ({f"goal:{goal_id}"} if goal_id else {str(inc_rec.get("fingerprint") or "*")})
-            | ({f"skill:{skill}"} if skill else set())
-        )
-    if code in _DOMAIN_SCOPED_INCIDENT_CODES:
-        if code == "DISPATCH_STARVATION":
-            return frozenset(
-                {"domain:dispatch"}
-                | ({f"skill:{skill}"} if skill else set())
-                | ({f"goal:{goal_id}"} if goal_id else set())
-            )
-        if skill in SKILL_CONFLICT_DOMAIN:
-            return frozenset({f"skill:{skill}"})
-        if goal_id in GOAL_CONFLICT_DOMAIN:
-            return frozenset({f"goal:{goal_id}"})
-        return _incident_edit_scope(inc_rec)
-    return frozenset({"*"})
+        strict_scope = _claim_parallel_scope(inc_rec, parallel_policy="strict")
+        return _expand_strict_files_with_relaxed_tokens(inc_rec, strict_scope)
+    return _relaxed_base_scope(inc_rec)
 
 
 

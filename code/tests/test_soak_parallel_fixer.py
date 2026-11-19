@@ -1097,7 +1097,7 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
             frozenset({"skill:gather_wood"}),
         )
 
-        # 1 merge_conflict_requeue -> downgrades to strict file scope.
+        # 1 merge_conflict_requeue -> expands strict file scope with overlapping relaxed symbolic tokens.
         wood_one_conflict = {
             **wood_base,
             "gate_history": [
@@ -1106,12 +1106,26 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
             ],
         }
         strict_wood = soak_ctl._claim_parallel_scope(wood_one_conflict, parallel_policy="strict")
-        self.assertEqual(
-            soak_ctl._claim_parallel_scope(wood_one_conflict, parallel_policy="relaxed"),
-            strict_wood,
-        )
+        relaxed_one = soak_ctl._claim_parallel_scope(wood_one_conflict, parallel_policy="relaxed")
+        self.assertTrue(strict_wood.issubset(relaxed_one))
         self.assertIn("code/mcagent/loop/starter_skills.py", strict_wood)
         self.assertTrue(set(soak_ctl.GOAL_RECURRENCE_EXTRA_FILES).issubset(strict_wood))
+        for tok in (
+            "skill:gather_wood",
+            "skill:scout_island",
+            "skill:surface_for_air",
+            "domain:dispatch",
+            "domain:llm_session",
+        ):
+            self.assertIn(tok, relaxed_one)
+        for unrelated in (
+            "skill:mine_diamond",
+            "goal:mine_diamond",
+            "code/mcagent/skills/diamond.py",
+            "domain:combat_session",
+            "*",
+        ):
+            self.assertNotIn(unrelated, relaxed_one)
 
         # DISPATCH_STARVATION and API_BOTTLENECK_SLOW downgrade to '*' on 1 conflict (matching strict).
         for wide_rec in (
@@ -1163,6 +1177,27 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
             soak_ctl._claim_parallel_scope(goal_two_conflicts, parallel_policy="relaxed"),
             frozenset({"*"}),
         )
+
+        # 1 merge_conflict_requeue on combat/survival GOAL_MISS expands to combat_session + hunt_mob.
+        combat_one_conflict = {
+            "incident_id": "INC-CMB-1C",
+            "fingerprint": "GOAL_MISS:kill_a_mob",
+            "code": "GOAL_MISS",
+            "goal_id": "kill_a_mob",
+            "skill": "combat",
+            "editable_files": ["code/mcagent/skills/combat.py"],
+            "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+        }
+        combat_relaxed = soak_ctl._claim_parallel_scope(combat_one_conflict, parallel_policy="relaxed")
+        for tok in (
+            "code/mcagent/skills/combat.py",
+            "domain:combat_session",
+            "skill:hunt_mob",
+            "goal:kill_a_mob",
+        ):
+            self.assertIn(tok, combat_relaxed)
+        self.assertNotIn("skill:mine_diamond", combat_relaxed)
+        self.assertNotIn("domain:dispatch", combat_relaxed)
 
     def test_relaxed_wild_fatal_and_empty_goal_stay_exclusive(self):
         fatal_rec = {
@@ -1252,6 +1287,190 @@ class TestIncidentScopeAndConflictResolution(unittest.TestCase):
         )
         self.assertEqual(
             soak_ctl.read_state(self.session)["incidents"]["LOOP_CRASH:unknown"]["status"],
+            "pending",
+        )
+
+    def test_relaxed_one_conflict_blocks_overlapping_tokens_both_orders(self):
+        soak_ctl.init_session(self.repo, self.session, target_branch="feat/soak-autofix")
+
+        def make_scout_ccnt1(severity: str) -> dict:
+            return {
+                "incident_id": "INC-SCOUT-1",
+                "fingerprint": "SKILL_SPAM_LOOP:scout_island",
+                "code": "SKILL_SPAM_LOOP",
+                "skill": "scout_island",
+                "severity": severity,
+                "category": "strategy",
+                "status": "pending",
+                "attempts": 0,
+                "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+            }
+
+        def make_scout_ccnt0(severity: str) -> dict:
+            return {
+                "incident_id": "INC-SCOUT-0",
+                "fingerprint": "REPLAN_OSCILLATION:scout_island",
+                "code": "REPLAN_OSCILLATION",
+                "skill": "scout_island",
+                "severity": severity,
+                "category": "strategy",
+                "status": "pending",
+                "attempts": 0,
+            }
+
+        def make_air_ccnt0(severity: str) -> dict:
+            return {
+                "incident_id": "INC-AIR-0",
+                "fingerprint": "REPLAN_OSCILLATION:surface_for_air",
+                "code": "REPLAN_OSCILLATION",
+                "skill": "surface_for_air",
+                "severity": severity,
+                "category": "strategy",
+                "status": "pending",
+                "attempts": 0,
+            }
+
+        diamond_goal = {
+            "incident_id": "INC-DIA",
+            "fingerprint": "GOAL_MISS:mine_diamond",
+            "code": "GOAL_MISS",
+            "goal_id": "mine_diamond",
+            "skill": "mine_diamond",
+            "severity": "P2",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": ["code/mcagent/skills/diamond.py"],
+            "attempts": 0,
+        }
+
+        # (a) ccnt=1 scout_island claimed first -> blocks ccnt=0 scout_island and surface_for_air,
+        # while allowing disjoint GOAL_MISS:mine_diamond concurrently.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "SKILL_SPAM_LOOP:scout_island": make_scout_ccnt1("P0"),
+                "REPLAN_OSCILLATION:scout_island": make_scout_ccnt0("P1"),
+                "REPLAN_OSCILLATION:surface_for_air": make_air_ccnt0("P1"),
+                "GOAL_MISS:mine_diamond": dict(diamond_goal),
+            }
+        claimed_a = soak_ctl.claim_parallel_incidents(self.session, max_workers=4, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed_a],
+            ["SKILL_SPAM_LOOP:scout_island", "GOAL_MISS:mine_diamond"],
+        )
+        st_a = soak_ctl.read_state(self.session)
+        self.assertEqual(st_a["incidents"]["REPLAN_OSCILLATION:scout_island"]["status"], "pending")
+        self.assertEqual(st_a["incidents"]["REPLAN_OSCILLATION:surface_for_air"]["status"], "pending")
+
+        # (b) ccnt=0 scout_island has higher priority -> claims with mine_diamond, blocks ccnt=1 scout_island.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "REPLAN_OSCILLATION:scout_island": make_scout_ccnt0("P0"),
+                "SKILL_SPAM_LOOP:scout_island": make_scout_ccnt1("P1"),
+                "GOAL_MISS:mine_diamond": dict(diamond_goal),
+            }
+        claimed_b = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed_b],
+            ["REPLAN_OSCILLATION:scout_island", "GOAL_MISS:mine_diamond"],
+        )
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["SKILL_SPAM_LOOP:scout_island"]["status"],
+            "pending",
+        )
+
+        # (c) ccnt=0 surface_for_air has higher priority -> claims with mine_diamond, blocks ccnt=1 scout_island.
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "REPLAN_OSCILLATION:surface_for_air": make_air_ccnt0("P0"),
+                "SKILL_SPAM_LOOP:scout_island": make_scout_ccnt1("P1"),
+                "GOAL_MISS:mine_diamond": dict(diamond_goal),
+            }
+        claimed_c = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed_c],
+            ["REPLAN_OSCILLATION:surface_for_air", "GOAL_MISS:mine_diamond"],
+        )
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["SKILL_SPAM_LOOP:scout_island"]["status"],
+            "pending",
+        )
+
+        # ccnt=1 scout_island also blocks DISPATCH_STARVATION (domain:dispatch) and LLM_INVALID_OR_TIMEOUT (domain:llm_session).
+        starve_rec = {
+            "incident_id": "INC-DS-1",
+            "fingerprint": "DISPATCH_STARVATION:enter_the_nether",
+            "code": "DISPATCH_STARVATION",
+            "goal_id": "enter_the_nether",
+            "skill": "build_and_enter_portal",
+            "severity": "P1",
+            "category": "strategy",
+            "status": "pending",
+            "attempts": 0,
+        }
+        llm_rec = {
+            "incident_id": "INC-LLM-1",
+            "fingerprint": "LLM_INVALID_OR_TIMEOUT:session",
+            "code": "LLM_INVALID_OR_TIMEOUT",
+            "skill": "session",
+            "severity": "P1",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "SKILL_SPAM_LOOP:scout_island": make_scout_ccnt1("P0"),
+                "DISPATCH_STARVATION:enter_the_nether": dict(starve_rec),
+                "LLM_INVALID_OR_TIMEOUT:session": dict(llm_rec),
+                "GOAL_MISS:mine_diamond": dict(diamond_goal),
+            }
+        claimed_d = soak_ctl.claim_parallel_incidents(self.session, max_workers=4, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed_d],
+            ["SKILL_SPAM_LOOP:scout_island", "GOAL_MISS:mine_diamond"],
+        )
+        st_d = soak_ctl.read_state(self.session)
+        self.assertEqual(st_d["incidents"]["DISPATCH_STARVATION:enter_the_nether"]["status"], "pending")
+        self.assertEqual(st_d["incidents"]["LLM_INVALID_OR_TIMEOUT:session"]["status"], "pending")
+
+        # ccnt=1 GOAL_MISS:kill_a_mob (combat.py) blocks ccnt=0 COMBAT_OR_MOB_DEATH (domain:combat_session)
+        # while still allowing GOAL_MISS:mine_diamond.
+        combat_goal_ccnt1 = {
+            "incident_id": "INC-CMB-GOAL",
+            "fingerprint": "GOAL_MISS:kill_a_mob",
+            "code": "GOAL_MISS",
+            "goal_id": "kill_a_mob",
+            "skill": "combat",
+            "severity": "P0",
+            "category": "strategy",
+            "status": "pending",
+            "editable_files": ["code/mcagent/skills/combat.py"],
+            "attempts": 0,
+            "gate_history": [{"failed_gate": "merge_conflict_requeue"}],
+        }
+        combat_death_ccnt0 = {
+            "incident_id": "INC-CMB-DEATH",
+            "fingerprint": "COMBAT_OR_MOB_DEATH:1",
+            "code": "COMBAT_OR_MOB_DEATH",
+            "skill": "combat",
+            "severity": "P1",
+            "category": "bug",
+            "status": "pending",
+            "attempts": 0,
+        }
+        with soak_ctl.locked_state(self.session) as st:
+            st["incidents"] = {
+                "GOAL_MISS:kill_a_mob": dict(combat_goal_ccnt1),
+                "COMBAT_OR_MOB_DEATH:1": dict(combat_death_ccnt0),
+                "GOAL_MISS:mine_diamond": dict(diamond_goal),
+            }
+        claimed_e = soak_ctl.claim_parallel_incidents(self.session, max_workers=3, parallel_policy="relaxed")
+        self.assertEqual(
+            [c["fingerprint"] for c in claimed_e],
+            ["GOAL_MISS:kill_a_mob", "GOAL_MISS:mine_diamond"],
+        )
+        self.assertEqual(
+            soak_ctl.read_state(self.session)["incidents"]["COMBAT_OR_MOB_DEATH:1"]["status"],
             "pending",
         )
 
@@ -1796,7 +2015,7 @@ if skill == "gather_wood":
             return res
 
         # Batch 1: relaxed claims both starter tickets; surface_for_air promotes first,
-        # gather_wood hits cherry-pick conflict (conflict_count=1) and downgrades to strict scope.
+        # gather_wood hits cherry-pick conflict (conflict_count=1) and expands strict files with relaxed tokens.
         with patch.object(soak_ctl.subprocess, "run", side_effect=mock_uv_only), \
              patch.object(soak_ctl, "verify_and_promote", side_effect=signaled_verify):
             res1 = soak_ctl.run_fixer_batch(
@@ -1815,13 +2034,15 @@ if skill == "gather_wood":
         wood_rec1 = st1["incidents"]["SKILL_SPAM_LOOP:gather_wood"]
         self.assertEqual(wood_rec1["status"], "pending")
         self.assertEqual(wood_rec1.get("attempts", 0), 0)
-        self.assertEqual(
-            soak_ctl._claim_parallel_scope(wood_rec1, parallel_policy="relaxed"),
-            soak_ctl._claim_parallel_scope(wood_rec1, parallel_policy="strict"),
-        )
+        strict_wood1 = soak_ctl._claim_parallel_scope(wood_rec1, parallel_policy="strict")
+        relaxed_wood1 = soak_ctl._claim_parallel_scope(wood_rec1, parallel_policy="relaxed")
+        self.assertTrue(strict_wood1.issubset(relaxed_wood1))
+        self.assertIn("skill:surface_for_air", relaxed_wood1)
+        self.assertIn("domain:dispatch", relaxed_wood1)
+        self.assertNotIn("skill:mine_diamond", relaxed_wood1)
 
         # Batch 2: add disjoint-domain mine_diamond that also edits starter_skills.py;
-        # both claim (strict starter scope vs skill:mine_diamond), mine_diamond promotes first,
+        # both claim (expanded starter scope vs skill:mine_diamond), mine_diamond promotes first,
         # gather_wood conflicts a 2nd time -> scope escalates to wildcard '*'.
         (promote_dir / "batch2.active").write_text("1", encoding="utf-8")
         with soak_ctl.locked_state(self.session) as st:
