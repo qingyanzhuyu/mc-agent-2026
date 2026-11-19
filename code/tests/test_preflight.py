@@ -16,7 +16,7 @@ DEV = {
     "MC_API_BASE": "http://127.0.0.1:8787/api/v1",
     "MC_USER": "qyzy_dev",
     "MC_PASS": "localdev",
-    "LLM_KEY": "sk-mRbe07wnXwL975GpfflElIbOPH69Q4YMRO5BERpSAGxTBddG",
+    "LLM_KEY": "sk-mRbe_synthetic_blocked_public_test_key_0000",
     "LLM_MODEL": "default",
     "LLM_MAX_CONCURRENCY": "48",
 }
