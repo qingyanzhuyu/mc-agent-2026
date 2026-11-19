@@ -466,6 +466,208 @@ class TestDeathCauseClassification(unittest.TestCase):
                 self.assertEqual(inc["severity"], "P1", f"Mismatch severity for {cause}")
                 self.assertEqual(inc["category"], "strategy", f"Mismatch category for {cause}")
 
+    @staticmethod
+    def _make_state(*, in_water: bool = False, submerged: bool = False, oxygen: int = 20) -> State:
+        st = State()
+        st.set_status({
+            "ready": True,
+            "alive": True,
+            "pos": [0.5, 64.0, 0.5],
+            "in_water": in_water,
+            "submerged": submerged,
+            "oxygen": oxygen,
+        })
+        return st
+
+    @staticmethod
+    def _record_death(
+        obs: SoakObserver,
+        state: State,
+        cause: str,
+        *,
+        respawn_ms: float = 500.0,
+        triggered_death_loop: bool = False,
+    ) -> None:
+        obs.on_death_recovered(
+            state,
+            respawn_ms=respawn_ms,
+            cause=cause,
+            death_pos=[10.0, 64.0, 10.0],
+            before_inv_fp={},
+            after_inv_fp={},
+            triggered_death_loop=triggered_death_loop,
+        )
+
+    def test_distinct_death_causes_produce_distinct_fingerprints(self):
+        cases = [
+            ("Bot was slain by Skeleton", "COMBAT_OR_MOB_DEATH:mob:skeleton"),
+            ("Bot was slain by Zombie", "COMBAT_OR_MOB_DEATH:mob:zombie"),
+            ("Bot was blown up by Creeper", "COMBAT_OR_MOB_DEATH:mob:creeper"),
+            ("Bot was slain by Drowned", "COMBAT_OR_MOB_DEATH:mob:drowned"),
+            ("", "COMBAT_OR_MOB_DEATH:unknown:session"),
+            ("de7_soak died", "COMBAT_OR_MOB_DEATH:generic:session"),
+            ("Unknown death cause", None),
+        ]
+        for cause, _ in cases:
+            self._record_death(self.obs, self.state, cause)
+
+        self.assertEqual(len(self.obs._incidents), 7)
+        for cause, expected_fp in cases:
+            if expected_fp is not None:
+                self.assertIn(expected_fp, self.obs._incidents, f"Missing expected fingerprint for {cause!r}")
+                inc = self.obs._incidents[expected_fp]
+                fp = expected_fp
+            else:
+                known_fps = {fp for _, fp in cases if fp is not None}
+                other_fps = [fp for fp in self.obs._incidents if fp not in known_fps]
+                self.assertEqual(len(other_fps), 1)
+                fp = other_fps[0]
+                self.assertTrue(fp.startswith("COMBAT_OR_MOB_DEATH:other:"), f"Unexpected other fp: {fp}")
+                self.assertEqual(len(fp[len("COMBAT_OR_MOB_DEATH:other:"):]), 6)
+                inc = self.obs._incidents[fp]
+
+            self.assertEqual(inc["code"], "COMBAT_OR_MOB_DEATH")
+            self.assertEqual(inc["severity"], "P1")
+            self.assertEqual(inc["category"], "strategy")
+            self.assertEqual(inc["fingerprint"], fp)
+            self.assertEqual(inc["detail"]["cause_bucket"], fp[len("COMBAT_OR_MOB_DEATH:"):])
+
+    def test_identical_death_causes_deduplicate_onto_same_fingerprint(self):
+        groups = [
+            (["Bot was slain by Skeleton", "de7_soak was shot by Skeleton"], "COMBAT_OR_MOB_DEATH:mob:skeleton"),
+            (["Bot drowned", "de7_soak drowned"], "FATAL_ENV_DEATH:drown"),
+            (["de7_soak died", "de7_soak2158 died"], "COMBAT_OR_MOB_DEATH:generic:session"),
+        ]
+        for causes, expected_fp in groups:
+            for cause in causes:
+                self._record_death(self.obs, self.state, cause)
+            self.assertIn(expected_fp, self.obs._incidents)
+            self.assertEqual(self.obs._incidents[expected_fp]["count"], 2)
+
+        self.assertEqual(len(self.obs._incidents), 3)
+
+    def test_generic_drowning_inference_underwater_distress_vs_dry(self):
+        class _AirStub(Skill):
+            name = "surface_for_air"
+            goal = "survive:air"
+            params = {}
+
+            def run(self, ex, state):
+                return iter(())
+
+        # a) submerged & oxygen=-1, generic cause, no skill -> FATAL_ENV_DEATH:drown:session
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            st = self._make_state(in_water=True, submerged=True, oxygen=-1)
+            self._record_death(obs, st, "de7_soak2158 died")
+            inc = list(obs._incidents.values())[0]
+            self.assertEqual(inc["code"], "FATAL_ENV_DEATH")
+            self.assertEqual(inc["severity"], "P0")
+            self.assertEqual(inc["category"], "bug")
+            self.assertEqual(inc["fingerprint"], "FATAL_ENV_DEATH:drown:session")
+            self.assertEqual(inc["detail"]["cause_bucket"], "drown:session")
+
+        # b) in_water=True, submerged=False, oxygen=10 with active surface_for_air -> FATAL_ENV_DEATH:drown:surface_for_air
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            underwater_st = self._make_state(in_water=True, submerged=False, oxygen=10)
+            obs.on_skill_start(_AirStub(), "rule", "test", underwater_st)
+            self._record_death(obs, underwater_st, "de7_soak2158 died")
+            inc = list(obs._incidents.values())[0]
+            self.assertEqual(inc["code"], "FATAL_ENV_DEATH")
+            self.assertEqual(inc["severity"], "P0")
+            self.assertEqual(inc["category"], "bug")
+            self.assertEqual(inc["fingerprint"], "FATAL_ENV_DEATH:drown:surface_for_air")
+
+        # c) MainLoop lifecycle: on_skill_start -> on_skill_end(died_or_disconnected=True) -> on_death_recovered(dry)
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            underwater_st = self._make_state(in_water=True, submerged=False, oxygen=10)
+            respawned_dry_st = self._make_state(in_water=False, submerged=False, oxygen=20)
+            air_skill = _AirStub()
+            obs.on_skill_start(air_skill, "rule", "test", underwater_st)
+            obs.on_skill_end(air_skill, "replan", underwater_st, died_or_disconnected=True)
+            self._record_death(obs, respawned_dry_st, "de7_soak2158 died")
+            inc = list(obs._incidents.values())[0]
+            self.assertEqual(inc["code"], "FATAL_ENV_DEATH")
+            self.assertEqual(inc["severity"], "P0")
+            self.assertEqual(inc["category"], "bug")
+            self.assertEqual(inc["fingerprint"], "FATAL_ENV_DEATH:drown:surface_for_air")
+            self.assertEqual(inc["skill"], "session")
+
+        # d) in_water=True, submerged=False, oxygen=0, empty cause -> FATAL_ENV_DEATH:drown:session
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            st = self._make_state(in_water=True, submerged=False, oxygen=0)
+            self._record_death(obs, st, "")
+            inc = list(obs._incidents.values())[0]
+            self.assertEqual(inc["code"], "FATAL_ENV_DEATH")
+            self.assertEqual(inc["severity"], "P0")
+            self.assertEqual(inc["category"], "bug")
+            self.assertEqual(inc["fingerprint"], "FATAL_ENV_DEATH:drown:session")
+
+        # e) shallow non-distress (in_water=True, submerged=False, oxygen=12, no surface_for_air) -> COMBAT_OR_MOB_DEATH
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            st = self._make_state(in_water=True, submerged=False, oxygen=12)
+            self._record_death(obs, st, "de7_soak died")
+            inc = list(obs._incidents.values())[0]
+            self.assertEqual(inc["code"], "COMBAT_OR_MOB_DEATH")
+            self.assertEqual(inc["severity"], "P1")
+            self.assertEqual(inc["category"], "strategy")
+
+        # f) dry state: generic vs empty -> both COMBAT_OR_MOB_DEATH, distinct fingerprints
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            dry_st = self._make_state(in_water=False, submerged=False, oxygen=20)
+            self._record_death(obs, dry_st, "de7_soak died")
+            self._record_death(obs, dry_st, "")
+            self.assertEqual(len(obs._incidents), 2)
+            for expected_fp in ("COMBAT_OR_MOB_DEATH:generic:session", "COMBAT_OR_MOB_DEATH:unknown:session"):
+                inc = obs._incidents[expected_fp]
+                self.assertEqual(inc["code"], "COMBAT_OR_MOB_DEATH")
+                self.assertEqual(inc["severity"], "P1")
+                self.assertEqual(inc["category"], "strategy")
+
+        # g) underwater state + explicit mob -> stays COMBAT_OR_MOB_DEATH:mob:zombie
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp)
+            st = self._make_state(in_water=True, submerged=True, oxygen=-1)
+            self._record_death(obs, st, "Bot was slain by Zombie")
+            inc = list(obs._incidents.values())[0]
+            self.assertEqual(inc["code"], "COMBAT_OR_MOB_DEATH")
+            self.assertEqual(inc["severity"], "P1")
+            self.assertEqual(inc["category"], "strategy")
+            self.assertEqual(inc["fingerprint"], "COMBAT_OR_MOB_DEATH:mob:zombie")
+
+    def test_death_active_skill_ignores_stale_decision_history(self):
+        self.obs._decision_history.append({"elapsed_s": 0.0, "skill": "surface_for_air"})
+        self.obs.started_mono -= 120.0
+        self._record_death(self.obs, self.state, "de7_soak died")
+
+        self.assertEqual(len(self.obs._incidents), 1)
+        inc = list(self.obs._incidents.values())[0]
+        self.assertEqual(inc["fingerprint"], "COMBAT_OR_MOB_DEATH:generic:session")
+        self.assertEqual(inc["detail"]["cause_bucket"], "generic:session")
+
+    def test_death_loop_triggered_fingerprints(self):
+        cases = [
+            ("Bot fell into the void", "DEATH_LOOP_TRIGGERED:void"),
+            ("Bot was slain by Skeleton", "DEATH_LOOP_TRIGGERED:mob:skeleton"),
+            ("", "DEATH_LOOP_TRIGGERED:unknown:session"),
+        ]
+        for cause, expected_fp in cases:
+            self._record_death(self.obs, self.state, cause, triggered_death_loop=True)
+
+        self.assertEqual(len(self.obs._incidents), 3)
+        for cause, expected_fp in cases:
+            self.assertIn(expected_fp, self.obs._incidents, f"Missing fp for {cause!r}")
+            inc = self.obs._incidents[expected_fp]
+            self.assertEqual(inc["code"], "DEATH_LOOP_TRIGGERED")
+            self.assertEqual(inc["severity"], "P0")
+            self.assertEqual(inc["category"], "bug")
+            self.assertEqual(inc["fingerprint"], expected_fp)
+
 
 # ============================================================================
 # 4. 连续卡死检测（STUCK_NO_PROGRESS）

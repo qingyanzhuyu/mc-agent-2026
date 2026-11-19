@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import subprocess
 import time
@@ -49,6 +50,108 @@ _STANCE_ONLY_ENV_PREDICATES: frozenset[str] = frozenset({
     "dry_work_stand",
     "unconfirmed_work_stand",
 })
+
+_MOB_COMBAT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("skeleton", ("skeleton",)),
+    ("stray", ("stray",)),
+    ("bogged", ("bogged",)),
+    ("zombie", ("zombie",)),
+    ("husk", ("husk",)),
+    ("drowned", ("drowned",)),
+    ("creeper", ("creeper",)),
+    ("cave_spider", ("cave_spider", "cave spider")),
+    ("spider", ("spider",)),
+    ("enderman", ("enderman",)),
+    ("witch", ("witch",)),
+    ("slime", ("slime",)),
+    ("phantom", ("phantom",)),
+    ("pillager", ("pillager",)),
+    ("vindicator", ("vindicator",)),
+    ("blaze", ("blaze",)),
+    ("ghast", ("ghast",)),
+    ("piglin", ("piglin",)),
+    ("hoglin", ("hoglin",)),
+    ("wither", ("wither",)),
+    ("guardian", ("guardian",)),
+    ("magma", ("magma",)),
+    ("silverfish", ("silverfish",)),
+    ("arrow", ("arrow",)),
+    ("fireball", ("fireball",)),
+    ("explosion", ("explosion",)),
+    ("magic", ("magic",)),
+)
+
+
+def _classify_death_incident(
+    cause: str,
+    state: State,
+    active_skill: str,
+    *,
+    triggered_death_loop: bool,
+) -> tuple[str, str, str, str, str]:
+    """Classify a death event into (code, severity, category, bucket, custom_fingerprint)."""
+    cause_str = (cause or "").strip()
+    cause_low = cause_str.lower()
+    skill_tag = (active_skill or "").strip() or "session"
+    st = state.snapshot() if state is not None and hasattr(state, "snapshot") else {}
+
+    bucket = ""
+    is_env = False
+    cleaned_drown = re.sub(r"\b(?:by|escape|fighting)\s+drowned\b", "", cause_low)
+    if re.search(r"(?<![a-z])(?:world|void)", cause_low):
+        bucket = "void"
+        is_env = True
+    elif re.search(r"(?<![a-z])lava", cause_low):
+        bucket = "lava"
+        is_env = True
+    elif re.search(r"(?<![a-z])drown", cleaned_drown):
+        bucket = "drown"
+        is_env = True
+    elif re.search(r"(?<![a-z])suffocat", cause_low):
+        bucket = "suffocate"
+        is_env = True
+    elif any(
+        p in cause_low
+        for p in ("fell from a high", "fell off ", "fell while ", "hit the ground too hard", "fell too far")
+    ) or bool(re.search(r"(?<![a-z])fall", cause_low)):
+        bucket = "fall"
+        is_env = True
+    else:
+        matched_mob = ""
+        for kw, patterns in _MOB_COMBAT_KEYWORDS:
+            if any(re.search(rf"(?<![a-z]){re.escape(pat)}", cause_low) for pat in patterns):
+                matched_mob = kw
+                break
+        if matched_mob:
+            bucket = f"mob:{matched_mob}"
+            is_env = False
+        else:
+            is_generic = (not cause_low) or cause_low == "died" or cause_low.endswith(" died")
+            raw_ox = st.get("oxygen")
+            try:
+                oxygen_val = float(20.0 if raw_ox is None else raw_ox)
+            except (TypeError, ValueError):
+                oxygen_val = 20.0
+            underwater_distress = (st.get("submerged") is True) or (
+                st.get("in_water") is True and (oxygen_val <= 0.0 or skill_tag == "surface_for_air")
+            )
+            if is_generic and underwater_distress:
+                bucket = f"drown:{skill_tag}"
+                is_env = True
+            else:
+                is_env = False
+                if not cause_str:
+                    bucket = f"unknown:{skill_tag}"
+                elif cause_low == "died" or cause_low.endswith(" died"):
+                    bucket = f"generic:{skill_tag}"
+                else:
+                    bucket = f"other:{hashlib.sha1(cause_low.encode('utf-8')).hexdigest()[:6]}"
+
+    if triggered_death_loop:
+        return ("DEATH_LOOP_TRIGGERED", "P0", "bug", bucket, f"DEATH_LOOP_TRIGGERED:{bucket}")
+    if is_env:
+        return ("FATAL_ENV_DEATH", "P0", "bug", bucket, f"FATAL_ENV_DEATH:{bucket}")
+    return ("COMBAT_OR_MOB_DEATH", "P1", "strategy", bucket, f"COMBAT_OR_MOB_DEATH:{bucket}")
 
 # 初赛公告参考额度口径与满场时长（用于报告额度占比与 8h 满场外推）
 QUOTA_INPUT_TOKENS = 8_000_000
@@ -215,6 +318,7 @@ class SoakObserver:
         self._last_skill_snapshots: dict[str, tuple[dict, list[dict]]] = {}
         self._last_replan: Optional[dict[str, Any]] = None
         self._decision_history: deque[dict[str, Any]] = deque(maxlen=30)
+        self._pre_death_status: Optional[tuple[float, dict[str, Any]]] = None
 
         self.skill_stats: dict[str, dict[str, int]] = {}
         self.skill_elapsed_s: dict[str, float] = {}
@@ -270,6 +374,7 @@ class SoakObserver:
         })
 
     def on_skill_start(self, skill, plan_source: str, reason: str, state: State) -> dict[str, int]:
+        self._pre_death_status = None
         st = state.snapshot()
         inv = copy.deepcopy(state.inventory)
         fp = _inv_fingerprint(inv) or {}
@@ -529,6 +634,11 @@ class SoakObserver:
             **({"environment": environment.evidence()} if environment is not None else {}),
             **({"environment_recovery": True} if environment_recovery else {}),
         })
+        self._pre_death_status = (
+            (now_elapsed, state.snapshot())
+            if (died_or_disconnected or not state.st.get("alive", True))
+            else None
+        )
         self._skill_ctx = None
         self.write_summary()
 
@@ -583,6 +693,20 @@ class SoakObserver:
                 tape_slice=tape_slice,
             )
 
+    def _resolve_death_active_skill(self, respawn_ms: float) -> str:
+        if self._skill_ctx:
+            ctx_skill = str(self._skill_ctx.get("skill") or "").strip()
+            if ctx_skill:
+                return ctx_skill
+        if self._decision_history:
+            last = self._decision_history[-1]
+            last_skill = str(last.get("skill") or "").strip()
+            if last_skill:
+                window_s = max(15.0, max(0.0, float(respawn_ms)) / 1000.0 + 10.0)
+                if (self._elapsed_s() - float(last.get("elapsed_s") or 0.0)) <= window_s:
+                    return last_skill
+        return "session"
+
     def on_death_recovered(
         self,
         state: State,
@@ -600,13 +724,26 @@ class SoakObserver:
             kept = all(after_inv_fp.get(k, 0) >= v for k, v in before_inv_fp.items())
             self.keep_inventory_inferred = kept
 
-        cause_low = (cause or "").lower()
-        if triggered_death_loop:
-            code, sev, cat = "DEATH_LOOP_TRIGGERED", "P0", "bug"
-        elif any(k in cause_low for k in ("world", "void", "lava", "drown", "suffocat", "fell from a high")):
-            code, sev, cat = "FATAL_ENV_DEATH", "P0", "bug"
-        else:
-            code, sev, cat = "COMBAT_OR_MOB_DEATH", "P1", "strategy"
+        active_skill = self._resolve_death_active_skill(respawn_ms)
+        pre_death = self._pre_death_status
+        self._pre_death_status = None
+        classify_state = state
+        post_st = state.snapshot() if state is not None and hasattr(state, "snapshot") else {}
+        if not (post_st.get("submerged") is True or post_st.get("in_water") is True) and pre_death is not None:
+            pre_elapsed, pre_st = pre_death
+            window_s = max(15.0, max(0.0, float(respawn_ms)) / 1000.0 + 10.0)
+            if (self._elapsed_s() - pre_elapsed) <= window_s and (
+                pre_st.get("submerged") is True or pre_st.get("in_water") is True
+            ):
+                classify_state = State(getattr(state, "config", None))
+                classify_state.st = copy.deepcopy(pre_st)
+
+        code, sev, cat, bucket, custom_fp = _classify_death_incident(
+            cause,
+            classify_state,
+            active_skill,
+            triggered_death_loop=triggered_death_loop,
+        )
 
         self._append_jsonl(self.timeline_path, {
             "event": "death_recovered",
@@ -626,6 +763,8 @@ class SoakObserver:
             title=f"角色死亡并自愈重生: {cause or '原因未知'} (重生耗时 {respawn_ms:.0f}ms)",
             detail={
                 "cause": cause,
+                "cause_bucket": bucket,
+                "active_skill": active_skill,
                 "death_pos": death_pos,
                 "respawn_pos": state.pos,
                 "respawn_ms": round(respawn_ms, 1),
@@ -634,6 +773,7 @@ class SoakObserver:
             },
             state=state,
             outcome="death",
+            custom_fingerprint=custom_fp,
         )
         self.write_summary()
 
