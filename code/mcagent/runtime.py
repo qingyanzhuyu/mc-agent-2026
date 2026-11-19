@@ -238,6 +238,10 @@ class State:
                 continue
             if key in result:
                 self.st = {**self.st, key: copy.deepcopy(result[key])}
+                if key == "pos":
+                    # 速度属于上一次 /status 的物理 tick，与新动作返回的坐标不能混用。
+                    self.st.pop("speed", None)
+                    self.st.pop("velocity", None)
 
     def refresh_status(self, client: Client, max_age_s: Optional[float] = None) -> dict:
         ttl = self.config.status_ttl_s if max_age_s is None else max_age_s
@@ -415,6 +419,18 @@ class State:
     def deaths_in(self, window_s: float = 60) -> int:
         now = time.monotonic()
         return sum(1 for t in self.deaths if 0 <= now - t <= window_s)
+
+    @_locked
+    def last_hurt_source(self) -> Optional[str]:
+        for event in reversed(self.events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") in ("spawn", "death"):
+                break
+            if event.get("type") == "hurt":
+                source = event.get("source")
+                return source if isinstance(source, str) and source else None
+        return None
 
     def summary(self) -> str:
         st = self.st
@@ -890,7 +906,9 @@ class Executor:
 
     def stop(self, *, raise_on_error: bool = False) -> None:
         try:
-            self.client.stop()
+            res = self.client.stop()
+            if isinstance(res, dict) and res.get("released") is False:
+                raise ApiError("busy", "/stop 等待后动作仍未退出", res)
         except Exception as e:
             self.log(f"  [stop] 失败: {e}")
             if raise_on_error:
@@ -996,10 +1014,20 @@ class SafetyMonitor:
             return
         y = float(pos[1])
         prev_y = self._last_y
-        falling = prev_y is not None and prev_y - y >= self.config.void_fall_delta
-        ascending = prev_y is not None and y - prev_y > 0.05
-        self._last_y = y
         on_ground = st.get("on_ground")
+        velocity = st.get("velocity")
+        if isinstance(velocity, (list, tuple)) and len(velocity) == 3 and all(
+            isinstance(component, (float, int)) and not isinstance(component, bool) and math.isfinite(component)
+            for component in velocity
+        ):
+            # 落地所在 tick 仍可能有负的垂直位移。
+            falling = on_ground is not True and velocity[1] < 0
+            ascending = velocity[1] > 0
+        else:
+            # 旧版本与传送后的空值仍可用相邻位置样本判断。
+            falling = prev_y is not None and prev_y - y >= self.config.void_fall_delta
+            ascending = prev_y is not None and y - prev_y > 0.05
+        self._last_y = y
         # 潜行且仍在地面上（如搭桥探边准备放下一块）受原版潜行防坠保护，不把待放空气格误判为坠落
         if on_ground is True and st.get("sneaking") and not falling:
             self.state.set_support({

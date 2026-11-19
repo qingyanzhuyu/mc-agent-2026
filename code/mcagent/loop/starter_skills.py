@@ -415,6 +415,77 @@ def can_afford_gear(state: "State", item: str, *, assume_no_table: bool = True) 
     return payable(potential, recipes)
 
 
+def _is_valid_pos3(pos: object) -> bool:
+    return (
+        isinstance(pos, (list, tuple))
+        and len(pos) == 3
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in pos)
+    )
+
+
+def _forget_stale_table(state: "State", table: object) -> None:
+    if not _is_valid_pos3(table):
+        return
+    _forget_known_table(table)
+    dim = _dim_of(state.st)
+    memo_for(state).mark_unreachable(
+        table, dimension=dim, category="station", error_code="no_window", block="crafting_table",
+    )
+    vc = _voxel_cache(state)
+    if vc is not None:
+        vc.invalidate(table, dimension=dim)
+
+
+def _craft_with_space(
+    ex: "Executor", state: "State", item: str, *, table_pos: Optional[list] = None,
+) -> Iterator[dict]:
+    """库存满时尝试用一份现有无附魔食物腾位，no_window 时遗忘失效工作台。"""
+    before = state.count(item)
+    try:
+        result = ex.craft(item, 1)
+    except Replan as e:
+        code, extra = failure(e)
+        if code == "no_window":
+            table = extra.get("table")
+            _forget_stale_table(state, table if _is_valid_pos3(table) else table_pos)
+        if code != "inventory_full":
+            raise
+        yield rec("craft", item=item, error_code=code)
+        inv = state.refresh_inventory(ex.client)
+        gained = extra.get("gained")
+        if state.count(item) > before or (
+            isinstance(gained, (int, float)) and not isinstance(gained, bool) and gained > 0
+        ):
+            return
+        if inv.get("empty_slots") == 0:
+            st = state.refresh_status(ex.client, max_age_s=0)
+            raw_food = st.get("food", 20)
+            if not isinstance(raw_food, (int, float)) or isinstance(raw_food, bool) or raw_food >= 20:
+                raise
+            food = next(
+                (
+                    name
+                    for entry in inv.get("items", [])
+                    if isinstance(entry, dict)
+                    and (name := bare(entry.get("name"))) in EDIBLE_FOODS
+                    and entry.get("count") == 1
+                    and state.count(name) == 1
+                    and not entry.get("custom_name")
+                    and not entry.get("enchantments")
+                ),
+                None,
+            )
+            if food is None:
+                raise
+            yield rec("use_item", ex.use_item(food), item=food)
+            inv = state.refresh_inventory(ex.client)
+        empty_slots = inv.get("empty_slots")
+        if not isinstance(empty_slots, int) or isinstance(empty_slots, bool) or empty_slots <= 0:
+            raise
+        result = ex.craft(item, 1)
+    yield rec("craft", result, item=item)
+
+
 def _prepare_recipe_planks(ex: "Executor", state: "State", needed: int, target: str) -> Iterator[dict]:
     """每次配方前现查同种木板；最多 needed 次有进展的转化，动作后立即让出。"""
     for _ in range(needed):
@@ -425,7 +496,7 @@ def _prepare_recipe_planks(ex: "Executor", state: "State", needed: int, target: 
             raise Replan(f"合成 {target} 同种木板不足：单次需 {needed}，需补充原木")
         plank_item = _planks_for_log(max(logs, key=lambda lg: (state.count(_planks_for_log(lg)), state.count(lg))))
         before = state.count(plank_item)
-        yield rec("craft", ex.craft(plank_item, 1), item=plank_item)
+        yield from _craft_with_space(ex, state, plank_item)
         state.refresh_inventory(ex.client)
         if state.count(plank_item) <= before:
             raise Replan(f"合成 {plank_item} 后木板未增加，停止准备 {target}")
@@ -760,14 +831,13 @@ class GatherWood(Skill):
                     continue
 
             try:
-                dug_res = ex.dig(target, collect=True)
+                dug_res = yield from nav.dig_with_recovery(ex, state, target, collect=True)
                 if vc is not None:
                     vc.invalidate(t_key, dimension=dim)
                 memo.mark_reachable(t_key, dimension=dim, category="wood", block=chosen["name"])
                 after_name = _probe_block_name(ex, target, vc=vc, dim=dim)
                 if after_name is not None and after_name not in ALL_LOGS:
                     memo.mark_depleted(t_key, dimension=dim, category="wood")
-                yield rec("dig", dug_res, pos=target)
             except Replan as e:
                 code, _ = failure(e)
                 if code == "protected_region":
@@ -851,6 +921,7 @@ class CraftGear(Skill):
                 and eye_to_block_dist(st, e.pos) <= 48.0 and not _is_protected(e.pos)
             ]
         table_ready = False
+        active_table_pos: Optional[list] = None
         for tb in valid_tables:
             tpos, from_memo = tb["pos"], bool(tb.get("from_memo"))
             if from_memo and eye_to_block_dist(st, tpos) <= 36.0:
@@ -887,6 +958,7 @@ class CraftGear(Skill):
             _record_known_table(tpos)
             memo.mark_reachable(tpos, dimension=dim, category="station", block="crafting_table")
             _record_station(memo, "crafting_table", tpos, dim)
+            active_table_pos = tpos
             table_ready = True
             break
 
@@ -896,7 +968,7 @@ class CraftGear(Skill):
         while state.count("stick") < s_need:
             yield from _prepare_recipe_planks(ex, state, 2, "stick")
             before_sticks = state.count("stick")
-            yield rec("craft", ex.craft("stick", 1), item="stick")
+            yield from _craft_with_space(ex, state, "stick")
             state.refresh_inventory(ex.client)
             if state.count("stick") <= before_sticks:
                 raise Replan("合成 stick 后木棍未增加，停止准备工具")
@@ -904,7 +976,7 @@ class CraftGear(Skill):
         if not table_ready:
             if state.count("crafting_table") < 1:
                 yield from _prepare_recipe_planks(ex, state, 4, "crafting_table")
-                yield rec("craft", ex.craft("crafting_table", 1), item="crafting_table")
+                yield from _craft_with_space(ex, state, "crafting_table")
                 state.refresh_inventory(ex.client)
             try:
                 placed = ex.place("crafting_table")
@@ -912,6 +984,7 @@ class CraftGear(Skill):
                 _record_known_table(placed_pos)
                 memo.mark_reachable(placed_pos, dimension=dim, category="station", block="crafting_table")
                 _record_station(memo, "crafting_table", placed_pos, dim)
+                active_table_pos = placed_pos
                 yield rec("place", placed, item="crafting_table")
             except Replan as e:
                 if failure(e)[0] == "protected_region":
@@ -920,7 +993,7 @@ class CraftGear(Skill):
                     raise Replan("当前位置处于出生点保护区，无法放置工作台") from e
                 raise
         yield from _prepare_recipe_planks(ex, state, p_need, target)
-        yield rec("craft", ex.craft(target, 1), item=target)
+        yield from _craft_with_space(ex, state, target, table_pos=active_table_pos)
         state.refresh_inventory(ex.client)
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
@@ -1057,9 +1130,10 @@ class MineStone(Skill):
                                 if _is_under_feet(cur, [sx, clear_y, sz]):
                                     stair_origin, reobserve_stair = None, True
                                     break
-                                dug_res = ex.dig([sx, clear_y, sz], collect=bname not in PEEL_SURFACE)
+                                dug_res = yield from nav.dig_with_recovery(
+                                    ex, state, [sx, clear_y, sz], collect=bname not in PEEL_SURFACE
+                                )
                                 vc and vc.invalidate_radius([sx, clear_y, sz], radius=1, dimension=dim)
-                                yield rec("dig", dug_res, pos=[sx, clear_y, sz])
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
                                     return
@@ -1124,9 +1198,8 @@ class MineStone(Skill):
                     vc and vc.mark_unreachable("mine_stone", t_key, dimension=dim, stance_cell=cur_cell)
                     continue
                 before_dig_cobble = total_cobble(state)
-                dug_res = ex.dig(target, collect=True)
+                dug_res = yield from nav.dig_with_recovery(ex, state, target, collect=True)
                 vc and vc.invalidate(t_key, dimension=dim)
-                yield rec("dig", dug_res, pos=target)
             except Replan as e:
                 code, _ = failure(e)
                 if code == "protected_region":
