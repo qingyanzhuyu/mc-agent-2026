@@ -714,7 +714,7 @@ class GatherWood(Skill):
     params = {"count": Param(int, "要砍几块原木", default=3, min=1, max=16)}
     goal = "acq:wood"
     cooldown_s = 20.0
-    verified = "offline"
+    verified = "live"
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         state.refresh_status(ex.client, max_age_s=0)
@@ -902,7 +902,7 @@ class CraftGear(Skill):
     params = {"item": Param(str, "要合成的物品", choices=("wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace", "stick"), default="wooden_pickaxe")}
     goal = "craft:{item}"
     cooldown_s = 20.0
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state: "State") -> str:
@@ -1034,7 +1034,7 @@ class MineStone(Skill):
     params = {"count": Param(int, "期望新增圆石数", default=8, min=1, max=32)}
     goal = "acq:cobblestone"
     cooldown_s = 20.0
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state: "State") -> str:

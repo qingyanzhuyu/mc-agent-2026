@@ -96,7 +96,7 @@ class EmergencyEscape(Skill):
     }
     goal = "safety:{intent}"
     cooldown_s = 5.0
-    verified = "offline"
+    verified = "live"
 
     _start_pos: Optional[tuple[float, float, float]] = None
 

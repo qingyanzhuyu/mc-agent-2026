@@ -417,7 +417,7 @@ class EmergencyEscapeSkillTests(unittest.TestCase):
         self.assertIs(REGISTRY.get("emergency_escape"), EmergencyEscape)
         self.assertEqual(contract_errors(EmergencyEscape), [])
         self.assertEqual(EmergencyEscape.goal, "safety:{intent}")
-        self.assertEqual(EmergencyEscape.verified, "offline")
+        self.assertEqual(EmergencyEscape.verified, "live")
         self.assertEqual(EmergencyEscape.params["intent"].choices, ("surface", "flee", "douse"))
 
         for intent in ("surface", "flee", "douse"):
