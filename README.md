@@ -1,6 +1,6 @@
 # 南大 AI Agent for Minecraft 开发大赛 · Harness 赛道备赛仓库
 
-> 状态：**架构收拢分支 `feat/arch-converge-v2-agy`（待合入 `main`；4 项核心技能 `verified: live` + 57 项技能 `verified: offline` / 阶段二技能另附 `local-target` 冒烟）** · 更新 2026-11-19
+> 状态：**架构收拢分支 `feat/arch-converge-v2-agy`（待合入 `main`；4 项核心技能 `verified: live` + 75 项技能 `verified: offline` / 含阶段二 37 项与阶段三 18 项 T4 精选技能，另附 `local-target` 冒烟）** · 更新 2026-11-19
 > 初赛：**11/22（日）10:00–18:00，8 小时，每人一座虚空岛（v2 草案）** · 决赛：12/6
 > 出线：初赛取 8 队 · 报名截止：**11/18**
 
@@ -52,6 +52,7 @@ docs/
   10-推进批次.md      99 个计分项聚成 22 批（按共享前置）+ 岛体检结构指纹表
   11-任务性价比分层.md  99 项分四层：底仓 / 有就做 / 长链带止损 / 放弃
   13-得分目标脚本与子目标规划.md  99 项拆成子目标与公共脚本 + 新旧技能对照 + 岛体检 + 成本与时间线
+  14-T4精选扩展与子目标规划.md    Stage 3 1.21.11×API 交叉审计、Wave A–D 18 项 T4 精选扩展与 10 项共享 T4_PREP 子图
   99-原始记录/        v1/v2/v3 原始分析 + 官方接口规范原文
 plan/
   11-12到11-22执行计划.md
@@ -63,9 +64,9 @@ code/
     preflight.py     赛前切换自检（12 项静态门禁：官方端点 / 凭据 / 2 路并发闸门 / 8787 网关 / 残留 soak_ctl·mcagent 进程 / apiin 误配 7897 代理拦截）
     smoke.py probe.py 冒烟与基线测量（含 --api-capabilities / --pathfinding）
     planner/         决策层：objective.py（目标级战略校验）、skill_choice.py、decision.py、llm.py（2 路 BoundedSemaphore 并发闸门）、scheduler.py
-    skills/          执行层：L2 原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（原子 JSON 检查点）、61 个注册 L3 技能（4 项 verified="live" + 57 项 verified="offline"，含 emergency_escape）
-    loop/            主循环与策略：engine.py（同格冷却自旋三级升级 + 30s 沿路增量扫描）、goals.py（76 项 GoalSpec 台账：71 计分项 / 1,725 分上限，6 graduated / 1 candidate / 69 draft）、subgoals.py（6 项活谓词）、strategy.py & strategy_async.py（--strategy llm）、context.py、auditor.py、tape.py
-  tests/             离线故障注入、架构契约与集成回归单测：1,275 项 Python unittest（verified: offline）
+    skills/          执行层：L2 原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（21 类指纹 + 原子 JSON 检查点）、79 个注册 L3 技能（4 项 verified="live" + 75 项 verified="offline"，含 emergency_escape 及阶段三 18 项 T4 技能）
+    loop/            主循环与策略：engine.py（同格冷却自旋三级升级 + 30s 沿路增量扫描）、goals.py（104 项 GoalSpec 台账：89 计分项 / 2,730 分上限 [80.6%]，6 graduated / 1 candidate / 97 draft）、subgoals.py（10 项活谓词 + 10 类工作站）、strategy.py & strategy_async.py（--strategy llm）、context.py、auditor.py、tape.py
+  tests/             离线故障注入、架构契约与集成回归单测：1,397 项 Python unittest（verified: offline）
 tools/
   local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，含 11 项 Node 网关契约单测，与比赛代码零耦合）
 ```
@@ -84,13 +85,13 @@ tools/
 - [x] 抓全公告 + 初赛细则 + 计分/判据表整理（`docs/00`、`docs/08`–`docs/13`）
 - [x] 读完接口规范 v1.3.1–v1.3.11，探通官方双端点无鉴权（2026-11-19 实测：校园网 `apiin.nmo.net.cn` 长连接 RTT `4.0–4.3 ms`，公网 `mc-api.windywindie.top` `816–973 ms`，均返 `401 unauthorized`）
 - [x] 底层容错与运行时加固（401 单点重登与 Token 持久化、16 RPS 三级限速、连续异步 `SafetyMonitor`、死亡去重与 65s 避险锁存、非幂等超时判重、有界 `move_to` 超时禁重试、`emergency()` 紧急抢占、移植 `v1.3.11` 精选恢复 4 项）
-- [x] 架构收拢至 `feat/arch-converge-v2-agy`（**61 个注册 L3 技能**：`4` 项 `verified="live"` + `57` 项 `verified="offline"`；**76 项 `GoalSpec` 台账**：`71` 计分项 / `1,725` 分上限，`6 graduated / 1 candidate / 69 draft`；共享子图 DAG 边际 ROI、30s 节流沿路扫描、`furnace_lease` 异步租约与 5 条提速替代路线）+ **1,275 项 Python `unittest` + 11 项 Node 网关契约单测全绿**
-- [x] 本地靶场 `local-target` 冷启动与阶段二技能冒烟复测（2 轮 240s 冷启动验证动作/清障/脱困/`--strategy llm`/检查点闭环，第 2 轮 `de7_v2_test02` 0 死亡拿 10 分；阶段二 `survey_island`/`discover_structure`/`trade_villager`/`furnace_lease` 门禁与 2 扇区写入 44 条资源冒烟通过；**不进入正式比赛时间预算表**）
+- [x] 架构收拢至 `feat/arch-converge-v2-agy` 并合入 Stage 3（Wave A–D，**79 个注册 L3 技能**：`4` 项 `verified="live"` + `75` 项 `verified="offline"`；**104 项 `GoalSpec` 台账**：`89` 计分项 / `2,730` 分上限 [80.6%]，`6 graduated / 1 candidate / 97 draft`；10 项活谓词、21 类世界指纹、受控图腾单次安全钩子、共享子图 DAG 边际 ROI、被动机会根目标门控、30s 节流沿路扫描与 `furnace_lease` 异步租约）+ **1,397 项 Python `unittest` + 11 项 Node 网关契约单测全绿**
+- [x] 本地靶场 `local-target` 冷启动、阶段二与阶段三技能冒烟复测（2 轮 240s 冷启动验证闭环，第 2 轮 `de7_v2_test02` 0 死亡拿 10 分；阶段二 `survey_island`/`discover_structure`/`trade_villager`/`furnace_lease` 冒烟通过；阶段三 Step 0 `T4-P1..P4` 标定及 18 项空包 `blocked` 18/18 拦截 + Vanilla 1.21.11 实跑 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 解锁真实进度；**均不进入正式比赛时间预算表**）
 - [x] **官方正式皮肤站账号登录 + `ready=True`**（校园网 `apiin.nmo.net.cn` `preflight --apply --live` 15/15 全绿、`smoke` `0.5s` 登录进服就绪，Token TTL 24h）
 - [x] **官方校园网基线 `probe` + 能力标定 + AIA 实测**（`T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`、`MC_MAX_RPS` 4/8/12/16 零限流、C16 虚空保护误报 `0/12`、官方 AIA `qwen3.6-35b-a3b` 快路径 `4/4` `p50=1652.7 ms`，已关闭 `docs/04` B18/C1 等 10 项待确认项，数据归档 `results/probe/`）
 - [x] **官方真机故障演练 3/3 PASS**（断线重连 `63.11s`、`safe_mode` `65.2s` 冷却自愈、3 线程并发 401 单飞刷新 `login_calls=1`，归档 `results/probe/fault-drills-official-20261119.json`）
 - [x] **官方 2 小时长跑取证 + 根因修复 + 评审五部分材料冻结**（`official-soak-20261119` 有效 `6303.9s` **0 死亡 0 崩溃**、`emergency_escape` 6/6，前 `124.7s` 拿下 5 项起步目标；4 项零缺陷技能升格 `verified="live"`；暴露的 4 环死锁与 Token 烧爆已在 `c03c26e` 闭环修复；`INC-005` 可 100% 离线 `--replay`；`report.md`、`report.pdf`、`demo.md`、`results/` 已脱敏汇编就绪）
-- [ ] **阶段二技能真机晋级 + 合入 `main` + 赛前收尾**（阶段二及未实测技能共 **57 项仍保持 `verified="offline"`**、台账 69 项仍为 `draft`，`feat/arch-converge-v2-agy` **尚待最终合入 `main`**；另待 11/22 演示备用录屏、跟进官方提交入口 `docs/04` A3 与 `docs/05` 角色表人类签字）
+- [ ] **阶段二/三技能真机晋级 + 合入 `main` + 赛前收尾**（阶段二/三及未实测技能共 **75 项仍保持 `verified="offline"`**、台账 97 项仍为 `draft`，`feat/arch-converge-v2-agy` **尚待最终合入 `main`**；另待 11/22 演示备用录屏、跟进官方提交入口 `docs/04` A3 与 `docs/05` 角色表人类签字）
 
 ## 已知的两个坑
 
