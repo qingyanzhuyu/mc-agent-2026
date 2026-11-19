@@ -1,0 +1,1363 @@
+{
+  "id": "INC-005",
+  "incident_id": "INC-005",
+  "fingerprint": "e47330b766",
+  "severity": "P2",
+  "category": "strategy",
+  "code": "REPLAN_OSCILLATION",
+  "skill": "craft_gear",
+  "title": "目标 craft:furnace 在 180s 内连续失败 3 次 (replan)",
+  "count": 92,
+  "first_seen_s": 728.3,
+  "last_seen_s": 6064.4,
+  "source": "official",
+  "git": {
+    "commit": "090a04a",
+    "branch": "feat/arch-converge-v2-agy",
+    "dirty": true
+  },
+  "world_snapshot_id": "unspecified",
+  "run_dir": "mcagent/logs/official-soak-20261119",
+  "run_meta": {
+    "mode": "campaign",
+    "strategy": "llm",
+    "skill": null,
+    "target_goal": null,
+    "stop_on_goal": false,
+    "use_llm": true,
+    "llm_profile": "official",
+    "llm_model": "default",
+    "min_verified": "offline",
+    "max_steps": 0,
+    "max_seconds": 7260.0,
+    "checkpoint_path": "mcagent/logs/official-soak-20261119/checkpoint.json",
+    "base": "https://apiin.nmo.net.cn/api/v1",
+    "bot_user": "<redacted_bot>"
+  },
+  "detail": {
+    "goal": "craft:furnace",
+    "recent_failures": 3,
+    "last_error": "合成 furnace 木板不足：同种材料无法完成木棍、工作台与目标配方，需补充原木"
+  },
+  "last_detail": {
+    "goal": "craft:furnace",
+    "recent_failures": 4,
+    "last_error": "合成 furnace 木板不足：同种材料无法完成木棍、工作台与目标配方，需补充原木"
+  },
+  "skill_context": {
+    "skill": "craft_gear",
+    "args": {
+      "item": "furnace"
+    },
+    "outcome": "replan",
+    "initial_status": {
+      "username": "<redacted_bot>",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "yaw": 1.53,
+      "speed": 0,
+      "velocity": [
+        0,
+        0,
+        0
+      ],
+      "dimension": "overworld",
+      "gamemode": "survival",
+      "health": 20,
+      "food": 20,
+      "saturation": 5,
+      "xp_level": 0,
+      "xp_progress": 0.571,
+      "armor_points": 0,
+      "held": null,
+      "offhand": null,
+      "effects": [],
+      "on_fire": false,
+      "is_sleeping": false,
+      "in_water": false,
+      "submerged": false,
+      "in_lava": false,
+      "in_vehicle": null,
+      "sneaking": false,
+      "held_controls": null,
+      "jumping": false,
+      "blocking": false,
+      "using_item": null,
+      "time_of_day": 20468,
+      "is_day": false,
+      "raining": false,
+      "thundering": false,
+      "biome": "",
+      "on_ground": true,
+      "alive": true,
+      "ready": true,
+      "busy": null
+    },
+    "initial_inventory": {
+      "items": [
+        {
+          "name": "stick",
+          "count": 4,
+          "slot": 35
+        },
+        {
+          "name": "dirt",
+          "count": 18,
+          "slot": 36
+        },
+        {
+          "name": "cobblestone",
+          "count": 64,
+          "slot": 37
+        },
+        {
+          "name": "coal",
+          "count": 4,
+          "slot": 38
+        },
+        {
+          "name": "granite",
+          "count": 22,
+          "slot": 39
+        },
+        {
+          "name": "andesite",
+          "count": 13,
+          "slot": 40
+        },
+        {
+          "name": "cobblestone",
+          "count": 63,
+          "slot": 41
+        },
+        {
+          "name": "stone_sword",
+          "count": 1,
+          "slot": 43
+        },
+        {
+          "name": "spruce_planks",
+          "count": 1,
+          "slot": 44
+        }
+      ],
+      "armor": {
+        "head": null,
+        "chest": null,
+        "legs": null,
+        "feet": null
+      },
+      "offhand": null,
+      "held": null,
+      "empty_slots": 27
+    },
+    "before_counts": {
+      "cobblestone": 127,
+      "spruce_planks": 1,
+      "andesite": 13,
+      "dirt": 18,
+      "granite": 22,
+      "coal": 4,
+      "stone_sword": 1,
+      "stick": 4
+    }
+  },
+  "state_snapshot": {
+    "username": "<redacted_bot>",
+    "pos": [
+      13082.3,
+      52,
+      -5812.5
+    ],
+    "yaw": 1.53,
+    "speed": 0,
+    "velocity": [
+      0,
+      0,
+      0
+    ],
+    "dimension": "overworld",
+    "gamemode": "survival",
+    "health": 20,
+    "food": 20,
+    "saturation": 5,
+    "xp_level": 0,
+    "xp_progress": 0.571,
+    "armor_points": 0,
+    "held": null,
+    "offhand": null,
+    "effects": [],
+    "on_fire": false,
+    "is_sleeping": false,
+    "in_water": false,
+    "submerged": false,
+    "in_lava": false,
+    "in_vehicle": null,
+    "sneaking": false,
+    "held_controls": null,
+    "jumping": false,
+    "blocking": false,
+    "using_item": null,
+    "time_of_day": 20468,
+    "is_day": false,
+    "raining": false,
+    "thundering": false,
+    "biome": "",
+    "on_ground": true,
+    "alive": true,
+    "ready": true,
+    "busy": null
+  },
+  "inventory_fingerprint": {
+    "cobblestone": 127,
+    "spruce_planks": 1,
+    "andesite": 13,
+    "dirt": 18,
+    "granite": 22,
+    "coal": 4,
+    "stone_sword": 1,
+    "stick": 4
+  },
+  "recent_steps": [
+    {
+      "event": "step",
+      "elapsed_s": 639.7,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "equip",
+      "pos": [
+        13081.7,
+        52.1,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "equip",
+        "item": "wooden_pickaxe",
+        "result": {
+          "held": {
+            "name": "wooden_pickaxe",
+            "count": 1,
+            "slot": 42,
+            "durability_used": 56
+          }
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 641.5,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "dig",
+      "pos": [
+        13081.7,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "dig",
+        "pos": [
+          13081,
+          53,
+          -5812
+        ],
+        "result": {
+          "dug": "stone",
+          "dig_ms": 1200,
+          "tool": "wooden_pickaxe",
+          "gained": {
+            "cobblestone": 1
+          }
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 643.8,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "dig",
+      "pos": [
+        13081.7,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "dig",
+        "pos": [
+          13081,
+          52,
+          -5812
+        ],
+        "result": {
+          "dug": "stone",
+          "dig_ms": 1200,
+          "tool": "wooden_pickaxe",
+          "gained": {
+            "cobblestone": 1
+          }
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 644.5,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13081.5,
+        52,
+        -5811.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5811.5
+        ],
+        "result": {
+          "pos": [
+            13081.5,
+            52,
+            -5811.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 645.3,
+      "skill": "craft_gear",
+      "source": "llm",
+      "op": "craft",
+      "pos": [
+        13081.5,
+        52,
+        -5811.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "craft",
+        "item": "stick",
+        "count": 1,
+        "result": {
+          "crafted": "stick",
+          "gained": 4,
+          "used_table": false,
+          "inventory": {
+            "stick": 4,
+            "dirt": 18,
+            "cobblestone": 126,
+            "coal": 4,
+            "granite": 22,
+            "andesite": 13,
+            "wooden_pickaxe": 1,
+            "stone_sword": 1,
+            "spruce_planks": 1
+          }
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 647.8,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13081.5,
+        52,
+        -5812.3
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13081.5,
+            52,
+            -5812.3
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 650.3,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13082.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 655.4,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 666.6,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 677.6,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 683.7,
+      "skill": "mine_stone",
+      "source": "llm",
+      "op": "dig",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "dig",
+        "pos": [
+          13082,
+          54,
+          -5813
+        ],
+        "result": {
+          "dug": "stone",
+          "dig_ms": 1200,
+          "tool": "wooden_pickaxe",
+          "gained": {
+            "cobblestone": 1
+          }
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 689.4,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 701.0,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 712.1,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    },
+    {
+      "event": "step",
+      "elapsed_s": 723.5,
+      "skill": "scout_island",
+      "source": "rule",
+      "op": "move_to_recover",
+      "pos": [
+        13082.3,
+        52,
+        -5812.5
+      ],
+      "hp": 20.0,
+      "food": 20,
+      "record": {
+        "op": "move_to_recover",
+        "pos": [
+          13081.5,
+          52.0,
+          -5812.5
+        ],
+        "result": {
+          "pos": [
+            13082.3,
+            52,
+            -5812.5
+          ]
+        }
+      }
+    }
+  ],
+  "recent_events": [
+    {
+      "seq": 239,
+      "t": 1795082393054,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 240,
+      "t": 1795082394114,
+      "type": "chat",
+      "text": "Yuzq_bot4 joined the game"
+    },
+    {
+      "seq": 241,
+      "t": 1795082394116,
+      "type": "chat",
+      "text": "Yuzq_bot4: 已连接到 [survivaltest]。"
+    },
+    {
+      "seq": 242,
+      "t": 1795082396155,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 243,
+      "t": 1795082400354,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 244,
+      "t": 1795082410954,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 245,
+      "t": 1795082412805,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 246,
+      "t": 1795082415354,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 247,
+      "t": 1795082418004,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 248,
+      "t": 1795082420354,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 249,
+      "t": 1795082423054,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 250,
+      "t": 1795082427304,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 251,
+      "t": 1795082429654,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    },
+    {
+      "seq": 252,
+      "t": 1795082433252,
+      "type": "chat",
+      "text": "Yuzq_bot3: 已退出服务器。"
+    },
+    {
+      "seq": 253,
+      "t": 1795082433263,
+      "type": "chat",
+      "text": "Yuzq_bot3 left the game"
+    },
+    {
+      "seq": 254,
+      "t": 1795082433701,
+      "type": "chat",
+      "text": "Yuzq_bot1: 已退出服务器。"
+    },
+    {
+      "seq": 255,
+      "t": 1795082433713,
+      "type": "chat",
+      "text": "Yuzq_bot1 left the game"
+    },
+    {
+      "seq": 256,
+      "t": 1795082462449,
+      "type": "chat",
+      "text": "Yuzq: 已退出服务器。"
+    },
+    {
+      "seq": 257,
+      "t": 1795082462463,
+      "type": "chat",
+      "text": "Yuzq left the game"
+    },
+    {
+      "seq": 258,
+      "t": 1795082469502,
+      "type": "pickup",
+      "item": "cobblestone",
+      "count": 1
+    }
+  ],
+  "http_tape": [
+    {
+      "t": 1795082511.266,
+      "ms": 5.2,
+      "thread": "main",
+      "method": "GET",
+      "path": "status",
+      "body": null,
+      "ok": true,
+      "result": {
+        "username": "<redacted_bot>",
+        "pos": [
+          13082.3,
+          52,
+          -5812.5
+        ],
+        "yaw": 1.53,
+        "speed": 0,
+        "velocity": [
+          0,
+          0,
+          0
+        ],
+        "dimension": "overworld",
+        "gamemode": "survival",
+        "health": 20,
+        "food": 20,
+        "saturation": 5,
+        "xp_level": 0,
+        "xp_progress": 0.571,
+        "armor_points": 0,
+        "held": null,
+        "offhand": null,
+        "effects": [],
+        "on_fire": false,
+        "is_sleeping": false,
+        "in_water": false,
+        "submerged": false,
+        "in_lava": false,
+        "in_vehicle": null,
+        "sneaking": false,
+        "held_controls": null,
+        "jumping": false,
+        "blocking": false,
+        "using_item": null,
+        "time_of_day": 20468,
+        "is_day": false,
+        "raining": false,
+        "thundering": false,
+        "biome": "",
+        "on_ground": true,
+        "alive": true,
+        "ready": true,
+        "busy": null
+      },
+      "seq": 6210
+    },
+    {
+      "t": 1795082511.33,
+      "ms": 63.7,
+      "thread": "main",
+      "method": "POST",
+      "path": "find_blocks",
+      "body": {
+        "radius": 16,
+        "limit": 5,
+        "types": [
+          "crafting_table"
+        ]
+      },
+      "ok": true,
+      "result": {
+        "total": 0,
+        "blocks": []
+      },
+      "seq": 6211
+    }
+  ],
+  "episode_profile": {
+    "elapsed_s": 6064.4,
+    "decision_sources": {
+      "rule": 529,
+      "llm": 833
+    },
+    "step_sources": {
+      "rule": 641,
+      "llm": 214
+    },
+    "llm_calls": 1269,
+    "llm_fallbacks": 432,
+    "goals_reached": {
+      "prep_wood": 69.4,
+      "prep_wooden_pickaxe": 74.8,
+      "mine_stone": 118.9,
+      "upgrade_tools": 123.9,
+      "prep_stone_sword": 124.7
+    },
+    "skill_stats": {
+      "gather_wood": {
+        "started": 13,
+        "ok": 1,
+        "replan": 2,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 47.1
+      },
+      "scout_island": {
+        "started": 512,
+        "ok": 29,
+        "replan": 483,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 1491.2
+      },
+      "craft_gear": {
+        "started": 141,
+        "ok": 4,
+        "replan": 137,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 32.9
+      },
+      "mine_stone": {
+        "started": 12,
+        "ok": 11,
+        "replan": 1,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 456.2
+      },
+      "sleep_in_bed": {
+        "started": 124,
+        "ok": 0,
+        "replan": 124,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 54.4
+      },
+      "hunt_mob": {
+        "started": 519,
+        "ok": 0,
+        "replan": 4,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 212.6
+      },
+      "build_and_enter_portal": {
+        "started": 17,
+        "ok": 0,
+        "replan": 3,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 48.0
+      },
+      "emergency_escape": {
+        "started": 6,
+        "ok": 6,
+        "replan": 0,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 7.3
+      },
+      "mine_diamond": {
+        "started": 18,
+        "ok": 0,
+        "replan": 18,
+        "budget_stopped": 0,
+        "bug": 0,
+        "elapsed_s": 10.8
+      }
+    },
+    "repeated_skill_args": [
+      {
+        "skill": "scout_island",
+        "args": {
+          "radius": 36
+        },
+        "started": 508,
+        "ok": 27,
+        "replan": 481,
+        "env_blocked": 0,
+        "total_elapsed_s": 1477.7
+      },
+      {
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "started": 311,
+        "ok": 0,
+        "replan": 0,
+        "env_blocked": 311,
+        "total_elapsed_s": 129.6
+      },
+      {
+        "skill": "sleep_in_bed",
+        "args": {},
+        "started": 124,
+        "ok": 0,
+        "replan": 124,
+        "env_blocked": 0,
+        "total_elapsed_s": 54.4
+      },
+      {
+        "skill": "craft_gear",
+        "args": {
+          "item": "furnace"
+        },
+        "started": 93,
+        "ok": 0,
+        "replan": 93,
+        "env_blocked": 0,
+        "total_elapsed_s": 14.2
+      },
+      {
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "string",
+          "count": 1
+        },
+        "started": 75,
+        "ok": 0,
+        "replan": 0,
+        "env_blocked": 75,
+        "total_elapsed_s": 26.6
+      },
+      {
+        "skill": "hunt_mob",
+        "args": {
+          "target": "creeper",
+          "drop": "none",
+          "count": 1
+        },
+        "started": 58,
+        "ok": 0,
+        "replan": 0,
+        "env_blocked": 58,
+        "total_elapsed_s": 25.8
+      },
+      {
+        "skill": "hunt_mob",
+        "args": {
+          "target": "zombie",
+          "drop": "none",
+          "count": 1
+        },
+        "started": 45,
+        "ok": 0,
+        "replan": 0,
+        "env_blocked": 45,
+        "total_elapsed_s": 19.6
+      },
+      {
+        "skill": "craft_gear",
+        "args": {
+          "item": "stone_pickaxe"
+        },
+        "started": 45,
+        "ok": 1,
+        "replan": 44,
+        "env_blocked": 0,
+        "total_elapsed_s": 11.9
+      }
+    ],
+    "http_stats": [
+      {
+        "path": "events",
+        "count": 8585,
+        "ok": 8585,
+        "errors": 0,
+        "total_ms": 1680438.0,
+        "avg_ms": 195.7,
+        "max_ms": 9596.4,
+        "pct_of_elapsed": 27.7
+      },
+      {
+        "path": "get_block",
+        "count": 20735,
+        "ok": 20735,
+        "errors": 0,
+        "total_ms": 1295286.9,
+        "avg_ms": 62.5,
+        "max_ms": 2568.1,
+        "pct_of_elapsed": 21.4
+      },
+      {
+        "path": "status",
+        "count": 14147,
+        "ok": 14147,
+        "errors": 0,
+        "total_ms": 793802.3,
+        "avg_ms": 56.1,
+        "max_ms": 1379.1,
+        "pct_of_elapsed": 13.1
+      },
+      {
+        "path": "dig",
+        "count": 212,
+        "ok": 211,
+        "errors": 1,
+        "total_ms": 383523.6,
+        "avg_ms": 1809.1,
+        "max_ms": 11675.1,
+        "pct_of_elapsed": 6.3
+      },
+      {
+        "path": "find_blocks",
+        "count": 1555,
+        "ok": 1555,
+        "errors": 0,
+        "total_ms": 111268.9,
+        "avg_ms": 71.6,
+        "max_ms": 268.6,
+        "pct_of_elapsed": 1.8
+      },
+      {
+        "path": "move_to",
+        "count": 604,
+        "ok": 561,
+        "errors": 43,
+        "total_ms": 90727.9,
+        "avg_ms": 150.2,
+        "max_ms": 15907.3,
+        "pct_of_elapsed": 1.5
+      },
+      {
+        "path": "inventory",
+        "count": 1111,
+        "ok": 1111,
+        "errors": 0,
+        "total_ms": 62409.7,
+        "avg_ms": 56.2,
+        "max_ms": 1442.3,
+        "pct_of_elapsed": 1.0
+      },
+      {
+        "path": "get_entities",
+        "count": 515,
+        "ok": 515,
+        "errors": 0,
+        "total_ms": 32346.2,
+        "avg_ms": 62.8,
+        "max_ms": 153.6,
+        "pct_of_elapsed": 0.5
+      }
+    ],
+    "recent_decisions": [
+      {
+        "elapsed_s": 6008.2,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:none>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6010.7,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:none>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6013.5,
+        "skill": "scout_island",
+        "args": {
+          "radius": 36
+        },
+        "source": "rule",
+        "reason": "基础石器齐备，持续扫描岛屿结构与矿脉",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "周边未找到有两格空气的安全新陆地站位（防虚空不盲走）",
+        "steps": 1
+      },
+      {
+        "elapsed_s": 6014.0,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:none>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6018.3,
+        "skill": "craft_gear",
+        "args": {
+          "item": "furnace"
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <craft_gear:craft:furnace>",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "合成 furnace 木板不足：同种材料无法完成木棍、工作台与目标配方，需补充原木",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6025.2,
+        "skill": "scout_island",
+        "args": {
+          "radius": 36
+        },
+        "source": "rule",
+        "reason": "基础石器齐备，持续扫描岛屿结构与矿脉",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "周边未找到有两格空气的安全新陆地站位（防虚空不盲走）",
+        "steps": 1
+      },
+      {
+        "elapsed_s": 6025.4,
+        "skill": "craft_gear",
+        "args": {
+          "item": "stone_pickaxe"
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <craft_gear:craft:stone_pickaxe>",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "合成 stone_pickaxe 木板不足：同种材料无法完成木棍、工作台与目标配方，需补充原木",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6030.9,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "string",
+          "count": 4
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:string>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6036.8,
+        "skill": "scout_island",
+        "args": {
+          "radius": 36
+        },
+        "source": "rule",
+        "reason": "基础石器齐备，持续扫描岛屿结构与矿脉",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "周边未找到有两格空气的安全新陆地站位（防虚空不盲走）",
+        "steps": 1
+      },
+      {
+        "elapsed_s": 6037.3,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:none>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6042.8,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:none>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6047.7,
+        "skill": "scout_island",
+        "args": {
+          "radius": 36
+        },
+        "source": "rule",
+        "reason": "基础石器齐备，持续扫描岛屿结构与矿脉",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "周边未找到有两格空气的安全新陆地站位（防虚空不盲走）",
+        "steps": 1
+      },
+      {
+        "elapsed_s": 6054.3,
+        "skill": "hunt_mob",
+        "args": {
+          "target": "spider",
+          "drop": "none",
+          "count": 1
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <hunt_mob:acq:combat:spider:none>",
+        "outcome": "env_blocked",
+        "error_code": "env_blocked",
+        "error_msg": "未观察到有掩体退路的目标敌对生物，先切换目标",
+        "steps": 0
+      },
+      {
+        "elapsed_s": 6059.1,
+        "skill": "scout_island",
+        "args": {
+          "radius": 36
+        },
+        "source": "rule",
+        "reason": "基础石器齐备，持续扫描岛屿结构与矿脉",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "周边未找到有两格空气的安全新陆地站位（防虚空不盲走）",
+        "steps": 1
+      },
+      {
+        "elapsed_s": 6064.4,
+        "skill": "craft_gear",
+        "args": {
+          "item": "furnace"
+        },
+        "source": "llm",
+        "reason": "战术层无技能，LLM 兜底选择 <craft_gear:craft:furnace>",
+        "outcome": "replan",
+        "error_code": "replan",
+        "error_msg": "合成 furnace 木板不足：同种材料无法完成木棍、工作台与目标配方，需补充原木",
+        "steps": 0
+      }
+    ]
+  },
+  "path": "mcagent/logs/official-soak-20261119/incidents/INC-005-P2-replan_oscillation-craft_gear.json"
+}

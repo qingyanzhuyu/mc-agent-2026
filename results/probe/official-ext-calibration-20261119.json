@@ -1,0 +1,613 @@
+{
+  "ts": "2026-11-19 04:34:25",
+  "source": "official",
+  "base": "https://apiin.nmo.net.cn/api/v1",
+  "status_keys": [
+    "alive",
+    "armor_points",
+    "biome",
+    "blocking",
+    "busy",
+    "dimension",
+    "effects",
+    "food",
+    "gamemode",
+    "health",
+    "held",
+    "held_controls",
+    "in_lava",
+    "in_vehicle",
+    "in_water",
+    "is_day",
+    "is_sleeping",
+    "jumping",
+    "offhand",
+    "on_fire",
+    "on_ground",
+    "pos",
+    "raining",
+    "ready",
+    "saturation",
+    "sneaking",
+    "speed",
+    "submerged",
+    "thundering",
+    "time_of_day",
+    "username",
+    "using_item",
+    "velocity",
+    "xp_level",
+    "xp_progress",
+    "yaw"
+  ],
+  "status_sample": {
+    "username": "<redacted_bot>",
+    "pos": [
+      13033.5,
+      64,
+      -5894.4
+    ],
+    "yaw": -3.14,
+    "speed": 0,
+    "velocity": [
+      0,
+      0,
+      0
+    ],
+    "dimension": "overworld",
+    "gamemode": "survival",
+    "health": 20,
+    "food": 20,
+    "saturation": 5,
+    "xp_level": 0,
+    "xp_progress": 0,
+    "armor_points": 0,
+    "held": {
+      "name": "dirt",
+      "count": 1,
+      "slot": 36
+    },
+    "offhand": null,
+    "effects": [],
+    "on_fire": false,
+    "is_sleeping": false,
+    "in_water": false,
+    "submerged": false,
+    "in_lava": false,
+    "in_vehicle": null,
+    "sneaking": false,
+    "held_controls": null,
+    "jumping": false,
+    "blocking": false,
+    "using_item": null,
+    "time_of_day": 11549,
+    "is_day": true,
+    "raining": false,
+    "thundering": false,
+    "biome": "",
+    "on_ground": true,
+    "alive": true,
+    "ready": true,
+    "busy": null
+  },
+  "look_probe": {
+    "ok": true,
+    "supported": true,
+    "result": {
+      "yaw": 0,
+      "pitch": 0
+    }
+  },
+  "advancements_c10": {
+    "completed": {
+      "ready": true,
+      "count": 0,
+      "sample": [],
+      "keys": [
+        "advancements",
+        "packets_received",
+        "ready",
+        "summary",
+        "updated_at"
+      ]
+    },
+    "incomplete": {
+      "error": "bad_args (status must be all, completed, in_progress, or not_started)"
+    },
+    "all": {
+      "ready": true,
+      "count": 0,
+      "sample": [],
+      "keys": [
+        "advancements",
+        "packets_received",
+        "ready",
+        "summary",
+        "updated_at"
+      ]
+    }
+  },
+  "rps_sweep": [
+    {
+      "target_rps": 4,
+      "sent": 16,
+      "ok": 16,
+      "errs": [],
+      "elapsed_s": 4.25,
+      "achieved_rps": 3.76,
+      "p50_ms": 232.5,
+      "max_ms": 748.3
+    },
+    {
+      "target_rps": 8,
+      "sent": 16,
+      "ok": 16,
+      "errs": [],
+      "elapsed_s": 3.09,
+      "achieved_rps": 5.18,
+      "p50_ms": 130.6,
+      "max_ms": 809.8
+    },
+    {
+      "target_rps": 12,
+      "sent": 16,
+      "ok": 16,
+      "errs": [],
+      "elapsed_s": 1.57,
+      "achieved_rps": 10.19,
+      "p50_ms": 96.1,
+      "max_ms": 266.9
+    },
+    {
+      "target_rps": 16,
+      "sent": 16,
+      "ok": 16,
+      "errs": [],
+      "elapsed_s": 2.83,
+      "achieved_rps": 5.65,
+      "p50_ms": 111.1,
+      "max_ms": 516.8
+    }
+  ],
+  "nearby_scan": {
+    "summary": {
+      "radius": 24,
+      "scanned": 3699,
+      "blocks": {
+        "short_grass": {
+          "count": 389,
+          "nearest": [
+            13033,
+            64,
+            -5894
+          ],
+          "dist": 0.7
+        },
+        "grass_block": {
+          "count": 1736,
+          "nearest": [
+            13034,
+            64,
+            -5895
+          ],
+          "dist": 0.8
+        },
+        "cornflower": {
+          "count": 4,
+          "nearest": [
+            13029,
+            65,
+            -5899
+          ],
+          "dist": 6.5
+        },
+        "tall_grass": {
+          "count": 75,
+          "nearest": [
+            13041,
+            64,
+            -5895
+          ],
+          "dist": 7.5
+        },
+        "oxeye_daisy": {
+          "count": 1,
+          "nearest": [
+            13028,
+            65,
+            -5901
+          ],
+          "dist": 8.6
+        },
+        "dandelion": {
+          "count": 19,
+          "nearest": [
+            13032,
+            65,
+            -5903
+          ],
+          "dist": 8.8
+        },
+        "azure_bluet": {
+          "count": 1,
+          "nearest": [
+            13032,
+            65,
+            -5907
+          ],
+          "dist": 12.7
+        },
+        "poppy": {
+          "count": 2,
+          "nearest": [
+            13028,
+            65,
+            -5908
+          ],
+          "dist": 14.7
+        },
+        "diorite": {
+          "count": 75,
+          "nearest": [
+            13027,
+            52,
+            -5887
+          ],
+          "dist": 15.5
+        },
+        "andesite": {
+          "count": 68,
+          "nearest": [
+            13026,
+            52,
+            -5888
+          ],
+          "dist": 15.5
+        },
+        "stone": {
+          "count": 384,
+          "nearest": [
+            13028,
+            52,
+            -5886
+          ],
+          "dist": 15.7
+        },
+        "water": {
+          "count": 814,
+          "nearest": [
+            13027,
+            51,
+            -5887
+          ],
+          "dist": 16.3
+        },
+        "glow_lichen": {
+          "count": 1,
+          "nearest": [
+            13028,
+            51,
+            -5885
+          ],
+          "dist": 17
+        },
+        "granite": {
+          "count": 21,
+          "nearest": [
+            13026,
+            49,
+            -5890
+          ],
+          "dist": 17.3
+        },
+        "bush": {
+          "count": 13,
+          "nearest": [
+            13024,
+            65,
+            -5879
+          ],
+          "dist": 18.1
+        },
+        "sand": {
+          "count": 49,
+          "nearest": [
+            13039,
+            63,
+            -5912
+          ],
+          "dist": 18.4
+        },
+        "dirt": {
+          "count": 42,
+          "nearest": [
+            13024,
+            64,
+            -5876
+          ],
+          "dist": 20.7
+        },
+        "copper_ore": {
+          "count": 3,
+          "nearest": [
+            13052,
+            52,
+            -5897
+          ],
+          "dist": 22.2
+        },
+        "seagrass": {
+          "count": 2,
+          "nearest": [
+            13057,
+            62,
+            -5893
+          ],
+          "dist": 23.6
+        }
+      }
+    },
+    "stones_logs": {
+      "total": 384,
+      "blocks": [
+        {
+          "name": "stone",
+          "pos": [
+            13028,
+            52,
+            -5886
+          ],
+          "dist": 15.7,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13026,
+            51,
+            -5889
+          ],
+          "dist": 16,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13028,
+            52,
+            -5885
+          ],
+          "dist": 16.2,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13030,
+            51,
+            -5885
+          ],
+          "dist": 16.4,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13025,
+            51,
+            -5889
+          ],
+          "dist": 16.5,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13024,
+            52,
+            -5888
+          ],
+          "dist": 16.6,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13028,
+            52,
+            -5884
+          ],
+          "dist": 16.8,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13025,
+            50,
+            -5890
+          ],
+          "dist": 17,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13024,
+            51,
+            -5889
+          ],
+          "dist": 17,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13030,
+            51,
+            -5884
+          ],
+          "dist": 17,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13031,
+            50,
+            -5885
+          ],
+          "dist": 17.1,
+          "properties": {}
+        },
+        {
+          "name": "stone",
+          "pos": [
+            13023,
+            52,
+            -5888
+          ],
+          "dist": 17.2,
+          "properties": {}
+        }
+      ]
+    },
+    "waters": {
+      "total": 4339,
+      "blocks": [
+        {
+          "name": "water",
+          "pos": [
+            13027,
+            51,
+            -5887
+          ],
+          "dist": 16.3,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13026,
+            51,
+            -5888
+          ],
+          "dist": 16.3,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13028,
+            51,
+            -5886
+          ],
+          "dist": 16.4,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13026,
+            52,
+            -5886
+          ],
+          "dist": 16.5,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13025,
+            52,
+            -5887
+          ],
+          "dist": 16.5,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13029,
+            50,
+            -5887
+          ],
+          "dist": 16.5,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13027,
+            50,
+            -5888
+          ],
+          "dist": 16.7,
+          "properties": {
+            "level": 0
+          }
+        },
+        {
+          "name": "water",
+          "pos": [
+            13026,
+            51,
+            -5887
+          ],
+          "dist": 16.7,
+          "properties": {
+            "level": 0
+          }
+        }
+      ]
+    },
+    "entities_count": 3,
+    "entities_sample": [
+      {
+        "id": 44380,
+        "type": "animal",
+        "name": "cow",
+        "pos": [
+          13044.5,
+          65,
+          -5897.1
+        ],
+        "dist": 11.3
+      },
+      {
+        "id": 44379,
+        "type": "animal",
+        "name": "cow",
+        "pos": [
+          13044.6,
+          65,
+          -5898.1
+        ],
+        "dist": 11.7
+      },
+      {
+        "id": 44376,
+        "type": "animal",
+        "name": "cow",
+        "pos": [
+          13037.2,
+          64,
+          -5913.8
+        ],
+        "dist": 19.7
+      }
+    ]
+  }
+}

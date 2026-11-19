@@ -1,0 +1,178 @@
+{
+  "ts": "2026-11-19 04:31:44",
+  "base": "https://api.nju-aia.com/v1",
+  "model_requested": "default",
+  "proxy_fast_configured": true,
+  "models_endpoint": {
+    "status": 200,
+    "ms": 4439.4,
+    "ids": [
+      "default",
+      "qwen3.6-35b-a3b"
+    ]
+  },
+  "c8_thinking_compat": [
+    {
+      "variant": "default_thinking_on",
+      "status": 200,
+      "ms": 1936.5,
+      "returned_model": "qwen3.6-35b-a3b",
+      "system_fingerprint": "b12501-120141f1f",
+      "finish_reason": "stop",
+      "content_preview": "{\"ok\": true}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 27,
+      "completion_tokens": 6,
+      "total_tokens": 33
+    },
+    {
+      "variant": "chat_template_kwargs_false",
+      "status": 200,
+      "ms": 1591.7,
+      "returned_model": "qwen3.6-35b-a3b",
+      "system_fingerprint": "b12501-120141f1f",
+      "finish_reason": "stop",
+      "content_preview": "{\"ok\": true}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 27,
+      "completion_tokens": 6,
+      "total_tokens": 33
+    },
+    {
+      "variant": "thinking_type_disabled",
+      "status": 200,
+      "ms": 1564.3,
+      "returned_model": "qwen3.6-35b-a3b",
+      "system_fingerprint": "b12501-120141f1f",
+      "finish_reason": "stop",
+      "content_preview": "{\"ok\": true}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 27,
+      "completion_tokens": 6,
+      "total_tokens": 33
+    },
+    {
+      "variant": "both_params",
+      "status": 200,
+      "ms": 3743.2,
+      "returned_model": "qwen3.6-35b-a3b",
+      "system_fingerprint": "b12501-120141f1f",
+      "finish_reason": "stop",
+      "content_preview": "{\"ok\": true}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 27,
+      "completion_tokens": 6,
+      "total_tokens": 33
+    }
+  ],
+  "c4_llmclient_fast": [
+    {
+      "i": 1,
+      "ok": true,
+      "ms": 3000.1,
+      "route": "proxy",
+      "reply": "```json\n{\n  \"step\": 1,\n  \"goal\": \"prep_wood\"\n}\n```"
+    },
+    {
+      "i": 2,
+      "ok": true,
+      "ms": 1636.2,
+      "route": "proxy",
+      "reply": "```json\n{\n  \"step\": 2,\n  \"goal\": \"prep_wood\"\n}\n```"
+    },
+    {
+      "i": 3,
+      "ok": true,
+      "ms": 1280.3,
+      "route": "proxy",
+      "reply": "```json\n{\n  \"step\": 3,\n  \"goal\": \"prep_wood\"\n}\n```"
+    },
+    {
+      "i": 4,
+      "ok": true,
+      "ms": 1669.1,
+      "route": "proxy",
+      "reply": "```json\n{\"step\": 4, \"goal\": \"prep_wood\"}\n```"
+    }
+  ],
+  "c4_summary": {
+    "ok": 4,
+    "total": 4,
+    "p50_ms": 1652.7,
+    "p95_ms": 3000.1,
+    "min_ms": 1280.3,
+    "max_ms": 3000.1,
+    "client_stats": {
+      "proxy_ok": 4,
+      "direct_ok": 0,
+      "fallback_direct": 0,
+      "proxy_opened": 0,
+      "endpoint_opened": 0,
+      "short_circuited": 0,
+      "no_slot": 0,
+      "thinking_field_dropped": 0,
+      "budget_exceeded": 0,
+      "prompt_tokens": 160,
+      "completion_tokens": 101,
+      "total_tokens": 261
+    }
+  },
+  "c8_reasoning_suppression": [
+    {
+      "variant": "default_thinking_on",
+      "status": 200,
+      "ms": 3977.7,
+      "returned_model": "qwen3.6-35b-a3b",
+      "finish_reason": "stop",
+      "content_preview": "{\n\"goal\": \"prep_wood\",\n\"why\": \"血量满且无工具，木材是制作工作台、火把和床的唯一原料；不造床无法跳过危险夜晚，不造火把无法照明防怪，故木材优先级远高于矿石。\"\n}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 68,
+      "completion_tokens": 58,
+      "total_tokens": 126
+    },
+    {
+      "variant": "chat_template_kwargs_false",
+      "status": 200,
+      "ms": 2385.5,
+      "returned_model": "qwen3.6-35b-a3b",
+      "finish_reason": "stop",
+      "content_preview": "{\"goal\": \"prep_wood\", \"why\": \"天黑前需要木制工具/武器防怪，原木可直接合成木板，耗时短且无需挖矿经验。\"}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 68,
+      "completion_tokens": 37,
+      "total_tokens": 105
+    },
+    {
+      "variant": "thinking_type_disabled",
+      "status": 200,
+      "ms": 1581.4,
+      "returned_model": "qwen3.6-35b-a3b",
+      "finish_reason": "stop",
+      "content_preview": "{\n\"goal\": \"prep_wood\",\n\"why\": \"天黑前急需工具与庇护所以防怪物，木材是制作工作台及初期工具的唯一材料，比矿石更易获取且能立即转化为生存资源。\"\n}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 68,
+      "completion_tokens": 51,
+      "total_tokens": 119
+    },
+    {
+      "variant": "both_params",
+      "status": 200,
+      "ms": 1786.4,
+      "returned_model": "qwen3.6-35b-a3b",
+      "finish_reason": "stop",
+      "content_preview": "{\n  \"goal\": \"prep_wood\",\n  \"why\": \"天黑有怪物，需优先用原木制作木剑/木镐和床以保命，石矿有风险且非当前急需。\"\n}",
+      "has_reasoning": false,
+      "reasoning_len": 0,
+      "prompt_tokens": 68,
+      "completion_tokens": 50,
+      "total_tokens": 118
+    }
+  ]
+}
