@@ -1115,6 +1115,7 @@ class BotSession {
           cleanup();
           try {
             bot.pathfinder.setGoal(null);
+            bot.clearControlStates();
           } catch (_) {}
           reject(
             new ApiBizError("stalled", "Stuck for 8s without movement progress", {
@@ -1145,6 +1146,7 @@ class BotSession {
           cleanup();
           try {
             bot.pathfinder.setGoal(null);
+            bot.clearControlStates();
           } catch (_) {}
           reject(
             new ApiBizError("path_not_found", `Pathfinder ${results.status} to target`, {
@@ -1157,6 +1159,7 @@ class BotSession {
         cleanup();
         try {
           bot.pathfinder.setGoal(null);
+          bot.clearControlStates();
         } catch (_) {}
         reject(
           new ApiBizError("timeout", `Pathfinding timed out after ${timeoutMs}ms`, {

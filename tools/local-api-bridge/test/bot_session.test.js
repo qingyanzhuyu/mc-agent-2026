@@ -83,12 +83,21 @@ test("move_to returns stalled when its pathfinder watchdog sees no movement", as
   t.mock.method(Date, "now", () => now);
   let watchdog;
   t.mock.method(global, "setInterval", (fn) => { watchdog = fn; });
+  session.bot.setControlState("forward", true);
   const action = session.moveTo({ x: 30, z: 30 });
   const result = assert.rejects(action, { code: "stalled" });
   now += 8000;
   watchdog();
   await result;
   assert.equal(session.busy, null);
+  assert.equal(session.bot.getControlState("forward"), false);
+
+  session.bot.setControlState("forward", true);
+  const noPathAction = session.moveTo({ x: 40, z: 40 });
+  const noPathResult = assert.rejects(noPathAction, { code: "path_not_found" });
+  session.bot.emit("path_update", { status: "noPath", path: [] });
+  await noPathResult;
+  assert.equal(session.bot.getControlState("forward"), false);
 });
 
 test("control hits a visible boat and stops at intervening blocks", async () => {
