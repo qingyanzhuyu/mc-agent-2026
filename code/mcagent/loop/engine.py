@@ -837,6 +837,12 @@ class MainLoop:
                                 self.observer.tape.end_skill_slice()
                             active_skill.abort()
                             if self.observer is not None:
+                                if self.state.st.get("sneaking") or self.state.st.get("blocking"):
+                                    try:
+                                        self.state.refresh_status(self.client, max_age_s=0)
+                                    except ApiError as refresh_err:
+                                        if refresh_err.kind == FATAL:
+                                            raise
                                 self.observer.on_skill_end(
                                     active_skill, "budget_stopped", self.state, died_or_disconnected=False
                                 )
@@ -918,6 +924,12 @@ class MainLoop:
                             else:
                                 active_skill.mark_failed()
                         if self.observer is not None:
+                            if not is_death_err and (self.state.st.get("sneaking") or self.state.st.get("blocking")):
+                                try:
+                                    self.state.refresh_status(self.client, max_age_s=0)
+                                except ApiError as refresh_err:
+                                    if refresh_err.kind == FATAL:
+                                        raise
                             self.observer.on_skill_end(
                                 active_skill,
                                 "env_blocked" if environment is not None else "replan",
@@ -964,6 +976,8 @@ class MainLoop:
                         if monitor is not None and self.config.async_observe_for_llm:
                             if self.state.inventory_dirty:
                                 self.state.refresh_inventory(self.client)
+                            if self.state.st.get("sneaking") or self.state.st.get("blocking"):
+                                self.state.refresh_status(self.client, max_age_s=0)
                         else:
                             # 技能已完成；这里读不到状态不应把它记成失败，留给下一拍刷新与恢复
                             self._refresh_with_backoff()

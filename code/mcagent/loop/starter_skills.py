@@ -567,6 +567,7 @@ class ScoutIsland(Skill):
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         st, cur = _refresh_stance(ex, state)
+        scout_start_pos = list(cur)
         dim, memo, r = _dim_of(st), memo_for(state), int(self.args["radius"])
         summary = ex.client.find_blocks(radius=r, limit=40)
         memo.ingest_find_blocks(summary, dimension=dim, origin=st)
@@ -577,6 +578,7 @@ class ScoutIsland(Skill):
         if MINE_TRAILS and math.dist(cur, MINE_TRAILS[-1][-1]) <= 16.0 and MINE_TRAILS[-1][0][1] > cur[1] + 2.0:
             trail = MINE_TRAILS[-1]
             indices = list(range(len(trail) - 1, -1, -10)) + ([0] if (len(trail) - 1) % 10 != 0 else [])
+            trail_nav_failed = False
             for idx in indices:
                 if idx == len(trail) - 1:
                     continue
@@ -587,11 +589,12 @@ class ScoutIsland(Skill):
                     code, _ = failure(e)
                     if code not in NAV_FAIL_CODES:
                         raise
+                    trail_nav_failed = True
                     yield rec("move_to", pos=wp, fingerprints=hits, error_code=code)
                     break
                 yield rec("move_to", moved_up, pos=wp, fingerprints=hits)
             st, cur = _refresh_stance(ex, state)
-            if cur[1] >= trail[0][1] - 1.5 and MINE_TRAILS and MINE_TRAILS[-1] is trail:
+            if MINE_TRAILS and MINE_TRAILS[-1] is trail and (cur[1] >= trail[0][1] - 1.5 or (trail_nav_failed and cur[1] >= 62.0)):
                 MINE_TRAILS.pop()
 
         target_wood, cur_wood_dist = None, 0.0
@@ -638,8 +641,10 @@ class ScoutIsland(Skill):
                 return True
             return False
 
-        def _try_staircase_climb_out(*, allow_above_sea: bool = False) -> Generator[dict, None, bool]:
-            """被周围方块围困在矿井/地表凹坑时，优先持镐或徒手挖软壁开 1~2 级 1x2 阶梯，否则用垫块 step_up_1x2 脱困。"""
+        def _try_staircase_climb_out(
+            *, allow_above_sea: bool = False, min_target_y: Optional[float] = None,
+        ) -> Generator[dict, None, bool]:
+            """被周围方块围困在矿井/地表凹坑时，优先持镐或徒手挖软壁开 1~4 级 1x2 阶梯，否则用垫块 step_up_1x2 脱困。"""
             nonlocal st, cur
             if not allow_above_sea and cur[1] >= 62.0:
                 return False
@@ -652,7 +657,7 @@ class ScoutIsland(Skill):
                 "short_grass", "tall_grass", "leaf_litter",
             }
             start_y = float(cur[1])
-            climbed = False
+            target_y = max(start_y, float(min_target_y) if min_target_y is not None else start_y)
 
             def _is_soft(name: str) -> bool:
                 return name in soft_diggable or name.endswith("_leaves")
@@ -674,17 +679,21 @@ class ScoutIsland(Skill):
                     return False
                 return True
 
-            for _step in range(2):
+            for _step in range(4):
+                if float(cur[1]) > target_y + 1.5:
+                    break
                 state.refresh_inventory(ex.client)
                 pick = best_pickaxe(state)
                 ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                 chosen_dir = None
+                overhead_cells: list[list[int]] = [[ix, fy + 2, iz]]
                 for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     if _valid_step_dir(ix, fy, iz, dx, dz, bool(pick)):
                         chosen_dir = (ix + dx, fy, iz + dz)
                         break
                 if chosen_dir is None:
-                    # 凹坑中央四邻均为空时，先贴近一格到坑壁再向上挖阶梯
+                    # 凹坑中央四邻均为空时，先贴近一格到坑壁再向上挖阶梯；
+                    # 若 GoalNear(rng>=1) 因距离=1 格原地未动，直接隔空开凿 2 格外的坑壁并一并踏上台阶。
                     for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         mx, mz = ix + dx, iz + dz
                         if not _valid_step_dir(mx, fy, mz, dx, dz, bool(pick)):
@@ -707,21 +716,33 @@ class ScoutIsland(Skill):
                         ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                         if _valid_step_dir(ix, fy, iz, dx, dz, bool(pick)):
                             chosen_dir = (ix + dx, fy, iz + dz)
+                            overhead_cells = [[ix, fy + 2, iz]]
+                        elif _valid_step_dir(mx, fy, mz, dx, dz, bool(pick)):
+                            chosen_dir = (mx + dx, fy, mz + dz)
+                            overhead_cells = [[mx, fy + 2, mz]]
                         break
                 if chosen_dir is None:
                     break
                 nx, fy, nz = chosen_dir
                 dig_targets = [
-                    p for p in ([ix, fy + 2, iz], [nx, fy + 1, nz], [nx, fy + 2, nz])
+                    p for p in (*overhead_cells, [nx, fy + 1, nz], [nx, fy + 2, nz])
                     if (bn := bare(_get_block(ex, vc, p, dim).get("name", ""))) and bn not in AIR
                 ]
                 if dig_targets and pick and bare((state.st.get("held") or {}).get("name")) != pick:
                     yield rec("equip", ex.equip(pick, "hand"), item=pick)
                     st, cur = _refresh_stance(ex, state)
                 for dig_pos in dig_targets:
-                    yield from nav.dig_with_recovery(ex, state, dig_pos, collect=False)
+                    try:
+                        yield from nav.dig_with_recovery(ex, state, dig_pos, collect=False)
+                    except Replan as e:
+                        if failure(e)[0] == "nothing_to_dig":
+                            vc and vc.invalidate(dig_pos, dimension=dim)
+                            yield rec("dig", pos=dig_pos, error_code="nothing_to_dig")
+                            continue
+                        raise
                     vc and vc.invalidate(dig_pos, dimension=dim)
                 up_dest = [nx + 0.5, float(fy + 1), nz + 0.5]
+                before_step_pos = list(cur)
                 try:
                     moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
                 except Replan as e:
@@ -731,10 +752,12 @@ class ScoutIsland(Skill):
                     break
                 yield rec("move_to", moved_u, pos=up_dest, fingerprints=hits)
                 st, cur = _refresh_stance(ex, state)
-                climbed = True
+                if math.dist(cur, before_step_pos) < 0.35:
+                    break
 
-            # 无镐且坑壁为硬石时，若背包有可放垫块（泥土/圆石），在相邻空位放块垫高一级
-            if not climbed:
+            escaped_up = float(cur[1]) > target_y + 0.5
+            # 无镐且坑壁为硬石（或仅退回原坑未真正抬升）时，若背包有可放垫块（泥土/圆石），在相邻空位放块垫高一级
+            if not escaped_up:
                 state.refresh_inventory(ex.client)
                 try:
                     block_item = pick_placeable(state)
@@ -764,18 +787,17 @@ class ScoutIsland(Skill):
                                 moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
                                 yield rec("move_to", moved_u, pos=up_dest, fingerprints=hits)
                                 st, cur = _refresh_stance(ex, state)
-                                climbed = True
                             except Replan as e:
                                 if failure(e)[0] not in NAV_FAIL_CODES:
                                     raise
                                 yield rec("move_to", pos=[nx + 0.5, float(fy + 1), nz + 0.5], fingerprints=hits, error_code=failure(e)[0])
                             break
+                    escaped_up = float(cur[1]) > target_y + 0.5
 
-            if climbed:
-                if float(cur[1]) > start_y + 0.5:
-                    RECENT_RECOVERY_LANDINGS.clear()
+            if escaped_up:
+                RECENT_RECOVERY_LANDINGS.clear()
                 VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
-            return climbed
+            return escaped_up
 
         def _recover_with_guard(dest_hint) -> Generator[dict, None, bool]:
             nonlocal st, cur
@@ -786,7 +808,9 @@ class ScoutIsland(Skill):
             try:
                 _record_recovery_landing(arrived)
             except Replan:
-                if (yield from _try_staircase_climb_out(allow_above_sea=True)):
+                if (yield from _try_staircase_climb_out(
+                    allow_above_sea=True, min_target_y=max(float(cur[1]), float(scout_start_pos[1])),
+                )):
                     return True
                 raise
             VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
