@@ -79,6 +79,8 @@ def dispatch_async_objective(
     blocks_snap = {
         k: type(v)(v.error, v.observation) for k, v in p.rules._environment_blocks.items()
     }
+    hub_susp_snap = dict(p.rules._hub_suspensions)
+    abandoned_snap = set(p.rules._abandoned_goals)
     timeout_budget = max(0.05, float(state.config.model_timeout_s))
     llm_client = p.llm
 
@@ -100,6 +102,8 @@ def dispatch_async_objective(
             telemetry=p.rules.telemetry,
             environment_blocks=blocks_snap,
             reservation_book=reservation_snap,
+            hub_suspensions=hub_susp_snap,
+            abandoned_goals=abandoned_snap,
             attempts=2,
             thinking=False,
             total_timeout=timeout_budget,
@@ -242,6 +246,8 @@ def poll_async_scheduler(orch: "StrategyOrchestrator", state: State, now: float)
             ep_goal_fails=p.rules.ep_goal_fails, ep_goal_elapsed=p.rules.ep_goal_elapsed,
             telemetry=p.rules.telemetry, environment_blocks=p.rules._environment_blocks,
             reservation_book=p.reservations,
+            hub_suspensions=p.rules._hub_suspensions,
+            abandoned_goals=p.rules._abandoned_goals,
             source="llm", now=now,
         )
         if validated is None:

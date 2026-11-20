@@ -2193,6 +2193,102 @@ def is_goal_stopped_out(
 
 _SHARED_SUBGRAPH_WEIGHT: float = 0.35
 _SHARED_SUBGRAPH_CAP: int = 6
+HUB_DOWNSTREAM_THRESHOLD: int = 5
+
+
+def compute_downstream_counts(ledger: Collection[GoalSpec] = GOALS) -> dict[str, int]:
+    """计算台账 DAG 中每个目标的传递下游依赖节点总数（不含自身）。"""
+    by_id = {g.id: g for g in ledger}
+    children: dict[str, list[str]] = {gid: [] for gid in by_id}
+    for g in ledger:
+        for pid in g.prereq_goals:
+            if pid in children:
+                children[pid].append(g.id)
+    counts: dict[str, int] = {}
+    for gid in by_id:
+        seen: set[str] = set()
+        stack = list(children[gid])
+        while stack:
+            cur = stack.pop()
+            if cur not in seen and cur != gid:
+                seen.add(cur)
+                stack.extend(children.get(cur, ()))
+        counts[gid] = len(seen)
+    return counts
+
+
+def compute_hub_goal_ids(
+    ledger: Collection[GoalSpec] = GOALS,
+    *,
+    min_downstream: int = HUB_DOWNSTREAM_THRESHOLD,
+) -> frozenset[str]:
+    """自动由台账 DAG 下游闭包识别核心枢纽目标集合（下游节点数 >= min_downstream，无需硬编码）。"""
+    threshold = max(1, int(min_downstream))
+    counts = compute_downstream_counts(ledger)
+    return frozenset(gid for gid, cnt in counts.items() if cnt >= threshold)
+
+
+def compute_goal_marginal_rois(
+    state: State,
+    active_goals: Collection[GoalSpec],
+    *,
+    completed_advs: Collection[str] = (),
+    ep_goal_fails: Optional[Mapping[str, int]] = None,
+    ep_goal_elapsed: Optional[Mapping[str, float]] = None,
+    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    suspended_goals: Collection[str] = (),
+    memo: Any = None,
+) -> dict[str, float]:
+    """计算每个可执行根目标在共享子图分摊后的边际 ROI，供战略菜单超长时做 Top-K 截断。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
+    goals_tuple = tuple(active_goals)
+    by_id = {g.id: g for g in goals_tuple}
+
+    def _unmet_chain(root: GoalSpec) -> Optional[list[GoalSpec]]:
+        chain: list[GoalSpec] = []
+        seen: set[str] = set()
+
+        def _walk(node: GoalSpec, is_root: bool) -> bool:
+            if node.id in seen:
+                return True
+            if not is_root and is_prereq_satisfied(node, state, completed_advs, memo=resolved_memo):
+                return True
+            if node.id in suspended_goals or is_goal_stopped_out(node, ep_goal_fails, ep_goal_elapsed):
+                return False
+            for pid in node.prereq_goals:
+                parent = by_id.get(pid)
+                if parent is not None and not _walk(parent, False):
+                    return False
+            seen.add(node.id)
+            chain.append(node)
+            return True
+
+        return chain if _walk(root, True) else None
+
+    chains: list[tuple[GoalSpec, list[GoalSpec]]] = []
+    node_dependents: dict[str, set[str]] = {}
+    for g in goals_tuple:
+        if is_goal_achieved(g, state, completed_advs, memo=resolved_memo):
+            continue
+        chain = _unmet_chain(g)
+        if not chain:
+            continue
+        chains.append((g, chain))
+        if g.score > 0:
+            for x in chain:
+                node_dependents.setdefault(x.id, set()).add(g.id)
+
+    out: dict[str, float] = {}
+    for g, chain in chains:
+        p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs, memo=resolved_memo))
+        amortized_cost = 0.0
+        for x in chain:
+            raw_x_cost = effective_goal_cost(x, telemetry)
+            share_count = len(node_dependents.get(x.id, ()))
+            extra_shares = min(_SHARED_SUBGRAPH_CAP, max(0, share_count - 1))
+            amortized_cost += raw_x_cost / (1.0 + _SHARED_SUBGRAPH_WEIGHT * extra_shares)
+        out[g.id] = round(p_score / max(1.0, amortized_cost), 4) if p_score > 0 else 0.0
+    return out
 
 
 def rank_actionable_goals(

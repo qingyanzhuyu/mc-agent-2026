@@ -22,8 +22,9 @@ from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
 from .context import DecisionContext, ObjectiveRecord
 from .goals import (
-    DEFAULT_CAMPAIGN_STAGES, GOALS, OFFICIAL_CAMPAIGN_STAGES, STONE_OR_BETTER_PICKS, GoalSpec,
-    check_item_expr, diagnose_goal_gap, is_goal_achieved, is_goal_stopped_out,
+    DEFAULT_CAMPAIGN_STAGES, GOALS, HUB_DOWNSTREAM_THRESHOLD, OFFICIAL_CAMPAIGN_STAGES,
+    STONE_OR_BETTER_PICKS, GoalSpec,
+    check_item_expr, compute_hub_goal_ids, diagnose_goal_gap, is_goal_achieved, is_goal_stopped_out,
     is_prereq_satisfied, normalize_goal_ids, rank_actionable_goals, resolve_active_goals,
 )
 from .reserve import ReservationBook
@@ -36,6 +37,9 @@ if TYPE_CHECKING:
 STRATEGIES: tuple[str, ...] = ("legacy", "rule", "llm")
 _SAFETY_INTENT_DEFAULT_TTL_S: float = 15.0
 _ESCAPE_INTENT_KINDS: frozenset[str] = frozenset({"flee", "douse", "surface", "escape_lava", "lava", "void_risk"})
+DEFAULT_HUB_COOLDOWN_S: float = 180.0
+DEFAULT_HUB_WAKE_MOVE_DIST: float = 32.0
+DEFAULT_HUB_MAX_RESTARTS: int = 8
 
 
 @dataclass
@@ -214,6 +218,37 @@ class _EnvironmentBlock:
         return (current is (self.error.wake_on == "day")) if self.error.wake_on in ("day", "night") else (previous is not None)
 
 
+@dataclass
+class _HubSuspension:
+    """核心枢纽目标的可恢复临时挂起记录：位移离开 >= 32 格、切换维度或冷却到期后自动唤醒。"""
+
+    goal_id: str
+    dimension: str
+    x: float
+    z: float
+    suspended_at: float
+    cooldown_s: float
+    restart_count: int = 0
+    reason: str = ""
+
+    def should_wake(self, state: State, *, now: float, move_dist: float = DEFAULT_HUB_WAKE_MOVE_DIST) -> Optional[str]:
+        if self.cooldown_s >= 0.0 and (now - self.suspended_at) >= self.cooldown_s:
+            return "cooldown"
+        st = state.snapshot()
+        dim = str(st.get("dimension") or "overworld")
+        if dim != self.dimension:
+            return "dimension_changed"
+        pos = st.get("pos")
+        if isinstance(pos, (list, tuple)) and len(pos) == 3:
+            try:
+                px, pz = float(pos[0]), float(pos[2])
+                if math.isfinite(px) and math.isfinite(pz) and math.hypot(px - self.x, pz - self.z) >= move_dist:
+                    return "moved"
+            except (TypeError, ValueError):
+                pass
+        return None
+
+
 def build_state_summary(state: State, *, goal_hint: str = "") -> str:
     """给技能级模型选择（兼容 `--llm`）的一屏状态摘要（遵守 J17）。战略层上下文见 `loop/context.py`。"""
     st = state.snapshot()
@@ -247,6 +282,11 @@ class RulePlanner:
         telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
         min_verified: str = "offline",
         reservations: Optional[ReservationBook] = None,
+        hub_min_downstream: int = HUB_DOWNSTREAM_THRESHOLD,
+        hub_cooldown_s: float = DEFAULT_HUB_COOLDOWN_S,
+        hub_wake_dist: float = DEFAULT_HUB_WAKE_MOVE_DIST,
+        hub_max_restarts: int = DEFAULT_HUB_MAX_RESTARTS,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.registry = REGISTRY if registry is None else registry
         self.min_verified = min_verified
@@ -272,15 +312,122 @@ class RulePlanner:
         self._last_expand_blocked_goal_id: Optional[str] = None
         self._env_recovery_counts: dict[tuple[str, int, int], int] = {}
         self._max_env_recovery_per_cell: int = 4
+        self._clock: Callable[[], float] = clock
+        self.hub_cooldown_s: float = max(0.0, float(hub_cooldown_s))
+        self.hub_wake_dist: float = max(1.0, float(hub_wake_dist))
+        self.hub_max_restarts: int = max(0, int(hub_max_restarts))
+        self.hub_goal_ids: frozenset[str] = compute_hub_goal_ids(self.ledger, min_downstream=hub_min_downstream)
+        self._hub_suspensions: dict[str, _HubSuspension] = {}
+        self._hub_restart_counts: dict[str, int] = {}
+        self._last_observed_pos: tuple[str, float, float] = ("overworld", 0.0, 0.0)
+        self._fallback_explore_turn: int = 0
+
+    def is_hub_goal(self, goal_id: Optional[str]) -> bool:
+        """基于台账 DAG 下游闭包自动判断目标是否为核心枢纽。"""
+        return bool(goal_id and goal_id in self.hub_goal_ids)
+
+    def _extract_pos(self, state: Optional[State]) -> tuple[str, float, float]:
+        if state is None:
+            return self._last_observed_pos
+        st = state.snapshot()
+        dim = str(st.get("dimension") or "overworld")
+        pos = st.get("pos")
+        if isinstance(pos, (list, tuple)) and len(pos) == 3:
+            try:
+                px, pz = float(pos[0]), float(pos[2])
+                if math.isfinite(px) and math.isfinite(pz):
+                    self._last_observed_pos = (dim, px, pz)
+                    return self._last_observed_pos
+            except (TypeError, ValueError):
+                pass
+        return self._last_observed_pos
+
+    def _next_hub_cooldown(self, restart_count: int) -> float:
+        scale = min(3.0, 1.0 + (2.0 / 3.0) * max(0, int(restart_count)))
+        return round(self.hub_cooldown_s * scale, 1)
+
+    def _clear_single_goal_cooldown(self, goal_id: str) -> None:
+        spec = self.ledger_map.get(goal_id)
+        if spec is None:
+            return
+        for sname, sargs in ((spec.skill, spec.args_dict), *((fb_s, dict(fb_a)) for _, fb_s, fb_a in spec.gather_fallbacks)):
+            cls = self.registry.get(sname)
+            if cls is None:
+                continue
+            bound, errs = bind_args(cls, sargs or {})
+            if not errs:
+                skill_base._COOLDOWN.pop(cls.goal.format(**bound), None)
+
+    def suspend_hub_goal(self, goal_id: str, *, state: Optional[State] = None, reason: str = "") -> bool:
+        """将核心枢纽目标转为可恢复临时挂起；超出累计重启上限时退回本轮放弃。"""
+        if not goal_id or goal_id not in self.ledger_map or not self.is_hub_goal(goal_id):
+            return False
+        spec = self.ledger_map[goal_id]
+        if goal_id in self._hub_suspensions:
+            self._abandoned_goals.add(goal_id)
+            if self._last_selected_goal_id == goal_id:
+                self._last_selected_goal_id = None
+            return True
+        restarts = self._hub_restart_counts.get(goal_id, 0)
+        if self.hub_max_restarts > 0 and restarts >= self.hub_max_restarts:
+            self._abandoned_goals.add(goal_id)
+            if spec.max_fails_per_ep > 0:
+                self.ep_goal_fails[goal_id] = max(self.ep_goal_fails.get(goal_id, 0), spec.max_fails_per_ep)
+            if self._last_selected_goal_id == goal_id:
+                self._last_selected_goal_id = None
+            return False
+        dim, px, pz = self._extract_pos(state)
+        self._hub_suspensions[goal_id] = _HubSuspension(
+            goal_id=goal_id,
+            dimension=dim,
+            x=px,
+            z=pz,
+            suspended_at=self._clock(),
+            cooldown_s=self._next_hub_cooldown(restarts),
+            restart_count=restarts,
+            reason=reason,
+        )
+        self._abandoned_goals.add(goal_id)
+        if spec.max_fails_per_ep > 0:
+            self.ep_goal_fails[goal_id] = max(self.ep_goal_fails.get(goal_id, 0), spec.max_fails_per_ep)
+        if self._last_selected_goal_id == goal_id:
+            self._last_selected_goal_id = None
+        return True
 
     def record_environment_block(self, skill: Skill, error: EnvBlocked, state: State) -> None:
+        self._extract_pos(state)
         self._environment_blocks[skill.goal] = _EnvironmentBlock(error, _EnvironmentBlock.observe(error, state))
         self._last_selected_goal_id = None
 
-    def refresh_environment_blocks(self, state: State) -> None:
+    def refresh_environment_blocks(self, state: State) -> list[str]:
+        self._extract_pos(state)
         for key, block in list(self._environment_blocks.items()):
             if block.wake_if_changed(state):
                 del self._environment_blocks[key]
+
+        now = self._clock()
+        woken_hubs: list[str] = []
+        for gid, susp in list(self._hub_suspensions.items()):
+            if susp.should_wake(state, now=now, move_dist=self.hub_wake_dist) is not None:
+                del self._hub_suspensions[gid]
+                self._abandoned_goals.discard(gid)
+                self.ep_goal_fails[gid] = 0
+                if gid in self.ep_goal_elapsed:
+                    self.ep_goal_elapsed[gid] = 0.0
+                self._hub_restart_counts[gid] = susp.restart_count + 1
+                self._clear_single_goal_cooldown(gid)
+                woken_hubs.append(gid)
+
+        woken_set = set(woken_hubs)
+        for gid in self.hub_goal_ids:
+            if gid in self._hub_suspensions or gid in woken_set:
+                continue
+            spec = self.ledger_map.get(gid)
+            if spec is None or is_goal_achieved(spec, state, self.completed_advancements):
+                continue
+            if spec.max_fails_per_ep > 0 and int(self.ep_goal_fails.get(gid, 0)) >= spec.max_fails_per_ep:
+                self.suspend_hub_goal(gid, state=state, reason="max_fails")
+        return woken_hubs
 
     def environment_block(self, goal_key: str) -> Optional[EnvBlocked]:
         block = self._environment_blocks.get(goal_key)
@@ -295,10 +442,13 @@ class RulePlanner:
             cx, cz = 0, 0
         return str(st.get("dimension") or "overworld"), cx, cz
 
-    def abandon_goal(self, goal_id: Optional[str]) -> bool:
-        """将当前反复空转失败的目标在本轮标记放弃，使规划器立即切向下一个可得分目标。"""
+    def abandon_goal(self, goal_id: Optional[str], *, state: Optional[State] = None) -> bool:
+        """将反复空转失败的目标挂起或放弃：核心枢纽转为可恢复挂起，非枢纽叶目标按原规则本轮止损。"""
         if not goal_id or goal_id not in self.ledger_map:
             return False
+        if self.is_hub_goal(goal_id):
+            self.suspend_hub_goal(goal_id, state=state, reason="abandoned")
+            return True
         self._abandoned_goals.add(goal_id)
         spec = self.ledger_map[goal_id]
         if spec.max_fails_per_ep > 0:
@@ -640,9 +790,11 @@ class RulePlanner:
         )
 
     def _rank(self, state: State):
+        self._extract_pos(state)
         suspended = (
             {g.id for g in self.active_goals if self._environment_blocks and self._block_for_goal(g, state)}
             | set(self._abandoned_goals)
+            | set(self._hub_suspensions)
         )
         return rank_actionable_goals(
             state,
@@ -709,9 +861,48 @@ class RulePlanner:
                 self.ep_goal_elapsed[gid] = self.ep_goal_elapsed.get(gid, 0.0) + float(elapsed_s)
             if not ok:
                 self.ep_goal_fails[gid] = self.ep_goal_fails.get(gid, 0) + 1
+                spec = self.ledger_map.get(gid)
+                if (
+                    spec is not None
+                    and self.is_hub_goal(gid)
+                    and spec.max_fails_per_ep > 0
+                    and self.ep_goal_fails[gid] >= spec.max_fails_per_ep
+                ):
+                    self.suspend_hub_goal(gid, state=None, reason="max_fails")
 
         self._last_selected_goal_id = None
         return gid
+
+    def _choose_explore_fallback(
+        self,
+        state: State,
+        *,
+        scout_radius: int,
+        survey_reason: str,
+        scout_reason: str,
+    ) -> tuple[Optional[Skill], str, bool]:
+        """兜底防空转：优先在 scout_island 之前交替派发 survey_island(sectors=2, radius=32)。"""
+        raw_dim = str((state.st or {}).get("dimension") or "overworld").removeprefix("minecraft:").strip().lower()
+        survey_dim = raw_dim if raw_dim in ("overworld", "the_nether", "the_end") else "overworld"
+        survey_cls = self.registry.get("survey_island")
+        survey_args: dict[str, Any] = {"sectors": 2, "radius": 32}
+        if survey_cls is not None and "dimension" in getattr(survey_cls, "params", {}):
+            survey_args["dimension"] = survey_dim
+
+        prefer_survey = (self._fallback_explore_turn % 2) == 0
+        order = (
+            (("survey_island", survey_args, survey_reason), ("scout_island", {"radius": scout_radius}, scout_reason))
+            if prefer_survey
+            else (("scout_island", {"radius": scout_radius}, scout_reason), ("survey_island", survey_args, survey_reason))
+        )
+        any_cooling = False
+        for name, args, reason in order:
+            inst, _, cooling = self._diagnose_skill(name, args, state)
+            any_cooling = any_cooling or cooling
+            if inst is not None:
+                self._fallback_explore_turn += 1
+                return inst, reason, False
+        return None, "", any_cooling
 
     def choose(self, state: State) -> PlanDecision:
         self._last_selected_goal_id = None
@@ -744,14 +935,19 @@ class RulePlanner:
                             cooling_goal_id = g.id
 
             sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
-            sc, _, sc_cooling = self._diagnose_skill("scout_island", {"radius": sc_radius}, state)
-            if sc is not None:
-                return PlanDecision(sc, "rule", f"目标 {ranked[0].step_goal.id} 当前位置受阻或冷却，外迁探索")
+            fb_skill, fb_reason, fb_cooling = self._choose_explore_fallback(
+                state,
+                scout_radius=sc_radius,
+                survey_reason=f"目标 {ranked[0].step_goal.id} 当前位置受阻或冷却，先扇区外扩体检",
+                scout_reason=f"目标 {ranked[0].step_goal.id} 当前位置受阻或冷却，外迁探索",
+            )
+            if fb_skill is not None:
+                return PlanDecision(fb_skill, "rule", fb_reason)
             return PlanDecision(
                 None,
                 "idle",
                 f"目标 {ranked[0].step_goal.id} 无符合 verified={self.min_verified} 且可启动的技能",
-                cooldown_blocked=(cooling_goal_id is not None or sc_cooling),
+                cooldown_blocked=(cooling_goal_id is not None or fb_cooling),
                 blocked_goal_id=cooling_goal_id or ranked[0].step_goal.id,
             )
 
@@ -782,14 +978,19 @@ class RulePlanner:
             if ms is not None:
                 return PlanDecision(ms, "rule", "维持圆石垫块与建造库存")
 
-        sc, _, sc_cooling = self._diagnose_skill("scout_island", {"radius": 36}, state)
-        if sc is not None:
-            return PlanDecision(sc, "rule", "基础石器齐备，持续扫描岛屿结构与矿脉")
+        fb_skill, fb_reason, fb_cooling = self._choose_explore_fallback(
+            state,
+            scout_radius=36,
+            survey_reason="当前无可推进目标，优先分扇区外扩体检并唤醒挂起枢纽",
+            scout_reason="基础石器齐备，持续扫描岛屿结构与矿脉",
+        )
+        if fb_skill is not None:
+            return PlanDecision(fb_skill, "rule", fb_reason)
         return PlanDecision(
             None,
             "idle",
             f"无符合 verified={self.min_verified} 且可启动的兜底技能",
-            cooldown_blocked=sc_cooling,
+            cooldown_blocked=fb_cooling,
         )
 
 
@@ -808,6 +1009,9 @@ class CampaignPlanner:
         clock: Callable[[], float] = time.monotonic,
         subgoal_provider: Optional[Callable[[State], Optional[Mapping[str, Any]]]] = None,
         reserve_provider: Optional[Callable[[State], Any]] = None,
+        hub_cooldown_s: float = DEFAULT_HUB_COOLDOWN_S,
+        hub_wake_dist: float = DEFAULT_HUB_WAKE_MOVE_DIST,
+        hub_max_restarts: int = DEFAULT_HUB_MAX_RESTARTS,
     ):
         from .strategy import DEFAULT_STRATEGY_REVIEW_S, StrategyOrchestrator, env_bool, env_float
 
@@ -831,6 +1035,10 @@ class CampaignPlanner:
             self.registry, ledger=ledger, include_stages=include_stages,
             target_goal=target_goal, telemetry=telemetry, min_verified=min_verified,
             reservations=self.reservations,
+            hub_cooldown_s=hub_cooldown_s,
+            hub_wake_dist=hub_wake_dist,
+            hub_max_restarts=hub_max_restarts,
+            clock=clock,
         )
         self.on_llm_telemetry, self.on_objective_telemetry = on_llm_telemetry, on_objective_telemetry
         self.review_interval_s = (
@@ -928,8 +1136,8 @@ class CampaignPlanner:
             self.reservations.release(self._active_material_consumer)
             self._active_material_consumer = None
 
-    def abandon_goal(self, goal_id: Optional[str]) -> bool:
-        abandoned = self.rules.abandon_goal(goal_id)
+    def abandon_goal(self, goal_id: Optional[str], *, state: Optional[State] = None) -> bool:
+        abandoned = self.rules.abandon_goal(goal_id, state=state)
         if abandoned and self.strategy != "legacy" and self.current_objective is not None:
             if self.current_objective.goal_id == goal_id and self.scheduler is not None:
                 self.scheduler.invalidate()

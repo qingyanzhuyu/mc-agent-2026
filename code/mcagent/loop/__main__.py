@@ -22,7 +22,7 @@ from ..planner.skill_choice import meets_verification
 from ..preflight import OFFICIAL_HOSTS
 from ..runtime import Executor, Fatal, State
 from ..skills import REGISTRY, contract_errors
-from .goals import normalize_goal_ids
+from .goals import GOAL_STAGES, normalize_goal_ids
 from . import (
     GOAL_MAP,
     GOALS,
@@ -60,6 +60,28 @@ def resolve_cli_strategy(args: argparse.Namespace) -> str:
     return str(getattr(args, "strategy", "rule"))
 
 
+def resolve_cli_include_stages(args: argparse.Namespace) -> tuple[str, ...] | None:
+    """解析 `--include-draft` 与 `--goal-stages`；未传时返回 None 以保持既有默认阶段门禁。"""
+    raw_stages = getattr(args, "goal_stages", None)
+    include_draft = bool(getattr(args, "include_draft", False))
+    if raw_stages is None:
+        return GOAL_STAGES if include_draft else None
+
+    tokens: list[str] = []
+    for part in str(raw_stages).split(","):
+        st = part.strip()
+        if st and st not in tokens:
+            tokens.append(st)
+    invalid = [st for st in tokens if st not in GOAL_STAGES]
+    if not tokens or invalid:
+        raise ValueError(
+            f"非法 --goal-stages {', '.join(invalid) or raw_stages!r}（仅允许: {', '.join(GOAL_STAGES)}）"
+        )
+    if include_draft and "draft" not in tokens:
+        tokens.insert(0, "draft")
+    return tuple(tokens)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Minecraft Agent 统一比赛主循环与持续异常取证运行器")
     p.add_argument("--mode", choices=("campaign", "focus"), default="campaign", help="campaign=比赛跑法, focus=单技能定向验收")
@@ -67,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skill-args", default="{}", help="focus 模式下的 JSON 参数对象")
     p.add_argument("--goal", default=None,
                    help="聚焦推进并验收目标台账中的 goal_id；多个用逗号分隔表示同一轮一起追（如 smelt_iron,kill_a_mob）")
+    p.add_argument("--include-draft", action="store_true",
+                   help="解锁全部 draft 阶段目标进入规划器与战略菜单（等价全阶段 GOAL_STAGES；仍严格受 --min-verified 约束）")
+    p.add_argument("--goal-stages", default=None,
+                   help="逗号分隔的目标阶段白名单（可选: draft,candidate,graduated,live；未传时沿用默认门禁）")
     p.add_argument("--no-stop-on-goal", action="store_true", help="与 --goal 同用时达成目标后不提前结束，继续跑完预算")
     p.add_argument("--goal-telemetry", type=Path, default=None, help="可选实测成本 JSON 路径（用于动态调整目标排序）")
     p.add_argument("--strategy", choices=("legacy", "rule", "llm"), default="rule", action=_ExplicitStrategyAction,
@@ -99,7 +125,13 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _run_dry(cfg: Config, *, min_verified: str = "offline", strategy: str = "rule") -> int:
+def _run_dry(
+    cfg: Config,
+    *,
+    min_verified: str = "offline",
+    strategy: str = "rule",
+    include_stages: tuple[str, ...] | None = None,
+) -> int:
     print(f"[dry] 已注册技能 ({len(REGISTRY)}): {', '.join(sorted(REGISTRY))}")
     for name, cls in sorted(REGISTRY.items()):
         errs = contract_errors(cls)
@@ -110,7 +142,7 @@ def _run_dry(cfg: Config, *, min_verified: str = "offline", strategy: str = "rul
     if ledger_errs:
         print(f"[dry] 目标台账契约不合格: {ledger_errs}")
         return 1
-    planner = RulePlanner(min_verified=min_verified)
+    planner = RulePlanner(min_verified=min_verified, include_stages=include_stages)
     active_cnt = len(planner.active_goals)
     print(f"[dry] 目标台账核验通过: 共 {len(GOALS)} 项（已激活 {active_cnt} 项）")
     st = State()
@@ -118,7 +150,12 @@ def _run_dry(cfg: Config, *, min_verified: str = "offline", strategy: str = "rul
     st.set_inventory({"items": []})
     d = planner.choose(st)
     print(f"[dry] 空包规则首拍决策 -> {d.skill} ({d.reason})")
-    cp = CampaignPlanner(mode="campaign", strategy=strategy, min_verified=min_verified)
+    cp = CampaignPlanner(
+        mode="campaign",
+        strategy=strategy,
+        min_verified=min_verified,
+        include_stages=include_stages,
+    )
     if strategy != "llm" and cp.select(st, []).skill is None:
         print(f"[dry] strategy={strategy} 空包首拍未产出技能")
         return 1
@@ -163,6 +200,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         args.goal = ",".join(goal_ids)
 
+    try:
+        include_stages = resolve_cli_include_stages(args)
+    except ValueError as e:
+        print(f"参数错误: {e}", file=sys.stderr)
+        return 2
+
     cfg = Config.load()
     if args.user:
         cfg.username = args.user
@@ -172,7 +215,12 @@ def main(argv: list[str] | None = None) -> int:
     effective_strategy = resolve_cli_strategy(args)
 
     if args.dry:
-        return _run_dry(cfg, min_verified=args.min_verified or "offline", strategy=effective_strategy)
+        return _run_dry(
+            cfg,
+            min_verified=args.min_verified or "offline",
+            strategy=effective_strategy,
+            include_stages=include_stages,
+        )
 
     official = urlsplit(cfg.base).hostname in OFFICIAL_HOSTS
     if official and not args.live:
@@ -214,6 +262,12 @@ def main(argv: list[str] | None = None) -> int:
 
     source_tag = "official" if official else "local-target"
     min_ver = args.min_verified or ("live" if source_tag == "official" else "offline")
+    if (official or args.live) and (args.include_draft or (include_stages is not None and "draft" in include_stages)):
+        print(
+            f"[loop] ⚠ 风险提示：官方端点已开启 --include-draft / draft 目标阶段（stages={list(include_stages or ())}），"
+            f"仍严格受 --min-verified={min_ver} 技能验证门禁约束，未验证技能不会被放行。",
+            file=sys.stderr,
+        )
     if args.mode == "focus":
         cls = REGISTRY.get(args.skill)
         if cls is None:
@@ -254,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
                 "use_llm": use_llm,
                 **llm_meta,
                 "min_verified": min_ver,
+                "include_draft": bool(args.include_draft),
+                "include_stages": list(include_stages) if include_stages is not None else None,
                 "max_steps": args.max_steps,
                 "max_seconds": args.max_seconds,
                 "checkpoint_path": args.checkpoint,
@@ -272,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         on_llm_telemetry=observer.on_llm_call if observer else None,
         on_objective_telemetry=observer.on_objective_decision if observer else None,
         target_goal=args.goal,
+        include_stages=include_stages,
         telemetry=telemetry,
         review_interval_s=args.strategy_review_s,
         require_iron=True if args.require_iron else None,

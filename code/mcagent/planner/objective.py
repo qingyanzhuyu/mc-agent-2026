@@ -92,6 +92,7 @@ class ObjectiveCandidate:
     prereqs_met: bool
     missing_prereqs: tuple[str, ...] = ()
     default_budget_s: float = 180.0
+    marginal_roi: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,8 @@ def _make_probe_planner(
     ep_goal_fails: Optional[Mapping[str, int]], ep_goal_elapsed: Optional[Mapping[str, float]],
     telemetry: Optional[Mapping[str, Mapping[str, Any]]], environment_blocks: Optional[Mapping[str, Any]],
     reservation_book: Optional[ReservationBook],
+    hub_suspensions: Optional[Mapping[str, Any]] = None,
+    abandoned_goals: Collection[str] = (),
 ):
     _, RulePlanner = _loop_modules()
     probe = RulePlanner(
@@ -169,11 +172,26 @@ def _make_probe_planner(
     probe.completed_advancements = set(completed_advs)
     probe.ep_goal_fails = dict(ep_goal_fails or {})
     probe.ep_goal_elapsed = dict(ep_goal_elapsed or {})
+    if abandoned_goals or hub_suspensions:
+        probe._abandoned_goals = set(abandoned_goals) | set(hub_suspensions or ())
     if environment_blocks:
         probe._environment_blocks = {
             k: type(v)(v.error, v.observation) for k, v in dict(environment_blocks).items()
         }
     return probe
+
+
+def _format_hub_suspension_info(goal: "GoalSpec", susp: Any) -> SuspendedGoalInfo:
+    cooldown_s = float(getattr(susp, "cooldown_s", 180.0) or 180.0)
+    restarts = int(getattr(susp, "restart_count", 0) or 0)
+    return SuspendedGoalInfo(
+        goal_id=goal.id,
+        title=goal.title,
+        score=goal.score,
+        wake_on=f"move>=32m_or_{cooldown_s:.0f}s",
+        missing_predicate="hub_retry_cooldown",
+        message=f"枢纽目标临时挂起(第{restarts + 1}次)，离开>=32格或冷却{cooldown_s:.0f}s后自动唤醒",
+    )
 
 
 def collect_objective_candidates(
@@ -183,6 +201,8 @@ def collect_objective_candidates(
     ep_goal_fails: Optional[Mapping[str, int]] = None, ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None, environment_blocks: Optional[Mapping[str, Any]] = None,
     reservation_book: Optional[ReservationBook] = None,
+    hub_suspensions: Optional[Mapping[str, Any]] = None,
+    abandoned_goals: Collection[str] = (),
 ) -> tuple[list[ObjectiveCandidate], list[SuspendedGoalInfo]]:
     """按台账静态声明顺序收集「可选且未达成目标」与「被环境挂起目标」（不透传规则性价比排序）。"""
     goals_mod, _ = _loop_modules()
@@ -194,23 +214,38 @@ def collect_objective_candidates(
         {g.id for g in goals_mod.resolve_active_goals(all_goals, include_stages=eff_stages, target_goal=focus_goals)}
         if focus_goals else None
     )
+    active_pool = tuple(
+        g for g in all_goals
+        if (g.id in focus_ids if focus_ids is not None else g.stage in allowed_stage_set)
+    )
+    susp_hub_map = dict(hub_suspensions or {})
+    abandoned_set = set(abandoned_goals or ())
+    marginal_rois = goals_mod.compute_goal_marginal_rois(
+        state,
+        active_pool,
+        completed_advs=completed_advs,
+        ep_goal_fails=ep_goal_fails,
+        ep_goal_elapsed=ep_goal_elapsed,
+        telemetry=telemetry,
+        suspended_goals=set(susp_hub_map) | abandoned_set,
+    )
 
     eligible: list[ObjectiveCandidate] = []
     suspended: list[SuspendedGoalInfo] = []
-    for g in all_goals:
-        if focus_ids is not None:
-            if g.id not in focus_ids:
-                continue
-        elif g.stage not in allowed_stage_set:
-            continue
+    for g in active_pool:
         if goals_mod.is_goal_achieved(g, state, completed_advs):
+            continue
+        if g.id in susp_hub_map:
+            suspended.append(_format_hub_suspension_info(g, susp_hub_map[g.id]))
+            continue
+        if g.id in abandoned_set:
             continue
 
         probe = _make_probe_planner(
             g.id, ledger=all_goals, registry=registry, min_verified=min_verified,
             include_stages=eff_stages, completed_advs=completed_advs, ep_goal_fails=ep_goal_fails,
             ep_goal_elapsed=ep_goal_elapsed, telemetry=telemetry, environment_blocks=environment_blocks,
-            reservation_book=reservation_book,
+            reservation_book=reservation_book, hub_suspensions=susp_hub_map, abandoned_goals=abandoned_set,
         )
         probe.refresh_environment_blocks(state)
         blocked_map = probe.blocked_targets(state, g.id, refresh=False)
@@ -226,8 +261,40 @@ def collect_objective_candidates(
         rem_cost, prereqs_met, missing = compute_remaining_cost_and_prereqs(
             g, state, ledger_map, completed_advs=completed_advs, telemetry=telemetry
         )
-        eligible.append(ObjectiveCandidate(g.id, g.title, g.score, rem_cost, prereqs_met, missing, clamp_budget(g.budget_s)))
+        m_roi = marginal_rois.get(g.id)
+        eligible.append(ObjectiveCandidate(
+            g.id, g.title, g.score, rem_cost, prereqs_met, missing, clamp_budget(g.budget_s), marginal_roi=m_roi
+        ))
     return eligible, suspended
+
+
+def format_objective_candidate_line(item: ObjectiveCandidate) -> str:
+    """将单个可选目标格式化为单行菜单文本。"""
+    if item.prereqs_met:
+        prereq_tag = "前置=已满足"
+    elif item.missing_prereqs:
+        short = ",".join(item.missing_prereqs[:2])
+        more = f"+{len(item.missing_prereqs) - 2}" if len(item.missing_prereqs) > 2 else ""
+        prereq_tag = f"前置=缺({short}{more})"
+    else:
+        prereq_tag = "前置=缺原料"
+    return (
+        f"- {item.goal_id}: {item.title} | {item.score}分 | 预计剩余{item.est_remaining_cost_s:.0f}s "
+        f"| 默认预算{item.default_budget_s:.0f}s | {prereq_tag}"
+    )
+
+
+def render_suspended_section(suspended: Sequence[SuspendedGoalInfo] = (), *, max_items: Optional[int] = None) -> str:
+    """渲染被挂起目标段落（不含坐标或实体 id）。"""
+    if not suspended:
+        return "被挂起目标：无"
+    shown = suspended if max_items is None else suspended[:max(1, int(max_items))]
+    lines = ["被挂起目标（等待唤醒条件，当前不可选）："]
+    for s in shown:
+        lines.append(f"- {s.goal_id}: {s.title} | {s.score}分 | 缺失={s.missing_predicate} | 唤醒={s.wake_on}")
+    if max_items is not None and len(suspended) > len(shown):
+        lines.append(f"- ...(其余 {len(suspended) - len(shown)} 项挂起略)")
+    return "\n".join(lines)
 
 
 def render_objective_menu(
@@ -239,24 +306,8 @@ def render_objective_menu(
         lines.append("- （无可选目标）")
     else:
         for item in eligible:
-            if item.prereqs_met:
-                prereq_tag = "前置=已满足"
-            elif item.missing_prereqs:
-                short = ",".join(item.missing_prereqs[:2])
-                more = f"+{len(item.missing_prereqs) - 2}" if len(item.missing_prereqs) > 2 else ""
-                prereq_tag = f"前置=缺({short}{more})"
-            else:
-                prereq_tag = "前置=缺原料"
-            lines.append(
-                f"- {item.goal_id}: {item.title} | {item.score}分 | 预计剩余{item.est_remaining_cost_s:.0f}s "
-                f"| 默认预算{item.default_budget_s:.0f}s | {prereq_tag}"
-            )
-    if suspended:
-        lines.append("被挂起目标（等待唤醒条件，当前不可选）：")
-        for s in suspended:
-            lines.append(f"- {s.goal_id}: {s.title} | {s.score}分 | 缺失={s.missing_predicate} | 唤醒={s.wake_on}")
-    else:
-        lines.append("被挂起目标：无")
+            lines.append(format_objective_candidate_line(item))
+    lines.append(render_suspended_section(suspended))
     return "\n".join(lines)
 
 
@@ -269,6 +320,8 @@ def resolve_objective(
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     environment_blocks: Optional[Mapping[str, Any]] = None,
     reservation_book: Optional[ReservationBook] = None,
+    hub_suspensions: Optional[Mapping[str, Any]] = None,
+    abandoned_goals: Collection[str] = (),
     source: str = "llm", now: Optional[float] = None,
 ) -> tuple[Optional[Objective], list[str]]:
     """校验候选字典并构造 `Objective`；不合法返回 `(None, 错误原文列表)`。"""
@@ -303,12 +356,13 @@ def resolve_objective(
         ledger=all_goals, registry=registry, min_verified=min_verified, include_stages=eff_stages,
         completed_advs=completed_advs, ep_goal_fails=ep_goal_fails, ep_goal_elapsed=ep_goal_elapsed,
         telemetry=telemetry, environment_blocks=environment_blocks, reservation_book=reservation_book,
+        hub_suspensions=hub_suspensions, abandoned_goals=abandoned_goals,
     )
 
     goal = ledger_map.get(goal_id)
     if goal is None:
         eligible, _ = collect_objective_candidates(state, focus_goals=focus_goals, **common_kw)
-        valid_ids = ", ".join(c.goal_id for c in eligible) or "（无）"
+        valid_ids = ", ".join(c.goal_id for c in eligible[:15]) or "（无）"
         return None, [f"目标 {goal_id!r} 不在目标台账内；当前可选目标: {valid_ids}"]
     if focus_goals:
         focus_closure = goals_mod.resolve_active_goals(all_goals, include_stages=eff_stages, target_goal=focus_goals)
@@ -318,6 +372,9 @@ def resolve_objective(
         return None, [f"目标 {goal_id} 的 stage={goal.stage!r} 不在当前允许阶段 {list(eff_stages)} 内（min_verified={min_verified}）"]
     if goals_mod.is_goal_achieved(goal, state, completed_advs):
         return None, [f"目标 {goal_id}（{goal.title}）在本局已达成，请换未达成的目标"]
+    if hub_suspensions and goal_id in hub_suspensions:
+        info = _format_hub_suspension_info(goal, hub_suspensions[goal_id])
+        return None, [f"目标 {goal_id} 当前处于枢纽临时挂起（唤醒条件={info.wake_on}），请改选其他平行目标"]
 
     probe = _make_probe_planner(goal_id, **common_kw)
     probe.refresh_environment_blocks(state)

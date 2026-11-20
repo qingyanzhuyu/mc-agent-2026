@@ -110,11 +110,18 @@ class StrategyOrchestrator:
             p.registry, ledger=p.rules.ledger, include_stages=p.rules.include_stages,
             target_goal=goal_id, telemetry=p.rules.telemetry, min_verified=p.min_verified,
             reservations=p.reservations,
+            hub_cooldown_s=p.rules.hub_cooldown_s,
+            hub_wake_dist=p.rules.hub_wake_dist,
+            hub_max_restarts=p.rules.hub_max_restarts,
+            clock=p.rules._clock,
         )
         tp.completed_advancements = p.rules.completed_advancements
         tp.ep_goal_fails, tp.ep_goal_elapsed = p.rules.ep_goal_fails, p.rules.ep_goal_elapsed
         tp._environment_blocks = p.rules._environment_blocks
         tp._abandoned_goals = p.rules._abandoned_goals
+        tp._hub_suspensions = p.rules._hub_suspensions
+        tp._hub_restart_counts = p.rules._hub_restart_counts
+        tp._last_observed_pos = p.rules._last_observed_pos
         return tp
 
     def is_iron_complete(self, state: State) -> bool:
@@ -128,7 +135,9 @@ class StrategyOrchestrator:
         p = self.planner
         t_now = self.clock() if now is None else float(now)
         excluded, seen_roots = set(exclude_goals), set()
-        p.rules.refresh_environment_blocks(state)
+        woken_hubs = p.rules.refresh_environment_blocks(state)
+        for gid in woken_hubs or ():
+            self._consecutive_goal_fails[gid] = 0
         for step in p.rules._rank(state):
             root = step.root_goal
             if root.id in seen_roots or root.id in excluded:
@@ -161,6 +170,8 @@ class StrategyOrchestrator:
             subgoal_predicates=p.subgoal_provider(state) if p.subgoal_provider is not None else None,
             reservations=p.reserve_provider(state) if p.reserve_provider is not None else None,
             reservation_book=p.reservations,
+            hub_suspensions=p.rules._hub_suspensions,
+            abandoned_goals=p.rules._abandoned_goals,
         )
 
     def emit_objective_telemetry(
@@ -202,7 +213,7 @@ class StrategyOrchestrator:
         if not ok:
             self._consecutive_goal_fails[gid] = self._consecutive_goal_fails.get(gid, 0) + 1
             self._last_failure_kind.setdefault(gid, "other_replan")
-        elif (spec is not None and spec.skill == skill_name) or skill_name not in ("eat_food", "scout_island"):
+        elif (spec is not None and spec.skill == skill_name) or skill_name not in ("eat_food", "scout_island", "survey_island"):
             self._consecutive_goal_fails[gid] = 0
 
     def _detect_trigger(
@@ -253,7 +264,9 @@ class StrategyOrchestrator:
             self.record_objective_history(prev_obj, outcome=old_outcome, failure_kind=failure_kind, now=now, detail=detail)
             spec = p.rules.ledger_map.get(prev_obj.goal_id)
             if trigger in ("max_fails_reached", "goal_abandoned") and spec is not None:
-                if spec.max_fails_per_ep > 0:
+                if p.rules.is_hub_goal(spec.id):
+                    p.rules.suspend_hub_goal(spec.id, state=state, reason=trigger)
+                elif spec.max_fails_per_ep > 0:
                     p.rules.ep_goal_fails[spec.id] = max(p.rules.ep_goal_fails.get(spec.id, 0), spec.max_fails_per_ep)
                 excluded.add(spec.id)
                 self._consecutive_goal_fails[spec.id] = 0
@@ -299,7 +312,9 @@ class StrategyOrchestrator:
         p = self.planner
         self.sync_external_objective()
         now = self.clock()
-        p.rules.refresh_environment_blocks(state)
+        woken_hubs = p.rules.refresh_environment_blocks(state)
+        for gid in woken_hubs or ():
+            self._consecutive_goal_fails[gid] = 0
 
         if recent_failures and recent_failures[-1] != self._seen_failure_str:
             self._seen_failure_str = recent_failures[-1]

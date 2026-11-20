@@ -17,7 +17,9 @@ from ..planner.objective import (
     ObjectiveCandidate,
     SuspendedGoalInfo,
     collect_objective_candidates,
+    format_objective_candidate_line,
     render_objective_menu,
+    render_suspended_section,
 )
 from ..runtime import State, _inv_fingerprint
 from ..skills.items import best_pickaxe
@@ -344,15 +346,66 @@ class DecisionContext:
         sections.append("\n".join(rec_lines))
 
         menu_str = self.render_menu()
-        full_text = "\n\n".join([*sections, menu_str])
+        prefix = "\n\n".join(sections)
+        full_text = f"{prefix}\n\n{menu_str}"
         if len(full_text) <= max_chars:
             return full_text
 
-        # 超长台账极端保护：优先裁剪可选目标列表描述尾部，确保始终 <= max_chars
-        budget_for_menu = max(200, max_chars - len("\n\n".join(sections)) - 24)
-        trimmed_menu = menu_str[:budget_for_menu].rsplit("\n", 1)[0] + "\n- ...(其余目标略)"
-        compact = "\n\n".join([*sections, trimmed_menu])
-        return compact[:max_chars]
+        # 超长台账保护：按边际 ROI 截取可选目标 Top-K，同时保留被挂起目标与唤醒条件，严格保证 <= max_chars
+        susp_block = render_suspended_section(self.suspended_goals, max_items=4)
+        if len(susp_block) > 360:
+            susp_block = render_suspended_section(self.suspended_goals, max_items=2)
+        if len(susp_block) > 360:
+            susp_block = susp_block[:357] + "..."
+
+        cur_gid = self.current_objective.goal_id if self.current_objective is not None else None
+
+        def _roi_key(pair: tuple[int, ObjectiveCandidate]) -> tuple[int, int, float, int, int, float, int]:
+            idx, c = pair
+            m_roi = (
+                float(c.marginal_roi)
+                if c.marginal_roi is not None
+                else (float(c.score) / max(1.0, float(c.est_remaining_cost_s)))
+            )
+            return (
+                1 if (cur_gid is not None and c.goal_id == cur_gid) else 0,
+                1 if c.score > 0 else 0,
+                round(m_roi, 6),
+                1 if c.prereqs_met else 0,
+                int(c.score),
+                -float(c.est_remaining_cost_s),
+                -idx,
+            )
+
+        ordered = [c for _, c in sorted(enumerate(self.eligible_goals), key=_roi_key, reverse=True)]
+        header = "可选目标（只能从这里选 goal_id）："
+        total_elig = len(ordered)
+        selected_lines: list[str] = []
+        # 预留 footer 与 suspended_block 字符预算
+        footer_reserve = len(f"\n- ...(共 {total_elig} 项可选，按边际 ROI 展示 Top-{total_elig})")
+        fixed_len = len(prefix) + 2 + len(header) + 1 + len(susp_block) + footer_reserve
+        avail = max(0, max_chars - fixed_len)
+        used = 0
+        for item in ordered:
+            line = format_objective_candidate_line(item)
+            add_len = len(line) + 1
+            if used + add_len > avail:
+                break
+            selected_lines.append(line)
+            used += add_len
+
+        menu_lines = [header]
+        if selected_lines:
+            menu_lines.extend(selected_lines)
+            if len(selected_lines) < total_elig:
+                menu_lines.append(f"- ...(共 {total_elig} 项可选，按边际 ROI 展示 Top-{len(selected_lines)})")
+        elif total_elig > 0:
+            menu_lines.append(f"- ...(共 {total_elig} 项可选，预算受限已折叠)")
+        else:
+            menu_lines.append("- （无可选目标）")
+        menu_lines.append(susp_block)
+        compact = f"{prefix}\n\n" + "\n".join(menu_lines)
+        return compact if len(compact) <= max_chars else compact[:max_chars]
 
 
 def build_decision_context(
@@ -378,6 +431,8 @@ def build_decision_context(
     reservation_book: Optional[ReservationBook] = None,
     extra_fields: Optional[Mapping[str, Any]] = None,
     world_landmarks: Optional[Mapping[str, Any]] = None,
+    hub_suspensions: Optional[Mapping[str, Any]] = None,
+    abandoned_goals: Collection[str] = (),
 ) -> DecisionContext:
     """由 harness 客观组装战略决策上下文（不含 current_goal_hint、科技硬编码、坐标与实体 id）。"""
     total_budget_s = float(max_match_seconds) if max_match_seconds > 0.0 else DEFAULT_MATCH_SECONDS
@@ -397,6 +452,8 @@ def build_decision_context(
         telemetry=telemetry,
         environment_blocks=environment_blocks,
         reservation_book=reservation_book,
+        hub_suspensions=hub_suspensions,
+        abandoned_goals=abandoned_goals,
     )
 
     cleaned_suspended = tuple(
