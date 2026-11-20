@@ -80,7 +80,7 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
     if start.get("alive") is False:
         raise Replan("探矿阶梯开工前角色未存活")
     if y != cy - 1 or abs(x - cx) + abs(z - cz) != 1:
-        raise Replan("阶梯落点须位于现场站位相邻方向且低一格")
+        raise MineStepUnsafe("stance", "阶梯落点须位于现场站位相邻方向且低一格")
     if not safe_mine_column(ex, pos, solid=solid):
         raise MineStepUnsafe("cut", "探矿阶梯站位或承重/净空变化，停止挖掘以保留支撑")
 

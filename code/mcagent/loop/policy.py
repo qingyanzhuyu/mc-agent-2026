@@ -678,6 +678,64 @@ class RulePlanner:
             return None, f"技能 {name} 的物资被预留、数量不足或库存待刷新", False
         return inst, "", False
 
+    def _recover_blocked_skill_prereq(
+        self,
+        skill_name: str,
+        state: State,
+        seen_goals: Optional[set[str]] = None,
+    ) -> tuple[Optional[Skill], str]:
+        """当技能（或补料技能）因 `cls.blocked(state)` 受阻时，回溯对应目标的未满足前置工具/工作站链。"""
+        cls = self.registry.get(skill_name)
+        if cls is None or not cls.blocked(state):
+            return None, ""
+        seen = seen_goals if seen_goals is not None else set()
+        providers = [g for g in self.active_goals if g.skill == skill_name and g.prereq_goals]
+        for prov in providers:
+            if prov.id in seen:
+                continue
+            seen.add(prov.id)
+            inst, why = self._expand_unmet_prereq_chain(prov, state, seen)
+            if inst is not None:
+                return inst, why
+        return None, ""
+
+    def _expand_unmet_prereq_chain(
+        self,
+        goal: GoalSpec,
+        state: State,
+        seen: set[str],
+    ) -> tuple[Optional[Skill], str]:
+        """深度优先展开 `goal` 未满足的 `prereq_goals`（工具/工作站耗尽或死后丢失时自动补造）。"""
+        for pid in goal.prereq_goals:
+            parent = self.ledger_map.get(pid)
+            if parent is None or parent.id in seen:
+                continue
+            if is_prereq_satisfied(parent, state, self.completed_advancements):
+                continue
+            seen.add(parent.id)
+            inst, why = self._expand_unmet_prereq_chain(parent, state, seen)
+            if inst is not None:
+                return inst, why
+            ready = all(check_item_expr(state, expr) for expr in parent.prereq_items)
+            if ready:
+                cand, _, _ = self._diagnose_skill(parent.skill, parent.args_dict, state)
+                if cand is not None:
+                    self._last_selected_goal_id = parent.id
+                    return cand, f"恢复受阻技能前置 {parent.id}（{parent.title}）"
+                rec_inst, rec_why = self._recover_blocked_skill_prereq(parent.skill, state, seen)
+                if rec_inst is not None:
+                    return rec_inst, rec_why
+            if not ready or parent.gather_when_blocked:
+                for req_expr, fb_skill, fb_args in _supplies(parent, state):
+                    cand, _, _ = self._diagnose_skill(fb_skill, fb_args, state)
+                    if cand is not None:
+                        self._last_selected_goal_id = parent.id
+                        return cand, f"恢复受阻前置 {parent.id} 补齐材料（{req_expr}）"
+                    rec_inst, rec_why = self._recover_blocked_skill_prereq(fb_skill, state, seen)
+                    if rec_inst is not None:
+                        return rec_inst, rec_why
+        return None, ""
+
     def expand_objective_skill(self, state: State) -> tuple[Optional[Skill], str]:
         """针对 `target_goal` 展开下一个可启动技能；无法展开时返回 `(None, 明确原因)`。"""
         self._last_selected_goal_id = None
@@ -708,6 +766,10 @@ class RulePlanner:
                 if inst is not None:
                     self._last_selected_goal_id = g.id
                     return inst, f"推进目标 {g.id}（{g.title}）"
+                if not cooling_only:
+                    rec_inst, rec_why = self._recover_blocked_skill_prereq(g.skill, state)
+                    if rec_inst is not None:
+                        return rec_inst, rec_why
                 reasons.append(f"{g.id}: {why_not}")
                 if cooling_only and cooling_step_id is None:
                     cooling_step_id = g.id
@@ -719,6 +781,10 @@ class RulePlanner:
                     if inst is not None:
                         self._last_selected_goal_id = g.id
                         return inst, f"为目标 {g.id} 补齐前置材料（{req_expr}）"
+                    if not cooling_only:
+                        rec_inst, rec_why = self._recover_blocked_skill_prereq(fb_skill, state)
+                        if rec_inst is not None:
+                            return rec_inst, rec_why
                     reasons.append(f"{g.id}({req_expr}): {why_not}")
                     if cooling_only and cooling_step_id is None:
                         cooling_step_id = g.id

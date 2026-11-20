@@ -318,14 +318,12 @@ class SmeltIron(Skill):
         cur = status.get("pos") or state.pos
         stance = status if status.get("pos") is not None else cur
         reach_mod = _reach_mod()
-        equipped_pick = False
         if not can_reach_block(ex, stance, pos, reach=MINING_REACH):
             if (reach_mod is not None
                     and status.get("dimension") == dimension
                     and not under_feet(cur, pos)
                     and eye_to_block_dist(stance, pos) <= MINING_REACH):
                 yield from prepare_mining_pick(ex, state)
-                equipped_pick = True
                 yield from reach_mod.clear_line_of_sight(
                     ex, state, pos, max_clear=2, reach=API_DIG_EYE_REACH,
                 )
@@ -347,9 +345,7 @@ class SmeltIron(Skill):
                         and not under_feet(cur, pos)
                         and not can_reach_block(ex, stance, pos, reach=MINING_REACH)
                         and eye_to_block_dist(stance, pos) <= API_DIG_EYE_REACH):
-                    if not equipped_pick:
-                        yield from prepare_mining_pick(ex, state)
-                        equipped_pick = True
+                    yield from prepare_mining_pick(ex, state)
                     yield from reach_mod.clear_line_of_sight(
                         ex, state, pos, max_clear=2, reach=API_DIG_EYE_REACH,
                     )
@@ -365,8 +361,8 @@ class SmeltIron(Skill):
         block_type = bare(ex.client.get_block(pos).get("name"))
         if block_type not in ores:
             raise Replan(f"到达 {pos} 后 get_block 未确认目标矿 {ores}")
-        if not equipped_pick:
-            yield from prepare_mining_pick(ex, state)
+        # move_to / clear_line_of_sight 可能触发服务端自动切换手持物品，开挖前无条件复核持镐
+        yield from prepare_mining_pick(ex, state)
         status = state.refresh_status(ex.client, max_age_s=0)
         cur = status.get("pos") or state.pos
         stance = status if status.get("pos") is not None else cur
@@ -464,9 +460,18 @@ class SmeltIron(Skill):
             candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
             return candidates if candidates or state.count("raw_iron") else None
 
+        reach_mod = _reach_mod()
+        stance_retries = 0
+
         try:
             while completed_steps < max_steps:
-                cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                status = state.refresh_status(ex.client, max_age_s=0)
+                if (reach_mod is not None and hasattr(reach_mod, "settle_dry_landing")
+                        and status.get("on_ground") is False
+                        and not status.get("in_water")
+                        and not status.get("in_lava")):
+                    status = reach_mod.settle_dry_landing(ex, state)
+                cur = status.get("pos") or state.pos
                 x, y, z = map(math.floor, cur)
                 visited.add((x, z))
                 dirs = (heading,) + tuple(d for d in ((1, 0), (-1, 0), (0, 1), (0, -1)) if d != heading)
@@ -488,6 +493,10 @@ class SmeltIron(Skill):
                 try:
                     dest, observation = yield from mine_step(ex, state, pos, after_dig=observe_cut)
                 except MineStepUnsafe as err:
+                    if err.stage == "stance" and stance_retries < 4:
+                        visited.discard((pos[0], pos[2]))
+                        stance_retries += 1
+                        continue
                     if completed_steps > 0:
                         continue
                     if err.stage == "cut" and any(
@@ -496,6 +505,7 @@ class SmeltIron(Skill):
                     ):
                         continue
                     raise
+                stance_retries = 0
                 if dest is None:
                     return observation
                 heading = (pos[0] - x, pos[2] - z)
