@@ -463,7 +463,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 if math.dist(before_burst, (px, py, pz)) < 1.5:
                     burst_blocked = True
 
-    flee_stride = 16.0 if is_creeper else 14.0
+    flee_stride = 16.0 if is_creeper else 18.0
     moved = yield from _move_to_bounded(
         ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=12.0,
     )
@@ -477,6 +477,22 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
 
     st_after = _refresh_status(ex, state)
     after_hostile = st_after.get("nearest_hostile") or {}
+    if moved and isinstance(after_hostile, dict) and after_hostile:
+        after_d = after_hostile.get("dist")
+        after_pos_now = st_after.get("pos")
+        after_hpos = after_hostile.get("pos")
+        if (isinstance(after_pos_now, (list, tuple)) and len(after_pos_now) >= 3
+                and isinstance(after_hpos, (list, tuple)) and len(after_hpos) >= 3):
+            actual_d = math.dist(after_pos_now[:3], after_hpos[:3])
+        elif isinstance(after_d, (int, float)) and not isinstance(after_d, bool):
+            actual_d = float(after_d)
+        else:
+            actual_d = 99.0
+        if actual_d < 5.5:
+            # move_to 寻路禁疾跑，若结束时高速敌怪仍紧贴 <5.5 格，补一次疾跑跳拉脱
+            yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=900)
+            st_after = _refresh_status(ex, state)
+            after_hostile = st_after.get("nearest_hostile") or {}
     if not after_hostile:
         return True
     flee_dist = float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)

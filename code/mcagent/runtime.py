@@ -1372,7 +1372,12 @@ def _same_escape_kind(active_escape: Optional[str], hazard_kind: str) -> bool:
         return True
     douse_group = {"douse", "escape_lava"}
     surface_group = {"surface", "escape_water"}
-    return (a in douse_group and h in douse_group) or (a in surface_group and h in surface_group)
+    flee_group = {"flee", "void_risk"}
+    return (
+        (a in douse_group and h in douse_group)
+        or (a in surface_group and h in surface_group)
+        or (a in flee_group and h in flee_group)
+    )
 
 
 class SafetyMonitor:
@@ -1529,10 +1534,10 @@ class SafetyMonitor:
                     if not has_aabb_support:
                         evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
                 elif falling:
-                    # 普通地形下落时再往下探 2 格，区分正常下 1~2 格台阶与真悬空/深坑
+                    # 普通地形下落时再往下探 3 格，区分正常下 1~3 格零摔伤台阶/山坡与真悬空/深坑（>=4 格）
                     has_near_ground = False
                     below_checked = []
-                    for dy in (1, 2):
+                    for dy in (1, 2, 3):
                         bpos = [under[0], under[1] - dy, under[2]]
                         b = self._get_block_uncached(bpos)
                         bname = str(b.get("name", "")).removeprefix("minecraft:")
