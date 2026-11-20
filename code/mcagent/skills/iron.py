@@ -666,9 +666,11 @@ class SmeltIron(Skill):
                 code, _ = failure(err)
                 if isinstance(err, _OreRouteUnconfirmed):
                     code = "arrival_unconfirmed"
+                elif code == "network" and ("timed out" in str(err).lower() or "timeout" in str(err).lower()):
+                    code = "move_timeout"
                 dig_skip = code in ("dig_unconfirmed", "out_of_reach", "protected_region")
                 route_skip = code in (
-                    "path_not_found", "unreachable", "move_timeout", "stalled", "arrival_unconfirmed",
+                    "path_not_found", "unreachable", "move_timeout", "timeout", "stalled", "arrival_unconfirmed",
                 )
                 if route_skip:
                     _halt_residual_motion(ex, state)

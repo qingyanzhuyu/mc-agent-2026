@@ -374,16 +374,26 @@ def _resolve_flee_vector(
 def _pick_alternate_escape_yaw(
     ex: "Executor", px: float, py: float, pz: float, ux: float, uz: float, cache: Any, dim: str,
 ) -> float:
-    """主逃离方向撞墙/无路径时，优先挑左右正交（±90°）可通行干地方向，避免原地连撞同一堵墙。"""
+    """主逃离方向撞墙/无路径时，依次扫描左右正交（±90°）、斜向与反方向可通行干地通道，避免继续撞墙。"""
     fx, fy, fz = block_cell([px, py, pz])
-    ortho_dirs = [(-uz, ux), (uz, -ux)]
-    for ox, oz in ortho_dirs:
-        sx, sz = int(round(ox)), int(round(oz))
+    candidate_dirs = [
+        (-uz, ux),
+        (uz, -ux),
+        (-ux, -uz),
+        (-uz - ux, ux - uz),
+        (uz - ux, -ux - uz),
+    ]
+    for ox, oz in candidate_dirs:
+        norm = math.hypot(ox, oz)
+        if norm <= 1e-6:
+            continue
+        nx, nz = ox / norm, oz / norm
+        sx, sz = int(round(nx)), int(round(nz))
         if (sx, sz) == (0, 0):
             continue
         for dy in (0, 1, -1):
             if _is_dry_standable(cache, ex.client, (fx + sx, fy + dy, fz + sz), dim):
-                return math.atan2(-ox, -oz)
+                return math.atan2(-nx, -nz)
     return math.atan2(uz, -ux)  # 右旋 90° 保底
 
 
