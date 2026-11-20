@@ -209,6 +209,8 @@ class WaveCWorld(GridWorld):
         self.on_shoot: Callable[..., dict | None] | None = None
         self.on_look: Callable[..., dict | None] | None = None
         self.on_control: Callable[..., dict | None] | None = None
+        self._last_look_entity_id: int | None = None
+        self._last_look_pos: list[float] | None = None
         self.on_equip: Callable[..., dict | None] | None = None
         self.on_window_act: Callable[..., dict | None] | None = None
 
@@ -417,6 +419,8 @@ class WaveCWorld(GridWorld):
         self.calls.append(
             ("look", {"yaw": yaw, "pitch": pitch, "pos": list(pos) if pos is not None else None, "entity_id": entity_id})
         )
+        self._last_look_entity_id = entity_id
+        self._last_look_pos = list(pos) if pos is not None else None
         if self.on_look is not None:
             res = self.on_look(self, yaw=yaw, pitch=pitch, pos=pos, entity_id=entity_id)
             if res is not None:
@@ -429,6 +433,21 @@ class WaveCWorld(GridWorld):
             res = self.on_control(self, **keys)
             if res is not None:
                 return res
+        if keys.get("hit"):
+            target = None
+            if self._last_look_entity_id is not None:
+                target = next((e for e in self.entities if e.get("id") == self._last_look_entity_id), None)
+            elif self._last_look_pos is not None:
+                hostiles = [e for e in self.entities if e.get("type") == "hostile"]
+                if hostiles:
+                    target = min(hostiles, key=lambda e: math.dist(e["pos"], self._last_look_pos))
+            if target is not None:
+                eid = target["id"]
+                if self.on_attack is not None:
+                    self.on_attack(self, entity_id=eid, max_hits=1)
+                else:
+                    self.entities = [e for e in self.entities if e.get("id") != eid]
+                return {"ok": True, "hits": [{"t_ms": 0, "entity": {"id": eid, "name": target.get("name")}}]}
         return {"ok": True, **keys}
 
     def window_act(self, target, ops, *, stop_on=None) -> dict:

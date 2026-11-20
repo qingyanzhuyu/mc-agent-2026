@@ -303,6 +303,22 @@ def _douse_or_escape_lava(ex: "Executor", state: "State") -> Generator[dict, Non
     return not st.get("on_fire") and not st.get("in_lava")
 
 
+def _has_shield(state: "State", st: dict) -> bool:
+    if bare((st.get("offhand") or {}).get("name")) == "shield":
+        return True
+    return hasattr(state, "count") and state.count("shield") >= 1
+
+
+def _set_shield(ex: "Executor", state: "State", active: bool) -> bool:
+    if not active and state.st.get("alive") is False:
+        return False
+    try:
+        res = ex.posture(shield=active)
+        return bool(res.get("blocking", active)) if isinstance(res, dict) else active
+    except (ApiError, Replan, AttributeError):
+        return False
+
+
 def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]:
     st = _refresh_status(ex, state)
     pos = st.get("pos")
@@ -313,6 +329,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     cache = voxel_cache_for(state)
 
     hostile = st.get("nearest_hostile") or {}
+    h_name = bare(hostile.get("name")).strip().lower() if isinstance(hostile, dict) else ""
+    h_dist_raw = hostile.get("dist") if isinstance(hostile, dict) else None
+    h_dist = float(h_dist_raw) if isinstance(h_dist_raw, (int, float)) and not isinstance(h_dist_raw, bool) else 99.0
+    is_creeper = h_name == "creeper"
     h_pos = hostile.get("pos") if isinstance(hostile, dict) else None
     ux, uz = 1.0, 0.0
     if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
@@ -327,7 +347,41 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 break
 
     away_yaw = math.atan2(-ux, -uz)
-    moved = yield from _move_to_bounded(ex, [round(px + ux * 8.0, 2), py, round(pz + uz * 8.0, 2)], rng=2, timeout=12.0)
+    to_mob_yaw = math.atan2(ux, uz)
+
+    # 苦力怕贴脸（<=3.5 格）且持盾时：先举盾朝向苦力怕后退挡爆，再收盾拉开至安全距离（>=7 格）
+    if is_creeper and h_dist <= 3.5:
+        if state.inventory_dirty:
+            state.refresh_inventory(ex.client)
+        if _has_shield(state, st):
+            shield_up = _set_shield(ex, state, True)
+            try:
+                if hasattr(ex, "look"):
+                    try:
+                        if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
+                            ex.look(pos=[float(h_pos[0]), float(h_pos[1]) + 0.9, float(h_pos[2])])
+                        else:
+                            ex.look(yaw=to_mob_yaw, pitch=0.0)
+                    except (ApiError, Replan, AttributeError):
+                        pass
+                yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=500)
+            finally:
+                if shield_up:
+                    _set_shield(ex, state, False)
+            st_mid = _refresh_status(ex, state)
+            mid_hostile = st_mid.get("nearest_hostile") or {}
+            if not mid_hostile or (
+                isinstance(mid_hostile.get("dist"), (int, float)) and float(mid_hostile["dist"]) >= 7.0
+            ):
+                return True
+            mid_pos = st_mid.get("pos")
+            if mid_pos and len(mid_pos) >= 3:
+                px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+
+    flee_stride = 10.0 if is_creeper else 8.0
+    moved = yield from _move_to_bounded(
+        ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=12.0,
+    )
     if not moved:
         yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=800)
 
@@ -336,7 +390,8 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     if not after_hostile:
         return True
     flee_dist = float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)
-    if (h_dist := after_hostile.get("dist")) is not None and float(h_dist) >= flee_dist:
+    safe_dist = max(flee_dist, 7.0) if is_creeper else flee_dist
+    if (after_dist := after_hostile.get("dist")) is not None and float(after_dist) >= safe_dist:
         return True
     after_pos = st_after.get("pos")
     if after_pos and len(after_pos) >= 3 and math.dist(after_pos[:3], [px, py, pz]) >= 1.5:

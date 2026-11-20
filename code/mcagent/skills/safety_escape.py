@@ -66,19 +66,48 @@ def _fallback_escape_step(ex: Any, state: Any, intent: str) -> Generator[dict, N
         if pos is not None and hasattr(ex, "move_to"):
             px, py, pz = pos
             hostile = st.get("nearest_hostile")
+            h_name = (
+                str(hostile.get("name", "")).removeprefix("minecraft:").strip().lower()
+                if isinstance(hostile, Mapping)
+                else ""
+            )
+            h_dist = hostile.get("dist") if isinstance(hostile, Mapping) else None
+            is_creeper = h_name == "creeper"
+            stride = 10.0 if is_creeper else 8.0
             hpos = _valid_pos(hostile.get("pos")) if isinstance(hostile, Mapping) else None
             if hpos is not None:
                 dx = px - hpos[0]
                 dz = pz - hpos[2]
                 dist = math.hypot(dx, dz)
                 if dist > 1e-6:
-                    tx = px + (dx / dist) * 8.0
-                    tz = pz + (dz / dist) * 8.0
+                    tx = px + (dx / dist) * stride
+                    tz = pz + (dz / dist) * stride
                 else:
-                    tx, tz = px + 8.0, pz
+                    tx, tz = px + stride, pz
             else:
-                tx, tz = px + 8.0, pz
-            yield rec("move_to", ex.move_to(pos=[tx, py, tz], rng=2), intent="flee")
+                tx, tz = px + stride, pz
+            shield_up = False
+            if (
+                is_creeper
+                and _is_number(h_dist)
+                and float(h_dist) <= 3.5
+                and hasattr(state, "count")
+                and state.count("shield") >= 1
+                and hasattr(ex, "posture")
+            ):
+                try:
+                    ex.posture(shield=True)
+                    shield_up = True
+                except Exception:
+                    shield_up = False
+            try:
+                yield rec("move_to", ex.move_to(pos=[tx, py, tz], rng=2), intent="flee")
+            finally:
+                if shield_up and _state_dict(state).get("alive") is not False:
+                    try:
+                        ex.posture(shield=False)
+                    except Exception:
+                        pass
             return True
         yield rec("escape_noop", {"intent": "flee", "fallback": True})
         return False
@@ -162,8 +191,10 @@ class EmergencyEscape(Skill):
             hostile = st.get("nearest_hostile")
             if not isinstance(hostile, Mapping) or not hostile:
                 return ""
+            h_name = str(hostile.get("name", "")).removeprefix("minecraft:").strip().lower()
+            safe_dist = 7.0 if h_name == "creeper" else 6.0
             dist = hostile.get("dist")
-            if _is_number(dist) and dist >= 6.0:
+            if _is_number(dist) and dist >= safe_dist:
                 return ""
             cur_pos = _valid_pos(st.get("pos"))
             if self._start_pos is not None and cur_pos is not None:

@@ -19,8 +19,18 @@ DEFLECT = "minecraft:story/deflect_arrow"
 SHOOT_ARROW = "minecraft:adventure/shoot_arrow"
 OL_BETSY = "minecraft:adventure/ol_betsy"
 SKELETONS = frozenset(("skeleton", "parched"))
+_NON_MELEE_HOSTILES = frozenset(("ghast", "phantom", "blaze", "ender_dragon", "guardian", "elder_guardian"))
 _CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _SCAN_RADIUS = 20
+
+
+class CrowdAmbush(Replan):
+    """交战中探测到 2 只以上近战敌对生物贴脸，触发垫高柱/倒水防围殴。"""
+
+    def __init__(self, message: str, *, crowd: list[dict], origin: dict):
+        super().__init__(message)
+        self.crowd = crowd
+        self.origin = origin
 
 
 @dataclass(frozen=True)
@@ -85,9 +95,44 @@ def _aim(entity):
     return (x, y + 0.5, z)
 
 
+def _live_hostile(entity) -> bool:
+    health = entity.get("health")
+    return entity.get("type") == "hostile" and type(health) in (int, float) and health > 0
+
+
 def _hostiles_near(entities, target_id, origin):
     return any(entity["id"] != target_id and entity.get("type") == "hostile"
                and math.dist(_position(entity["pos"]), origin) <= 6 for entity in entities)
+
+
+def _hostiles_near_target(entities, target, radius: float = 6.0) -> int:
+    tpos = _position(target["pos"])
+    tid = target["id"]
+    return sum(
+        1 for entity in entities
+        if entity["id"] != tid and _live_hostile(entity) and math.dist(_position(entity["pos"]), tpos) <= radius
+    )
+
+
+def _hostile_pack_size(entities, center, radius: float = 8.0) -> int:
+    return sum(
+        1 for entity in entities
+        if _live_hostile(entity) and math.dist(_position(entity["pos"]), center) <= radius
+    )
+
+
+def crowd_melee_hostiles(entities, origin_pos, *, radius: float = 5.0) -> list[dict]:
+    """返回玩家附近贴脸（<=radius 格、同层）的近战敌对生物列表，按距离升序。"""
+    origin = _position(origin_pos)
+    close = [
+        entity for entity in entities
+        if _live_hostile(entity)
+        and bare(entity.get("name")) not in _NON_MELEE_HOSTILES
+        and math.dist(_position(entity["pos"]), origin) <= radius
+        and abs(_position(entity["pos"])[1] - origin[1]) <= 2.5
+    ]
+    close.sort(key=lambda entity: math.dist(_position(entity["pos"]), origin))
+    return close
 
 
 def _other_in_shot(entities, target_id, origin, aim, splash_radius):
@@ -140,10 +185,14 @@ def _no_entity(description, missing, wake_on="chunk_moved"):
 
 
 def select_encounter(ex, state, predicate, *, description, missing, max_distance, aimed=False,
-                     night_source=False, backstops=(), min_distance=2, splash_radius=0):
+                     night_source=False, backstops=(), min_distance=2, splash_radius=0,
+                     rank_key=None, target_isolation_radius=0.0, max_pack_size=0):
     origin, entities = _observe(ex, state)
     candidates = [entity for entity in entities if predicate(entity)]
-    candidates.sort(key=lambda entity: math.dist(_position(entity["pos"]), origin["pos"]))
+    if rank_key is not None:
+        candidates.sort(key=lambda entity: rank_key(entity, origin["pos"]))
+    else:
+        candidates.sort(key=lambda entity: math.dist(_position(entity["pos"]), origin["pos"]))
     scenes = [(entity, _aim(entity)) for entity in candidates[:6]]
     scenes.extend((None, pos) for pos in backstops)
     for target, aim in scenes:
@@ -154,6 +203,11 @@ def select_encounter(ex, state, predicate, *, description, missing, max_distance
         target_id = target["id"] if target else None
         if _hostiles_near(entities, target_id, origin["pos"]):
             continue
+        if target is not None:
+            if target_isolation_radius > 0 and _hostiles_near_target(entities, target, target_isolation_radius) > 0:
+                continue
+            if max_pack_size > 0 and _hostile_pack_size(entities, _position(target["pos"])) >= max_pack_size:
+                continue
         retreat = _retreat(ex, origin, aim)
         if retreat is None:
             continue
@@ -179,9 +233,13 @@ def refresh_encounter(ex, state, scene, *, aimed=False):
             raise Replan("交战目标已离开视野或死亡，停止动作")
     aim = _aim(target) if target is not None else scene.aim
     target_id = target["id"] if target else None
+    if _hostiles_near(entities, target_id, origin["pos"]):
+        crowd = crowd_melee_hostiles(entities, origin["pos"], radius=5.0)
+        if len(crowd) >= 2:
+            raise CrowdAmbush("交战期间被 2 只以上近战怪贴脸", crowd=crowd, origin=origin)
+        raise Replan("交战距离、旁侧敌对或掩体退路已变化")
     if not scene.min_distance <= math.dist(origin["pos"], aim) <= scene.max_distance or (
-        _hostiles_near(entities, target_id, origin["pos"])
-        or not _retreat_clear(ex, origin["pos"], scene.retreat)
+        not _retreat_clear(ex, origin["pos"], scene.retreat)
         or not _cover(ex, {"pos": scene.retreat, "sneaking": origin.get("sneaking")}, aim)
         or (target is None and not _backstop_present(ex, origin, aim))
     ):

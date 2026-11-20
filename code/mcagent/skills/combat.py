@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,11 +13,12 @@ from .combat_materials import (
     ROCKET, MaterialPlan, blocked_loadout, carried_sword, prepare_loadout, ranged_plan, shield_plan,
 )
 from .combat_scene import (
-    DEFLECT, KILL_MOB, OL_BETSY, SHOOT_ARROW, SKELETONS, check_after_action, completed, confirm_progress,
-    gate_reason, interrupted, prepared_scene, refresh_encounter, select_encounter, stop_activity,
+    DEFLECT, KILL_MOB, OL_BETSY, SHOOT_ARROW, SKELETONS, CrowdAmbush, check_after_action, completed,
+    confirm_progress, gate_reason, interrupted, prepared_scene, refresh_encounter, select_encounter,
+    stop_activity,
 )
-from .encounter import combat_melee, shoot_projectile
-from .field import _cell, collect_drops, equip_item, scan_blocks
+from .encounter import combat_melee, dump_water_crowd_control, pillar_up, shoot_projectile
+from .field import _cell, _position, collect_drops, equip_item, scan_blocks
 from .items import bare
 from .observations import refresh_inventory as _fresh_inventory
 from .registry import register
@@ -24,6 +26,8 @@ from .registry import register
 _CRITERIA = Path(__file__).resolve().parents[3] / "docs" / "99-原始记录" / "criteria-1.21.11.json"
 _DROPS = ("string", "bone", "arrow", "tipped_arrow", "spectral_arrow")
 _BACKSTOPS = ("stone", "cobblestone", "deepslate", "stone_bricks", "obsidian")
+_PREFERRED_HUNT_MOBS = frozenset(("spider", "zombie"))
+_SECONDARY_MELEE_MOBS = frozenset(("husk", "drowned", "slime", "silverfish", "endermite", "zombified_piglin"))
 
 
 @lru_cache(maxsize=1)
@@ -53,6 +57,65 @@ def _hostile(entity):
 
 def _shield_source(entity):
     return _hostile(entity) and bare(entity.get("name")) in SKELETONS
+
+
+def _hunt_rank(entity, origin_pos):
+    """主动打怪优先级：落单蜘蛛/僵尸 > 其余低威胁近战 > 其他敌怪，同类按距离升序。"""
+    name = bare(entity.get("name"))
+    tier = 0 if name in _PREFERRED_HUNT_MOBS else (1 if name in _SECONDARY_MELEE_MOBS else 2)
+    return (tier, math.dist(_position(entity["pos"]), origin_pos))
+
+
+def _ready_ranged_plan(state):
+    plan = ranged_plan(state, crossbow_only=False)
+    if plan is None or plan.crafts or blocked_loadout(state, plan):
+        return None
+    return plan
+
+
+def _defend_crowd_and_engage(ex, state, scene, crowd):
+    """交战中被 2 只以上近战怪贴脸：优先垫 3 格高柱或倒水，再转 /control(hit) 或 /shoot。"""
+    target = next((e for e in crowd if scene.target and e["id"] == scene.target["id"]), crowd[0])
+    elevated = yield from pillar_up(ex, state, height=3)
+    if elevated:
+        yield rec("combat_crowd_defense", {"method": "pillar_up", "crowd": len(crowd)})
+        st = state.refresh_status(ex.client, max_age_s=0)
+        ppos, tpos = _position(st.get("pos")), _position(target["pos"])
+        horiz = math.hypot(ppos[0] - tpos[0], ppos[2] - tpos[2])
+        rplan = _ready_ranged_plan(state)
+        if rplan is not None and horiz > 3.5:
+            try:
+                return (yield from shoot_projectile(
+                    ex, state, entity=target, weapon=rplan.weapon,
+                    retreat_pos=None, max_distance=16, elevated_ok=True,
+                ))
+            finally:
+                stop_activity(ex, state, items=("bow", "crossbow"))
+        return (yield from combat_melee(
+            ex, state, target, retreat_pos=None, timeout_ms=3000, radius=6, tactic="bunker_hit",
+        ))
+
+    if state.count("water_bucket") >= 1:
+        dumped = yield from dump_water_crowd_control(ex, state)
+        if dumped:
+            yield rec("combat_crowd_defense", {"method": "water_bucket", "crowd": len(crowd)})
+            rplan = _ready_ranged_plan(state)
+            if rplan is not None:
+                try:
+                    return (yield from shoot_projectile(
+                        ex, state, entity=target, weapon=rplan.weapon,
+                        retreat_pos=scene.retreat, max_distance=16, elevated_ok=True,
+                    ))
+                finally:
+                    stop_activity(ex, state, items=("bow", "crossbow"))
+            try:
+                return (yield from combat_melee(
+                    ex, state, target, retreat_pos=scene.retreat, timeout_ms=3000, radius=6, tactic="kite",
+                ))
+            finally:
+                stop_activity(ex, state, busy="attack")
+
+    raise Replan("交战时被 2 只以上近战怪贴脸且无法垫起 3 格高柱或倒水，立即撤离")
 
 
 @register
@@ -99,27 +162,46 @@ class HuntMob(Skill):
         def eligible(entity):
             return _hostile(entity) and bare(entity.get("name")) in candidates
 
-        scene = select_encounter(ex, state, eligible, description="有掩体退路的目标敌对生物",
-                                 missing=f"safe_hostile:{requested}", max_distance=6,
-                                 night_source=requested != "parched")
+        scene = select_encounter(
+            ex, state, eligible, description="有掩体退路的落单目标敌对生物",
+            missing=f"safe_hostile:{requested}", max_distance=10,
+            night_source=requested != "parched",
+            rank_key=_hunt_rank, target_isolation_radius=6.0, max_pack_size=3,
+        )
         try:
             yield from equip_item(ex, state, sword)
-            scene = refresh_encounter(ex, state, scene)
+            offhand_name = bare(((state.inventory or {}).get("offhand") or {}).get("name"))
+            if state.count("shield") >= 1 and offhand_name not in ("shield", "totem_of_undying"):
+                yield from equip_item(ex, state, "shield", slot="off-hand")
             before = {name: state.count(name) for name in _DROPS}
+            crowd_defended = False
             try:
-                evidence = yield from combat_melee(ex, state, scene.target, retreat_pos=scene.retreat,
-                                                   timeout_ms=3000, radius=6)
-            finally:
-                stop_activity(ex, state, busy="attack")
-            check_after_action(ex, state, scene, stay=False)
-            yield rec("combat_kill_receipt", None, killed=evidence["receipt"].get("killed"),
-                      entity=bare(scene.target["name"]))
+                scene = refresh_encounter(ex, state, scene)
+            except CrowdAmbush as ambush:
+                crowd_defended = True
+                evidence = yield from _defend_crowd_and_engage(ex, state, scene, ambush.crowd)
+            if not crowd_defended:
+                try:
+                    evidence = yield from combat_melee(
+                        ex, state, scene.target, retreat_pos=scene.retreat,
+                        timeout_ms=3000, radius=10, tactic="auto",
+                    )
+                finally:
+                    stop_activity(ex, state, busy="attack")
+                check_after_action(ex, state, scene, stay=False)
+            else:
+                after_st = state.refresh_status(ex.client, max_age_s=0)
+                if after_st.get("alive") is not True or after_st.get("dimension") != scene.origin["dimension"]:
+                    raise Replan("1vN 防守交战后角色未存活或已切换维度")
+            receipt = evidence.get("receipt") or {}
+            yield rec("combat_kill_receipt", None, killed=receipt.get("killed", receipt.get("fired")),
+                      entity=bare(scene.target["name"]), tactic=evidence.get("tactic"))
             gained = {name: state.count(name) - count for name, count in before.items()
                       if state.count(name) > count}
             yield rec("combat_drops", gained, source="attack_inventory_delta")
             if drop == "none":
-                yield from confirm_progress(ex, (KILL_MOB,), KILL_MOB, initial=initial,
-                                            check=lambda: check_after_action(ex, state, scene, stay=False))
+                progress_check = None if crowd_defended else (lambda: check_after_action(ex, state, scene, stay=False))
+                yield from confirm_progress(ex, (KILL_MOB,), KILL_MOB, initial=initial, check=progress_check)
             elif state.count(drop) < quantity:
                 gained = yield from collect_drops(ex, state, drop, count=quantity - state.count(drop),
                                                   radius=4, max_targets=1)

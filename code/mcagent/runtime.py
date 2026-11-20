@@ -74,6 +74,9 @@ class RuntimeConfig:
     oxygen_warn: float = 6.0
     hostile_risk_dist: float = 16.0
     hostile_flee_dist: float = 6.0
+    creeper_urgent_dist: float = 5.0
+    food_warn: float = 6.0
+    food_crit: float = 2.0
     night_start: float = 13000.0
     night_end: float = 23000.0
     support_ttl_s: float = 5.0
@@ -96,6 +99,8 @@ class RuntimeConfig:
             raise ValueError("MC_OXYGEN_WARN 必须使用 1.21 的 20 格氧气刻度")
         if values["poll_risk_s"] > values["poll_safe_s"] or values["hp_crit"] > values["hp_risk"]:
             raise ValueError("风险轮询不能比安全轮询慢，危急血量不能高于预警血量")
+        if values["food_crit"] > values["food_warn"]:
+            raise ValueError("危急饱食度不能高于预警饱食度")
         if values["safe_cooldown_s"] < 65:
             raise ValueError("死亡循环冷却不能低于 65 秒")
         return cls(**values)
@@ -820,6 +825,20 @@ def controlled_totem_trigger(
 
 
 # ---------------------------------------------------------------- 安全闸
+_EDIBLE_FOODS: frozenset[str] = frozenset({
+    "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod",
+    "cooked_salmon", "cooked_rabbit", "bread", "baked_potato", "golden_carrot",
+    "golden_apple", "enchanted_golden_apple", "pumpkin_pie", "apple", "carrot",
+    "melon_slice", "sweet_berries", "glow_berries", "beef", "porkchop", "mutton",
+    "chicken", "rabbit", "potato", "beetroot", "dried_kelp", "cookie",
+    "mushroom_stew", "beetroot_soup", "rabbit_stew",
+})
+
+
+def _has_edible_food(s: State) -> bool:
+    return any(s.count(food) >= 1 for food in _EDIBLE_FOODS)
+
+
 class Safety:
     """纯判断：urgent 抢占，soft 留给执行层在动作边界切换技能。"""
 
@@ -837,7 +856,7 @@ class Safety:
         def add(kind: str, why: str, severity: str = "urgent", **extra: Any) -> None:
             out.append({"kind": kind, "why": why, "severity": severity, **extra})
 
-        # 致命物理险情（岩浆/缺氧/失重坠落）必须排在 safe_mode 之前，避免 65s 避险锁存遮蔽当前逃生意图
+        # 致命物理险情（岩浆/缺氧/失重坠落/近身苦力怕）必须排在 safe_mode 之前，避免 65s 避险锁存遮蔽当前逃生意图
         if st.get("in_lava"):
             add("escape_lava", "在岩浆里")
         oxygen = st.get("oxygen")
@@ -850,6 +869,23 @@ class Safety:
             and support.get("status_pos") == st.get("pos")
         ):
             add("void_risk", support["risk"])
+        hostile = st.get("nearest_hostile") or {}
+        hostile_name = (
+            str(hostile.get("name", "")).removeprefix("minecraft:").strip().lower()
+            if isinstance(hostile, dict)
+            else ""
+        )
+        hostile_dist = float(hostile.get("dist", 99)) if isinstance(hostile, dict) and hostile else 99.0
+        creeper_urgent = hostile_name == "creeper" and hostile_dist < self.config.creeper_urgent_dist
+        if creeper_urgent:
+            add(
+                "flee",
+                f"近身苦力怕 距离 {hostile.get('dist')}",
+                "urgent",
+                hostile="creeper",
+                dist=hostile.get("dist"),
+                creeper=True,
+            )
         if s.in_safe_mode:
             add(
                 "safe_mode",
@@ -859,8 +895,14 @@ class Safety:
         hp = float(st.get("health", 20))
         if hp <= self.config.hp_crit:
             add("heal", f"血量 {hp}", "soft")
-        hostile = st.get("nearest_hostile") or {}
-        if hostile and float(hostile.get("dist", 99)) < self.config.hostile_flee_dist:
+        raw_food = st.get("food")
+        if isinstance(raw_food, (int, float)) and not isinstance(raw_food, bool):
+            food = float(raw_food)
+            if food <= self.config.food_warn:
+                can_eat = _has_edible_food(s)
+                sev = "urgent" if (food <= self.config.food_crit and can_eat) else "soft"
+                add("eat", f"低饱食度 {food:g}", sev, food=food, has_food=can_eat)
+        if not creeper_urgent and hostile and hostile_dist < self.config.hostile_flee_dist:
             add(
                 "flee",
                 f"{hostile.get('name')} 距离 {hostile.get('dist')}",
@@ -1341,11 +1383,18 @@ class SafetyMonitor:
         rc = self.state.get_risk_context()
         hostile = st.get("nearest_hostile") or {}
         tod = float(st.get("time_of_day", 0)) % 24000
+        raw_food = st.get("food")
+        low_food = (
+            isinstance(raw_food, (int, float))
+            and not isinstance(raw_food, bool)
+            and float(raw_food) <= cfg.food_warn
+        )
         return bool(
             not st
             or cfg.night_start <= tod <= cfg.night_end
             or "nether" in st.get("dimension", "")
             or float(st.get("health", 20)) < cfg.hp_risk
+            or low_food
             or float(hostile.get("dist", 999)) <= cfg.hostile_risk_dist
             or st.get("in_water")
             or st.get("submerged")
@@ -1496,6 +1545,12 @@ class SafetyMonitor:
         hazards = self.safety.hazards(self.state)
         for hazard in hazards:
             if hazard["kind"] == "heal" and self.executor.active_action in ("attack", "shoot"):
+                hazard["severity"] = "urgent"
+            elif (
+                hazard["kind"] == "eat"
+                and hazard.get("has_food")
+                and self.executor.active_action in ("attack", "shoot")
+            ):
                 hazard["severity"] = "urgent"
         self.state.set_safety_intent(hazards[0] if hazards else None)
         urgent = [h for h in hazards if h["severity"] == "urgent"]

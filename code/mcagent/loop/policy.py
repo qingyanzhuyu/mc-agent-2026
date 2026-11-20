@@ -103,6 +103,16 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
     # 直接物理险情兜底（即使后台 monitor 未启动或尚未刷出 safety_intent）
     if st.get("in_lava"):
         return "escape_lava", "in_lava"
+    hostile = st.get("nearest_hostile") or {}
+    if isinstance(hostile, Mapping) and hostile:
+        hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
+        creeper_dist = float(getattr(state.config, "creeper_urgent_dist", 5.0))
+        try:
+            hdist = float(hostile.get("dist", 99.0))
+        except (TypeError, ValueError):
+            hdist = 99.0
+        if hname == "creeper" and math.isfinite(hdist) and hdist < creeper_dist:
+            return "flee", f"近身苦力怕 距离 {hdist:g}"
     if st.get("on_fire") and not st.get("in_water"):
         return "douse", "on_fire"
     oxygen = st.get("oxygen")
@@ -114,6 +124,45 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
         if math.isfinite(ox) and ox <= 10.0:
             return "surface", f"in_water oxygen={ox:g}"
     return None
+
+
+def _is_urgent_escape_hazard(state: State) -> bool:
+    """判断当前是否存在应优先于进食与 safe_mode 的致命/近身苦力怕抢占险情。"""
+    st = state.snapshot()
+    if st.get("in_lava"):
+        return True
+    oxygen = st.get("oxygen")
+    if st.get("submerged") and oxygen is not None:
+        try:
+            ox = float(oxygen)
+        except (TypeError, ValueError):
+            ox = float(OXYGEN_FULL)
+        if math.isfinite(ox) and ox < float(getattr(state.config, "oxygen_warn", 6.0)):
+            return True
+    hostile = st.get("nearest_hostile") or {}
+    if isinstance(hostile, Mapping) and hostile:
+        hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
+        creeper_dist = float(getattr(state.config, "creeper_urgent_dist", 5.0))
+        try:
+            hdist = float(hostile.get("dist", 99.0))
+        except (TypeError, ValueError):
+            hdist = 99.0
+        if hname == "creeper" and math.isfinite(hdist) and hdist < creeper_dist:
+            return True
+    raw = getattr(state, "safety_intent", None)
+    if isinstance(raw, Mapping):
+        now = time.monotonic()
+        expires_at = raw.get("expires_at")
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and now >= float(expires_at):
+            return False
+        at_ts = raw.get("at")
+        if isinstance(at_ts, (int, float)) and not isinstance(at_ts, bool) and now - float(at_ts) > _SAFETY_INTENT_DEFAULT_TTL_S:
+            return False
+        kind = str(raw.get("kind") or raw.get("intent") or "").strip().lower()
+        sev = str(raw.get("severity") or "").strip().lower()
+        if sev == "urgent" and kind in _ESCAPE_INTENT_KINDS:
+            return True
+    return False
 
 
 def _material_plan(skill: Skill, state: State):
@@ -529,7 +578,13 @@ class RulePlanner:
         return None, "；".join(reasons[:3]) or f"目标 {ranked[0].step_goal.id} 无可启动技能"
 
     def choose_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
-        """在一切目标之上的生存补给、`safe_mode` 避险与 `SafetyMonitor` 脱险意图处理（命中即返回，否则返回 None）。"""
+        """在一切目标之上的致命抢占脱险、生存补给、`safe_mode` 避险与软安全意图处理。"""
+        # 致命物理险情（岩浆/濒溺/近身苦力怕 <5 格）必须先于进食与 safe_mode 脱险
+        if _is_urgent_escape_hazard(state):
+            urgent_escape = self._choose_safety_escape(state)
+            if urgent_escape is not None:
+                return urgent_escape
+
         hp = float(state.st.get("health", 20))
         food = float(state.st.get("food", 20))
         raw_intent = getattr(state, "safety_intent", None)
@@ -539,7 +594,7 @@ class RulePlanner:
             else (raw_intent.strip().lower() if isinstance(raw_intent, str) else "")
         )
 
-        if food <= 14 or (hp < 18 and food < 20) or (intent_kind == "heal" and food < 20):
+        if food <= 14 or (hp < 18 and food < 20) or (intent_kind in ("heal", "eat") and food < 20):
             eat = self._try_make("eat_food", {}, state)
             if eat is not None:
                 return PlanDecision(eat, "rule", f"生存补给 hp={hp} food={food}")
