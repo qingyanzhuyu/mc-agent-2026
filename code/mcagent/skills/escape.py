@@ -482,11 +482,19 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
 
 
 def escape_hazard_step(ex: "Executor", state: "State", intent: str) -> Generator[dict, None, bool]:
-    """按安全意图分派单轮应急脱困流程。"""
+    """按安全意图分派单轮应急脱困流程（遭遇敌怪时先评估双方战力与躲避可行性，决定反杀或规避）。"""
     if intent in ("surface", "escape_water"):
         return (yield from escape_water_to_shore(ex, state))
     if intent in ("douse", "escape_lava"):
         return (yield from _douse_or_escape_lava(ex, state))
     if intent == "flee":
+        st = _refresh_status(ex, state)
+        if isinstance(st.get("nearest_hostile"), dict) and st["nearest_hostile"]:
+            from .combat_eval import counterattack_hostile, decide_combat_or_flee
+
+            decision = decide_combat_or_flee(ex, state)
+            if decision.action == "fight":
+                if (yield from counterattack_hostile(ex, state, decision)):
+                    return True
         return (yield from _flee_hostile(ex, state))
     return False
