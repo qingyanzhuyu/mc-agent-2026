@@ -716,6 +716,180 @@ class TestHardModeSafetyAndEating(unittest.TestCase):
         })
         self.assertEqual(esc.verify_done(state), "")
 
+    def test_spawn_camp_and_safe_mode_live_hostile_triggers_flee_immediately(self):
+        reg = {"emergency_escape": EmergencyEscape, "eat_food": EatFood}
+        planner = RulePlanner(registry=reg, min_verified="offline")
+
+        # 1) Tick-0 刚出生 monitor 尚未刷出 safety_intent，僵尸已在 0.5 格贴脸 -> 必须立刻逃离
+        st_spawn = State(dataclasses.replace(RuntimeConfig(), status_ttl_s=0.0))
+        st_spawn.set_status({
+            "ready": True, "alive": True, "health": 20, "food": 20, "oxygen": 20,
+            "pos": [0.5, 64.0, 0.5], "on_ground": True, "dimension": "overworld",
+            "nearest_hostile": {"id": 1, "name": "zombie", "dist": 0.5, "pos": [1.0, 64.0, 0.5]},
+        })
+        st_spawn.set_inventory({"items": [{"name": "bread", "count": 2, "slot": 0}]})
+        dec_spawn = planner.choose(st_spawn)
+        self.assertEqual(dec_spawn.skill.name, "emergency_escape")
+        self.assertEqual(dec_spawn.skill.args["intent"], "flee")
+
+        # 2) safe_mode 期间若真有僵尸守尸 (<6 格) -> 绝不原地发呆吃第 3 死
+        st_spawn.safe_mode_until = time.monotonic() + 60.0
+        dec_safe_camp = planner.choose(st_spawn)
+        self.assertEqual(dec_safe_camp.skill.name, "emergency_escape")
+        self.assertEqual(dec_safe_camp.skill.args["intent"], "flee")
+
+        # 3) 贴脸僵尸 (<=2.5 格) + 低饱食度 -> 先逃离再吃东西
+        st_spawn.safe_mode_until = 0.0
+        st_spawn.st["food"] = 10
+        dec_point_blank = planner.choose(st_spawn)
+        self.assertEqual(dec_point_blank.skill.name, "emergency_escape")
+        self.assertEqual(dec_point_blank.skill.args["intent"], "flee")
+
+    def test_monitor_session_error_disables_async_cache_and_throttles_logs(self):
+        from mcagent.loop.engine import LoopConfig, MainLoop
+
+        class _DisconnClient(_FakeSafetyClient):
+            def status(self):
+                raise ApiError("not_connected", "Bot is not connected")
+
+        logs: list[str] = []
+        client = _DisconnClient()
+        state = State(dataclasses.replace(RuntimeConfig(), status_ttl_s=0.0))
+        state._status_booted = True
+        state._events_booted = True
+        ex = Executor(client, state, log=logs.append)
+        mon = SafetyMonitor(client, state, ex, continuous=True)
+
+        # 模拟连续 3 拍 not_connected：只记 1 条日志，且立刻置位 session_error
+        calls = 0
+
+        def stop_after_three(_wait):
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                mon._stop_ev.set()
+
+        with patch.object(mon._stop_ev, "wait", side_effect=stop_after_three) as wait_mock:
+            mon._loop()
+
+        self.assertEqual(mon.session_error, "not_connected")
+        self.assertEqual(len(logs), 1)
+        self.assertGreaterEqual(wait_mock.call_args_list[0].args[0], 3.0)
+        loop = MainLoop(client, state, ex, planner=RulePlanner(registry={}), config=LoopConfig())
+        self.assertFalse(loop._use_async_observation(mon))
+
+    def test_flee_uses_stop_on_death_repulsion_vector_and_point_blank_sprint_burst(self):
+        # 真实服务端 /status.nearest_hostile 无 pos，且僵尸在 +X (1.5, 64, 0.5) 贴脸 1.0 格
+        world = HardCombatWorld(
+            pos=(0.5, 64.0, 0.5),
+            entities=[_mob("zombie", identifier=99, pos=(1.5, 64.0, 0.5))],
+        )
+        world.st["nearest_hostile"] = {"id": 99, "name": "zombie", "dist": 1.0}
+
+        def burst_away(w, **req):
+            self.assertEqual(req.get("stop_on"), ("death",))
+            self.assertTrue(req.get("forward"))
+            self.assertTrue(req.get("sprint"))
+            self.assertTrue(req.get("jump"))
+            # 敌人在 +X，逃离方向应为 -X (yaw = +pi/2)
+            self.assertAlmostEqual(req["yaw"], math.pi / 2, places=3)
+            w.st["pos"] = [-5.5, 64.0, 0.5]
+            w.st["nearest_hostile"] = {"id": 99, "name": "zombie", "dist": 7.0}
+            return {"moved": 6.0}
+
+        def move_farther(w, **req):
+            self.assertEqual(req.get("stop_on"), ("death",))
+            self.assertLess(req["pos"][0], -10.0)
+            w.st["pos"] = [-16.0, 64.0, 0.5]
+            w.st["nearest_hostile"] = None
+            return {"pos": list(w.st["pos"])}
+
+        world.queue("control", burst_away)
+        world.queue("move_to", move_farther)
+        ex, state = world.session()
+
+        ok, _ = _drive_ret(escape_hazard_step(ex, state, "flee"), ex)
+        self.assertTrue(ok)
+        self.assertEqual(ex.acts, ["control", "move_to"])
+        world.assert_exhausted()
+
+    def test_mine_step_collect_only_ores_and_accepts_natural_landing(self):
+        from mcagent.skills.mining import mine_step
+
+        # 复现 INC-003：挖完最后一块石头时角色若已落入目标台阶格 (1, 63, 0)，应直接确认到达而非误报 Replan
+        blocks = {(1, 62, 0): "stone", (1, 63, 0): "iron_ore", (1, 64, 0): "stone", (1, 65, 0): "stone"}
+        world = HardCombatWorld({"stone_pickaxe": 1}, pos=(0.5, 64.0, 0.5), blocks=blocks, held="stone_pickaxe")
+        collect_flags: list[tuple[list[int], bool]] = []
+
+        def dig_cb(w, pos, collect=True, **_):
+            collect_flags.append((list(pos), bool(collect)))
+            w.blocks.pop(tuple(pos), None)
+            if list(pos) == [1, 63, 0]:
+                # 模拟 collect=True 捡铁矿后自然落到目标台阶格 (1, 63, 0)
+                w.st["pos"] = [1.5, 63.0, 0.5]
+                w.st["on_ground"] = True
+            return {"dug": "stone"}
+
+        world.queue("dig", dig_cb, dig_cb, dig_cb)
+        ex, state = world.session()
+
+        res, _ = _drive_ret(mine_step(ex, state, (1, 63, 0)), ex)
+        self.assertEqual(res, ([1.5, 63.0, 0.5], None))
+        # 非矿石块 collect=False，矿石块 collect=True
+        self.assertEqual(collect_flags, [([1, 65, 0], False), ([1, 64, 0], False), ([1, 63, 0], True)])
+        self.assertEqual(ex.acts, ["dig", "dig", "dig"])
+        world.assert_exhausted()
+
+    def test_safety_monitor_suppresses_self_preemption_for_active_flee_but_keeps_lava(self):
+        # 复现 INC-010：EmergencyEscape(flee) 运行期间遇近身苦力怕不得自我 /stop 抢占，但遇岩浆仍须立即抢占
+        client = _FakeSafetyClient()
+        state = State(dataclasses.replace(RuntimeConfig(), stop_cooldown_s=10))
+        ex = Executor(client, state, log=lambda *_: None)
+        mon = SafetyMonitor(client, state, ex)
+
+        state.set_active_escape("flee")
+        client.st["nearest_hostile"] = {"name": "creeper", "dist": 3.5}
+        state.status_at = float("-inf")
+        mon.tick()
+        self.assertEqual(client.stops, 0)  # 同类 flee 不自打断
+
+        client.st["in_lava"] = True
+        state.status_at = float("-inf")
+        mon.tick()
+        self.assertEqual(client.stops, 1)  # 跨类致命险情（岩浆）仍立即抢占
+        state.set_active_escape(None)
+
+    def test_flee_rotates_orthogonal_yaw_when_wall_blocks_primary_burst(self):
+        # 复现 INC-009：主方向贴脸疾跑撞墙 (moved < 1.5) 且 move_to path_not_found 后，旋转 ±90° 而非重撞同一堵墙
+        blocks = {(x, 63, z): "stone" for x in range(-4, 5) for z in range(-4, 5)}
+        world = HardCombatWorld(pos=(0.5, 64.0, 0.5), blocks=blocks, entities=[_mob("zombie", identifier=7, pos=(1.5, 64.0, 0.5))])
+        world.st["nearest_hostile"] = {"id": 7, "name": "zombie", "dist": 1.0}
+        seen_yaws: list[float] = []
+
+        def burst_hit_wall(w, **req):
+            seen_yaws.append(float(req["yaw"]))
+            # 只移动 0.4 格 -> 视为撞墙
+            w.st["pos"] = [0.1, 64.0, 0.5]
+            return {"moved": 0.4}
+
+        def retry_ortho(w, **req):
+            seen_yaws.append(float(req["yaw"]))
+            w.st["pos"] = [0.1, 64.0, -5.5]
+            w.st["nearest_hostile"] = None
+            return {"moved": 6.0}
+
+        world.queue("control", burst_hit_wall, retry_ortho)
+        world.queue("move_to", ApiError("path_not_found", "wall"))
+        ex, state = world.session()
+
+        ok, _ = _drive_ret(escape_hazard_step(ex, state, "flee"), ex)
+        self.assertTrue(ok)
+        self.assertEqual(len(seen_yaws), 2)
+        # 第二次逃生角度必须与第一次撞墙角度正交（差约 pi/2）
+        delta = abs(math.atan2(math.sin(seen_yaws[1] - seen_yaws[0]), math.cos(seen_yaws[1] - seen_yaws[0])))
+        self.assertAlmostEqual(delta, math.pi / 2, places=2)
+        world.assert_exhausted()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -102,7 +102,8 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
         if name not in solid:
             raise MineStepUnsafe("cut", "探矿阶梯目标方块变化，停止挖掘以保留支撑")
         try:
-            result = ex.dig(target, collect=name not in PEEL_SURFACE)
+            # 阶梯开凿非矿石填充块不启用 collect，防止服务端寻路捡圆石把角色提前拉进半挖坑位
+            result = ex.dig(target, collect=name.endswith("_ore"))
         except Replan as exc:
             code, _ = failure(exc)
             after_err = state.refresh_status(ex.client, max_age_s=0)
@@ -134,9 +135,12 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
         raise MineStepUnsafe("move", "探矿阶梯承重/净空变化，停止下行")
     current = state.refresh_status(ex.client, max_age_s=0)
     cur = current.get("pos") or state.pos
+    dest = [x + 0.5, float(y), z + 0.5]
+    if tuple(map(math.floor, cur)) == tuple(pos) and _same_world(start, current) and current.get("on_ground") is True:
+        # 挖完最后一块时若角色已安全落入目标台阶格，直接确认到达而非误报站位变化
+        return dest, None
     if tuple(map(math.floor, cur)) != (cx, cy, cz) or not _same_world(start, current):
         raise Replan("探矿阶梯站位变化，停止下行")
-    dest = [x + 0.5, float(y), z + 0.5]
     result = ex.move_to(pos=dest, rng=1)
     yield rec("move_to", result, pos=dest)
     current = state.refresh_status(ex.client, max_age_s=0)

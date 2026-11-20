@@ -101,7 +101,11 @@ def _fallback_escape_step(ex: Any, state: Any, intent: str) -> Generator[dict, N
                 except Exception:
                     shield_up = False
             try:
-                yield rec("move_to", ex.move_to(pos=[tx, py, tz], rng=2), intent="flee")
+                try:
+                    mv = ex.move_to(pos=[tx, py, tz], rng=2, stop_on=("death",))
+                except TypeError:
+                    mv = ex.move_to(pos=[tx, py, tz], rng=2)
+                yield rec("move_to", mv, intent="flee")
             finally:
                 if shield_up and _state_dict(state).get("alive") is not False:
                     try:
@@ -124,7 +128,7 @@ class EmergencyEscape(Skill):
         "intent": Param(str, "紧急安全意图", default="surface", choices=("surface", "flee", "douse")),
     }
     goal = "safety:{intent}"
-    cooldown_s = 5.0
+    cooldown_s = 1.0
     verified = "live"
 
     _start_pos: Optional[tuple[float, float, float]] = None
@@ -160,11 +164,18 @@ class EmergencyEscape(Skill):
     def run(self, ex, state):
         self._start_pos = _valid_pos(_state_dict(state).get("pos"))
         intent = self.args["intent"]
-        escape_step = _resolve_escape_hazard_step()
-        if escape_step is not None:
-            ok = yield from escape_step(ex, state, intent)
-            return ok
-        return (yield from _fallback_escape_step(ex, state, intent))
+        setter = getattr(state, "set_active_escape", None)
+        if callable(setter):
+            setter(intent)
+        try:
+            escape_step = _resolve_escape_hazard_step()
+            if escape_step is not None:
+                ok = yield from escape_step(ex, state, intent)
+                return ok
+            return (yield from _fallback_escape_step(ex, state, intent))
+        finally:
+            if callable(setter):
+                setter(None)
 
     def verify_done(self, state, before_counts=None) -> str:
         st = _state_dict(state)

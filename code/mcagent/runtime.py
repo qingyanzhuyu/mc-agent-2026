@@ -133,6 +133,7 @@ class State:
         self._inventory_generation = 0
         self._status_generation = 0
         self.safety_intent: Optional[dict] = None
+        self.active_escape_intent: Optional[str] = None
         self.risk_context = {"near_water": False, "near_void": False, "void_guard": False}
         self.support: dict = {}
         self.st: dict = {}
@@ -302,6 +303,14 @@ class State:
     @_locked
     def set_safety_intent(self, hazard: Optional[dict]) -> None:
         self.safety_intent = copy.deepcopy(hazard)
+
+    @_locked
+    def set_active_escape(self, intent: Optional[str]) -> None:
+        self.active_escape_intent = intent
+
+    @_locked
+    def get_active_escape(self) -> Optional[str]:
+        return self.active_escape_intent
 
     def drain(self, client: Client, limit: int = 200) -> list[dict]:
         """首次启动先追平历史积压（防数小时前旧 death 误计为实时死亡），运行期每拍读一页防挤占急停额度。"""
@@ -1353,6 +1362,19 @@ def _accepts_use_cache(fn: Any) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
+def _same_escape_kind(active_escape: Optional[str], hazard_kind: str) -> bool:
+    """避免后台 SafetyMonitor 重复 /stop 打断正在执行的同类紧急脱险（如 flee 被 flee 抢占）。"""
+    if not active_escape:
+        return False
+    a = active_escape.strip().lower()
+    h = hazard_kind.strip().lower()
+    if a == h:
+        return True
+    douse_group = {"douse", "escape_lava"}
+    surface_group = {"surface", "escape_water"}
+    return (a in douse_group and h in douse_group) or (a in surface_group and h in surface_group)
+
+
 class SafetyMonitor:
     """唯一定时 status/events 读取者；持续危险一次抢占，软危险只发布意图。"""
 
@@ -1374,6 +1396,9 @@ class SafetyMonitor:
         self._active: set[str] = set()
         self._triggered: dict[str, float] = {}
         self._last_y: Optional[float] = None
+        self.session_error: Optional[str] = None
+        self._last_err_msg: str = ""
+        self._err_repeat: int = 0
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -1553,7 +1578,11 @@ class SafetyMonitor:
             ):
                 hazard["severity"] = "urgent"
         self.state.set_safety_intent(hazards[0] if hazards else None)
-        urgent = [h for h in hazards if h["severity"] == "urgent"]
+        active_escape = self.state.get_active_escape()
+        urgent = [
+            h for h in hazards
+            if h["severity"] == "urgent" and not _same_escape_kind(active_escape, h["kind"])
+        ]
         keys = {h["kind"] for h in urgent}
         # 持续存在的危险不重新触发；解除后也要过冷静期，防止阈值抖动。
         if reconcile:
@@ -1583,6 +1612,7 @@ class SafetyMonitor:
     def _loop(self) -> None:
         while not self._stop_ev.is_set():
             started = time.monotonic()
+            session_backoff = 0.0
             try:
                 bg_obs = getattr(self.client, "background_observation", None)
                 ctx = bg_obs() if callable(bg_obs) else None
@@ -1590,8 +1620,23 @@ class SafetyMonitor:
                     ctx = contextlib.nullcontext()
                 with ctx:
                     self.tick()
+                self.session_error = None
+                self._last_err_msg = ""
+                self._err_repeat = 0
             except Exception as e:
-                self.executor.log(f"  [monitor] 轮询异常: {e}")
+                code = e.code if isinstance(e, ApiError) else ""
+                if code in ("not_connected", "death_loop_cooldown", "wrong_server"):
+                    self.session_error = code
+                    session_backoff = 3.0
+                msg = str(e)
+                if msg == self._last_err_msg:
+                    self._err_repeat += 1
+                    if self._err_repeat % 10 == 0:
+                        self.executor.log(f"  [monitor] 轮询异常（重复×{self._err_repeat}）: {msg}")
+                else:
+                    self._last_err_msg = msg
+                    self._err_repeat = 1
+                    self.executor.log(f"  [monitor] 轮询异常: {msg}")
             if self.continuous:
                 if self.interval_s is not None:
                     wait_s = max(0.0, float(self.interval_s) - (time.monotonic() - started))
@@ -1600,6 +1645,8 @@ class SafetyMonitor:
             else:
                 # 从轮询开始计时，慢 RTT 时不堆积补发。
                 wait_s = max(0.01, self.next_interval() - (time.monotonic() - started))
+            if session_backoff > 0.0:
+                wait_s = max(wait_s, session_backoff)
             self._stop_ev.wait(wait_s)
 
     def start(self) -> None:

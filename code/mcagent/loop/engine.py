@@ -416,6 +416,7 @@ class MainLoop:
             and self.config.async_observe_for_llm
             and self.state._status_booted
             and self.state._events_booted
+            and not getattr(monitor, "session_error", None)
         )
 
     # ---- 瞬时故障自愈 -------------------------------------------------

@@ -91,11 +91,15 @@ def _exec_step(
 
 
 def _move_to_bounded(ex: "Executor", target_pos: list[float], *, rng: float = 1, timeout: float = 15.0) -> Generator[dict, None, bool]:
+    # 脱困移动必须使用 stop_on=("death",)：逃离怪群/岩浆/火焰时挨一下或受灼烧绝不能中途停步
     try:
         try:
-            res = ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0)
+            res = ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0, stop_on=("death",))
         except TypeError:
-            res = ex.move_to(pos=target_pos, rng=rng)
+            try:
+                res = ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0)
+            except TypeError:
+                res = ex.move_to(pos=target_pos, rng=rng)
         yield rec("move_to", res, pos=target_pos)
         return True
     except Replan as err:
@@ -109,6 +113,7 @@ def _move_to_bounded(ex: "Executor", target_pos: list[float], *, rng: float = 1,
 
 
 def _control_step(ex: "Executor", **kwargs: Any) -> Generator[dict, None, tuple[bool, str]]:
+    kwargs.setdefault("stop_on", ("death",))
     try:
         res = ex.control(**kwargs)
         yield rec("control", res, **{k: v for k, v in kwargs.items() if k in ("yaw", "ms")})
@@ -319,6 +324,69 @@ def _set_shield(ex: "Executor", state: "State", active: bool) -> bool:
         return False
 
 
+def _resolve_flee_vector(
+    ex: "Executor", px: float, py: float, pz: float, hostile: dict, cache: Any, dim: str,
+) -> tuple[float, float, Optional[list[float]]]:
+    """计算远离所有近场敌对生物的单位逃离向量，避免仅靠 /status 缺 pos 时盲目撞向第二只怪。"""
+    h_pos = hostile.get("pos") if isinstance(hostile, dict) else None
+    if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
+        dx, dz = px - float(h_pos[0]), pz - float(h_pos[2])
+        if (norm := math.hypot(dx, dz)) >= 1e-6:
+            return dx / norm, dz / norm, [float(h_pos[0]), float(h_pos[1]), float(h_pos[2])]
+
+    # 真实服务端 /status.nearest_hostile 不含 pos 字段，补一次 0~1ms 只读 get_entities 合成斥力向量
+    get_ent = getattr(ex.client, "get_entities", None)
+    if callable(get_ent):
+        try:
+            res = get_ent(radius=12, types=["hostile"])
+            ents = res.get("entities") if isinstance(res, dict) else None
+        except (ApiError, AttributeError, TypeError):
+            ents = None
+        if isinstance(ents, list) and ents:
+            rx, rz = 0.0, 0.0
+            nearest_pos: Optional[list[float]] = None
+            nearest_d = float("inf")
+            for ent in ents:
+                if not isinstance(ent, dict):
+                    continue
+                ep = ent.get("pos")
+                if not isinstance(ep, (list, tuple)) or len(ep) < 3:
+                    continue
+                dx, dz = px - float(ep[0]), pz - float(ep[2])
+                d = math.hypot(dx, dz)
+                if d < nearest_d:
+                    nearest_d = d
+                    nearest_pos = [float(ep[0]), float(ep[1]), float(ep[2])]
+                w = 1.0 / max(0.5, d * d)
+                if d >= 1e-6:
+                    rx += (dx / d) * w
+                    rz += (dz / d) * w
+            if (norm := math.hypot(rx, rz)) >= 1e-6:
+                return rx / norm, rz / norm, nearest_pos
+
+    fx, fy, fz = block_cell([px, py, pz])
+    for dx, dz in _CARDINALS:
+        if _is_dry_standable(cache, ex.client, (fx + dx, fy, fz + dz), dim):
+            return float(dx), float(dz), None
+    return 1.0, 0.0, None
+
+
+def _pick_alternate_escape_yaw(
+    ex: "Executor", px: float, py: float, pz: float, ux: float, uz: float, cache: Any, dim: str,
+) -> float:
+    """主逃离方向撞墙/无路径时，优先挑左右正交（±90°）可通行干地方向，避免原地连撞同一堵墙。"""
+    fx, fy, fz = block_cell([px, py, pz])
+    ortho_dirs = [(-uz, ux), (uz, -ux)]
+    for ox, oz in ortho_dirs:
+        sx, sz = int(round(ox)), int(round(oz))
+        if (sx, sz) == (0, 0):
+            continue
+        for dy in (0, 1, -1):
+            if _is_dry_standable(cache, ex.client, (fx + sx, fy + dy, fz + sz), dim):
+                return math.atan2(-ox, -oz)
+    return math.atan2(uz, -ux)  # 右旋 90° 保底
+
+
 def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]:
     st = _refresh_status(ex, state)
     pos = st.get("pos")
@@ -333,21 +401,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     h_dist_raw = hostile.get("dist") if isinstance(hostile, dict) else None
     h_dist = float(h_dist_raw) if isinstance(h_dist_raw, (int, float)) and not isinstance(h_dist_raw, bool) else 99.0
     is_creeper = h_name == "creeper"
-    h_pos = hostile.get("pos") if isinstance(hostile, dict) else None
-    ux, uz = 1.0, 0.0
-    if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
-        dx, dz = px - float(h_pos[0]), pz - float(h_pos[2])
-        if (norm := math.hypot(dx, dz)) >= 1e-6:
-            ux, uz = dx / norm, dz / norm
-    else:
-        fx, fy, fz = block_cell(pos)
-        for dx, dz in _CARDINALS:
-            if _is_dry_standable(cache, ex.client, (fx + dx, fy, fz + dz), dim):
-                ux, uz = float(dx), float(dz)
-                break
+    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, hostile, cache, dim)
 
     away_yaw = math.atan2(-ux, -uz)
     to_mob_yaw = math.atan2(ux, uz)
+    burst_blocked = False
 
     # 苦力怕贴脸（<=3.5 格）且持盾时：先举盾朝向苦力怕后退挡爆，再收盾拉开至安全距离（>=7 格）
     if is_creeper and h_dist <= 3.5:
@@ -377,13 +435,35 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             mid_pos = st_mid.get("pos")
             if mid_pos and len(mid_pos) >= 3:
                 px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+    elif h_dist < 2.5:
+        # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用原生疾跑跳脱离近战命中圈再补 move_to
+        before_burst = (px, py, pz)
+        ok_burst, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=900)
+        if ok_burst:
+            st_mid = _refresh_status(ex, state)
+            mid_hostile = st_mid.get("nearest_hostile") or {}
+            safe_mid = 7.0 if is_creeper else float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)
+            if not mid_hostile or (
+                isinstance(mid_hostile.get("dist"), (int, float)) and float(mid_hostile["dist"]) >= safe_mid + 2.0
+            ):
+                return True
+            mid_pos = st_mid.get("pos")
+            if mid_pos and len(mid_pos) >= 3:
+                px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+                if math.dist(before_burst, (px, py, pz)) < 1.5:
+                    burst_blocked = True
 
-    flee_stride = 10.0 if is_creeper else 8.0
+    flee_stride = 16.0 if is_creeper else 14.0
     moved = yield from _move_to_bounded(
         ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=12.0,
     )
     if not moved:
-        yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=800)
+        retry_yaw = (
+            _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+            if burst_blocked
+            else away_yaw
+        )
+        yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=retry_yaw, ms=800)
 
     st_after = _refresh_status(ex, state)
     after_hostile = st_after.get("nearest_hostile") or {}

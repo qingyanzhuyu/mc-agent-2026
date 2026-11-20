@@ -107,12 +107,15 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
     if isinstance(hostile, Mapping) and hostile:
         hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
         creeper_dist = float(getattr(state.config, "creeper_urgent_dist", 5.0))
+        flee_dist = float(getattr(state.config, "hostile_flee_dist", 6.0))
         try:
             hdist = float(hostile.get("dist", 99.0))
         except (TypeError, ValueError):
             hdist = 99.0
         if hname == "creeper" and math.isfinite(hdist) and hdist < creeper_dist:
             return "flee", f"近身苦力怕 距离 {hdist:g}"
+        if math.isfinite(hdist) and hdist < flee_dist:
+            return "flee", f"{hname or 'hostile'} 距离 {hdist:g}"
     if st.get("on_fire") and not st.get("in_water"):
         return "douse", "on_fire"
     oxygen = st.get("oxygen")
@@ -127,7 +130,7 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
 
 
 def _is_urgent_escape_hazard(state: State) -> bool:
-    """判断当前是否存在应优先于进食与 safe_mode 的致命/近身苦力怕抢占险情。"""
+    """判断当前是否存在应优先于进食与 safe_mode 的致命/贴脸敌怪抢占险情。"""
     st = state.snapshot()
     if st.get("in_lava"):
         return True
@@ -143,11 +146,17 @@ def _is_urgent_escape_hazard(state: State) -> bool:
     if isinstance(hostile, Mapping) and hostile:
         hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
         creeper_dist = float(getattr(state.config, "creeper_urgent_dist", 5.0))
+        flee_dist = float(getattr(state.config, "hostile_flee_dist", 6.0))
         try:
             hdist = float(hostile.get("dist", 99.0))
         except (TypeError, ValueError):
             hdist = 99.0
         if hname == "creeper" and math.isfinite(hdist) and hdist < creeper_dist:
+            return True
+        # safe_mode 期间若真有敌怪守尸/贴近（<6 格），绝不可原地发呆吃第 3 死；常态下贴脸（<=2.5 格）亦先脱险再进食
+        if math.isfinite(hdist) and (
+            (state.in_safe_mode and hdist < flee_dist) or hdist <= 2.5
+        ):
             return True
     raw = getattr(state, "safety_intent", None)
     if isinstance(raw, Mapping):
