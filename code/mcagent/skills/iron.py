@@ -67,15 +67,17 @@ SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
 MAX_ORE_ROUTE_FAILURES = 3
 POLL_SECONDS = 2.0
-# 同连接、维度、区块和生存阶段共享不可达矿点记忆，及水矿洞区块黑名单。
+# 同连接、维度、区块和生存阶段共享不可达矿点记忆，及水矿洞/已耗尽矿井区块黑名单。
 _SESSION_EXCLUDED = WeakKeyDictionary()
 _FLOODED_CHUNKS = WeakKeyDictionary()
+_EXHAUSTED_SHAFTS = WeakKeyDictionary()
 _WATER_BLOCKS = frozenset({"water", "flowing_water", "bubble_column"})
 
 
 def reset_iron_memo() -> None:
     _SESSION_EXCLUDED.clear()
     _FLOODED_CHUNKS.clear()
+    _EXHAUSTED_SHAFTS.clear()
 
 
 def _flooded_chunks_for(client: object, dim: str) -> set[tuple[int, int]]:
@@ -83,6 +85,14 @@ def _flooded_chunks_for(client: object, dim: str) -> set[tuple[int, int]]:
     if by_dim is None:
         by_dim = {}
         _FLOODED_CHUNKS[client] = by_dim
+    return by_dim.setdefault(dim, set())
+
+
+def _exhausted_shafts_for(client: object, dim: str) -> set[tuple[int, int]]:
+    by_dim = _EXHAUSTED_SHAFTS.get(client)
+    if by_dim is None:
+        by_dim = {}
+        _EXHAUSTED_SHAFTS[client] = by_dim
     return by_dim.setdefault(dim, set())
 
 
@@ -486,11 +496,19 @@ class SmeltIron(Skill):
         start_y = start[1]
         start_chunk = (start[0] // 16, start[2] // 16)
         flooded_chunks = _flooded_chunks_for(ex.client, dim)
+        exhausted_shafts = _exhausted_shafts_for(ex.client, dim)
         if start_chunk in flooded_chunks:
             raise EnvBlocked(
                 f"当前区块 {start_chunk} 已探明存在水矿洞，直接绕开前往其他区域",
                 missing_predicate="dry_iron_shaft",
                 searched_volume=f"已跳过积水区块 {start_chunk}",
+                wake_on="chunk_moved",
+            )
+        if start_chunk in exhausted_shafts:
+            raise EnvBlocked(
+                f"当前区块 {start_chunk} 的探矿阶梯已耗尽，直接外迁换区探索",
+                missing_predicate="exposed_iron",
+                searched_volume=f"已跳过耗尽矿口区块 {start_chunk}",
                 wake_on="chunk_moved",
             )
         max_steps = min(MAX_PROSPECT_STEPS, max(PROSPECT_STEPS, start_y - SHALLOW_IRON_Y))
@@ -582,6 +600,9 @@ class SmeltIron(Skill):
                 searched_volume=f"起点 {start} 遇水矿洞，已标记积水区块 {start_chunk} 与 {(end[0] // 16, end[2] // 16)}",
                 wake_on="chunk_moved",
             )
+        if completed_steps > 0:
+            exhausted_shafts.add(start_chunk)
+            exhausted_shafts.add((end[0] // 16, end[2] // 16))
         scan_scope = f"仅查近场 {MINING_REACH} 格" if in_reach_only else "半径 32/64"
         raise EnvBlocked(
             f"{scan_scope} 内未找到可采的暴露铁矿，"

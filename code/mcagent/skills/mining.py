@@ -16,10 +16,12 @@ PEEL_SURFACE = frozenset(("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_
 SOLID_SUPPORT = frozenset((
     "stone", "cobblestone", "deepslate", "cobbled_deepslate",
     "dirt", "coarse_dirt", "grass_block", "andesite", "diorite", "granite", "tuff",
-    "calcite", "dripstone_block", "clay",
+    "calcite", "dripstone_block", "clay", "smooth_basalt", "amethyst_block",
+    "sandstone", "red_sandstone", "terracotta", "mossy_cobblestone", "stone_bricks",
     "coal_ore", "deepslate_coal_ore", "copper_ore", "deepslate_copper_ore",
     "lapis_ore", "deepslate_lapis_ore", "gold_ore", "deepslate_gold_ore",
     "redstone_ore", "deepslate_redstone_ore",
+    "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore",
     "iron_ore", "deepslate_iron_ore", "raw_iron_block", "raw_copper_block",
 ))
 
