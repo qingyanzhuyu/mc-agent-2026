@@ -969,6 +969,32 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             mid_pos = st_mid.get("pos")
             if mid_pos and len(mid_pos) >= 3:
                 px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+        else:
+            # 无盾直面贴脸/起爆苦力怕（<=3.5 格，引信 1.5s）：跳过慢速 A* move_to，立即原生疾跑跳拉脱爆炸半径
+            creeper_pref_yaw = (
+                _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+                if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim)
+                else away_yaw
+            )
+            safe_creeper_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, creeper_pref_yaw, cache, dim)
+            if safe_creeper_yaw is not None:
+                ok_cb, _ = yield from _control_step(
+                    ex, forward=True, sprint=True, jump=True, yaw=safe_creeper_yaw, ms=900,
+                )
+                if ok_cb:
+                    st_mid = _refresh_status(ex, state)
+                    if st_mid.get("alive") is False:
+                        return False
+                    mid_hostile = st_mid.get("nearest_hostile") or {}
+                    if not mid_hostile or (
+                        isinstance(mid_hostile.get("dist"), (int, float))
+                        and not isinstance(mid_hostile.get("dist"), bool)
+                        and float(mid_hostile["dist"]) >= 9.0
+                    ):
+                        return True
+                    mid_pos = st_mid.get("pos")
+                    if mid_pos and len(mid_pos) >= 3:
+                        px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
     else:
         sealed = yield from _try_seal_underground_tunnel(ex, state, st, h_pos, cache, dim)
         if sealed:

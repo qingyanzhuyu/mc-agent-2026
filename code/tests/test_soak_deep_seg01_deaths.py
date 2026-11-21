@@ -910,6 +910,87 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(sk.verify_done(state, before_counts), "")
         self.assertTrue(state.inventory_dirty, "must mark inventory_dirty when slot sync lagged behind confirmed eat")
 
+    def test_nighttime_low_hp_hold_guard_persists_when_hostile_within_10_to_12m(self) -> None:
+        # 复现 seg-07 t=318s：夜间 hp=1.1 无甲且敌怪处于 8.8~11.5 格（safe_12=False）时，
+        # 仍必须命中夜间残血驻留守卫，严禁退回派发 survey_island/scout_island/breed_animal 冲进暗林送死
+        planner = RulePlanner(min_verified="offline")
+        st = State()
+        st.set_status({
+            "ready": True, "alive": True, "health": 1.1, "food": 17, "armor_points": 0,
+            "dimension": "overworld", "is_day": False, "time_of_day": 18797,
+            "pos": [-66.5, 64.0, -46.5],
+            "nearest_hostile": {"id": 129949, "name": "creeper", "dist": 10.5},
+        })
+        st.set_inventory({"items": [{"name": "stone_sword", "count": 1, "slot": 0}]})
+        dec = planner.choose_proactive_survival(st)
+        self.assertIsNotNone(dec)
+        assert dec is not None
+        self.assertIsNone(dec.skill)
+        self.assertEqual(dec.source, "idle")
+        self.assertIn("夜间残血无甲", dec.reason)
+
+    def test_unshielded_close_creeper_flee_uses_instant_sprint_burst_before_move_to(self) -> None:
+        # 复现 seg-07 t=337s：无盾直面 2.8m 贴脸苦力怕时，必须立即原生疾跑跳脱离起爆半径，而非直接慢速 move_to 被炸死
+        blocks = {(x, 65, z): "grass_block" for x in range(-14, 15) for z in range(-14, 15)}
+
+        class _CloseCreeperWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 66.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=1.1,
+                    nearest_hostile={"id": 129949, "name": "creeper", "dist": 2.8, "pos": [0.5, 66.0, 3.3]},
+                )
+                self.controls: list[dict] = []
+                self.moves: int = 0
+
+            def control(self, **kwargs):
+                self.controls.append(dict(kwargs))
+                self.st["pos"] = [0.5, 66.0, -7.5]
+                self.st["nearest_hostile"] = {"id": 129949, "name": "creeper", "dist": 10.8, "pos": [0.5, 66.0, 3.3]}
+                return {"pos": list(self.st["pos"]), "moved": 8.0}
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                return super().move_to(*args, **kwargs)
+
+        w = _CloseCreeperWorld()
+        ex, state = w.session()
+        drive(EmergencyEscape(intent="flee"), ex, state)
+        self.assertGreaterEqual(len(w.controls), 1, "expected immediate sprint-jump burst for unshielded <=3.5m creeper")
+        self.assertTrue(w.controls[0].get("sprint") and w.controls[0].get("jump"))
+        self.assertEqual(w.moves, 0, "should clear creeper blast radius via fast control burst without slow move_to")
+
+    def test_survey_island_yields_immediately_on_close_creeper_instead_of_post_scan(self) -> None:
+        # 复现 seg-07 t=334..337s：survey_sector move_to 结束后若苦力怕已迫近 <7m，立即让位脱险而非继续扫 2.4s 方块
+        from mcagent.runtime import Replan
+        from mcagent.skills.survey import SurveyIsland
+
+        blocks = {(x, 65, z): "grass_block" for x in range(-20, 21) for z in range(-20, 21)}
+
+        class _CreeperSurveyWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 66.0, 0.5], items={"stone_pickaxe": 1})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=10.0, biome="forest")
+                self.find_blocks_after_move = 0
+                self.moved_once = False
+
+            def find_blocks(self, *args, **kwargs):
+                if self.moved_once:
+                    self.find_blocks_after_move += 1
+                return {"blocks": []}
+
+            def move_to(self, *args, **kwargs):
+                self.moved_once = True
+                self.st["pos"] = [8.5, 66.0, 0.5]
+                self.st["nearest_hostile"] = {"id": 129949, "name": "creeper", "dist": 5.4, "pos": [13.9, 66.0, 0.5]}
+                return {"pos": list(self.st["pos"])}
+
+        w = _CreeperSurveyWorld()
+        ex, state = w.session()
+        with self.assertRaisesRegex(Replan, "让位脱险"):
+            drive(SurveyIsland(dimension="overworld", sectors=2, radius=16), ex, state)
+        self.assertEqual(w.find_blocks_after_move, 0, "must abort post-move find_blocks scan when creeper is <7m")
+
 
 if __name__ == "__main__":
     unittest.main()

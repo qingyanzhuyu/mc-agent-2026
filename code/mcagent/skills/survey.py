@@ -309,6 +309,23 @@ def _sample_site(ex: Any, state: Any, memo: Any, st: Mapping[str, Any], dim: str
     return bare(st.get("biome", "")).strip().lower(), set(tags) | _sweep_entities(ex, state, dim), ingested
 
 
+def _has_active_threat(state: Any, st: Mapping[str, Any]) -> bool:
+    """检查是否存在待响应安全意图或近身敌怪（防体检长扫方块 2~3s 期间被苦力怕近身引爆）。"""
+    if getattr(state, "safety_intent", None):
+        return True
+    if st.get("in_lava") or st.get("on_fire") or st.get("submerged"):
+        return True
+    nh = st.get("nearest_hostile")
+    if isinstance(nh, Mapping) and nh:
+        hname = bare(nh.get("name", "")).strip().lower()
+        raw_d = nh.get("dist")
+        if isinstance(raw_d, (int, float)) and not isinstance(raw_d, bool) and math.isfinite(float(raw_d)):
+            d = float(raw_d)
+            if (hname == "creeper" and d < 7.0) or d < 5.5:
+                return True
+    return False
+
+
 def survey_sector(
     ex: Any, state: Any, *, sector_idx: int = 0, total_sectors: int = 4, radius: int = 48,
     ring_radius: Optional[int] = None, anchor: Optional[tuple[float, float, float]] = None,
@@ -325,6 +342,8 @@ def survey_sector(
     if moved:
         st2 = state.refresh_status(ex.client, max_age_s=0)
         dim = _norm_dim(st2.get("dimension") or dim)
+        if _has_active_threat(state, st2):
+            return {"sector": sector_idx, "dimension": dim, "moved": moved, "biome": cur_biome, "landmarks": sorted(discovered_tags), "ingested": total_ingested, "aborted_threat": True}
         post_biome, post_tags, post_ingested = _sample_site(ex, state, memo, st2, dim, sector_idx, scan_r)
         cur_biome = post_biome or cur_biome
         discovered_tags.update(post_tags)
@@ -369,13 +388,17 @@ class SurveyIsland(Skill):
         missing = [i for i in range(sectors) if i not in memo.done_sectors(dimension=dim)]
         if missing:
             for idx in missing:
-                yield from survey_sector(ex, state, sector_idx=idx, total_sectors=sectors, radius=radius, ring_radius=radius, anchor=anchor)
+                res = yield from survey_sector(ex, state, sector_idx=idx, total_sectors=sectors, radius=radius, ring_radius=radius, anchor=anchor)
+                if isinstance(res, Mapping) and res.get("aborted_threat"):
+                    raise Replan("扇区体检期间出现近身威胁或安全意图，立即让位脱险")
             if memo.get_spiral_cursor(dimension=dim)["ring"] == 0 and all(i in memo.done_sectors(dimension=dim) for i in range(sectors)):
                 memo.advance_spiral_cursor(dimension=dim, sectors_per_ring=1)
         else:
             for _ in range(sectors):
                 cur = memo.get_spiral_cursor(dimension=dim)
-                yield from survey_sector(ex, state, sector_idx=cur["sector"], total_sectors=8, radius=radius, ring_radius=cur["radius"], anchor=anchor)
+                res = yield from survey_sector(ex, state, sector_idx=cur["sector"], total_sectors=8, radius=radius, ring_radius=cur["radius"], anchor=anchor)
+                if isinstance(res, Mapping) and res.get("aborted_threat"):
+                    raise Replan("扇区体检期间出现近身威胁或安全意图，立即让位脱险")
                 memo.advance_spiral_cursor(dimension=dim, sectors_per_ring=8)
         self._completed_batch = True
 

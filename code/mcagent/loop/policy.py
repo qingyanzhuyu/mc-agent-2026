@@ -1152,13 +1152,15 @@ class RulePlanner:
                 if sleep_sk is not None:
                     return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
 
-        # 8.5 Nighttime Overworld Survival Guard（无床且地表黑夜：残血无甲无粮或裸装空手重生时驻留避险待天亮，禁止冲进暗林送死）
-        if dim == "overworld" and day is False and near_surface_for_camp and safe_12:
+        # 8.5 Nighttime Overworld Survival Guard（无床且地表黑夜：残血无甲或裸装空手重生时驻留避险待天亮，
+        # 禁止因 safe_12 在敌怪距 8~12 格时失效而把残血角色派进暗林执行 survey_island/scout_island/breed_animal 送死）
+        if dim == "overworld" and day is False and near_surface_for_camp:
             unarmored = not has_equipped_armor(state)
-            if hp <= 8.0 and unarmored and restore < 4:
-                return PlanDecision(None, "idle", f"夜间残血无甲无粮原地避险待天亮 (hp={hp:.1f})")
+            if hp <= 8.0 and unarmored:
+                return PlanDecision(None, "idle", f"夜间残血无甲原地避险待天亮 (hp={hp:.1f})")
             if (
-                unarmored
+                safe_12
+                and unarmored
                 and not has_sword
                 and best_pickaxe(state) not in STONE_OR_BETTER_PICKS
                 and state.count("shield") < 1
