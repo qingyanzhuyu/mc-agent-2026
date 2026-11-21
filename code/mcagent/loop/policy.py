@@ -1016,6 +1016,12 @@ class RulePlanner:
         camp = memo.get_camp(dimension=dim)
         has_camp_chest = isinstance(camp, Mapping) and bool(camp.get("chest") or camp.get("chests"))
         has_furnace_ready = state.count("furnace") >= 1 or memo.has_station("furnace", dimension=dim)
+        has_table_or_12 = (
+            state.count("chest") >= 1
+            or state.count("crafting_table") >= 1
+            or memo.has_station("crafting_table", dimension=dim)
+            or (total_planks(state) + total_logs(state) * 4 >= 12)
+        )
         if (
             dim == "overworld"
             and safe_12
@@ -1023,6 +1029,7 @@ class RulePlanner:
             and best_pickaxe(state) in STONE_OR_BETTER_PICKS
             and has_furnace_ready
             and _camp_plan.has_chest_or_materials(state)
+            and has_table_or_12
         ):
             setup_sk = self._try_make("manage_camp_chest", {"mode": "setup"}, state)
             if setup_sk is not None:

@@ -1711,7 +1711,11 @@ class SafetyMonitor:
     def _dispatch(self, reconcile: bool = True) -> Optional[dict]:
         hazards = self.safety.hazards(self.state)
         for hazard in hazards:
-            if hazard["kind"] == "heal" and self.executor.active_action in ("attack", "shoot"):
+            if (
+                hazard["kind"] == "heal"
+                and self.executor.active_action in ("attack", "shoot")
+                and not (getattr(self.state, "foraging_passive", False) and not _has_edible_food(self.state))
+            ):
                 hazard["severity"] = "urgent"
             elif (
                 hazard["kind"] == "eat"

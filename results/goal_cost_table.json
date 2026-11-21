@@ -1,0 +1,381 @@
+{
+  "schema_version": 1,
+  "source": "local-target",
+  "generated_at": "2026-11-21T11:01:35Z",
+  "runs_included": [
+    "seg-01",
+    "seg-02",
+    "seg-03",
+    "seg-04",
+    "seg-05",
+    "seg-06",
+    "seg-07",
+    "seg-08",
+    "s15-soak-0228",
+    "s4-soak-0522",
+    "s4-soak-0522-seg02"
+  ],
+  "note": "由自搭困难服(local-target)长跑实测日志聚合生成，仅用于本地/相对成本重排参考，不作为官方校园网绝对时间预算（AGENTS.md §4）",
+  "goals": {
+    "allay_deliver_item_to_player": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 0.4,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 4
+    },
+    "avoid_vibration": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 0.4,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 4
+    },
+    "axolotl_in_a_bucket": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 43.6,
+      "skill_ok": 0,
+      "skill_fail": 12,
+      "skill_env_blocked": 0
+    },
+    "breed_an_animal": {
+      "episodes": 9,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 1.0,
+      "skill_ok": 2,
+      "skill_fail": 3,
+      "skill_env_blocked": 63
+    },
+    "deflect_arrow": {
+      "episodes": 7,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 53.1,
+      "skill_ok": 9,
+      "skill_fail": 10,
+      "skill_env_blocked": 0
+    },
+    "enchant_item": {
+      "episodes": 5,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 25.7,
+      "skill_ok": 63,
+      "skill_fail": 1,
+      "skill_env_blocked": 0
+    },
+    "enter_the_end": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 280.0,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 0
+    },
+    "enter_the_nether": {
+      "episodes": 7,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 126.5,
+      "skill_ok": 16,
+      "skill_fail": 36,
+      "skill_env_blocked": 12
+    },
+    "find_fortress": {
+      "episodes": 3,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 35.7,
+      "skill_ok": 4,
+      "skill_fail": 2,
+      "skill_env_blocked": 2
+    },
+    "fishy_business": {
+      "episodes": 3,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 49.5,
+      "skill_ok": 7,
+      "skill_fail": 3,
+      "skill_env_blocked": 1
+    },
+    "follow_ender_eye": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 357.6,
+      "skill_ok": 1,
+      "skill_fail": 1,
+      "skill_env_blocked": 23
+    },
+    "form_obsidian": {
+      "episodes": 3,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 118.5,
+      "skill_ok": 5,
+      "skill_fail": 5,
+      "skill_env_blocked": 0
+    },
+    "iron_tools": {
+      "episodes": 9,
+      "hits": 6,
+      "hit_rate": 0.6667,
+      "p50_elapsed_s": 15.1,
+      "skill_ok": 28,
+      "skill_fail": 18,
+      "skill_env_blocked": 9
+    },
+    "kill_a_mob": {
+      "episodes": 10,
+      "hits": 6,
+      "hit_rate": 0.6,
+      "p50_elapsed_s": 1.8,
+      "skill_ok": 13,
+      "skill_fail": 2,
+      "skill_env_blocked": 19
+    },
+    "kill_axolotl_target": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 0.4,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 4
+    },
+    "kill_mob_near_sculk_catalyst": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 0.4,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 4
+    },
+    "lava_bucket": {
+      "episodes": 9,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 77.3,
+      "skill_ok": 19,
+      "skill_fail": 20,
+      "skill_env_blocked": 8
+    },
+    "mine_diamond": {
+      "episodes": 5,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 114.3,
+      "skill_ok": 1,
+      "skill_fail": 9,
+      "skill_env_blocked": 2
+    },
+    "mine_stone": {
+      "episodes": 11,
+      "hits": 11,
+      "hit_rate": 1.0,
+      "p50_elapsed_s": 34.9,
+      "skill_ok": 7,
+      "skill_fail": 1,
+      "skill_env_blocked": 0
+    },
+    "minecraft_trials_edition": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 20.1,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 4
+    },
+    "obtain_armor": {
+      "episodes": 5,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 144.5,
+      "skill_ok": 8,
+      "skill_fail": 6,
+      "skill_env_blocked": 4
+    },
+    "ol_betsy": {
+      "episodes": 8,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 55.4,
+      "skill_ok": 27,
+      "skill_fail": 16,
+      "skill_env_blocked": 27
+    },
+    "plant_seed": {
+      "episodes": 11,
+      "hits": 8,
+      "hit_rate": 0.7273,
+      "p50_elapsed_s": 6.0,
+      "skill_ok": 1,
+      "skill_fail": 1,
+      "skill_env_blocked": 22
+    },
+    "prep_furnace": {
+      "episodes": 11,
+      "hits": 11,
+      "hit_rate": 1.0,
+      "p50_elapsed_s": 12.0,
+      "skill_ok": 45,
+      "skill_fail": 3,
+      "skill_env_blocked": 0
+    },
+    "prep_ominous_bottle": {
+      "episodes": 7,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 1.4,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 26
+    },
+    "prep_stone_sword": {
+      "episodes": 11,
+      "hits": 11,
+      "hit_rate": 1.0,
+      "p50_elapsed_s": 12.0,
+      "skill_ok": 18,
+      "skill_fail": 2,
+      "skill_env_blocked": 0
+    },
+    "prep_wood": {
+      "episodes": 11,
+      "hits": 11,
+      "hit_rate": 1.0,
+      "p50_elapsed_s": 97.3,
+      "skill_ok": 35,
+      "skill_fail": 28,
+      "skill_env_blocked": 0
+    },
+    "prep_wooden_pickaxe": {
+      "episodes": 11,
+      "hits": 11,
+      "hit_rate": 1.0,
+      "p50_elapsed_s": 8.7,
+      "skill_ok": 22,
+      "skill_fail": 6,
+      "skill_env_blocked": 0
+    },
+    "shiny_gear": {
+      "episodes": 11,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 280.4,
+      "skill_ok": 15,
+      "skill_fail": 37,
+      "skill_env_blocked": 10
+    },
+    "shoot_arrow": {
+      "episodes": 3,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 1.0,
+      "skill_ok": 4,
+      "skill_fail": 4,
+      "skill_env_blocked": 16
+    },
+    "sleep_in_bed": {
+      "episodes": 9,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 19.9,
+      "skill_ok": 38,
+      "skill_fail": 22,
+      "skill_env_blocked": 3
+    },
+    "smelt_iron": {
+      "episodes": 11,
+      "hits": 9,
+      "hit_rate": 0.8182,
+      "p50_elapsed_s": 283.2,
+      "skill_ok": 21,
+      "skill_fail": 33,
+      "skill_env_blocked": 1
+    },
+    "summon_iron_golem": {
+      "episodes": 5,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 48.6,
+      "skill_ok": 1,
+      "skill_fail": 9,
+      "skill_env_blocked": 0
+    },
+    "tactical_fishing": {
+      "episodes": 3,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 31.6,
+      "skill_ok": 0,
+      "skill_fail": 4,
+      "skill_env_blocked": 0
+    },
+    "throw_trident": {
+      "episodes": 6,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 193.2,
+      "skill_ok": 275,
+      "skill_fail": 12,
+      "skill_env_blocked": 0
+    },
+    "totem_of_undying": {
+      "episodes": 8,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 140.0,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 0
+    },
+    "trade": {
+      "episodes": 9,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 1.1,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 96
+    },
+    "upgrade_tools": {
+      "episodes": 11,
+      "hits": 11,
+      "hit_rate": 1.0,
+      "p50_elapsed_s": 64.7,
+      "skill_ok": 100,
+      "skill_fail": 17,
+      "skill_env_blocked": 0
+    },
+    "voluntary_exile": {
+      "episodes": 8,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 1.0,
+      "skill_ok": 0,
+      "skill_fail": 2,
+      "skill_env_blocked": 18
+    },
+    "who_needs_rockets": {
+      "episodes": 1,
+      "hits": 0,
+      "hit_rate": 0.0,
+      "p50_elapsed_s": 180.0,
+      "skill_ok": 0,
+      "skill_fail": 0,
+      "skill_env_blocked": 0
+    }
+  }
+}

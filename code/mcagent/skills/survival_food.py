@@ -326,7 +326,12 @@ class GatherFood(Skill):
             if eye_to_point_dist(st, pos) > ENTITY_EYE_REACH:
                 if not (yield from _try_act("move_to", lambda: ex.move_to(entity_id=eid, pos=pos, rng=2), entity_id=eid, pos=pos)):
                     continue
-            if not (yield from _try_act("attack", lambda: ex.attack(eid, max_hits=6), entity_id=eid)):
+            state.foraging_passive = True
+            try:
+                ok_atk = yield from _try_act("attack", lambda: ex.attack(eid, max_hits=6), entity_id=eid)
+            finally:
+                state.foraging_passive = False
+            if not ok_atk:
                 continue
             yield from _collect_visible_drops(ex, state, _HUNT_DROPS)
             _refresh_inv(ex, state)
@@ -360,19 +365,16 @@ class GatherFood(Skill):
                     if not table_ok:
                         for _, tpos in (yield from _find_or_place_stations(ex, state, "crafting_table", ("crafting_table",), self.name)):
                             if (yield from _reach_block(ex, state, tpos, STATION_EYE_REACH)):
-                                table_ok = True
-                                break
+                                table_ok = True; break
                     for _ in range(6):
                         if not table_ok or state.count("wheat") < 3 or inventory_food_restore(state) >= target_restore:
                             break
                         if "bread" in RECIPES:
                             yield from craft_recipe(ex, state, "bread", goal_qty=state.count("bread") + 1)
                         else:
-                            yield rec("craft", ex.craft("bread", 1), item="bread", count=1)
-                            _refresh_inv(ex, state)
+                            yield rec("craft", ex.craft("bread", 1), item="bread", count=1); _refresh_inv(ex, state)
             elif bname == "sweet_berry_bush" and (yield from _reach_block(ex, state, pos, STATION_EYE_REACH)):
                 yield rec("interact", ex.interact(pos=list(pos)), pos=list(pos))
-                _refresh_inv(ex, state)
                 yield from _collect_visible_drops(ex, state, frozenset({"sweet_berries"}))
                 _refresh_inv(ex, state)
 
@@ -393,6 +395,4 @@ class GatherFood(Skill):
                                      searched_volume="半径 32 格实体与半径 24 格方块", wake_on="chunk_moved")
 
     def verify_done(self, state, before_counts=None) -> str:
-        if inventory_food_restore(state) >= self.args["target_restore"] or self._made_progress(state):
-            return ""
-        return "补粮结束后食物回复量与熟食均未增加且未装炉烤肉"
+        return "" if (inventory_food_restore(state) >= self.args["target_restore"] or self._made_progress(state)) else "补粮结束后食物回复量与熟食均未增加且未装炉烤肉"

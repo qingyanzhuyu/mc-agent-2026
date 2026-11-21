@@ -234,8 +234,8 @@ class Sprint15CoreFixesAndShelterTests(unittest.TestCase):
 
     def test_p0_cold_start_auto_camp_setup_and_shield_with_logs(self) -> None:
         planner = RulePlanner(min_verified="offline")
-        # 1) 石镐 + 熔炉 + 造箱木料且尚无营地箱 -> 自动派发 manage_camp_chest(mode="setup")
-        st = _make_state(items={"stone_pickaxe": 1, "furnace": 1, "oak_log": 2, "cooked_beef": 4})
+        # 1) 石镐 + 熔炉 + 造箱（及工作台）木料且尚无营地箱 -> 自动派发 manage_camp_chest(mode="setup")
+        st = _make_state(items={"stone_pickaxe": 1, "furnace": 1, "oak_log": 3, "cooked_beef": 4})
         dec = planner.choose_survival_or_safe_mode(st)
         self.assertIsNotNone(dec)
         self.assertEqual(dec.skill.name, "manage_camp_chest")

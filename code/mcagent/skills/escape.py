@@ -593,10 +593,13 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             cover = _find_skeleton_cover_cell(ex, px, py, pz, h_pos, cache, dim)
             if cover is not None:
                 moved_cover = yield from _move_to_bounded(
-                    ex, [cover[0] + 0.5, float(cover[1]), cover[2] + 0.5], rng=1, timeout=8.0, skeleton_cover=True,
+                    ex, [cover[0] + 0.5, float(cover[1]), cover[2] + 0.5], rng=0, timeout=8.0, skeleton_cover=True,
                 )
                 if moved_cover:
-                    return True
+                    st_after_cov = _refresh_status(ex, state)
+                    ap = st_after_cov.get("pos") or [px, py, pz]
+                    if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
+                        return True
         if h_dist < 2.5:
             # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用原生疾跑跳脱离近战命中圈再补 move_to
             before_burst = (px, py, pz)

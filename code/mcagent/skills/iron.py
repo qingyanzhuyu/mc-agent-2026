@@ -789,6 +789,18 @@ class SmeltIron(Skill):
                 )
                 if route_skip:
                     _halt_residual_motion(ex, state)
+                if "void_risk" in str(err):
+                    # 趋近悬崖/深坑暴露矿时触发 void_risk 抢占：先将该矿点拉黑再向上抛出，防止下拍重复跳崖死循环
+                    excluded.add(tuple(pos))
+                    err_st = state.refresh_status(ex.client, max_age_s=0)
+                    err_cur = err_st.get("pos") or state.pos
+                    voxel_cache_for(state).mark_unreachable(
+                        "smelt_iron",
+                        pos,
+                        dimension=str(err_st.get("dimension") or "overworld"),
+                        stance_cell=tuple(map(math.floor, err_cur)),
+                    )
+                    raise
                 if not dig_skip and (
                     (
                         in_reach_only
