@@ -274,7 +274,7 @@ GOALS: tuple[GoalSpec, ...] = (
         tier="T1",
         score=5,
         skill="smelt_iron",
-        skill_args=(("count", 3),),
+        skill_args=(("count", 12), ("async_lease", True)),
         prereq_goals=("upgrade_tools", "prep_furnace"),
         done_advancements=("minecraft:story/smelt_iron",),
         done_items=("iron_ingot>=1",),
@@ -299,7 +299,7 @@ GOALS: tuple[GoalSpec, ...] = (
         must_hold_for_children=True,
         held_items=("@iron_plus_pickaxe>=1",),
         gather_fallbacks=(
-            ("iron_ingot>=3", "smelt_iron", (("count", 3),)),
+            ("iron_ingot>=3", "smelt_iron", (("count", 12), ("async_lease", True))),
             *_stick_fallbacks(2),
         ),
         budget_s=150.0,
@@ -320,7 +320,7 @@ GOALS: tuple[GoalSpec, ...] = (
         done_advancements=("minecraft:story/obtain_armor",),
         done_items=("iron_helmet|iron_chestplate|iron_leggings|iron_boots>=1",),
         gather_fallbacks=(
-            ("iron_ingot>=4", "smelt_iron", (("count", 4),)),
+            ("iron_ingot>=4", "smelt_iron", (("count", 12), ("async_lease", True))),
         ),
         budget_s=150.0,
         max_fails_per_ep=3,
@@ -339,7 +339,7 @@ GOALS: tuple[GoalSpec, ...] = (
         done_advancements=("minecraft:story/lava_bucket",),
         done_items=("lava_bucket>=1",),
         gather_fallbacks=(
-            ("bucket|iron_ingot>=3", "smelt_iron", (("count", 3),)),
+            ("bucket|iron_ingot>=3", "smelt_iron", (("count", 12), ("async_lease", True))),
             ("bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=210.0,
@@ -359,6 +359,10 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="sleep_in_bed",
         prereq_goals=("prep_wood",),
         done_advancements=("minecraft:adventure/sleep_in_bed",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            ("@wood_equiv>=3", "gather_wood", (("count", 2),)),
+        ),
         budget_s=150.0,
         max_fails_per_ep=3,
         stop_loss=True,
@@ -2449,7 +2453,13 @@ def _has_sleep_bed_ready(state: State, memo: Any, dim: str) -> bool:
         return True
     if any(state.count(wool) >= 3 for wool in _WOOL_ITEMS):
         return True
-    return memo is not None and hasattr(memo, "has_station") and memo.has_station("bed", dimension=dim)
+    if memo is not None and hasattr(memo, "has_station") and memo.has_station("bed", dimension=dim):
+        return True
+    if memo is not None and hasattr(memo, "get_camp"):
+        camp = memo.get_camp(dimension=dim)
+        if isinstance(camp, Mapping) and camp.get("bed") is not None:
+            return True
+    return False
 
 
 def survival_readiness_multiplier(

@@ -14,12 +14,12 @@ from .combat_materials import (
 )
 from .combat_scene import (
     DEFLECT, KILL_MOB, OL_BETSY, SHOOT_ARROW, SKELETONS, CrowdAmbush, check_after_action, completed,
-    confirm_progress, gate_reason, interrupted, prepared_scene, refresh_encounter, select_encounter,
-    stop_activity,
+    confirm_progress, gate_reason, has_open_field_kit, interrupted, prepared_scene, refresh_encounter,
+    select_encounter, stop_activity,
 )
 from .encounter import combat_melee, dump_water_crowd_control, pillar_up, shoot_projectile
 from .field import _cell, _position, collect_drops, equip_item, scan_blocks
-from .items import bare
+from .items import bare, total_placeable
 from .observations import refresh_inventory as _fresh_inventory
 from .registry import register
 
@@ -86,14 +86,10 @@ def _defend_crowd_and_engage(ex, state, scene, crowd):
         if rplan is not None and horiz > 3.5:
             try:
                 return (yield from shoot_projectile(
-                    ex, state, entity=target, weapon=rplan.weapon,
-                    retreat_pos=None, max_distance=16, elevated_ok=True,
-                ))
+                    ex, state, entity=target, weapon=rplan.weapon, retreat_pos=None, max_distance=16, elevated_ok=True))
             finally:
                 stop_activity(ex, state, items=("bow", "crossbow"))
-        return (yield from combat_melee(
-            ex, state, target, retreat_pos=None, timeout_ms=3000, radius=6, tactic="bunker_hit",
-        ))
+        return (yield from combat_melee(ex, state, target, retreat_pos=None, timeout_ms=3000, radius=6, tactic="bunker_hit"))
 
     if state.count("water_bucket") >= 1:
         dumped = yield from dump_water_crowd_control(ex, state)
@@ -104,18 +100,27 @@ def _defend_crowd_and_engage(ex, state, scene, crowd):
                 try:
                     return (yield from shoot_projectile(
                         ex, state, entity=target, weapon=rplan.weapon,
-                        retreat_pos=scene.retreat, max_distance=16, elevated_ok=True,
-                    ))
+                        retreat_pos=scene.retreat, max_distance=16, elevated_ok=True))
                 finally:
                     stop_activity(ex, state, items=("bow", "crossbow"))
             try:
                 return (yield from combat_melee(
-                    ex, state, target, retreat_pos=scene.retreat, timeout_ms=3000, radius=6, tactic="kite",
-                ))
+                    ex, state, target, retreat_pos=scene.retreat, timeout_ms=3000, radius=6, tactic="kite"))
             finally:
                 stop_activity(ex, state, busy="attack")
 
     raise Replan("交战时被 2 只以上近战怪贴脸且无法垫起 3 格高柱或倒水，立即撤离")
+
+
+def _melee_with_stop(ex, state, scene, *, tactic: str):
+    """执行近战追击并在结束时停止攻击姿态、复核状态。"""
+    try:
+        evidence = yield from combat_melee(
+            ex, state, scene.target, retreat_pos=scene.retreat, timeout_ms=3000, radius=10, tactic=tactic)
+    finally:
+        stop_activity(ex, state, busy="attack")
+    check_after_action(ex, state, scene, stay=False)
+    return evidence
 
 
 @register
@@ -162,12 +167,12 @@ class HuntMob(Skill):
         def eligible(entity):
             return _hostile(entity) and bare(entity.get("name")) in candidates
 
+        open_mobs = _PREFERRED_HUNT_MOBS if has_open_field_kit(state) else ()
         scene = select_encounter(
             ex, state, eligible, description="有掩体退路的落单目标敌对生物",
             missing=f"safe_hostile:{requested}", max_distance=10,
-            night_source=requested != "parched",
-            rank_key=_hunt_rank, target_isolation_radius=6.0, max_pack_size=3,
-        )
+            night_source=requested != "parched", rank_key=_hunt_rank,
+            target_isolation_radius=6.0, max_pack_size=3, allow_open_field_mobs=open_mobs)
         try:
             yield from equip_item(ex, state, sword)
             offhand_name = bare(((state.inventory or {}).get("offhand") or {}).get("name"))
@@ -181,15 +186,16 @@ class HuntMob(Skill):
                 crowd_defended = True
                 evidence = yield from _defend_crowd_and_engage(ex, state, scene, ambush.crowd)
             if not crowd_defended:
-                try:
+                if (scene.open_field and bare(scene.target.get("name")) == "zombie"
+                        and state.count("shield") < 1 and total_placeable(state) >= 3
+                        and (yield from pillar_up(ex, state, height=3))):
+                    crowd_defended = True
                     evidence = yield from combat_melee(
-                        ex, state, scene.target, retreat_pos=scene.retreat,
-                        timeout_ms=3000, radius=10, tactic="auto",
-                    )
-                finally:
-                    stop_activity(ex, state, busy="attack")
-                check_after_action(ex, state, scene, stay=False)
-            else:
+                        ex, state, scene.target, retreat_pos=None, timeout_ms=3000, radius=6, tactic="bunker_hit")
+                else:
+                    evidence = yield from _melee_with_stop(
+                        ex, state, scene, tactic="kite" if scene.open_field else "auto")
+            if crowd_defended:
                 after_st = state.refresh_status(ex.client, max_age_s=0)
                 if after_st.get("alive") is not True or after_st.get("dimension") != scene.origin["dimension"]:
                     raise Replan("1vN 防守交战后角色未存活或已切换维度")

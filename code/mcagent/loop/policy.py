@@ -17,9 +17,8 @@ from ..planner.scheduler import DecisionScheduler
 from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint, effective_hostile_flee_dist
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills import base as skill_base
-from ..skills.camp_base import has_surplus_for_deposit, is_near_camp, needs_camp_withdraw
-from ..skills.camp_plan import has_chest_or_materials
-from ..skills.furnace_lease import best_fuel_for
+from ..skills import camp_plan as _camp_plan
+from ..skills.furnace_lease import best_fuel_for, lease_book_for
 from ..skills.items import best_pickaxe
 from ..skills.survival_food import cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
@@ -876,7 +875,7 @@ class RulePlanner:
         safe_gt_12 = hdist > 12.0
 
         # 5. Respawn Step 1: Camp Chest Withdraw (kit_chest 热备自动穿甲举盾 / vault_chest 取基础料)
-        if needs_camp_withdraw(state) and is_near_camp(state, max_dist=64.0):
+        if _camp_plan.needs_camp_withdraw(state) and _camp_plan.is_near_camp(state, max_dist=64.0):
             wd = self._try_make("manage_camp_chest", {"mode": "withdraw"}, state)
             if wd is not None:
                 return PlanDecision(wd, "rule", "重生/缺装回营地箱取装备")
@@ -905,7 +904,7 @@ class RulePlanner:
             and not has_camp_chest
             and best_pickaxe(state) in STONE_OR_BETTER_PICKS
             and has_furnace_ready
-            and has_chest_or_materials(state)
+            and _camp_plan.has_chest_or_materials(state)
         ):
             setup_sk = self._try_make("manage_camp_chest", {"mode": "setup"}, state)
             if setup_sk is not None:
@@ -922,11 +921,15 @@ class RulePlanner:
             if nb_sk is not None:
                 return PlanDecision(nb_sk, "rule", "下界门旁建造 3x3 防恶魂圆石碉堡")
 
-        # 7. Food Reserve Gate & Ready Food Lease Retrieval
+        # 7. Food Reserve Gate & Ready Food/Iron Lease Retrieval
         if has_ready_food_lease(state) and safe_12:
             gf_lease = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf_lease is not None:
                 return PlanDecision(gf_lease, "rule", "熟食熔炉租约已就绪，回炉取回熟肉防遗弃")
+        if any(l.expected_output == "iron_ingot" for l in lease_book_for(state).ready_leases(dimension=dim)) and safe_12:
+            ir_lease = self._try_make("smelt_iron", {"count": 12, "async_lease": True}, state)
+            if ir_lease is not None:
+                return PlanDecision(ir_lease, "rule", "铁锭熔炉租约已就绪，回炉取回铁锭防遗弃")
         needs_food_now = food <= 17.0 or hp < 18.0
         proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
         if restore < 10 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
@@ -945,18 +948,25 @@ class RulePlanner:
                 return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})与燃料，烤肉熟化补仓")
 
         # 8. Night Bed Sleep Fast-Path
-        has_bed_ready = (
+        has_existing_or_held_bed = (
             any(state.count(b) >= 1 for b in _BED_ITEMS)
-            or any(state.count(w) >= 3 for w in _WOOL_ITEMS)
             or memo.has_station("bed", dimension=dim)
+            or (isinstance(camp, Mapping) and camp.get("bed") is not None)
         )
+        has_wool_for_bed = any(state.count(w) >= 3 for w in _WOOL_ITEMS)
+        has_bed_ready = has_existing_or_held_bed or has_wool_for_bed
         if day is False and dim == "overworld" and safe_gt_12 and has_bed_ready:
-            sleep_sk = self._try_make("sleep_in_bed", {}, state)
-            if sleep_sk is not None:
-                return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
+            if not has_existing_or_held_bed and total_planks(state) < 3 and total_logs(state) < 1:
+                gw = self._try_make("gather_wood", {"count": 2}, state)
+                if gw is not None:
+                    return PlanDecision(gw, "rule", "夜晚持羊毛造床缺木料，先采原木")
+            else:
+                sleep_sk = self._try_make("sleep_in_bed", {}, state)
+                if sleep_sk is not None:
+                    return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
 
         # 9. Camp Surplus Deposit (尊重 ReservationBook 预留物资；距营地 <=96 格高价/满包回存)
-        if has_surplus_for_deposit(state, reservations=self.reservations) and is_near_camp(state, max_dist=96.0) and safe_12:
+        if _camp_plan.has_surplus_for_deposit(state, reservations=self.reservations) and _camp_plan.is_near_camp(state, max_dist=96.0) and safe_12:
             dep = self._try_make("manage_camp_chest", {"mode": "deposit"}, state)
             if dep is not None:
                 return PlanDecision(dep, "rule", "携带高价值或满包富余物资，回营地箱存仓")

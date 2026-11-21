@@ -174,7 +174,7 @@ class SurvivalTests(unittest.TestCase):
             return {"dug": "short_grass"}
 
         world.queue("dig", no_seed)
-        self.assert_blocked(world, "plant_seed", "reachable_wheat_seeds", "半径 12 格内最多 8 个候选")
+        self.assert_blocked(world, "plant_seed", "reachable_wheat_seeds", "半径 32 格内最多 48 个候选")
 
     def test_plant_success_receipt_without_crop_fails(self):
         world = self.plant_world()
@@ -223,7 +223,7 @@ class SurvivalTests(unittest.TestCase):
                 world = SurvivalWorld({"wheat_seeds": 2})
                 world.queue("advancements", progress())
                 world.queue("get_entities", entities(FIRST, other))
-                self.assert_blocked(world, "breed_animal", "reachable_pair:chicken", "半径 16 格内最多 40 个候选")
+                self.assert_blocked(world, "breed_animal", "reachable_pair:chicken", "半径 32 格内最多 40 个候选")
 
     def test_breed_two_successful_feeds_without_breeding_fail(self):
         world = self.breeding_world(extra_polls=3)

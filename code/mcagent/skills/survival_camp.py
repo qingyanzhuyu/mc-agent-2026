@@ -6,40 +6,33 @@ import math
 
 from ..runtime import EnvBlocked, Replan
 from .base import Skill, failure, rec
-from .field import collect_drops, place_block, scan_blocks, scan_entities
+from .field import collect_drops, move_local, place_block, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
-from .recipes import RECIPES, craft_recipe
+from .recipes import RECIPES, _ingredient_items, craft_recipe
 from .registry import register
 from .sightline import ENTITY_EYE_REACH, block_center
 from .survival import (
-    _SLEEP_PROGRESS, _SUPPORT, _above, _approach, _block, _can_reach, _cell,
+    _PLANKS, _SLEEP_PROGRESS, _SUPPORT, _above, _approach, _block, _can_reach, _cell,
     _fresh_inventory, _has_progress, _neighbors, _on_ground, _plank_plan,
     _site_missing, _stand_for, _standable,
 )
+from .world_memo import memo_for
 
 
 _BEDS = tuple(item for item in RECIPES if item.endswith("_bed"))
 _COLORS = tuple(item.removesuffix("_bed") for item in _BEDS)
 _WOOLS = tuple(f"{color}_wool" for color in _COLORS)
 _DYE_SOURCES: dict[str, tuple[tuple[str, int], ...]] = {
-    "white_dye": (("bone_meal", 1), ("lily_of_the_valley", 1)),
-    "blue_dye": (("lapis_lazuli", 1), ("cornflower", 1)),
-    "black_dye": (("ink_sac", 1), ("wither_rose", 1)),
-    "brown_dye": (("cocoa_beans", 1),),
-    "yellow_dye": (("dandelion", 1), ("sunflower", 2)),
-    "red_dye": (("poppy", 1), ("red_tulip", 1), ("beetroot", 1), ("rose_bush", 2)),
-    "orange_dye": (("orange_tulip", 1), ("open_eyeblossom", 1), ("torchflower", 1)),
-    "magenta_dye": (("allium", 1), ("lilac", 2)),
-    "light_blue_dye": (("blue_orchid", 1),),
-    "pink_dye": (("pink_tulip", 1), ("pink_petals", 1), ("peony", 2), ("cactus_flower", 1)),
-    "gray_dye": (("closed_eyeblossom", 1),),
+    "white_dye": (("bone_meal", 1), ("lily_of_the_valley", 1)), "blue_dye": (("lapis_lazuli", 1), ("cornflower", 1)),
+    "black_dye": (("ink_sac", 1), ("wither_rose", 1)), "brown_dye": (("cocoa_beans", 1),),
+    "yellow_dye": (("dandelion", 1), ("sunflower", 2)), "light_blue_dye": (("blue_orchid", 1),),
+    "red_dye": (("poppy", 1), ("red_tulip", 1), ("beetroot", 1), ("rose_bush", 2)), "gray_dye": (("closed_eyeblossom", 1),),
+    "orange_dye": (("orange_tulip", 1), ("open_eyeblossom", 1), ("torchflower", 1)), "magenta_dye": (("allium", 1), ("lilac", 2)),
+    "pink_dye": (("pink_tulip", 1), ("pink_petals", 1), ("peony", 2), ("cactus_flower", 1)), "cyan_dye": (("pitcher_plant", 2),),
     "light_gray_dye": (("azure_bluet", 1), ("oxeye_daisy", 1), ("white_tulip", 1)),
-    "cyan_dye": (("pitcher_plant", 2),),
 }
-_BED_RADIUS = 12
-_EARLY_NIGHT_START = 12542
-_NIGHT_END = 23459
+_BED_RADIUS, _EARLY_NIGHT_START, _NIGHT_END = 12, 12542, 23459
 
 
 def _can_sleep_now(status):
@@ -50,14 +43,8 @@ def _can_sleep_now(status):
     if isinstance(tod, (int, float)) and not isinstance(tod, bool):
         if _EARLY_NIGHT_START <= int(tod) % 24000 <= _NIGHT_END:
             return True
-        if status.get("is_day") is False:
-            return True
-        return False
-    if status.get("is_day") is False:
-        return True
-    if status.get("is_day") is True:
-        return False
-    return None
+        return True if status.get("is_day") is False else False
+    return (not status["is_day"]) if isinstance(status.get("is_day"), bool) else None
 
 
 def _sleep_window(status):
@@ -78,23 +65,41 @@ def _sleep_window(status):
         raise Replan("床边附近有敌对生物，请让安全层处理后再睡")
 
 
-def _held_bed(state):
-    return next((item for item in _BEDS if state.count(item)), None)
+def _fresh_sleep_status(ex, state):
+    status = state.refresh_status(ex.client, max_age_s=0)
+    _sleep_window(status)
+    return status
 
 
-def _wool_bed(state):
-    return next((bed for bed, wool in zip(_BEDS, _WOOLS) if state.count(wool) >= 3), None)
+def _held_bed(state): return next((item for item in _BEDS if state.count(item)), None)
+def _wool_bed(state): return next((b for b, w in zip(_BEDS, _WOOLS) if state.count(w) >= 3), None)
+def _partial_wool(state): wool = max(_WOOLS, key=state.count); return wool if state.count(wool) else None
+def _sheared_bed(state, wool): return _wool_bed(state) if wool is None else (wool.removesuffix("_wool") + "_bed" if state.count(wool) >= 3 else None)
 
 
-def _partial_wool(state):
-    wool = max(_WOOLS, key=state.count)
-    return wool if state.count(wool) else None
+def _known_bed_in_memo(state) -> bool:
+    memo = memo_for(state)
+    if memo.has_station("bed", dimension="overworld"):
+        return True
+    camp = memo.get_camp(dimension="overworld")
+    return isinstance(camp, dict) and camp.get("bed") is not None
 
 
-def _sheared_bed(state, wool):
-    if wool is None:
-        return _wool_bed(state)
-    return wool.removesuffix("_wool") + "_bed" if state.count(wool) >= 3 else None
+def _record_bed_memo(state, pos, bed) -> None:
+    memo = memo_for(state)
+    memo.record_station(bed, pos, dimension="overworld")
+    camp = memo.get_camp(dimension="overworld")
+    if isinstance(camp, dict) and camp.get("bed") is None and camp.get("pos") is not None and math.dist(camp["pos"], pos) <= 16:
+        memo.set_camp(camp["pos"], dimension="overworld", bed=pos)
+
+
+def _craft_planks_from_log(ex, state):
+    for plank in _PLANKS:
+        recipe = RECIPES[plank]
+        if all(sum(state.count(n) for n in _ingredient_items(ing)) >= need for ing, need in recipe.ingredients):
+            yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + recipe.output)
+            if _plank_plan(state, 3):
+                return
 
 
 @dataclass(frozen=True)
@@ -122,58 +127,36 @@ def plan_wool_dyeing(state) -> _WoolDyePlan | None:
     best_key: tuple[int, int, int, int] | None = None
     best_plan: _WoolDyePlan | None = None
     for idx, c in enumerate(_COLORS):
-        target_wool = f"{c}_wool"
-        dye_item = f"{c}_dye"
+        target_wool, dye_item = f"{c}_wool", f"{c}_dye"
         owned_target = state.count(target_wool)
         dyes_needed = 3 - owned_target
         direct = min(dyes_needed, state.count(dye_item))
-        shortfall = dyes_needed - direct
-        source_crafts: list[tuple[str, int]] = []
-        if shortfall > 0:
-            for src_item, yield_qty in _DYE_SOURCES.get(dye_item, ()):
-                avail = state.count(src_item)
-                if avail <= 0:
-                    continue
-                batches = min(avail, math.ceil(shortfall / yield_qty))
-                if batches > 0:
-                    source_crafts.append((src_item, batches))
-                    shortfall = max(0, shortfall - batches * yield_qty)
-                if shortfall == 0:
-                    break
+        shortfall, source_crafts = dyes_needed - direct, []
+        for src_item, yield_qty in _DYE_SOURCES.get(dye_item, ()):
+            if shortfall <= 0:
+                break
+            avail = state.count(src_item)
+            batches = min(avail, math.ceil(shortfall / yield_qty)) if avail > 0 else 0
+            if batches > 0:
+                source_crafts.append((src_item, batches))
+                shortfall = max(0, shortfall - batches * yield_qty)
         if shortfall > 0:
             continue
 
-        reserved: list[tuple[str, int, str]] = []
-        if owned_target > 0:
-            reserved.append((target_wool, owned_target, "consume"))
+        reserved = [(target_wool, owned_target, "consume")] if owned_target > 0 else []
         donor_left = dyes_needed
         for wool, qty in wool_counts.items():
-            if wool == target_wool:
-                continue
-            take = min(donor_left, qty)
-            if take > 0:
+            if wool != target_wool and donor_left > 0:
+                take = min(donor_left, qty)
                 reserved.append((wool, take, "consume"))
                 donor_left -= take
-            if donor_left == 0:
-                break
         if direct > 0:
             reserved.append((dye_item, direct, "consume"))
-        for src_item, batches in source_crafts:
-            reserved.append((src_item, batches, "consume"))
+        reserved.extend((s, b, "consume") for s, b in source_crafts)
 
         rank = (dyes_needed, len(source_crafts), sum(b for _, b in source_crafts), idx)
         if best_key is None or rank < best_key:
-            best_key = rank
-            best_plan = _WoolDyePlan(
-                color=c,
-                target_wool=target_wool,
-                target_bed=f"{c}_bed",
-                dye_item=dye_item,
-                dyes_needed=dyes_needed,
-                direct_dyes=direct,
-                dye_source_crafts=tuple(source_crafts),
-                reserved_items=tuple(reserved),
-            )
+            best_key, best_plan = rank, _WoolDyePlan(c, target_wool, f"{c}_bed", dye_item, dyes_needed, direct, tuple(source_crafts), tuple(reserved))
     return best_plan
 
 
@@ -183,8 +166,7 @@ def _craft_until(ex, state, item: str, target_qty: int, max_steps: int, fail_lab
         if state.count(item) >= target_qty:
             break
         before = state.count(item)
-        receipt = ex.craft(item, 1)
-        yield rec("craft", receipt, item=item, count=1)
+        yield rec("craft", ex.craft(item, 1), item=item, count=1)
         _fresh_inventory(ex, state)
         if state.count(item) <= before:
             raise Replan(f"{fail_label} {item} 后背包未确认增加")
@@ -203,13 +185,11 @@ def _dye_mixed_wool_for_bed(ex, state):
 
 
 def _bed_half_supported(ex, pos):
-    return (_block(ex, _above(pos, -1)) in _SUPPORT
-            and _block(ex, _above(pos)) in AIR and _block(ex, _above(pos, 2)) in AIR)
+    return _block(ex, _above(pos, -1)) in _SUPPORT and _block(ex, _above(pos)) in AIR and _block(ex, _above(pos, 2)) in AIR
 
 
 def _bed_observed(ex, pos, bed):
-    return (_block(ex, pos) == bed and _bed_half_supported(ex, pos)
-            and any(_block(ex, mate) == bed and _bed_half_supported(ex, mate) for mate in _neighbors(pos)))
+    return _block(ex, pos) == bed and _bed_half_supported(ex, pos) and any(_block(ex, m) == bed and _bed_half_supported(ex, m) for m in _neighbors(pos))
 
 
 def _existing_bed(ex, state):
@@ -224,30 +204,24 @@ def _existing_bed(ex, state):
 
 def _bed_placement(ex, status):
     """§4.3 无朝向参数，预先验证四种可能延伸方向。"""
-    origin = _cell(status["pos"])
-    for pos in _neighbors(origin, radius=2):
-        if all(_standable(ex, cell) and _block(ex, _above(cell, 2)) in AIR
-               for cell in (pos, *_neighbors(pos))):
+    for pos in _neighbors(_cell(status["pos"]), radius=2):
+        if all(_standable(ex, cell) and _block(ex, _above(cell, 2)) in AIR for cell in (pos, *_neighbors(pos))):
             return pos
-    raise _site_missing("未观察到可安全容纳两格床的平面，请换平坦位置",
-                        "supported_bed_space", 3, 4)
+    raise _site_missing("未观察到可安全容纳两格床的平面，请换平坦位置", "supported_bed_space", 3, 4)
 
 
 def _shear_for_wool(ex, state, reserved_wool):
     """§4.4 支持剪毛，羊颜色和掉落时序用库存及实体复读验证。"""
-    sheep = scan_entities(ex, state, "sheep", radius=8, limit=3)["entities"]
-    for animal in sheep:
+    for animal in scan_entities(ex, state, "sheep", radius=8, limit=3)["entities"]:
         if animal.get("baby") is True or animal.get("is_baby") is True or animal.get("sheared") is True:
             continue
-        status = state.refresh_status(ex.client, max_age_s=0)
-        _sleep_window(status)
+        status = _fresh_sleep_status(ex, state)
         stand = _stand_for(ex, status, animal["pos"])
         if stand is None:
             continue
         fresh = yield from _approach(ex, state, status, stand, animal["pos"])
-        current = next((row for row in scan_entities(ex, state, "sheep", radius=8)["entities"]
-                        if row["id"] == animal["id"]), None)
-        if current is None or not _can_reach(fresh, current["pos"], ENTITY_EYE_REACH):
+        cur = next((r for r in scan_entities(ex, state, "sheep", radius=8)["entities"] if r["id"] == animal["id"]), None)
+        if cur is None or not _can_reach(fresh, cur["pos"], ENTITY_EYE_REACH):
             continue
         evidence = yield from use_item_on(ex, state, animal["id"], "shears")
         _fresh_inventory(ex, state)
@@ -274,8 +248,7 @@ def wake_from_bed(ex, state, pos):
         if failure(exc)[0] == "cannot_sleep":
             raise Replan("点击床起床失败：2 秒内服务端未确认下床（cannot_sleep）") from exc
         raise
-    after = evidence["after"]["status"]
-    if evidence["receipt"].get("woke") is not True or after.get("is_sleeping") is True:
+    if evidence["receipt"].get("woke") is not True or evidence["after"]["status"].get("is_sleeping") is True:
         raise Replan("点床起床后未确认 woke=true 且脱离 is_sleeping 状态")
     return evidence
 
@@ -289,19 +262,19 @@ def _click_bed(ex, state, pos):
         raise
 
 
+def _since_seq(ex, state):
+    snap = ex.client.events(since=state.last_seq, limit=30)
+    return None if snap.get("has_more") else snap.get("last_seq", state.last_seq)
+
+
 def _sleep_confirmed(ex, evidence, since):
-    receipt = evidence["receipt"]
-    after = evidence["after"]["status"]
+    receipt, after = evidence["receipt"], evidence["after"]["status"]
     if bare(after.get("dimension")) != "overworld" or after.get("alive") is not True:
         raise Replan("点床后未确认角色仍活着且处于主世界")
     if receipt.get("slept") is False:
         if receipt.get("daytime") is True and _can_sleep_now(after) is False:
-            raise EnvBlocked(
-                "现在是白天（daytime=true），点床仅绑定重生点未入睡",
-                missing_predicate="sleep_at_night",
-                searched_volume="当前主世界 /status 昼夜快照",
-                wake_on="night",
-            )
+            raise EnvBlocked("现在是白天（daytime=true），点床仅绑定重生点未入睡",
+                             missing_predicate="sleep_at_night", searched_volume="当前主世界 /status 昼夜快照", wake_on="night")
         raise Replan("点床返回 slept=false，服务端拒绝入睡，请检查昼夜时间或床边环境")
     if _has_progress(ex, _SLEEP_PROGRESS):
         return {"advancement_confirmed": True}
@@ -309,7 +282,7 @@ def _sleep_confirmed(ex, evidence, since):
         return {"observed_sleeping": True, "advancement_confirmed": False}
     if since is not None and receipt.get("slept") is True:
         after_events = ex.client.events(since=since, limit=30).get("events") or ()
-        if any(event.get("type") == "sleep" and event.get("seq", -1) > since for event in after_events):
+        if any(e.get("type") == "sleep" and e.get("seq", -1) > since for e in after_events):
             return {"observed_sleep_event": True, "advancement_confirmed": False}
     raise Replan("点床回执后未复核到睡眠状态、事件或睡眠进度")
 
@@ -324,9 +297,13 @@ class SleepInBed(Skill):
     @classmethod
     def blocked(cls, state):
         status = state.snapshot()
-        if status.get("ready") is True and bare(status.get("dimension")) == "overworld":
+        if not (status.get("ready") is True and bare(status.get("dimension")) == "overworld"):
+            return "缺少已就绪的主世界状态"
+        if status.get("is_sleeping") is True:
             return ""
-        return "缺少已就绪的主世界状态"
+        if _held_bed(state) or _wool_bed(state) or plan_wool_dyeing(state) or state.count("shears") >= 1 or _known_bed_in_memo(state):
+            return ""
+        return "既无床、又无 3 块同色/可染羊毛、又无剪刀，且记忆中无已知床位"
 
     @classmethod
     def material_plan(cls, args: dict, state) -> tuple[tuple[str, int, str], ...]:
@@ -334,8 +311,7 @@ class SleepInBed(Skill):
             return ()
         if bed := _held_bed(state):
             return ((bed, 1, "consume"),)
-        planks = _plank_plan(state, 3)
-        if not planks:
+        if not (planks := _plank_plan(state, 3)):
             return ()
         if bed := _wool_bed(state):
             return ((bed.removesuffix("_bed") + "_wool", 3, "consume"), *planks)
@@ -343,8 +319,7 @@ class SleepInBed(Skill):
             return (*dye_plan.reserved_items, *planks)
         if state.count("shears"):
             wool = _partial_wool(state)
-            held_wool = ((wool, state.count(wool), "consume"),) if wool else ()
-            return (("shears", 1, "borrow"), *held_wool, *planks)
+            return (("shears", 1, "borrow"), *(((wool, state.count(wool), "consume"),) if wool else ()), *planks)
         return ()
 
     def run(self, ex, state):
@@ -355,6 +330,15 @@ class SleepInBed(Skill):
             return
         _sleep_window(status)
         existing = _existing_bed(ex, state)
+        if existing is None and (camp := memo_for(state).get_camp(dimension="overworld")) and camp.get("bed") and status.get("pos"):
+            camp_bed = tuple(camp["bed"])
+            if math.dist(status["pos"], camp_bed) <= 48:
+                if math.dist(status["pos"], camp_bed) > 6:
+                    try:
+                        yield from move_local(ex, state, camp_bed, max_distance=48, require_move=False)
+                    except Replan:
+                        pass
+                existing = _existing_bed(ex, state)
         if existing:
             pos, bed = existing
         else:
@@ -362,7 +346,9 @@ class SleepInBed(Skill):
             bed = _held_bed(state)
             if bed is None:
                 if not _plank_plan(state, 3):
-                    raise Replan("自制床缺 3 块木板，请补料或寻找可复用床")
+                    yield from _craft_planks_from_log(ex, state)
+                    if not _plank_plan(state, 3):
+                        raise Replan("自制床缺 3 块木板，请补料或寻找可复用床")
                 bed = _wool_bed(state)
                 if bed is None and plan_wool_dyeing(state) is not None:
                     bed = yield from _dye_mixed_wool_for_bed(ex, state)
@@ -370,20 +356,16 @@ class SleepInBed(Skill):
                     bed = yield from _shear_for_wool(ex, state, _partial_wool(state))
                 if bed is None:
                     raise Replan("自制床需要 3 块同色羊毛，请剪同色羊或补齐同色羊毛")
-                status = state.refresh_status(ex.client, max_age_s=0)
-                _sleep_window(status)
-                _bed_placement(ex, status)
+                _bed_placement(ex, _fresh_sleep_status(ex, state))
                 yield from craft_recipe(ex, state, bed, goal_qty=1)
-            status = state.refresh_status(ex.client, max_age_s=0)
-            _sleep_window(status)
-            pos = _bed_placement(ex, status)
+            pos = _bed_placement(ex, _fresh_sleep_status(ex, state))
             before = state.count(bed)
             yield from place_block(ex, state, bed, pos)
             _fresh_inventory(ex, state)
             if before - state.count(bed) != 1:
                 raise Replan("摆床后未确认消耗一张床")
-        status = state.refresh_status(ex.client, max_age_s=0)
-        _sleep_window(status)
+        _record_bed_memo(state, pos, bed)
+        status = _fresh_sleep_status(ex, state)
         bed_target = block_center(pos)
         stand = _stand_for(ex, status, bed_target, block_pos=pos)
         if stand is None:
@@ -394,8 +376,7 @@ class SleepInBed(Skill):
             raise Replan("点床前未确认两格床体、承重与上方净空")
         if fresh.get("is_sleeping") is True:
             return
-        event_snapshot = ex.client.events(since=state.last_seq, limit=30)
-        since = None if event_snapshot.get("has_more") else event_snapshot.get("last_seq", state.last_seq)
+        since = _since_seq(ex, state)
         evidence = yield from _click_bed(ex, state, pos)
         if evidence["receipt"].get("woke") is True:
             after_wake = evidence["after"]["status"]
@@ -407,7 +388,6 @@ class SleepInBed(Skill):
             _sleep_window(after_wake)
             if not _bed_observed(ex, pos, bed):
                 raise Replan("下床后复读未确认两格床体、承重与上方净空")
-            event_snapshot = ex.client.events(since=state.last_seq, limit=30)
-            since = None if event_snapshot.get("has_more") else event_snapshot.get("last_seq", state.last_seq)
+            since = _since_seq(ex, state)
             evidence = yield from _click_bed(ex, state, pos)
         yield rec("verify_sleep", _sleep_confirmed(ex, evidence, since))

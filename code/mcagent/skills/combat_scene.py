@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from ..client import ApiError
-from ..runtime import EnvBlocked, Replan
+from ..runtime import EnvBlocked, Replan, has_equipped_armor
 from .base import failure, rec
+from .combat_materials import carried_sword
 from .encounter import _line_cells, _retreat_clear, verify_shot_lane
 from .field import _cell, _grounded, _position, _safe_support, _standable_cell, move_local, scan_entities
 from .items import bare
@@ -20,6 +22,11 @@ SHOOT_ARROW = "minecraft:adventure/shoot_arrow"
 OL_BETSY = "minecraft:adventure/ol_betsy"
 SKELETONS = frozenset(("skeleton", "parched"))
 _NON_MELEE_HOSTILES = frozenset(("ghast", "phantom", "blaze", "ender_dragon", "guardian", "elder_guardian"))
+_IRON_PLUS_ARMOR = frozenset(
+    f"{tier}_{slot}"
+    for tier in ("iron", "diamond", "netherite")
+    for slot in ("helmet", "chestplate", "leggings", "boots")
+)
 _CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _SCAN_RADIUS = 20
 
@@ -42,6 +49,7 @@ class Encounter:
     min_distance: int
     max_distance: int
     splash_radius: int
+    open_field: bool = False
 
 
 def gate_reason(state, status):
@@ -76,7 +84,22 @@ def _cover(ex, destination, danger):
     return any(_safe_support(ex, cell) for cell in list(_line_cells(eye, danger))[1:-1])
 
 
-def _retreat(ex, origin, aim):
+def has_open_field_kit(state) -> bool:
+    """判断是否具备开阔地接战条件：剑、盾牌或铁+护甲、且生命 >= 14。"""
+    inv = state.inventory or {}
+    held = inv.get("held")
+    held_name = bare(held.get("name") if isinstance(held, dict) else held)
+    has_sword = carried_sword(state) is not None or held_name.endswith("_sword")
+    offhand = inv.get("offhand")
+    offhand_name = bare(offhand.get("name")) if isinstance(offhand, dict) else ""
+    has_shield = state.count("shield") >= 1 or offhand_name == "shield"
+    has_armor = has_equipped_armor(state) or any(state.count(a) >= 1 for a in _IRON_PLUS_ARMOR)
+    hp = state.snapshot().get("health")
+    hp_ok = type(hp) in (int, float) and math.isfinite(hp) and hp >= 14
+    return bool(has_sword and (has_shield or has_armor) and hp_ok)
+
+
+def _retreat(ex, origin, aim, *, require_cover: bool = True):
     origin_pos = origin["pos"] if isinstance(origin, dict) else origin
     sneaking = origin.get("sneaking") if isinstance(origin, dict) else None
     x, y, z = _cell(origin_pos)
@@ -84,10 +107,15 @@ def _retreat(ex, origin, aim):
                   for stride in (2, 3) for dx, dz in _CARDINAL]
     for dest in sorted(candidates, key=lambda p: math.dist(p, aim), reverse=True):
         dest_source = {"pos": dest, "sneaking": sneaking} if sneaking is not None else dest
-        if math.dist(dest, aim) >= math.dist(origin_pos, aim) and _standable_cell(ex, dest) and (
-                _retreat_clear(ex, origin_pos, dest) and _cover(ex, dest_source, aim)):
+        if (math.dist(dest, aim) >= math.dist(origin_pos, aim) and _standable_cell(ex, dest)
+                and _retreat_clear(ex, origin_pos, dest)
+                and (not require_cover or _cover(ex, dest_source, aim))):
             return dest
     return None
+
+
+def _open_retreat(ex, origin, aim):
+    return _retreat(ex, origin, aim, require_cover=False)
 
 
 def _aim(entity):
@@ -186,7 +214,8 @@ def _no_entity(description, missing, wake_on="chunk_moved"):
 
 def select_encounter(ex, state, predicate, *, description, missing, max_distance, aimed=False,
                      night_source=False, backstops=(), min_distance=2, splash_radius=0,
-                     rank_key=None, target_isolation_radius=0.0, max_pack_size=0):
+                     rank_key=None, target_isolation_radius=0.0, max_pack_size=0,
+                     allow_open_field_mobs: Collection[str] = ()):
     origin, entities = _observe(ex, state)
     candidates = [entity for entity in entities if predicate(entity)]
     if rank_key is not None:
@@ -209,9 +238,15 @@ def select_encounter(ex, state, predicate, *, description, missing, max_distance
             if max_pack_size > 0 and _hostile_pack_size(entities, _position(target["pos"])) >= max_pack_size:
                 continue
         retreat = _retreat(ex, origin, aim)
+        open_field = False
+        if retreat is None and target is not None and bare(target.get("name")) in allow_open_field_mobs:
+            retreat = _open_retreat(ex, origin, aim)
+            if retreat is not None:
+                open_field = True
         if retreat is None:
             continue
-        scene = Encounter(origin, retreat, target, aim, min_distance, max_distance, splash_radius)
+        scene = Encounter(origin, retreat, target, aim, min_distance, max_distance, splash_radius,
+                          open_field=open_field)
         if not aimed or _clear_shot(ex, state, scene, entities):
             return scene
     wake_on = "night" if not candidates and night_source and origin.get("is_day") else "chunk_moved"
@@ -240,12 +275,12 @@ def refresh_encounter(ex, state, scene, *, aimed=False):
         raise Replan("交战距离、旁侧敌对或掩体退路已变化")
     if not scene.min_distance <= math.dist(origin["pos"], aim) <= scene.max_distance or (
         not _retreat_clear(ex, origin["pos"], scene.retreat)
-        or not _cover(ex, {"pos": scene.retreat, "sneaking": origin.get("sneaking")}, aim)
+        or (not scene.open_field and not _cover(ex, {"pos": scene.retreat, "sneaking": origin.get("sneaking")}, aim))
         or (target is None and not _backstop_present(ex, origin, aim))
     ):
         raise Replan("交战距离、旁侧敌对或掩体退路已变化")
     current = Encounter(origin, scene.retreat, target, aim, scene.min_distance,
-                        scene.max_distance, scene.splash_radius)
+                        scene.max_distance, scene.splash_radius, open_field=scene.open_field)
     if aimed and not _clear_shot(ex, state, current, entities):
         raise Replan("射界不再安全")
     return current
@@ -286,11 +321,12 @@ def retreat_after_failure(ex, state, scene):
             state.in_safe_mode or current.get("ready") is not True or not current.get("alive")
             or current.get("dimension") != scene.origin["dimension"]
             or not _grounded(ex, current) or not _retreat_clear(ex, current["pos"], scene.retreat)
-            or not _cover(ex, {"pos": scene.retreat, "sneaking": current.get("sneaking")}, scene.aim)
+            or (not scene.open_field
+                and not _cover(ex, {"pos": scene.retreat, "sneaking": current.get("sneaking")}, scene.aim))
         ):
             return
         after = yield from move_local(ex, state, scene.retreat, max_distance=6, require_move=True)
-        if not _cover(ex, after, scene.aim):
+        if not scene.open_field and not _cover(ex, after, scene.aim):
             yield rec("combat_retreat_unconfirmed", None, reason="移动后未重新见证掩体")
     except (ApiError, Replan) as exc:
         yield rec("combat_retreat_unconfirmed", None, reason=str(exc))

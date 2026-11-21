@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 import json
 import math
@@ -185,6 +185,36 @@ def _copy_death(death: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_CARDINAL_HEADINGS: tuple[tuple[int, int], ...] = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+def _require_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"非法{label}: {value!r}")
+    return int(value)
+
+
+def _parse_heading(value: Any) -> Optional[list[int]]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+        return None
+    dx, dz = int(value[0]), int(value[1])
+    return [dx, dz] if (dx, dz) in _CARDINAL_HEADINGS else None
+
+
+def _copy_shaft(shaft: Mapping[str, Any]) -> dict[str, Any]:
+    raw_bi = shaft.get("branch_index")
+    branch_index = {str(k): int(v) for k, v in raw_bi.items()} if isinstance(raw_bi, Mapping) else {}
+    return {
+        "entry": [int(v) for v in shaft["entry"]],
+        "lowest_y": int(shaft["lowest_y"]),
+        "lowest_pos": [int(v) for v in shaft["lowest_pos"]],
+        "heading": [int(v) for v in shaft["heading"]],
+        "branch_index": branch_index,
+    }
+
+
 def _is_recovery_kit_item(name: str) -> bool:
     b = bare(name).strip().lower()
     if not b:
@@ -260,6 +290,7 @@ class WorldResourceMemo:
         self.visited_biomes: dict[str, set[str]] = {}
         self.survey_sectors_done: dict[str, set[int]] = {}
         self._camps: dict[str, dict[str, Any]] = {}
+        self._mine_shafts: dict[str, dict[str, Any]] = {}
         self._last_deaths: dict[str, dict[str, Any]] = {}
         self._spawn_pos: dict[str, Cell] = {}
         self.landmark_version: int = 0
@@ -278,6 +309,7 @@ class WorldResourceMemo:
             self.visited_biomes.clear()
             self.survey_sectors_done.clear()
             self._camps.clear()
+            self._mine_shafts.clear()
             self._last_deaths.clear()
             self._spawn_pos.clear()
             self.landmark_version = 0
@@ -717,6 +749,127 @@ class WorldResourceMemo:
         with self._lock:
             return self._camp_has_recovery_kit_locked(dim)
 
+    def get_mine_shaft(self, *, dimension: str = "overworld") -> Optional[dict[str, Any]]:
+        """返回指定维度主矿井档案的防御性副本，未记录时返回 `None`。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            shaft = self._mine_shafts.get(dim)
+            return _copy_shaft(shaft) if shaft is not None else None
+
+    @property
+    def primary_mine_shaft(self) -> Optional[dict[str, Any]]:
+        """主世界主矿井档案的防御性副本，未记录时返回 `None`。"""
+        return self.get_mine_shaft(dimension="overworld")
+
+    def set_mine_shaft(
+        self,
+        entry: Any,
+        *,
+        dimension: str = "overworld",
+        lowest_y: Optional[int] = None,
+        lowest_pos: Any = None,
+        heading: Sequence[int] = (1, 0),
+        branch_index: Optional[Mapping[str, int]] = None,
+    ) -> dict[str, Any]:
+        """创建或覆盖指定维度的主矿井档案并返回防御性副本。"""
+        dim = _norm_dim(dimension)
+        entry_cell = block_cell(entry)
+        low_cell = block_cell(lowest_pos) if lowest_pos is not None else entry_cell
+        low_y = _require_int(lowest_y, "最低Y坐标") if lowest_y is not None else int(low_cell[1])
+        head = _parse_heading(heading)
+        if head is None:
+            raise ValueError(f"非法矿井朝向: {heading!r}")
+        norm_branches: dict[str, int] = {}
+        if branch_index is not None:
+            if not isinstance(branch_index, Mapping):
+                raise ValueError(f"非法支道索引映射: {branch_index!r}")
+            for raw_k, raw_v in branch_index.items():
+                if isinstance(raw_k, bool) or isinstance(raw_k, float):
+                    raise ValueError(f"非法支道层键: {raw_k!r}")
+                try:
+                    lvl = int(raw_k)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"非法支道层键: {raw_k!r}") from exc
+                cnt = _require_int(raw_v, "支道计数")
+                if cnt < 0:
+                    raise ValueError(f"非法支道计数: {raw_v!r}")
+                norm_branches[str(lvl)] = cnt
+        shaft: dict[str, Any] = {
+            "entry": list(entry_cell),
+            "lowest_y": low_y,
+            "lowest_pos": list(low_cell),
+            "heading": head,
+            "branch_index": norm_branches,
+        }
+        with self._lock:
+            self._mine_shafts[dim] = shaft
+            return _copy_shaft(shaft)
+
+    def update_mine_shaft(
+        self,
+        *,
+        dimension: str = "overworld",
+        lowest_y: Optional[int] = None,
+        lowest_pos: Any = None,
+        heading: Optional[Sequence[int]] = None,
+        branch_level: Optional[int] = None,
+        branch_idx: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """增量更新已存在的指定维度主矿井档案（仅深化最低深度），不存在时返回 `None`。"""
+        dim = _norm_dim(dimension)
+        new_low_y = _require_int(lowest_y, "最低Y坐标") if lowest_y is not None else None
+        lp = block_cell(lowest_pos) if lowest_pos is not None else None
+        parsed_heading: Optional[list[int]] = None
+        if heading is not None:
+            parsed_heading = _parse_heading(heading)
+            if parsed_heading is None:
+                raise ValueError(f"非法矿井朝向: {heading!r}")
+        parsed_branch_level: Optional[int] = None
+        parsed_branch_idx: Optional[int] = None
+        if branch_level is not None and branch_idx is not None:
+            parsed_branch_level = _require_int(branch_level, "支道层Y坐标")
+            parsed_branch_idx = _require_int(branch_idx, "支道索引")
+            if parsed_branch_idx < 0:
+                raise ValueError(f"非法支道索引: {branch_idx!r}")
+        with self._lock:
+            existing = self._mine_shafts.get(dim)
+            if existing is None:
+                return None
+            if new_low_y is not None and new_low_y < int(existing["lowest_y"]):
+                existing["lowest_y"] = new_low_y
+                if lp is not None:
+                    existing["lowest_pos"] = list(lp)
+            elif lp is not None and lp[1] < min(int(existing["lowest_y"]), int(existing["lowest_pos"][1])):
+                existing["lowest_pos"] = list(lp)
+                existing["lowest_y"] = int(lp[1])
+            elif lp is not None and lp[1] < int(existing["lowest_pos"][1]):
+                existing["lowest_pos"] = list(lp)
+            if parsed_heading is not None:
+                existing["heading"] = parsed_heading
+            if parsed_branch_level is not None and parsed_branch_idx is not None:
+                existing["branch_index"][str(parsed_branch_level)] = parsed_branch_idx
+            return _copy_shaft(existing)
+
+    def next_mine_branch(self, level_y: int, *, dimension: str = "overworld") -> int:
+        """分配并递增指定层高的下一个支道索引，若矿井档案不存在则自动初始化默认档案。"""
+        lvl = _require_int(level_y, "矿井层高")
+        dim = _norm_dim(dimension)
+        key = str(lvl)
+        with self._lock:
+            shaft = self._mine_shafts.get(dim)
+            if shaft is None:
+                shaft = {
+                    "entry": [0, lvl, 0],
+                    "lowest_y": lvl,
+                    "lowest_pos": [0, lvl, 0],
+                    "heading": [1, 0],
+                    "branch_index": {},
+                }
+                self._mine_shafts[dim] = shaft
+            idx = int(shaft["branch_index"].get(key, 0))
+            shaft["branch_index"][key] = idx + 1
+            return idx
+
     def record_death(
         self,
         pos: Any,
@@ -913,6 +1066,9 @@ class WorldResourceMemo:
                     summary["camp_chest_roles"] = sorted(camp["chests"].keys())
                 if camp.get("kit_depleted"):
                     summary["camp_kit_depleted"] = True
+            if shaft := self._mine_shafts.get(dim):
+                summary["has_mine_shaft"] = True
+                summary["mine_shaft_lowest_y"] = int(shaft["lowest_y"])
             return summary
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
@@ -959,6 +1115,7 @@ class WorldResourceMemo:
                 "visited_biomes": {dim: sorted(bs) for dim, bs in self.visited_biomes.items() if bs},
                 "survey_sectors_done": {dim: sorted(ss) for dim, ss in self.survey_sectors_done.items() if ss},
                 "camps": {dim: _copy_camp(camp) for dim, camp in self._camps.items()},
+                "primary_mine_shafts": {dim: _copy_shaft(s) for dim, s in self._mine_shafts.items()},
                 "last_deaths": {dim: _copy_death(death) for dim, death in self._last_deaths.items()},
                 "spawn_positions": {dim: list(cell) for dim, cell in self._spawn_pos.items()},
             }
@@ -1261,6 +1418,51 @@ class WorldResourceMemo:
                         "recorded_at": recorded_at,
                     }
 
+            new_mine_shafts: dict[str, dict[str, Any]] = {}
+            if "primary_mine_shafts" in data:
+                shafts_raw = data["primary_mine_shafts"]
+                if not isinstance(shafts_raw, Mapping):
+                    return False
+                for raw_dim, shaft_raw in shafts_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(shaft_raw, Mapping):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    entry_cell = _parse_cell(shaft_raw.get("entry"))
+                    if entry_cell is None:
+                        return False
+                    lowest_y_raw = shaft_raw.get("lowest_y")
+                    if isinstance(lowest_y_raw, bool) or not isinstance(lowest_y_raw, int):
+                        return False
+                    lowest_pos_cell = _parse_cell(shaft_raw.get("lowest_pos"))
+                    if lowest_pos_cell is None:
+                        return False
+                    head = _parse_heading(shaft_raw.get("heading"))
+                    if head is None:
+                        return False
+                    bi_raw = shaft_raw.get("branch_index", {})
+                    if not isinstance(bi_raw, Mapping):
+                        return False
+                    branch_index_out: dict[str, int] = {}
+                    for raw_k, raw_v in bi_raw.items():
+                        if not isinstance(raw_k, str):
+                            return False
+                        try:
+                            lvl = int(raw_k)
+                        except ValueError:
+                            return False
+                        if str(lvl) != raw_k:
+                            return False
+                        if isinstance(raw_v, bool) or not isinstance(raw_v, int) or raw_v < 0:
+                            return False
+                        branch_index_out[str(lvl)] = int(raw_v)
+                    new_mine_shafts[dim] = {
+                        "entry": list(entry_cell),
+                        "lowest_y": int(lowest_y_raw),
+                        "lowest_pos": list(lowest_pos_cell),
+                        "heading": head,
+                        "branch_index": branch_index_out,
+                    }
+
             with self._lock:
                 self._entries = new_entries
                 self._stations = new_stations
@@ -1269,6 +1471,7 @@ class WorldResourceMemo:
                 self.visited_biomes = new_biomes
                 self.survey_sectors_done = new_sectors
                 self._camps = new_camps
+                self._mine_shafts = new_mine_shafts
                 self._last_deaths = new_last_deaths
                 self._spawn_pos = new_spawn_pos
                 self.landmark_version = lv

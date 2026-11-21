@@ -29,9 +29,9 @@ _WHEAT = "wheat_seeds"
 _HOES = ("netherite_hoe", "diamond_hoe", "iron_hoe", "copper_hoe", "stone_hoe", "wooden_hoe", "golden_hoe")
 _TILLABLE = ("dirt", "grass_block")
 _GRASS = ("short_grass", "tall_grass")
-_BLOCK_RADIUS = 12
-_BLOCK_LIMIT = 10
-_ANIMAL_RADIUS = 16
+_BLOCK_RADIUS, _BLOCK_LIMIT = 12, 10
+_ANIMAL_RADIUS = 32
+_GRASS_RADIUS, _GRASS_LIMIT = 32, 48
 _FEEDS = {
     "chicken": (_WHEAT,), "cow": ("wheat",), "sheep": ("wheat",),
     "pig": ("carrot", "potato", "beetroot"),
@@ -119,8 +119,8 @@ def _craft_wooden_hoe(ex, state):
     yield from craft_recipe(ex, state, "wooden_hoe", goal_qty=1)
 
 
-def _gather_wheat(ex, state, goal_qty):
-    grass = scan_blocks(ex, state, _GRASS, radius=_BLOCK_RADIUS, limit=8)
+def _gather_wheat(ex, state, goal_qty, *, radius=_GRASS_RADIUS, limit=_GRASS_LIMIT):
+    grass = scan_blocks(ex, state, _GRASS, radius=radius, limit=limit)
     if grass.get("ready") is False:
         raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描草丛")
     for row in grass["blocks"]:
@@ -163,7 +163,7 @@ def _gather_wheat(ex, state, goal_qty):
         if state.count(_WHEAT) >= goal_qty:
             return
     raise _site_missing(f"可达草丛未凑齐 {goal_qty} 粒小麦种子，请换观测区或补种子",
-                        "reachable_wheat_seeds", _BLOCK_RADIUS, 8)
+                        "reachable_wheat_seeds", radius, limit)
 
 
 def _planting_site(ex, state, seed):
@@ -262,31 +262,43 @@ def _baby(entity):
     return entity.get("baby") is True or entity.get("is_baby") is True
 
 
-def _animals(ex, state, species):
-    scan = scan_entities(ex, state, species, radius=_ANIMAL_RADIUS)
+def _scan_live_animals(ex, state, query, allowed):
+    scan = scan_entities(ex, state, query, radius=_ANIMAL_RADIUS)
     if scan.get("ready") is False:
-        raise Replan(f"世界实体加载尚未就绪（not_ready），暂无法观察 {species}")
+        raise Replan(f"世界实体加载尚未就绪（not_ready），暂无法观察 {query or 'auto'}")
     return [entity for entity in scan["entities"]
-            if entity.get("type") == "animal" and bare(entity.get("name")) == species
+            if entity.get("type") == "animal" and bare(entity.get("name")) in allowed
             and isinstance(entity.get("health"), (int, float)) and entity["health"] > 0]
 
 
+def _animals(ex, state, species):
+    return _scan_live_animals(ex, state, species, {species})
+
+
 def _pair_missing(species):
-    return _site_missing(f"未观察到可安全接触的同种 {species} 亲本两只",
-                         f"reachable_pair:{species}", _ANIMAL_RADIUS, 40)
+    return _site_missing(f"未观察到可安全接触的同种 {species} 亲本两只", f"reachable_pair:{species}", _ANIMAL_RADIUS, 40)
 
 
-def _find_pair(ex, state, species):
-    animals = _animals(ex, state, species)
+def _scan_animal_pairs(ex, state, requested: str) -> tuple[str | None, tuple[dict, dict] | None]:
+    allowed = set(_FEEDS) if requested == "auto" else {requested}
+    animals = _scan_live_animals(ex, state, None if requested == "auto" else requested, allowed)
     status = state.refresh_status(ex.client, max_age_s=0)
     _require_ready(status)
-    eligible = {entity["id"]: entity for entity in animals
-                if not _baby(entity) and entity.get("in_love") is not True
-                and _stand_for(ex, status, entity["pos"]) is not None}
-    for first, second in combinations(eligible.values(), 2):
-        if math.dist(first["pos"], second["pos"]) <= 6:
-            return first, second
-    raise _pair_missing(species)
+    by_species: dict[str, dict[int, dict]] = {}
+    for e in animals:
+        if not _baby(e) and e.get("in_love") is not True and _stand_for(ex, status, e["pos"]) is not None:
+            by_species.setdefault(bare(e.get("name")), {})[e["id"]] = e
+    paired = {
+        sp: p for sp, el in by_species.items()
+        if (p := next(((a, b) for a, b in combinations(el.values(), 2) if math.dist(a["pos"], b["pos"]) <= 6), None))
+    }
+    if not paired:
+        return None, None
+    if requested != "auto":
+        return requested, paired[requested]
+    sp = (next((s for s in _FEEDS if s in paired and any(state.count(f) >= 2 for f in _FEEDS[s])), None)
+          or ("chicken" if "chicken" in paired else next(s for s in _FEEDS if s in paired)))
+    return sp, paired[sp]
 
 
 def _recheck_pair(ex, state, species, ids):
@@ -319,9 +331,7 @@ class BreedAnimal(Skill):
     def blocked(cls, state):
         if state.snapshot().get("ready") is False:
             return "世界正在加载区块和实体（ready=false），请稍候"
-        has_food = state.count(_WHEAT) >= 1 or any(
-            state.count(food) >= 2 for foods in _FEEDS.values() for food in foods
-        )
+        has_food = state.count(_WHEAT) >= 1 or any(state.count(f) >= 2 for fs in _FEEDS.values() for f in fs)
         return "" if has_food or _has_farm_tools(state) else "先备两份匹配饲料，或准备搜集小麦种子"
 
     def can_start(self, state):
@@ -340,18 +350,19 @@ class BreedAnimal(Skill):
         if _has_progress(ex, _BREED_PROGRESS):
             return
         _fresh_inventory(ex, state)
-        species, food = _feeding_route(self.args, state)
+        requested = self.args["animal"]
+        if requested != "auto":
+            req_species, req_food = _feeding_route(self.args, state)
+            if req_food != _WHEAT and state.count(req_food) < 2:
+                raise Replan(f"繁殖 {req_species} 需要两份 {req_food}，请先备足饲料")
+        species, parents = _scan_animal_pairs(ex, state, requested)
+        if species is None or parents is None:
+            raise _pair_missing(_feeding_route(self.args, state)[0])
+        food = next((f for f in _FEEDS[species] if state.count(f) >= 2), _FEEDS[species][0])
         if state.count(food) < 2:
             if food != _WHEAT:
-                raise Replan(f"繁殖 {species} 需要两份 {food}，请先备足饲料")
-            yield from _gather_wheat(ex, state, 2)
-        try:
-            parents = _find_pair(ex, state, species)
-        except EnvBlocked:
-            if self.args["animal"] != "auto" or species != "cow":
-                raise
-            species = "sheep"  # 同一份小麦预留仍适用，避免消耗未声明的替代饲料。
-            parents = _find_pair(ex, state, species)
+                raise Replan(f"附近有成对 {species}，但需要两份 {food}，请先备足饲料")
+            yield from _gather_wheat(ex, state, 2, radius=_GRASS_RADIUS, limit=_GRASS_LIMIT)
         ids = tuple(parent["id"] for parent in parents)
         baseline = set(ids)
         for remaining, parent_id in zip((2, 1), ids):

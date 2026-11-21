@@ -18,6 +18,9 @@ from .furnace_lease import (
     collect_leased, lease_book_for, load_and_lease, smelt_seconds_per_item,
 )
 from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe, block_name, record_mine_trail
+from .mine_shaft import (
+    branch_mine_level, column_has_water, navigate_to_shaft, plug_or_detour_water,
+)
 from .mining import (
     SOLID_SUPPORT, MineStepUnsafe, mine_step, prepare_mining_pick, safe_mine_column,
     under_feet,
@@ -71,13 +74,21 @@ POLL_SECONDS = 0.5
 _SESSION_EXCLUDED = WeakKeyDictionary()
 _FLOODED_CHUNKS = WeakKeyDictionary()
 _EXHAUSTED_SHAFTS = WeakKeyDictionary()
-_WATER_BLOCKS = frozenset({"water", "flowing_water", "bubble_column"})
 
 
 def reset_iron_memo() -> None:
     _SESSION_EXCLUDED.clear()
     _FLOODED_CHUNKS.clear()
     _EXHAUSTED_SHAFTS.clear()
+
+
+def has_ready_iron_lease(state: "State") -> bool:
+    """Return True if the current dimension has a ready furnace lease for `iron_ingot`."""
+    dim = str((state.st or {}).get("dimension") or "overworld")
+    return any(
+        lease.expected_output == "iron_ingot"
+        for lease in lease_book_for(state).ready_leases(dimension=dim)
+    )
 
 
 def _flooded_chunks_for(client: object, dim: str) -> set[tuple[int, int]]:
@@ -98,11 +109,6 @@ def _exhausted_shafts_for(client: object, dim: str) -> set[tuple[int, int]]:
 
 class _OreDropUncollected(Replan):
     """合规工具挖掘且无告警，但掉落物未立即入包；矿脉尚有邻矿时可继续采完。"""
-
-
-def _column_has_water(ex: "Executor", pos: Sequence[int]) -> bool:
-    x, y, z = int(pos[0]), int(pos[1]), int(pos[2])
-    return any(block_name(ex, [x, y + dy, z]) in _WATER_BLOCKS for dy in (-1, 0, 1, 2, 3))
 
 
 def _halt_residual_motion(ex: "Executor", state: "State") -> dict:
@@ -338,6 +344,8 @@ class SmeltIron(Skill):
 
     @classmethod
     def blocked(cls, state: "State") -> str:
+        if has_ready_iron_lease(state):
+            return ""
         has_iron_input = state.count("raw_iron") >= 1 or state.count("raw_iron_block") >= 1
         if not has_iron_input and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包无粗铁且缺石镐或更好的镐（木镐、金镐不能采铁）"
@@ -497,26 +505,67 @@ class SmeltIron(Skill):
         start_chunk = (start[0] // 16, start[2] // 16)
         flooded_chunks = _flooded_chunks_for(ex.client, dim)
         exhausted_shafts = _exhausted_shafts_for(ex.client, dim)
-        if start_chunk in flooded_chunks:
-            raise EnvBlocked(
-                f"当前区块 {start_chunk} 已探明存在水矿洞，直接绕开前往其他区域",
-                missing_predicate="dry_iron_shaft",
-                searched_volume=f"已跳过积水区块 {start_chunk}",
-                wake_on="chunk_moved",
-            )
-        if start_chunk in exhausted_shafts:
-            raise EnvBlocked(
-                f"当前区块 {start_chunk} 的探矿阶梯已耗尽，直接外迁换区探索",
-                missing_predicate="exposed_iron",
-                searched_volume=f"已跳过耗尽矿口区块 {start_chunk}",
-                wake_on="chunk_moved",
-            )
+
+        def _check_blocked_chunk(chunk: tuple[int, int]) -> None:
+            if chunk in flooded_chunks:
+                raise EnvBlocked(
+                    f"当前区块 {chunk} 已探明存在水矿洞，直接绕开前往其他区域",
+                    missing_predicate="dry_iron_shaft",
+                    searched_volume=f"已跳过积水区块 {chunk}",
+                    wake_on="chunk_moved",
+                )
+            if chunk in exhausted_shafts:
+                raise EnvBlocked(
+                    f"当前区块 {chunk} 的探矿阶梯已耗尽，直接外迁换区探索",
+                    missing_predicate="exposed_iron",
+                    searched_volume=f"已跳过耗尽矿口区块 {chunk}",
+                    wake_on="chunk_moved",
+                )
+
+        _check_blocked_chunk(start_chunk)
+
+        memo = memo_for(state)
+        existing_shaft = memo.get_mine_shaft(dimension=dim)
+        camp = memo.get_camp(dimension=dim) if existing_shaft is None else None
+        navigated = False
+        if existing_shaft is not None:
+            low_pos = existing_shaft["lowest_pos"]
+            entry_pos = existing_shaft["entry"]
+            low_chunk = (int(low_pos[0]) // 16, int(low_pos[2]) // 16)
+            entry_chunk = (int(entry_pos[0]) // 16, int(entry_pos[2]) // 16)
+            if (low_chunk not in flooded_chunks and low_chunk not in exhausted_shafts
+                    and entry_chunk not in flooded_chunks and entry_chunk not in exhausted_shafts):
+                anchor = low_pos if int(existing_shaft["lowest_y"]) >= SHALLOW_IRON_Y - 4 else entry_pos
+                if 3.0 < math.dist(start, anchor) <= 64.0:
+                    yield from navigate_to_shaft(ex, state, target_y=SHALLOW_IRON_Y, dimension=dim, max_dist=64.0)
+                    navigated = True
+        elif camp is not None and camp.get("mine_entry") is not None:
+            me = tuple(camp["mine_entry"])
+            me_chunk = (int(me[0]) // 16, int(me[2]) // 16)
+            if (me_chunk not in flooded_chunks and me_chunk not in exhausted_shafts
+                    and 3.0 < math.dist(start, me) <= 64.0):
+                yield from navigate_to_shaft(ex, state, target_y=SHALLOW_IRON_Y, dimension=dim, max_dist=64.0)
+                navigated = True
+
+        if navigated:
+            st0 = _halt_residual_motion(ex, state)
+            cur0 = st0.get("pos") or state.pos
+            start = tuple(map(math.floor, cur0))
+            start_y = start[1]
+            start_chunk = (start[0] // 16, start[2] // 16)
+            _check_blocked_chunk(start_chunk)
+
         max_steps = min(MAX_PROSPECT_STEPS, max(PROSPECT_STEPS, start_y - SHALLOW_IRON_Y))
         visited: set[tuple[int, int]] = set()
         completed_steps = 0
         backtracks = 0
+        water_plug_failures = 0
         water_blocked = False
-        heading = self._initial_heading(start, excluded)
+        has_deep_excluded = any(p[1] <= start[1] - 4 for p in excluded)
+        if existing_shaft is not None and not has_deep_excluded:
+            heading = (int(existing_shaft["heading"][0]), int(existing_shaft["heading"][1]))
+        else:
+            heading = self._initial_heading(start, excluded)
         waypoints: list[list[float]] = [[start[0] + 0.5, float(start_y), start[2] + 0.5]]
 
         def observe_cut():
@@ -544,15 +593,35 @@ class SmeltIron(Skill):
                             if (x + dx, z + dz) not in visited
                             and safe_mine_column(ex, [x + dx, y - 1, z + dz])), None)
                 if pos is None:
-                    # 遇水矿洞封死时不再在洞内来回回溯绕圈，直接标记积水区块并切去别处
-                    if any(
-                        (x + dx, z + dz) not in visited and _column_has_water(ex, [x + dx, y - 1, z + dz])
+                    has_water = any(
+                        (x + dx, z + dz) not in visited and column_has_water(ex, [x + dx, y - 1, z + dz])
                         for dx, dz in dirs
-                    ):
-                        water_blocked = True
-                        flooded_chunks.add((x // 16, z // 16))
-                        flooded_chunks.add(start_chunk)
-                        break
+                    )
+                    if has_water:
+                        can_recover_water = (
+                            completed_steps > 0
+                            or existing_shaft is not None
+                            or block_name(ex, [x, y + 2, z]) in SOLID_SUPPORT
+                        )
+                        if can_recover_water and water_plug_failures < 2:
+                            recovered, new_heading = yield from plug_or_detour_water(
+                                ex, state, (x, y, z), heading,
+                            )
+                            if recovered:
+                                heading = new_heading
+                                st_rec = state.refresh_status(ex.client, max_age_s=0) or {}
+                                cur_rec = st_rec.get("pos") or state.pos
+                                nx, ny, nz = map(math.floor, cur_rec)
+                                if (nx, ny, nz) != (x, y, z):
+                                    waypoints.append([nx + 0.5, float(ny), nz + 0.5])
+                                    visited.add((nx, nz))
+                                continue
+                            water_plug_failures += 1
+                        if not can_recover_water or water_plug_failures >= 2 or len(waypoints) < 2 or backtracks >= 2:
+                            water_blocked = True
+                            flooded_chunks.add((x // 16, z // 16))
+                            flooded_chunks.add(start_chunk)
+                            break
                     # 井底正前与两侧均遇水/砾石受阻时，沿已挖阶梯后退一级尝试侧向分支。
                     if len(waypoints) >= 2 and backtracks < 2:
                         prev = waypoints[-2]
@@ -585,12 +654,37 @@ class SmeltIron(Skill):
                 heading = (pos[0] - x, pos[2] - z)
                 waypoints.append(dest)
                 completed_steps += 1
+                if memo.get_mine_shaft(dimension=dim) is None:
+                    memo.set_mine_shaft(
+                        start, dimension=dim, lowest_y=int(pos[1]), lowest_pos=pos, heading=heading,
+                    )
+                else:
+                    memo.update_mine_shaft(
+                        dimension=dim, lowest_y=int(pos[1]), lowest_pos=pos, heading=heading,
+                    )
                 candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
                 if candidates:
                     return candidates
         finally:
             if completed_steps > 0:
                 record_mine_trail(waypoints)
+
+        cur_end = tuple(map(math.floor, (state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos)))
+        if not water_blocked and cur_end[1] <= SHALLOW_IRON_Y:
+            branch_ores = yield from branch_mine_level(
+                ex,
+                state,
+                level_y=SHALLOW_IRON_Y,
+                target_ores=IRON_ORES,
+                bonus_ores=("coal_ore", "deepslate_coal_ore"),
+                scan_radius=16,
+                max_length=12,
+                scan_stride=3,
+                dimension=dim,
+                excluded=excluded,
+            )
+            if branch_ores or state.count("raw_iron") >= 1 or state.count("raw_iron_block") >= 1:
+                return branch_ores
 
         end = tuple(map(math.floor, state.pos))
         if water_blocked:
@@ -620,7 +714,7 @@ class SmeltIron(Skill):
         """采满当次目标粗铁后，检查紧邻 5 格内同矿脉暴露铁矿并顺手挖完，避免重复下矿。"""
         if self.args["count"] < 2 or best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return
-        vein_cap = min(12, self.args["count"] + 6)
+        vein_cap = min(16, max(12, self.args["count"] + 6)) if self.args["count"] >= 3 else min(12, self.args["count"] + 6)
         for _ in range(vein_cap):
             if state.count("raw_iron") >= vein_cap or best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
                 return
@@ -972,6 +1066,9 @@ class SmeltIron(Skill):
                 if state.count("iron_ingot") - start_ingots >= self.args["count"]:
                     return
             if state.count("iron_ingot") > start_ingots:
+                return
+            if (state.count("raw_iron") < 1 and state.count("raw_iron_block") < 1
+                    and any(lease.expected_output == "iron_ingot" for lease in book.active_leases(dimension=dim))):
                 return
         if (state.count("raw_iron") < 1 and state.count("raw_iron_block") < 1
                 and not any(state.count(s) >= 1 for s in stations_for_item("raw_iron"))):

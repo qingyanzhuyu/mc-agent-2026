@@ -12,6 +12,10 @@ from .diamond_site import (
 )
 from .field import equip_item, mine_block_batch, place_block, scan_blocks
 from .items import AIR, NAV_FAIL_CODES, PICKAXE_ORDER, PLACEABLE_BLOCKS, bare, record_mine_trail
+from .mine_shaft import (
+    DIAMOND_LAYER_Y, branch_mine_level, column_has_water,
+    navigate_to_shaft, plug_or_detour_water,
+)
 from .mining import SOLID_SUPPORT, MineStepUnsafe, mine_step
 from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
@@ -30,7 +34,7 @@ _CLEAR_FAIL_CODES = frozenset({
 })
 _MAX_DESCENT = 24
 _MAX_ORES = 24
-_MIN_Y = -54
+_MIN_Y = DIAMOND_LAYER_Y
 _SCAN_RADIUS = 32
 
 LAPIS_ORES = frozenset(("lapis_ore", "deepslate_lapis_ore"))
@@ -345,13 +349,40 @@ class MineDiamond(Skill):
             if initial < looted < goal_qty:
                 yield self._partial(initial, looted, goal_qty)
             raise Replan("开采暴露钻矿前请补有耐久的铁镐、钻石镐或下界合金镐")
+        memo = _world_memo(state)
+        existing_shaft = memo.get_mine_shaft(dimension="overworld") if memo is not None else None
+        camp = memo.get_camp(dimension="overworld") if (memo is not None and existing_shaft is None) else None
+        start_cell = _cell(start["pos"])
+        try:
+            if existing_shaft is not None:
+                low_pos = tuple(existing_shaft["lowest_pos"])
+                entry_pos = tuple(existing_shaft["entry"])
+                low_y = int(existing_shaft["lowest_y"])
+                if start_cell[1] > low_y + 2 and min(math.dist(start_cell, low_pos), math.dist(start_cell, entry_pos)) <= 64.0:
+                    yield from navigate_to_shaft(ex, state, target_y=DIAMOND_LAYER_Y, dimension="overworld", max_dist=64.0)
+                    start = _safe_status(ex, state, "overworld")
+            elif camp is not None and camp.get("mine_entry") is not None:
+                me = _cell(camp["mine_entry"])
+                if 3.0 < math.dist(start_cell, me) <= 64.0 and start_cell[1] >= me[1] - 2:
+                    yield from navigate_to_shaft(ex, state, target_y=DIAMOND_LAYER_Y, dimension="overworld", max_dist=64.0)
+                    start = _safe_status(ex, state, "overworld")
+        except Replan:
+            collected = state.count("diamond")
+            if initial < collected < goal_qty:
+                yield self._partial(initial, collected, goal_qty)
+            raise
         path = [_cell(start["pos"])]
         waypoints = [start["pos"]]
         tried_ores = set()
         tried_bonus: set = set()
         bonus_mined = 0
+        branches_done = 0
         visited_columns = {(path[0][0], path[0][2])}
-        heading = CARDINALS[0]
+        heading = (
+            tuple(existing_shaft["heading"])
+            if (existing_shaft is not None and tuple(existing_shaft["heading"]) in CARDINALS)
+            else CARDINALS[0]
+        )
         stairs = 0
         vc = _voxel_cache(state)
         reach_mod = _reach_mod()
@@ -441,17 +472,73 @@ class MineDiamond(Skill):
                         )
                         status = _safe_status(ex, state, "overworld")
                         origin = _cell(status["pos"])
-                    if (_cell(status["pos"]) != path[-1] or stairs >= _MAX_DESCENT or origin[1] <= _MIN_Y):
-                        break
-                    step = yield from self._down_step(ex, state, origin, path, visited_columns, heading)
+                    stop_descent = (
+                        _cell(status["pos"]) != path[-1]
+                        or stairs >= _MAX_DESCENT
+                        or origin[1] <= _MIN_Y
+                    )
+                    step = None if stop_descent else (
+                        yield from self._down_step(ex, state, origin, path, visited_columns, heading)
+                    )
                     if step is None:
+                        if not stop_descent:
+                            status = _safe_status(ex, state, "overworld")
+                            origin = _cell(status["pos"])
+                        if _cell(status["pos"]) == path[-1] and origin[1] <= -54 and branches_done < 2:
+                            branches_done += 1
+                            branch_ores = yield from branch_mine_level(
+                                ex,
+                                state,
+                                level_y=DIAMOND_LAYER_Y,
+                                target_ores=DIAMOND_ORES,
+                                bonus_ores=tuple(BONUS_ORES),
+                                allowed_picks=frozenset(_IRON_PICKS),
+                                max_length=12,
+                                scan_stride=3,
+                                scan_radius=_SCAN_RADIUS,
+                                dimension="overworld",
+                                excluded=tried_ores,
+                            )
+                            after_branch = _safe_status(ex, state, "overworld")
+                            after_cell = _cell(after_branch["pos"])
+                            if after_cell != path[-1]:
+                                path.append(after_cell)
+                                waypoints.append(after_branch["pos"])
+                                visited_columns.add((after_cell[0], after_cell[2]))
+                                if memo is not None and memo.get_mine_shaft(dimension="overworld") is not None:
+                                    memo.update_mine_shaft(
+                                        dimension="overworld",
+                                        lowest_y=after_cell[1],
+                                        lowest_pos=after_cell,
+                                    )
+                            if branch_ores:
+                                continue
+                            if after_cell != origin and branches_done < 2:
+                                continue
                         break
                     if step is False:
                         continue  # A fresh scan found a new reachable diamond face during the cut.
                     path.append(_cell(step))
                     waypoints.append(step)
-                    heading = (path[-1][0] - origin[0], path[-1][2] - origin[2])
+                    visited_columns.add((path[-1][0], path[-1][2]))
+                    heading = self._normalize_heading(path[-1][0] - origin[0], path[-1][2] - origin[2], heading)
                     stairs += 1
+                    if memo is not None:
+                        if memo.get_mine_shaft(dimension="overworld") is None:
+                            memo.set_mine_shaft(
+                                path[0],
+                                dimension="overworld",
+                                lowest_y=path[-1][1],
+                                lowest_pos=path[-1],
+                                heading=heading,
+                            )
+                        else:
+                            memo.update_mine_shaft(
+                                dimension="overworld",
+                                lowest_y=path[-1][1],
+                                lowest_pos=path[-1],
+                                heading=heading,
+                            )
                     if stairs % 4 == 0:
                         minerals = ["lapis_ore", "deepslate_lapis_ore", "iron_ore", "deepslate_iron_ore"]
                         if path[-1][1] <= 0:
@@ -493,47 +580,85 @@ class MineDiamond(Skill):
         return rec("diamond_partial", {"held": collected, "gained": collected - initial,
                                        "requested": goal_qty, "inventory_criterion": True})
 
+    @staticmethod
+    def _normalize_heading(dx: int, dz: int, fallback: tuple[int, int]) -> tuple[int, int]:
+        if abs(dx) >= abs(dz) and dx != 0:
+            return (1 if dx > 0 else -1, 0)
+        if dz != 0:
+            return (0, 1 if dz > 0 else -1)
+        return fallback
+
+    def _cut_descent(self, ex, state, origin, path, visited_columns, landing):
+        column = (landing[0], landing[2])
+        cuts = tuple(_above(landing, dy) for dy in (0, 1, 2))
+        visited_columns.add(column)
+        remaining = sum(_dry_name(_block(ex, cell)) not in AIR for cell in cuts)
+        pick = yield from _hand_pick(ex, state, remaining + 1)
+        if (_cell(_safe_status(ex, state, "overworld")["pos"]) != origin
+                or not _safe_excavation(ex, origin, cuts, path, landing=landing)):
+            return None
+
+        def observe_cut():
+            status = _safe_status(ex, state, "overworld")
+            if (_cell(status["pos"]) != origin
+                    or not _safe_excavation(ex, origin, cuts, path, landing=landing)):
+                raise MineStepUnsafe("cut", "阶梯开凿时出现流体或支撑变化，停止使用该列")
+            # The callback can pause the movement before the next cell is dug.
+            ores = _nearby(ex, state, DIAMOND_ORES, radius=5, limit=6)
+            yield from ()
+            return any(_in_reach(ex, status, ore, reach=4)
+                       and _safe_excavation(ex, origin, (ore,), path)
+                       for ore in ores) or None
+
+        dest, evidence = yield from mine_step(
+            ex, state, landing, allowed_picks=frozenset((pick,)), after_dig=observe_cut,
+        )
+        if evidence:
+            return False
+        after = _safe_status(ex, state, "overworld")
+        if _cell(after["pos"]) != landing or not all(_standing(ex, cell) for cell in path[-2:]):
+            raise Replan("下一级落脚或回程阶梯支撑未确认，停止下探")
+        return dest
+
     def _down_step(self, ex, state, origin, path, visited_columns, heading):
         x, y, z = origin
-        for dx, dz in (heading, *(d for d in CARDINALS if d != heading)):
+        dirs = (heading, *(d for d in CARDINALS if d != heading))
+        for dx, dz in dirs:
             landing = (x + dx, y - 1, z + dz)
             column = (landing[0], landing[2])
             cuts = tuple(_above(landing, dy) for dy in (0, 1, 2))
             if column in visited_columns or not _safe_excavation(ex, origin, cuts, path, landing=landing):
                 continue
-            visited_columns.add(column)
-            remaining = sum(_dry_name(_block(ex, cell)) not in AIR for cell in cuts)
-            pick = yield from _hand_pick(ex, state, remaining + 1)
-            if (_cell(_safe_status(ex, state, "overworld")["pos"]) != origin
-                    or not _safe_excavation(ex, origin, cuts, path, landing=landing)):
-                return None
-
-            def observe_cut():
-                status = _safe_status(ex, state, "overworld")
-                if (_cell(status["pos"]) != origin
-                        or not _safe_excavation(ex, origin, cuts, path, landing=landing)):
-                    raise MineStepUnsafe("cut", "阶梯开凿时出现流体或支撑变化，停止使用该列")
-                # The callback can pause the movement before the next cell is dug.
-                ores = _nearby(ex, state, DIAMOND_ORES, radius=5, limit=6)
-                yield from ()
-                return any(_in_reach(ex, status, ore, reach=4)
-                           and _safe_excavation(ex, origin, (ore,), path)
-                           for ore in ores) or None
-
             try:
-                dest, evidence = yield from mine_step(
-                    ex, state, landing, allowed_picks=frozenset((pick,)), after_dig=observe_cut,
-                )
+                return (yield from self._cut_descent(ex, state, origin, path, visited_columns, landing))
             except MineStepUnsafe as exc:
                 if exc.stage == "move" or _cell(_safe_status(ex, state, "overworld")["pos"]) != origin:
                     raise
                 continue
-            if evidence:
-                return False
-            after = _safe_status(ex, state, "overworld")
-            if _cell(after["pos"]) != landing or not all(_standing(ex, cell) for cell in path[-2:]):
-                raise Replan("下一级落脚或回程阶梯支撑未确认，停止下探")
-            return dest
+        if any(
+            (x + dx, z + dz) not in visited_columns
+            and column_has_water(ex, [x + dx, y - 1, z + dz])
+            for dx, dz in dirs
+        ):
+            recovered, new_heading = yield from plug_or_detour_water(
+                ex, state, origin, heading, allowed_picks=frozenset(_IRON_PICKS),
+            )
+            if recovered:
+                cur_st = _safe_status(ex, state, "overworld")
+                cur_cell = _cell(cur_st["pos"])
+                if cur_cell != origin:
+                    return list(cur_st["pos"])
+                ndx, ndz = new_heading
+                landing = (x + ndx, y - 1, z + ndz)
+                column = (landing[0], landing[2])
+                cuts = tuple(_above(landing, dy) for dy in (0, 1, 2))
+                if column not in visited_columns and _safe_excavation(ex, origin, cuts, path, landing=landing):
+                    try:
+                        return (yield from self._cut_descent(ex, state, origin, path, visited_columns, landing))
+                    except MineStepUnsafe as exc:
+                        if exc.stage == "move" or _cell(_safe_status(ex, state, "overworld")["pos"]) != origin:
+                            raise
+                        return None
         return None
 
 
