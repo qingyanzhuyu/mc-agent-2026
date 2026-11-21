@@ -1,8 +1,9 @@
 """Craft exact iron equipment using the shared vanilla recipe table."""
 from __future__ import annotations
 
-from ..runtime import EnvBlocked
-from .base import Param, Skill
+from ..runtime import EnvBlocked, Replan
+from .base import Param, Skill, rec
+from .camp_plan import armor_equip_slot_for
 from .mine_return import ensure_crafting_table_ready
 from .recipes import RECIPES, _ingredient_items, craft_recipe
 from .registry import register
@@ -78,7 +79,7 @@ class CraftIronGear(Skill):
                 plank = log.removesuffix("_log") + "_planks"
                 yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 4)
         try:
-            yield from craft_recipe(ex, state, item, goal_qty=1)
+            crafted = yield from craft_recipe(ex, state, item, goal_qty=1)
         except EnvBlocked as err:
             if err.missing_predicate != "station_ready:crafting_table":
                 raise
@@ -90,7 +91,15 @@ class CraftIronGear(Skill):
             )
             if ready_pos is None:
                 raise
-            yield from craft_recipe(ex, state, item, goal_qty=1)
+            crafted = yield from craft_recipe(ex, state, item, goal_qty=1)
+        if isinstance(crafted, dict) and int(crafted.get("gained", 0) or 0) > 0:
+            slot = armor_equip_slot_for(item)
+            if slot is not None and state.count(item) >= 1:
+                try:
+                    yield rec("equip", ex.equip(item, slot), item=item, slot=slot)
+                    state.refresh_inventory(ex.client)
+                except Replan:
+                    pass
 
     def verify_done(self, state, before_counts):
         item = self.args["item"]

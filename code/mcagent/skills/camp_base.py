@@ -18,6 +18,7 @@ from .camp_plan import (
 )
 from .field import _drop_name, _observed_block, collect_drops, place_block, scan_blocks, scan_entities
 from .items import AIR, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, is_safe_solid_floor
+from .mine_return import is_underground_in_mine, return_to_surface_from_mine
 from .observations import refresh_inventory
 from .recipes import RECIPES, _table_position, craft_recipe
 from .registry import register
@@ -40,7 +41,6 @@ def _bounded_move_to(ex: "Executor", pos: Sequence[float], *, rng: int = 2, time
     except TypeError:
         return ex.move_to(pos=dest, rng=rng)
 
-
 def _find_place_spot(
     ex: "Executor", state: "State", *, require_top_air: bool = True, avoid_chests: Sequence[tuple[int, int, int]] = (),
 ) -> tuple[int, int, int]:
@@ -60,7 +60,6 @@ def _find_place_spot(
                     and can_reach_block(ex, status, cand, reach=INTERACT_EYE_REACH)):
                 return cand
     raise EnvBlocked("周围未找到可安全放置营地设施的实心支撑空位", missing_predicate="camp_place_spot", searched_volume="角色周围 1 格实心支撑平面", wake_on="chunk_moved")
-
 
 def _place_with_protection_retry(
     ex: "Executor", state: "State", item: str, dim: str, *, require_top_air: bool = True, avoid_chests: Sequence[tuple[int, int, int]] = (),
@@ -92,14 +91,12 @@ def _place_with_protection_retry(
             yield rec("move_to", _bounded_move_to(ex, dest, rng=2, timeout=30.0), pos=dest)
     raise EnvBlocked(f"多次绕开保护区后仍无法放置 {item}", missing_predicate="camp_place_spot", searched_volume="出生点保护区外缘环带", wake_on="chunk_moved")
 
-
 def _craft_planks_until(ex: "Executor", state: "State", target_planks: int):
     while sum(state.count(p) for p in _PLANK_ITEMS) < target_planks:
         if (log := next((l for l in ALL_LOG_BLOCKS if state.count(l) >= 1), None)) is None:
             break
         plank = log.removesuffix("_log") + "_planks"
         yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 4)
-
 
 def _ensure_chest_item(ex: "Executor", state: "State", dim: str):
     refresh_inventory(ex, state)
@@ -128,9 +125,11 @@ def _ensure_chest_item(ex: "Executor", state: "State", dim: str):
     if state.count("chest") <= before:
         raise Replan("合成 chest 后背包未确认产出")
 
-
 def _open_specific_chest(ex: "Executor", state: "State", chest_pos: tuple[int, int, int]):
     status = state.refresh_status(ex.client, max_age_s=0)
+    if chest_pos[1] > float((status.get("pos") or state.pos)[1]) + 6.0 and is_underground_in_mine(ex, state):
+        yield from return_to_surface_from_mine(ex, state)
+        status = state.refresh_status(ex.client, max_age_s=0)
     if not can_reach_block(ex, status, chest_pos, reach=INTERACT_EYE_REACH):
         yield rec("move_to", _bounded_move_to(ex, chest_pos, rng=2, timeout=30.0), pos=list(chest_pos))
         status = state.refresh_status(ex.client, max_age_s=0)

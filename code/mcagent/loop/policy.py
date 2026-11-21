@@ -769,14 +769,15 @@ class RulePlanner:
         if dim != "overworld":
             return None, "", eff_args
 
+        cls = self.registry.get("build_and_enter_portal")
+        cls_params = getattr(cls, "params", {}) or {} if cls is not None else {}
+        if "auto_bunker" in cls_params:
+            eff_args["auto_bunker"] = True
+
         missing = nether_preflight_missing(state)
         if not missing:
-            cls = self.registry.get("build_and_enter_portal")
-            cls_params = getattr(cls, "params", {}) or {} if cls is not None else {}
             if "strict_preflight" in cls_params:
                 eff_args["strict_preflight"] = True
-            if "auto_bunker" in cls_params:
-                eff_args["auto_bunker"] = True
             return None, "", eff_args
 
         if "camp_kit_backup" in missing:
@@ -1022,9 +1023,17 @@ class RulePlanner:
             or memo.has_station("crafting_table", dimension=dim)
             or (total_planks(state) + total_logs(state) * 4 >= 12)
         )
+        cur_pos_y = None
+        if isinstance(st.get("pos"), (list, tuple)) and len(st["pos"]) >= 2:
+            try:
+                cur_pos_y = float(st["pos"][1])
+            except (TypeError, ValueError):
+                cur_pos_y = None
+        near_surface_for_camp = cur_pos_y is None or cur_pos_y >= 52.0
         if (
             dim == "overworld"
             and safe_12
+            and near_surface_for_camp
             and not has_camp_chest
             and best_pickaxe(state) in STONE_OR_BETTER_PICKS
             and has_furnace_ready
