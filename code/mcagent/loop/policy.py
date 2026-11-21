@@ -18,8 +18,10 @@ from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint, effectiv
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills import base as skill_base
 from ..skills.camp_base import has_surplus_for_deposit, is_near_camp, needs_camp_withdraw
+from ..skills.camp_plan import has_chest_or_materials
+from ..skills.furnace_lease import best_fuel_for
 from ..skills.items import best_pickaxe
-from ..skills.survival_food import cooked_food_count, inventory_food_restore, raw_meat_count
+from ..skills.survival_food import cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
 from .context import DecisionContext, ObjectiveRecord, is_daytime
@@ -29,7 +31,7 @@ from .goals import (
     check_item_expr, compute_hub_goal_ids, diagnose_goal_gap, is_goal_achieved, is_goal_stopped_out,
     is_prereq_satisfied, normalize_goal_ids, rank_actionable_goals, resolve_active_goals,
 )
-from .reserve import ReservationBook
+from .reserve import ReservationBook, bind_reservation_book
 from .subgoals import item_available, tool_ready
 from .starter_skills import PROTECTED_ZONES, can_afford_gear, has_known_table, total_cobble, total_logs, total_planks
 
@@ -873,14 +875,17 @@ class RulePlanner:
         safe_12 = hdist >= 12.0
         safe_gt_12 = hdist > 12.0
 
-        # 5. Camp Chest Withdraw (Respawn Re-kit)
+        # 5. Respawn Step 1: Camp Chest Withdraw (kit_chest 热备自动穿甲举盾 / vault_chest 取基础料)
         if needs_camp_withdraw(state) and is_near_camp(state, max_dist=64.0):
             wd = self._try_make("manage_camp_chest", {"mode": "withdraw"}, state)
             if wd is not None:
                 return PlanDecision(wd, "rule", "重生/缺装回营地箱取装备")
 
-        # 6. Controlled Corpse Recovery
-        if not state.in_safe_mode and hp >= 14.0 and safe_10 and st.get("pos") is not None:
+        # 6. Respawn Step 2: Armed Controlled Corpse Recovery (严禁空手无食裸装捡尸)
+        restore = inventory_food_restore(state)
+        has_sword = any(state.count(s) >= 1 for s in _SURVIVAL_SWORDS)
+        has_recovery_food = cooked_food_count(state) >= 1 or restore >= 4
+        if not state.in_safe_mode and hp >= 14.0 and safe_10 and st.get("pos") is not None and has_sword and has_recovery_food:
             try:
                 should_recover = bool(memo.should_attempt_corpse_recovery(st.get("pos"), dimension=dim)[0])
             except Exception:
@@ -888,21 +893,56 @@ class RulePlanner:
             if should_recover:
                 rec_sk = self._try_make("manage_camp_chest", {"mode": "recover_corpse"}, state)
                 if rec_sk is not None:
-                    return PlanDecision(rec_sk, "rule", "受控捡尸回收铁器以上物资")
+                    return PlanDecision(rec_sk, "rule", "已武装受控捡尸回收铁器以上物资")
 
-        # 7. Food Reserve Gate
-        restore = inventory_food_restore(state)
-        has_sword = any(state.count(s) >= 1 for s in _SURVIVAL_SWORDS)
+        # 6.5 Tier 0 Cold-Start Auto Camp Setup (石镐 + 熔炉 + 造箱木料且营地尚无箱时自动建营)
+        camp = memo.get_camp(dimension=dim)
+        has_camp_chest = isinstance(camp, Mapping) and bool(camp.get("chest") or camp.get("chests"))
+        has_furnace_ready = state.count("furnace") >= 1 or memo.has_station("furnace", dimension=dim)
+        if (
+            dim == "overworld"
+            and safe_12
+            and not has_camp_chest
+            and best_pickaxe(state) in STONE_OR_BETTER_PICKS
+            and has_furnace_ready
+            and has_chest_or_materials(state)
+        ):
+            setup_sk = self._try_make("manage_camp_chest", {"mode": "setup"}, state)
+            if setup_sk is not None:
+                return PlanDecision(setup_sk, "rule", "冷启动石镐与熔炉就绪，自动建出生点营地箱(Tier 0)")
+
+        # 6.6 Tier 1 Blast-Proof Spawn Shelter / Nether Portal Bunker Auto Upgrade
+        shelter_tier = int(camp.get("shelter_tier", 0)) if isinstance(camp, Mapping) else 0
+        if dim == "overworld" and safe_12 and shelter_tier < 1 and total_cobble(state) >= 48:
+            sh_sk = self._try_make("build_spawn_shelter", {"mode": "tier1_shelter"}, state)
+            if sh_sk is not None:
+                return PlanDecision(sh_sk, "rule", "圆石充足，建造出生点 5x5 圆石防爆避难所(Tier 1)")
+        if dim == "the_nether" and safe_12 and shelter_tier < 1 and total_cobble(state) >= 24:
+            nb_sk = self._try_make("build_spawn_shelter", {"mode": "nether_bunker"}, state)
+            if nb_sk is not None:
+                return PlanDecision(nb_sk, "rule", "下界门旁建造 3x3 防恶魂圆石碉堡")
+
+        # 7. Food Reserve Gate & Ready Food Lease Retrieval
+        if has_ready_food_lease(state) and safe_12:
+            gf_lease = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+            if gf_lease is not None:
+                return PlanDecision(gf_lease, "rule", "熟食熔炉租约已就绪，回炉取回熟肉防遗弃")
         needs_food_now = food <= 17.0 or hp < 18.0
         proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
         if restore < 10 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
             gf = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf is not None:
                 return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<10)，白天补粮")
-        if raw_meat_count(state) >= 2 and cooked_food_count(state) < 4 and memo.has_station("furnace", dimension=dim) and safe_12:
+        if (
+            raw_meat_count(state) >= 2
+            and cooked_food_count(state) < 4
+            and best_fuel_for(state, 1, allow_lava_bucket=False) is not None
+            and has_furnace_ready
+            and safe_12
+        ):
             gf_cook = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf_cook is not None:
-                return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})，烤肉熟化补仓")
+                return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})与燃料，烤肉熟化补仓")
 
         # 8. Night Bed Sleep Fast-Path
         has_bed_ready = (
@@ -915,18 +955,18 @@ class RulePlanner:
             if sleep_sk is not None:
                 return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
 
-        # 9. Camp Surplus Deposit
-        if has_surplus_for_deposit(state) and is_near_camp(state, max_dist=32.0) and safe_12:
+        # 9. Camp Surplus Deposit (尊重 ReservationBook 预留物资；距营地 <=96 格高价/满包回存)
+        if has_surplus_for_deposit(state, reservations=self.reservations) and is_near_camp(state, max_dist=96.0) and safe_12:
             dep = self._try_make("manage_camp_chest", {"mode": "deposit"}, state)
             if dep is not None:
-                return PlanDecision(dep, "rule", "携带高价值富余物资，回营地箱存仓")
+                return PlanDecision(dep, "rule", "携带高价值或满包富余物资，回营地箱存仓")
 
-        # 10. Post-Iron Shield Readiness Fast-Path
+        # 10. Post-Iron Shield Readiness Fast-Path (原木可自动拆板计入)
         if (
             state.count("shield") < 1
             and state.count("iron_ingot") >= 1
             and (state.count("iron_pickaxe") >= 1 or state.count("iron_ingot") >= 4)
-            and total_planks(state) >= 6
+            and total_planks(state) + total_logs(state) * 4 >= 6
             and safe_12
         ):
             sh = self._try_make("craft_iron_gear", {"item": "shield"}, state)
@@ -1370,6 +1410,7 @@ class CampaignPlanner:
         return PlanDecision(skill, "focus", f"定向验收 {skill}")
 
     def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
+        bind_reservation_book(state, self.reservations)
         self.release_skill_materials()
         if not self.reservations.observe(state) and not state.inventory_dirty:
             self.reservations.reset(state)

@@ -687,6 +687,15 @@ class MainLoop:
                 self._note_outage(e)
             self._seen_deaths_len = len(self.state.deaths)
             self._load_checkpoint_if_configured()
+            if st.get("ready") and self._pos_tuple(self.state) is not None:
+                try:
+                    memo_for(self.state).set_spawn(
+                        self.state.st["pos"],
+                        dimension=str(self.state.st.get("dimension") or "overworld"),
+                        overwrite=False,
+                    )
+                except Exception:
+                    pass
             self.log(f"[loop] 启动完成: {self.state.summary()}")
 
             if monitor is not None:

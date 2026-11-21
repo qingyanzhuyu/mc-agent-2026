@@ -371,6 +371,15 @@ class SurveyFallbackUpgradeTests(unittest.TestCase):
     def test_alternates_survey_island_before_scout_island_when_all_goals_suspended(self) -> None:
         clock = _FakeClock(4000.0)
         st = _starter_done_state(pos=(0.5, 64.0, 0.5))
+        # 已有营地箱与足量熟食，避免主动生存层（冷启动建箱/补粮）抢占兜底探索验证
+        st.set_inventory({
+            "items": [
+                *list(st.inventory.get("items") or []),
+                {"name": "cooked_beef", "count": 4, "slot": 7},
+            ]
+        })
+        from mcagent.skills.world_memo import memo_for
+        memo_for(st).set_camp([0, 64, 0], chest=[1, 64, 0], stored_items={})
         # 仅保留默认 7 项且全部完成/挂起（前 6 项达成 + smelt_iron 临时挂起），触发兜底探索
         rp = RulePlanner(min_verified="offline", include_stages=DEFAULT_CAMPAIGN_STAGES, clock=clock)
         rp.completed_advancements.update({"minecraft:story/mine_stone", "minecraft:story/upgrade_tools"})

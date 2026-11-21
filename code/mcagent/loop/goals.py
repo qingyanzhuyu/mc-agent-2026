@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Collection, Mapping, Optional
 
@@ -1875,6 +1875,51 @@ GOALS: tuple[GoalSpec, ...] = (
     ),
 )
 
+_NETHER_END_ADV_PREFIXES: tuple[str, ...] = (
+    "minecraft:nether/",
+    "minecraft:end/",
+    "minecraft:story/enter_the_nether",
+    "minecraft:story/enter_the_end",
+)
+_NETHER_END_EXTRA_IDS: frozenset[str] = frozenset({
+    "enter_the_nether",
+    "enter_the_end",
+    "enter_end_gateway",
+    "find_end_city",
+    "levitate",
+    "elytra",
+    "place_dried_ghast_in_water",
+    "spyglass_at_ghast",
+    "prep_wither_3_skulls",
+    "prep_nether_star",
+    "prep_netherite_upgrade_set",
+    "netherite_armor",
+    "obtain_netherite_hoe",
+})
+
+
+def _is_nether_or_end_goal(goal: GoalSpec) -> bool:
+    return goal.id in _NETHER_END_EXTRA_IDS or any(
+        adv.startswith(_NETHER_END_ADV_PREFIXES) for adv in goal.done_advancements
+    )
+
+
+def _tighten_nether_end_stop_loss(goals: tuple[GoalSpec, ...]) -> tuple[GoalSpec, ...]:
+    """兑现 docs/11 §八（A13 已确认 keepInventory=false）：下界与末地高风险目标止损预算收紧一半。"""
+    out: list[GoalSpec] = []
+    for g in goals:
+        if not _is_nether_or_end_goal(g):
+            out.append(g)
+            continue
+        floor_s = 180.0 if g.tier in {"T2", "T3"} else 120.0
+        tightened_budget = max(floor_s, round(g.budget_s * 0.5, 1))
+        tightened_fails = min(g.max_fails_per_ep, 2) if g.max_fails_per_ep > 0 else 2
+        out.append(replace(g, budget_s=tightened_budget, max_fails_per_ep=tightened_fails, stop_loss=True))
+    return tuple(out)
+
+
+GOALS = _tighten_nether_end_stop_loss(GOALS)
+NETHER_END_HIGH_RISK_GOALS: frozenset[str] = frozenset(g.id for g in GOALS if _is_nether_or_end_goal(g))
 GOAL_MAP: dict[str, GoalSpec] = {g.id: g for g in GOALS}
 
 
@@ -2460,6 +2505,20 @@ def survival_readiness_multiplier(
             mult *= 2.8
         if not has_iron_armor and not has_shield and root_goal.id in _NAKED_POST_IRON_RISKY_ROOTS:
             mult *= 0.2
+
+    # (d) KeepInventory=False Nether/End Camp-Protection Gate (docs/11 §八 + docs/15)
+    # 仅在铁器已具基础护甲/盾牌准备跨维时介入，避免与早期/裸装基础门叠加破坏既有分段斜率。
+    if (
+        dim == "overworld"
+        and iron_stage_started
+        and (has_iron_armor or has_shield)
+        and root_goal.id in NETHER_END_HIGH_RISK_GOALS
+    ):
+        overworld_camp = resolved_memo.get_camp(dimension="overworld") if resolved_memo is not None else None
+        has_camp_kit = bool(resolved_memo is not None and resolved_memo.camp_has_recovery_kit(dimension="overworld"))
+        has_shelter = isinstance(overworld_camp, Mapping) and int(overworld_camp.get("shelter_tier", 0)) >= 1
+        if not (has_camp_kit or has_shelter):
+            mult *= 0.35
 
     # (c) Day/Night Dual-Track Weighting (Overworld only)
     if resolved_day is not None and dim == "overworld":

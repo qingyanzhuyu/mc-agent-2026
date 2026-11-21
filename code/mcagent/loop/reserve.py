@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Literal
+import threading
+from typing import Any, Literal, Optional
+import weakref
 
 from ..runtime import State
 from ..skills.items import bare
@@ -175,3 +177,50 @@ class ReservationBook:
             if (entry.consumer == consumer and (item is None or entry.item == bare(item))
                     and (mode is None or entry.mode == mode)):
                 del self._entries[key]
+
+
+_BOOK_LOCK = threading.RLock()
+_STATE_BOOKS: weakref.WeakKeyDictionary[Any, ReservationBook] = weakref.WeakKeyDictionary()
+
+
+def bind_reservation_book(state: Any, book: Optional[ReservationBook]) -> None:
+    """将活跃的 `ReservationBook` 绑定到 `State`（供存箱等技能查询预留物资）。"""
+    if state is None:
+        return
+    with _BOOK_LOCK:
+        try:
+            if book is None:
+                _STATE_BOOKS.pop(state, None)
+            else:
+                _STATE_BOOKS[state] = book
+        except TypeError:
+            pass
+
+
+def reservation_book_for(state: Any) -> Optional[ReservationBook]:
+    """查询绑定到 `State` 的 `ReservationBook`（优先读取 `state.reservations` 属性）。"""
+    if state is None:
+        return None
+    direct = getattr(state, "reservations", None)
+    if isinstance(direct, ReservationBook):
+        return direct
+    with _BOOK_LOCK:
+        try:
+            return _STATE_BOOKS.get(state)
+        except TypeError:
+            return None
+
+
+def reserved_item_counts(state: Any, book: Optional[ReservationBook] = None) -> dict[str, int]:
+    """统计当前在背包中被预留（非 `in_transit`）的各物品总量。"""
+    resolved = book if book is not None else reservation_book_for(state)
+    if resolved is None:
+        return {}
+    counts: dict[str, int] = {}
+    for entry in resolved.entries:
+        if entry.mode == "in_transit" or entry.count <= 0:
+            continue
+        name = bare(entry.item)
+        if name:
+            counts[name] = counts.get(name, 0) + int(entry.count)
+    return counts

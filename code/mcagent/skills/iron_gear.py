@@ -4,15 +4,25 @@ from __future__ import annotations
 from .base import Param, Skill
 from .recipes import RECIPES, _ingredient_items, craft_recipe
 from .registry import register
+from .world_memo import ALL_LOG_BLOCKS
 
 
 _GEAR = (
     "iron_pickaxe", "iron_boots", "iron_helmet", "iron_chestplate", "iron_leggings",
     "bucket", "shield", "iron_sword", "flint_and_steel", "shears", "compass",
 )
+_PLANK_ITEMS = tuple(item for item in RECIPES if item.endswith("_planks"))
+
+
+def _shield_affordable_with_logs(state) -> bool:
+    if state.count("iron_ingot") < 1:
+        return False
+    return sum(state.count(p) for p in _PLANK_ITEMS) + sum(state.count(l) for l in ALL_LOG_BLOCKS) * 4 >= 6
 
 
 def _affordable(item, state):
+    if item == "shield" and _shield_affordable_with_logs(state):
+        return True
     return all(sum(state.count(name) for name in _ingredient_items(ingredient)) >= qty
                for ingredient, qty in RECIPES[item].ingredients)
 
@@ -57,7 +67,15 @@ class CraftIronGear(Skill):
         return tuple((name, qty, "consume") for name, qty in materials.items())
 
     def run(self, ex, state):
-        yield from craft_recipe(ex, state, self.args["item"], goal_qty=1)
+        item = self.args["item"]
+        if item == "shield":
+            while sum(state.count(p) for p in _PLANK_ITEMS) < 6:
+                log = next((l for l in ALL_LOG_BLOCKS if state.count(l) >= 1), None)
+                if log is None:
+                    break
+                plank = log.removesuffix("_log") + "_planks"
+                yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 4)
+        yield from craft_recipe(ex, state, item, goal_qty=1)
 
     def verify_done(self, state, before_counts):
         item = self.args["item"]

@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import math
+import time
 
 from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
 from .field import _drop_name, _standable_cell, collect_drops, place_block, scan_blocks, scan_entities
 from .furnace import collect_furnace, load_furnace
-from .furnace_lease import SMELTING_STATIONS, best_fuel_for, smelt_output_for
+from .furnace_lease import (
+    SMELTING_STATIONS, best_fuel_for, collect_leased, lease_book_for, smelt_output_for, smelt_seconds_per_item,
+)
 from .items import bare
 from .recipes import RECIPES, craft_recipe
 from .registry import register
@@ -44,6 +47,7 @@ _WOOLS = tuple(f"{c}_wool" for c in ("white", "orange", "magenta", "light_blue",
     "gray", "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"))
 _HUNT_DROPS = frozenset(RAW_MEAT_TO_COOKED) | frozenset(_WOOLS) | {"leather"}
 _SKIP_ERRS = frozenset({"not_found", "out_of_reach", "path_not_found", "unreachable", "timeout", "move_timeout", "stalled"})
+COOK_POLL_SLEEP_S: float = 0.5
 
 
 def inventory_food_restore(state) -> int:
@@ -56,6 +60,25 @@ def cooked_food_count(state) -> int:
 
 def raw_meat_count(state) -> int:
     return sum(state.count(item) for item in RAW_MEAT_TO_COOKED)
+
+
+def _state_dim(state) -> str:
+    st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
+    return bare((st.get("dimension") if isinstance(st, dict) else None) or "overworld") or "overworld"
+
+
+def has_ready_food_lease(state) -> bool:
+    """检查当前维度是否存在已到时可取回的熟食熔炉租约。"""
+    dim = _state_dim(state)
+    return any(
+        l.expected_output in COOKED_FOODS or l.consumer == "gather_food"
+        for l in lease_book_for(state).ready_leases(dimension=dim)
+    )
+
+
+def has_cookable_food(state) -> bool:
+    """检查当前是否持有生肉且有可用燃料，或已有待取回熟食租约。"""
+    return (raw_meat_count(state) > 0 and best_fuel_for(state, 1, allow_lava_bucket=False) is not None) or has_ready_food_lease(state)
 
 
 def _is_night(st: dict) -> bool:
@@ -178,7 +201,7 @@ class GatherFood(Skill):
             return "角色尚未存活，等待重生"
         if bare(st.get("dimension") or "overworld") != "overworld":
             return "仅在主世界执行地表补粮"
-        has_cookable = raw_meat_count(state) > 0 and best_fuel_for(state, 1, allow_lava_bucket=False) is not None
+        has_cookable = has_cookable_food(state)
         if _is_night(st) and not has_cookable:
             return "夜晚停止地表狩猎补粮"
         has_weapon = any(state.count(w) > 0 for w in _WEAPONS)
@@ -189,15 +212,36 @@ class GatherFood(Skill):
     def _made_progress(self, state) -> bool:
         return inventory_food_restore(state) > self._before_restore or cooked_food_count(state) > self._before_cooked or self._loaded_furnace
 
+    def _collect_food_leases(self, ex, state, *, ready_only: bool = True):
+        dim = _state_dim(state)
+        book = lease_book_for(state)
+        leases = book.ready_leases(dimension=dim) if ready_only else book.active_leases(dimension=dim)
+        collected_any = False
+        for lease in [l for l in leases if l.expected_output in COOKED_FOODS or l.consumer == "gather_food"]:
+            if not (yield from _reach_block(ex, state, lease.pos, STATION_EYE_REACH)):
+                continue
+            try:
+                got = yield from collect_leased(ex, state, lease)
+            except Replan:
+                continue
+            _refresh_inv(ex, state)
+            if got > 0:
+                collected_any = True
+        return collected_any
+
     def _cook_raw_meat(self, ex, state):
-        if not self.args["cook"] or raw_meat_count(state) <= 0:
+        if not self.args["cook"]:
             return False
+        collected_lease = yield from self._collect_food_leases(ex, state, ready_only=True)
+        if raw_meat_count(state) <= 0:
+            return collected_lease
         raw_item = max(RAW_MEAT_TO_COOKED, key=state.count)
         qty, cooked_item = state.count(raw_item), smelt_output_for(raw_item, RAW_MEAT_TO_COOKED[raw_item])
         pair = next(((q, f) for q in range(qty, 0, -1) if (f := best_fuel_for(state, q, allow_lava_bucket=False)) is not None), None)
         if pair is None:
-            return False
+            return collected_lease
         qty, (fuel_item, fuel_count) = pair
+        dim, book = _state_dim(state), lease_book_for(state)
         for _, pos in (yield from _find_or_place_stations(ex, state, "furnace", ("smoker", "furnace"), self.name)):
             if not (yield from _reach_block(ex, state, pos, STATION_EYE_REACH)):
                 continue
@@ -224,22 +268,30 @@ class GatherFood(Skill):
                     if not window_section(res["view"], "fuel"):
                         yield from put_window_item(ex, state, target, fuel_item, fuel_count, "fuel", verify=lambda *_: True)
                 self._loaded_furnace = used = True
+                book.register_lease(pos, dimension=dim, station_kind=win, input_item=raw_item,
+                                    expected_output=cooked_item, count=qty, consumer=self.name)
             elif not used:
                 continue
-            for _ in range(4):
+            sec = smelt_seconds_per_item(win)
+            deadline = time.monotonic() + min(22.0, sec * qty + 2.0)
+            max_polls = min(24, max(4, int(sec * min(qty, 2) / COOK_POLL_SLEEP_S) + 2))
+            for poll in range(max_polls):
+                if poll:
+                    time.sleep(COOK_POLL_SLEEP_S)
                 view = yield from window_view(ex, target)
                 if (out_amt := window_amount(view, "output", cooked_item)) > 0:
                     view = (yield from _take_output(ex, state, target, win, cooked_item, out_amt, view))["view"]
                     _refresh_inv(ex, state)
-                    if not window_section(view, "input") or cooked_food_count(state) > self._before_cooked:
-                        break
-                elif not window_section(view, "input"):
+                if not window_section(view, "input") and window_amount(view, "output", cooked_item) <= 0:
+                    book.complete_lease(pos, dimension=dim)
+                    break
+                if time.monotonic() >= deadline:
                     break
             return True
         if _is_night(state.refresh_status(ex.client, max_age_s=0)) and not self._made_progress(state):
             raise EnvBlocked("附近未找到可用熔炉或烟熏炉以烤熟生肉", missing_predicate="station_ready:furnace",
                              searched_volume="半径 16 格熔炉或烟熏炉", wake_on="chunk_moved")
-        return False
+        return collected_lease
 
     def _hunt_animals(self, ex, state, target_restore: int):
         try:

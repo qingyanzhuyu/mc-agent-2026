@@ -145,7 +145,22 @@ def _validate_strict_items(items: Any) -> Optional[dict[str, int]]:
     return out
 
 
+_CAMP_CHEST_ROLES: tuple[str, ...] = ("kit", "vault", "bulk")
+
+
 def _copy_camp(camp: Mapping[str, Any]) -> dict[str, Any]:
+    chests_raw = camp.get("chests") if isinstance(camp.get("chests"), Mapping) else {}
+    chests = {
+        str(role): list(pos)
+        for role, pos in chests_raw.items()
+        if str(role) in _CAMP_CHEST_ROLES and pos is not None
+    }
+    chest_items_raw = camp.get("chest_items") if isinstance(camp.get("chest_items"), Mapping) else {}
+    chest_items = {
+        str(role): dict(items)
+        for role, items in chest_items_raw.items()
+        if str(role) in _CAMP_CHEST_ROLES and isinstance(items, Mapping)
+    }
     return {
         "pos": list(camp["pos"]),
         "chest": list(camp["chest"]) if camp.get("chest") is not None else None,
@@ -153,6 +168,11 @@ def _copy_camp(camp: Mapping[str, Any]) -> dict[str, Any]:
         "furnace": list(camp["furnace"]) if camp.get("furnace") is not None else None,
         "crafting_table": list(camp["crafting_table"]) if camp.get("crafting_table") is not None else None,
         "stored_items": dict(camp.get("stored_items", {})),
+        "shelter_tier": int(camp.get("shelter_tier", 0) or 0),
+        "chests": chests,
+        "chest_items": chest_items,
+        "mine_entry": list(camp["mine_entry"]) if camp.get("mine_entry") is not None else None,
+        "kit_depleted": bool(camp.get("kit_depleted", False)),
     }
 
 
@@ -241,6 +261,7 @@ class WorldResourceMemo:
         self.survey_sectors_done: dict[str, set[int]] = {}
         self._camps: dict[str, dict[str, Any]] = {}
         self._last_deaths: dict[str, dict[str, Any]] = {}
+        self._spawn_pos: dict[str, Cell] = {}
         self.landmark_version: int = 0
 
     def __len__(self) -> int:
@@ -258,7 +279,29 @@ class WorldResourceMemo:
             self.survey_sectors_done.clear()
             self._camps.clear()
             self._last_deaths.clear()
+            self._spawn_pos.clear()
             self.landmark_version = 0
+
+    def set_spawn(self, pos: Any, *, dimension: str = "overworld", overwrite: bool = False) -> list[int]:
+        """锚定指定维度的首次出生点坐标（单局默认不覆盖），供保护区外缘选址与重生测距使用。"""
+        dim = _norm_dim(dimension)
+        cell = block_cell(pos)
+        with self._lock:
+            if overwrite or dim not in self._spawn_pos:
+                self._spawn_pos[dim] = cell
+            return list(self._spawn_pos[dim])
+
+    def get_spawn(self, *, dimension: str = "overworld") -> Optional[list[int]]:
+        """返回指定维度已锚定的出生点坐标副本，未记录时返回 `None`。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            cell = self._spawn_pos.get(dim)
+            return list(cell) if cell is not None else None
+
+    @property
+    def spawn_pos(self) -> Optional[list[int]]:
+        """主世界已锚定的出生点坐标副本。"""
+        return self.get_spawn(dimension="overworld")
 
     def _cooldown(self, override: Optional[float]) -> float:
         return self._default_cooldown_s if override is None else float(override)
@@ -532,12 +575,14 @@ class WorldResourceMemo:
 
     def _camp_has_recovery_kit_locked(self, dim: str) -> bool:
         camp = self._camps.get(dim)
-        if camp is None or camp.get("chest") is None:
+        if camp is None or (camp.get("chest") is None and not camp.get("chests")):
             return False
-        return any(
-            count > 0 and _is_recovery_kit_item(name)
-            for name, count in camp.get("stored_items", {}).items()
-        )
+        if any(count > 0 and _is_recovery_kit_item(name) for name, count in camp.get("stored_items", {}).items()):
+            return True
+        for items in (camp.get("chest_items") or {}).values():
+            if any(count > 0 and _is_recovery_kit_item(name) for name, count in items.items()):
+                return True
+        return False
 
     def set_camp(
         self,
@@ -549,8 +594,13 @@ class WorldResourceMemo:
         furnace: Any = None,
         crafting_table: Any = None,
         stored_items: Optional[Mapping[str, int]] = None,
+        shelter_tier: Optional[int] = None,
+        chests: Optional[Mapping[str, Any]] = None,
+        mine_entry: Any = None,
+        kit_depleted: Optional[bool] = None,
+        chest_role: Optional[str] = None,
     ) -> dict[str, Any]:
-        """创建或更新指定维度的主营地档案，同步登记非空工作站并返回防御性副本。"""
+        """创建或更新指定维度的主营地档案（兼容旧单箱与三区仓库），同步登记非空工作站并返回防御性副本。"""
         dim = _norm_dim(dimension)
         pos_cell = block_cell(pos)
         station_updates: dict[str, Cell] = {}
@@ -562,21 +612,62 @@ class WorldResourceMemo:
         ):
             if raw_val is not None:
                 station_updates[kind] = block_cell(raw_val)
+        chest_updates: dict[str, Cell] = {}
+        if isinstance(chests, Mapping):
+            for role, raw_pos in chests.items():
+                rname = str(role).strip().lower()
+                if rname in _CAMP_CHEST_ROLES and raw_pos is not None:
+                    chest_updates[rname] = block_cell(raw_pos)
+        norm_role = str(chest_role).strip().lower() if chest_role else None
+        if norm_role in _CAMP_CHEST_ROLES and "chest" in station_updates:
+            chest_updates[norm_role] = station_updates["chest"]
+        mine_cell = block_cell(mine_entry) if mine_entry is not None else None
+        if shelter_tier is not None and (isinstance(shelter_tier, bool) or int(shelter_tier) not in (0, 1, 2)):
+            raise ValueError(f"shelter_tier 必须为 0/1/2；收到 {shelter_tier!r}")
         with self._lock:
             existing = self._camps.get(dim)
-            camp: dict[str, Any] = {
+            camp = _copy_camp(existing) if existing is not None else {
                 "pos": list(pos_cell),
-                "chest": list(existing["chest"]) if existing and existing.get("chest") is not None else None,
-                "bed": list(existing["bed"]) if existing and existing.get("bed") is not None else None,
-                "furnace": list(existing["furnace"]) if existing and existing.get("furnace") is not None else None,
-                "crafting_table": list(existing["crafting_table"]) if existing and existing.get("crafting_table") is not None else None,
-                "stored_items": dict(existing["stored_items"]) if existing else {},
+                "chest": None,
+                "bed": None,
+                "furnace": None,
+                "crafting_table": None,
+                "stored_items": {},
+                "shelter_tier": 0,
+                "chests": {},
+                "chest_items": {},
+                "mine_entry": None,
+                "kit_depleted": False,
             }
+            camp["pos"] = list(pos_cell)
             for kind, cell in station_updates.items():
                 camp[kind] = list(cell)
                 self._record_station_locked(kind, cell, dim)
+            for rname, cell in chest_updates.items():
+                camp["chests"][rname] = list(cell)
+                self._record_station_locked("chest", cell, dim)
+            if "chest" in station_updates and "kit" not in camp["chests"] and norm_role is None:
+                camp["chests"]["kit"] = list(station_updates["chest"])
+            if camp["chest"] is None and camp["chests"]:
+                primary = camp["chests"].get("kit") or next(iter(camp["chests"].values()))
+                camp["chest"] = list(primary)
+            if shelter_tier is not None:
+                camp["shelter_tier"] = max(int(camp.get("shelter_tier", 0)), int(shelter_tier))
+            if mine_cell is not None:
+                camp["mine_entry"] = list(mine_cell)
+            if kit_depleted is not None:
+                camp["kit_depleted"] = bool(kit_depleted)
             if stored_items is not None:
-                camp["stored_items"] = _normalize_stored_items(stored_items)
+                normalized = _normalize_stored_items(stored_items)
+                if norm_role in _CAMP_CHEST_ROLES:
+                    camp["chest_items"][norm_role] = normalized
+                    merged: dict[str, int] = {}
+                    for bucket in camp["chest_items"].values():
+                        for k, v in bucket.items():
+                            merged[k] = merged.get(k, 0) + v
+                    camp["stored_items"] = merged
+                else:
+                    camp["stored_items"] = normalized
             self._camps[dim] = camp
             return _copy_camp(camp)
 
@@ -587,14 +678,38 @@ class WorldResourceMemo:
             camp = self._camps.get(dim)
             return _copy_camp(camp) if camp is not None else None
 
-    def update_camp_stored(self, stored_items: Mapping[str, int], *, dimension: str = "overworld") -> None:
-        """更新指定维度主营地的箱内存储物品清单（若营地存在）。"""
+    def update_camp_stored(
+        self,
+        stored_items: Mapping[str, int],
+        *,
+        dimension: str = "overworld",
+        role: Optional[str] = None,
+    ) -> None:
+        """更新指定维度主营地的箱内存储物品清单（支持按 kit/vault/bulk 角色聚合）。"""
         dim = _norm_dim(dimension)
         normalized = _normalize_stored_items(stored_items)
+        norm_role = str(role).strip().lower() if role else None
+        with self._lock:
+            camp = self._camps.get(dim)
+            if camp is None:
+                return
+            if norm_role in _CAMP_CHEST_ROLES:
+                camp.setdefault("chest_items", {})[norm_role] = normalized
+                merged: dict[str, int] = {}
+                for bucket in camp["chest_items"].values():
+                    for k, v in bucket.items():
+                        merged[k] = merged.get(k, 0) + v
+                camp["stored_items"] = merged
+            else:
+                camp["stored_items"] = normalized
+
+    def set_camp_kit_depleted(self, depleted: bool, *, dimension: str = "overworld") -> None:
+        """设置指定维度营地热备是否耗尽标记。"""
+        dim = _norm_dim(dimension)
         with self._lock:
             camp = self._camps.get(dim)
             if camp is not None:
-                camp["stored_items"] = normalized
+                camp["kit_depleted"] = bool(depleted)
 
     def camp_has_recovery_kit(self, *, dimension: str = "overworld") -> bool:
         """判断指定维度主营地箱子中是否存有基础恢复物资（镐/剑/盾/护甲/可食用食物）。"""
@@ -786,11 +901,18 @@ class WorldResourceMemo:
                 summary["visited_biomes"] = sorted(bs)
             if ss := self.survey_sectors_done.get(dim):
                 summary["survey_sectors_done"] = sorted(ss)
+            if dim in self._spawn_pos:
+                summary["has_spawn_anchor"] = True
             if camp := self._camps.get(dim):
                 summary["has_camp"] = True
-                summary["camp_has_chest"] = camp.get("chest") is not None
+                summary["camp_has_chest"] = camp.get("chest") is not None or bool(camp.get("chests"))
                 summary["camp_has_recovery_kit"] = self._camp_has_recovery_kit_locked(dim)
                 summary["camp_stored_count"] = sum(camp["stored_items"].values())
+                summary["camp_shelter_tier"] = int(camp.get("shelter_tier", 0) or 0)
+                if camp.get("chests"):
+                    summary["camp_chest_roles"] = sorted(camp["chests"].keys())
+                if camp.get("kit_depleted"):
+                    summary["camp_kit_depleted"] = True
             return summary
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
@@ -838,6 +960,7 @@ class WorldResourceMemo:
                 "survey_sectors_done": {dim: sorted(ss) for dim, ss in self.survey_sectors_done.items() if ss},
                 "camps": {dim: _copy_camp(camp) for dim, camp in self._camps.items()},
                 "last_deaths": {dim: _copy_death(death) for dim, death in self._last_deaths.items()},
+                "spawn_positions": {dim: list(cell) for dim, cell in self._spawn_pos.items()},
             }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1053,7 +1176,62 @@ class WorldResourceMemo:
                     if stored_items is None:
                         return False
                     parsed_camp["stored_items"] = stored_items
+                    raw_tier = camp_raw.get("shelter_tier", 0)
+                    if isinstance(raw_tier, bool) or not isinstance(raw_tier, int) or raw_tier not in (0, 1, 2):
+                        return False
+                    parsed_camp["shelter_tier"] = int(raw_tier)
+                    chests_out: dict[str, list[int]] = {}
+                    raw_chests = camp_raw.get("chests", {})
+                    if not isinstance(raw_chests, Mapping):
+                        return False
+                    for rname, rpos in raw_chests.items():
+                        if not isinstance(rname, str) or rname not in _CAMP_CHEST_ROLES:
+                            return False
+                        rcell = _parse_cell(rpos)
+                        if rcell is None:
+                            return False
+                        chests_out[rname] = list(rcell)
+                    if not chests_out and parsed_camp.get("chest") is not None:
+                        chests_out["kit"] = list(parsed_camp["chest"])
+                    parsed_camp["chests"] = chests_out
+                    chest_items_out: dict[str, dict[str, int]] = {}
+                    raw_ci = camp_raw.get("chest_items", {})
+                    if not isinstance(raw_ci, Mapping):
+                        return False
+                    for rname, ritems in raw_ci.items():
+                        if not isinstance(rname, str) or rname not in _CAMP_CHEST_ROLES:
+                            return False
+                        validated = _validate_strict_items(ritems)
+                        if validated is None:
+                            return False
+                        chest_items_out[rname] = validated
+                    parsed_camp["chest_items"] = chest_items_out
+                    raw_mine = camp_raw.get("mine_entry")
+                    if raw_mine is None:
+                        parsed_camp["mine_entry"] = None
+                    else:
+                        mcell = _parse_cell(raw_mine)
+                        if mcell is None:
+                            return False
+                        parsed_camp["mine_entry"] = list(mcell)
+                    raw_dep = camp_raw.get("kit_depleted", False)
+                    if not isinstance(raw_dep, bool):
+                        return False
+                    parsed_camp["kit_depleted"] = raw_dep
                     new_camps[dim] = parsed_camp
+
+            new_spawn_pos: dict[str, Cell] = {}
+            if "spawn_positions" in data:
+                spawns_raw = data["spawn_positions"]
+                if not isinstance(spawns_raw, Mapping):
+                    return False
+                for raw_dim, raw_sp in spawns_raw.items():
+                    if not isinstance(raw_dim, str):
+                        return False
+                    scell = _parse_cell(raw_sp)
+                    if scell is None:
+                        return False
+                    new_spawn_pos[_norm_dim(raw_dim)] = scell
 
             new_last_deaths: dict[str, dict[str, Any]] = {}
             if "last_deaths" in data:
@@ -1092,6 +1270,7 @@ class WorldResourceMemo:
                 self.survey_sectors_done = new_sectors
                 self._camps = new_camps
                 self._last_deaths = new_last_deaths
+                self._spawn_pos = new_spawn_pos
                 self.landmark_version = lv
             return True
         except Exception:
