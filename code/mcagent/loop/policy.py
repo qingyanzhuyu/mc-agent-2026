@@ -1159,7 +1159,7 @@ class RulePlanner:
             if hp <= 8.0 and unarmored:
                 return PlanDecision(None, "idle", f"夜间残血无甲原地避险待天亮 (hp={hp:.1f})")
             if (
-                safe_12
+                not has_bed_ready
                 and unarmored
                 and not has_sword
                 and best_pickaxe(state) not in STONE_OR_BETTER_PICKS

@@ -650,10 +650,15 @@ def _is_yaw_wall_blocked(
     return _is_solid_wall_block(b_foot) or _is_solid_wall_block(b_top)
 
 
+def _yaw_diff(a: float, b: float) -> float:
+    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+
+
 def _pick_alternate_escape_yaw(
     ex: "Executor", px: float, py: float, pz: float, ux: float, uz: float, cache: Any, dim: str,
+    *, tried_yaws: Sequence[float] = (),
 ) -> float:
-    """主逃离方向撞墙/无路径时，依次扫描左右正交（±90°）、斜向与反方向可通行干地通道，避免继续撞墙。"""
+    """主逃离方向撞墙/无路径时，依次扫描左右正交（±90°）、斜向与反方向可通行干地通道，并跳过已撞墙失败的 tried_yaws。"""
     fx, fy, fz = block_cell([px, py, pz])
     candidate_dirs = [
         (-uz, ux),
@@ -661,18 +666,34 @@ def _pick_alternate_escape_yaw(
         (-ux, -uz),
         (-uz - ux, ux - uz),
         (uz - ux, -ux - uz),
+        (ux - uz, uz + ux),
+        (ux + uz, uz - ux),
+        (ux, uz),
     ]
+    untried_yaws: list[float] = []
     for ox, oz in candidate_dirs:
         norm = math.hypot(ox, oz)
         if norm <= 1e-6:
             continue
         nx, nz = ox / norm, oz / norm
+        cand_yaw = math.atan2(-nx, -nz)
+        if tried_yaws and any(_yaw_diff(cand_yaw, ty) < 0.65 for ty in tried_yaws):
+            continue
+        untried_yaws.append(cand_yaw)
         sx, sz = int(round(nx)), int(round(nz))
         if (sx, sz) == (0, 0):
             continue
         for dy in (0, 1, -1):
             if _is_dry_standable(cache, ex.client, (fx + sx, fy + dy, fz + sz), dim):
-                return math.atan2(-nx, -nz)
+                return cand_yaw
+    if untried_yaws:
+        return untried_yaws[0]
+    if tried_yaws:
+        # 若全部候选都接近 tried_yaws，选与最近受阻角度夹角最大（反向/正交）的角度强制换向
+        return max(
+            (math.atan2(-ox, -oz) for ox, oz in candidate_dirs if math.hypot(ox, oz) > 1e-6),
+            key=lambda y: min(_yaw_diff(y, ty) for ty in tried_yaws),
+        )
     return math.atan2(uz, -ux)  # 右旋 90° 保底
 
 
@@ -937,6 +958,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     away_yaw = math.atan2(-ux, -uz)
     to_mob_yaw = math.atan2(ux, uz)
     burst_blocked = False
+    tried_yaws: list[float] = []
     if getattr(state, "inventory_dirty", False):
         try:
             state.refresh_inventory(ex.client)
@@ -950,9 +972,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     )
     use_bisector = has_shield and (abs(shield_yaw - to_mob_yaw) > 0.15 or hurt_attacker_id is not None)
 
-    # 苦力怕贴脸（<=3.5 格）且持盾时：先举盾朝向苦力怕后退挡爆，再收盾拉开至安全距离（>=7 格）
-    if is_creeper and h_dist <= 3.5:
-        if has_shield:
+    # 苦力怕贴脸（<=3.5 格，或水中 <=6.5 格）时：持盾先举盾后退挡爆，无盾则立即原生疾跑跳/泳离爆炸半径
+    creeper_burst_range = 6.5 if st.get("in_water") else 3.5
+    if is_creeper and h_dist <= creeper_burst_range:
+        if has_shield and h_dist <= 3.5:
             shield_up = _set_shield(ex, state, True)
             try:
                 _look_at_hostile(ex, h_pos, shield_yaw, prefer_yaw=use_bisector)
@@ -1142,6 +1165,8 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
                     if math.dist(before_burst, (px, py, pz)) < 1.5:
                         burst_blocked = True
+                        if safe_burst_yaw is not None:
+                            tried_yaws.append(safe_burst_yaw)
                 # 窄洞首段疾跑被岩壁/拐角挡住且近怪仍贴脸（<4.5 格）：立即改沿侧向可通行通道二次疾跑，禁止直接回退慢速 move_to 站桩挨打
                 mid_dist_val = mid_hostile.get("dist") if isinstance(mid_hostile, dict) else None
                 if (
@@ -1151,9 +1176,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     and float(mid_dist_val) < 4.5
                 ):
                     ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, mid_hostile, cache, dim, state=state)
-                    alt_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+                    alt_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
                     safe_alt_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, alt_yaw, cache, dim)
                     if safe_alt_yaw is not None:
+                        before_alt = (px, py, pz)
                         ok_alt, _ = yield from _control_step(
                             ex, forward=True, sprint=True, jump=True, yaw=safe_alt_yaw, ms=700,
                         )
@@ -1170,6 +1196,8 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                             alt_pos = st_alt.get("pos")
                             if isinstance(alt_pos, (list, tuple)) and len(alt_pos) >= 3:
                                 px, py, pz = float(alt_pos[0]), float(alt_pos[1]), float(alt_pos[2])
+                                if math.dist(before_alt, (px, py, pz)) < 1.5:
+                                    tried_yaws.append(safe_alt_yaw)
                             ux, uz = -math.sin(safe_alt_yaw), -math.cos(safe_alt_yaw)
                             away_yaw = safe_alt_yaw
 
@@ -1177,9 +1205,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     if h_name in _FAST_PURSUERS and h_dist < 8.5:
         sprint_supported = True
         fast_safe_dist = max(10.0, effective_hostile_flee_dist(state, h_name))
+        consecutive_stalls = 0
         for _ in range(3):
             if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim) or burst_blocked:
-                cand_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+                cand_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
             else:
                 cand_yaw = away_yaw
             safe_fast_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, cand_yaw, cache, dim)
@@ -1197,9 +1226,21 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             if st_mid.get("alive") is False:
                 return False
             mid_pos = st_mid.get("pos")
+            moved_fast = 0.0
             if isinstance(mid_pos, (list, tuple)) and len(mid_pos) >= 3:
                 px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
-                burst_blocked = math.dist(before_fast, (px, py, pz)) < 1.5
+                moved_fast = math.dist(before_fast, (px, py, pz))
+                burst_blocked = moved_fast < 1.5
+                if burst_blocked:
+                    tried_yaws.append(safe_fast_yaw)
+            if moved_fast < 0.5:
+                consecutive_stalls += 1
+                if consecutive_stalls >= 2:
+                    # 连续 2 个不同角度疾跑均卡在树干/河岸坑位 <0.5 格：交给 A* move_to 绕障爬出，绝不原地站桩挨咬
+                    sprint_supported = False
+                    break
+            else:
+                consecutive_stalls = 0
             mid_hostile = st_mid.get("nearest_hostile") or {}
             if not isinstance(mid_hostile, dict) or not mid_hostile:
                 return True

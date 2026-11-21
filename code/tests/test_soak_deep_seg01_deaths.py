@@ -1066,6 +1066,93 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(client.disconnects, 1, "expected /disconnect self-heal after 3 unreleased busy stops")
         self.assertEqual(client.connects, 1, "expected /connect self-heal after /disconnect")
 
+    def test_combat_eval_never_counterattacks_in_water_or_with_outer_creeper(self) -> None:
+        # 复现 seg-09 Death #1：水中游泳或 16m 外圈存在苦力怕且无盾时，严禁反杀近身僵尸，必须先脱险
+        from mcagent.skills.combat_eval import decide_combat_or_flee
+
+        class _WaterCreeperWorld(GridWorld):
+            def __init__(self, *, in_water: bool, outer_creeper: bool):
+                blocks = {(x, 61, z): "water" if in_water else "stone" for x in range(-4, 5) for z in range(-4, 5)}
+                super().__init__(blocks=blocks, pos=[0.5, 62.0, 0.5], items={"stone_sword": 1})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=20.0, food=20,
+                    in_water=in_water, submerged=False,
+                    nearest_hostile={"id": 132688, "name": "zombie", "dist": 3.2, "pos": [3.7, 62.0, 0.5]},
+                )
+                self._outer_creeper = outer_creeper
+
+            def get_entities(self, radius=16, types=None):
+                ents = [{"id": 132688, "type": "hostile", "name": "zombie", "dist": 3.2, "pos": [3.7, 62.0, 0.5], "health": 20}]
+                if self._outer_creeper:
+                    ents.append({"id": 132662, "type": "hostile", "name": "creeper", "dist": 13.1, "pos": [0.5, 62.0, 13.6], "health": 20})
+                return {"entities": ents}
+
+        w1 = _WaterCreeperWorld(in_water=True, outer_creeper=False)
+        ex1, st1 = w1.session()
+        self.assertEqual(decide_combat_or_flee(ex1, st1).action, "flee")
+
+        w2 = _WaterCreeperWorld(in_water=False, outer_creeper=True)
+        ex2, st2 = w2.session()
+        self.assertEqual(decide_combat_or_flee(ex2, st2).action, "flee")
+
+    def test_fast_pursuer_flee_rotates_away_from_repeated_blocked_yaw(self) -> None:
+        # 复现 seg-09 Death #2（t=110..114s）：蜘蛛贴脸连跑时，受阻角度写入 tried_yaws，绝不可连续 3 次撞同一个 yaw=0.0
+        from mcagent.skills.escape import _flee_hostile, _yaw_diff
+
+        blocks = {(x, 68, z): "stone" for x in range(-12, 13) for z in range(-12, 13)}
+
+        class _SpiderBlockedYawWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 69.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=17.3,
+                    nearest_hostile={"id": 132686, "name": "spider", "dist": 1.1, "pos": [1.6, 69.0, 0.5]},
+                )
+                self.yaws: list[float] = []
+
+            def control(self, **kwargs):
+                yaw = float(kwargs.get("yaw", 0.0))
+                self.yaws.append(yaw)
+                # 前两次方向被树干卡死（0 位移），第 3 次起不同方向成功甩脱
+                if len(self.yaws) <= 2:
+                    return {"pos": list(self.st["pos"]), "moved": 0.0}
+                self.st["pos"] = [0.5, 69.0, 11.5]
+                self.st["nearest_hostile"] = {"id": 132686, "name": "spider", "dist": 11.5, "pos": [1.6, 69.0, 0.5]}
+                return {"pos": list(self.st["pos"]), "moved": 11.0}
+
+        w = _SpiderBlockedYawWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(w.yaws), 3)
+        # 每次撞墙后的下一次疾跑角度必须显著不同（>= 0.65 rad），禁止重复撞同一方向
+        self.assertGreaterEqual(_yaw_diff(w.yaws[1], w.yaws[0]), 0.65, f"repeated blocked yaw: {w.yaws}")
+        self.assertGreaterEqual(_yaw_diff(w.yaws[2], w.yaws[1]), 0.65, f"repeated blocked yaw: {w.yaws}")
+
+    def test_nighttime_naked_respawn_guard_holds_even_with_hostile_at_11m(self) -> None:
+        # 复现 seg-09 t=60.9s：夜间空手无甲重生时敌怪游荡至 11m（safe_12=False），仍必须驻留待天亮而非裸奔砍树
+        planner = RulePlanner(min_verified="offline")
+        st = State()
+        st.set_status({
+            "ready": True, "alive": True, "health": 20.0, "food": 20, "armor_points": 0,
+            "dimension": "overworld", "is_day": False, "time_of_day": 20477,
+            "pos": [-63.5, 69.0, 16.5],
+            "nearest_hostile": {"id": 132688, "name": "zombie", "dist": 11.0},
+        })
+        st.set_inventory({"items": []})
+        dec = planner.choose_proactive_survival(st)
+        self.assertIsNotNone(dec)
+        assert dec is not None
+        self.assertIsNone(dec.skill)
+        self.assertEqual(dec.source, "idle")
+        self.assertIn("夜间空手无甲", dec.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

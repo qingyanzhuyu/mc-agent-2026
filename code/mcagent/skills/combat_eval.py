@@ -366,17 +366,20 @@ def _refresh_st(ex: "Executor", state: "State") -> dict[str, Any]:
 def decide_combat_or_flee(ex: "Executor", state: "State", *, radius: float = 10.0) -> TacticalDecision:
     """综合双方战力与躲避可行性，决定当下反杀 (`fight`) 或躲避 (`flee`)。"""
     st = _state_snapshot(state)
-    hostiles, outer_ranged = _split_hostile_rings(
-        observe_nearby_hostiles(ex, state, radius=max(radius, 16.0)), melee_radius=radius,
-    )
+    all_hostiles = observe_nearby_hostiles(ex, state, radius=max(radius, 16.0))
+    hostiles, outer_ranged = _split_hostile_rings(all_hostiles, melee_radius=radius)
+    outer_creepers = [
+        e for e in all_hostiles
+        if _num(e.get("dist"), 99.0) > radius and bare(e.get("name")).strip().lower() == "creeper"
+    ]
     power = evaluate_combat_power(state, hostiles)
     evasion = evaluate_evasion_feasibility(ex, state, hostiles)
     target, hp = (hostiles[0] if hostiles else None), _num(st.get("health"), 20.0)
 
     if target is None or target.get("id") is None:
         return TacticalDecision("flee", None, target, power, evasion, "未获取可锁定敌怪实体 ID，执行规避")
-    if st.get("in_lava") or st.get("submerged"):
-        return TacticalDecision("flee", None, target, power, evasion, "身处岩浆或水下，优先脱险")
+    if st.get("in_lava") or st.get("submerged") or st.get("in_water"):
+        return TacticalDecision("flee", None, target, power, evasion, "身处岩浆或水域，优先上岸脱险")
     if getattr(state, "in_safe_mode", False):
         return TacticalDecision("flee", None, target, power, evasion, "处于安全模式冷却期，禁止恋战")
     if hp < 10.0:
@@ -387,6 +390,10 @@ def decide_combat_or_flee(ex: "Executor", state: "State", *, radius: float = 10.
         r0 = outer_ranged[0]
         return TacticalDecision("flee", None, target, power, evasion,
                                 f"16 格内存在远程敌怪 {bare(r0.get('name')) or 'ranged'}({_num(r0.get('dist'), 16.0):.1f}m) 且无盾，禁止原地对砍")
+    if outer_creepers and not power.has_shield:
+        c0 = outer_creepers[0]
+        return TacticalDecision("flee", None, target, power, evasion,
+                                f"16 格内存在苦力怕({_num(c0.get('dist'), 16.0):.1f}m) 且无盾，禁止近战恋战防偷袭引爆")
 
     proactive_hp_floor = 12.0 if (power.has_shield or _armor_multiplier(st) > 1.0) else 14.0
     if (power.best_weapon is not None and hp >= proactive_hp_floor and power.win_ratio >= 1.25
