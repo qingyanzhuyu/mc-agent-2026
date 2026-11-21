@@ -22,6 +22,7 @@ Cell = tuple[int, int, int]
 PLACE_EYE_REACH: float = DIG_EYE_REACH
 _WATER_BLOCKS = frozenset({"water", "flowing_water", "bubble_column"})
 _FLUID_OR_FIRE = _WATER_BLOCKS | {"lava", "flowing_lava", "fire", "soul_fire"}
+_RANGED_HOSTILES = frozenset({"skeleton", "stray", "bogged", "pillager", "parched"})
 _SOFT_OVERHANG = frozenset({
     "dirt", "grass_block", "coarse_dirt", "rooted_dirt",
     "sand", "red_sand", "clay", "mud", "gravel", "snow", "snow_block",
@@ -590,6 +591,79 @@ def _find_skeleton_cover_cell(
     return min(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
+def _try_place_ranged_barricade(
+    ex: "Executor", state: "State", st: dict, h_pos: Optional[list[float]], cache: Any, dim: str,
+) -> Generator[dict, None, bool]:
+    """遭遇骷髅等远程敌怪且缺少天然掩体时，朝敌怪方向原地立 2 格高挡箭墙切断射界。"""
+    p = _valid_vec3(st.get("pos"))
+    hp = _valid_vec3(h_pos)
+    if p is None or hp is None:
+        return False
+    px, py, pz = p
+    fx, fy, fz = block_cell([px, py, pz])
+    hx, hz = hp[0] - px, hp[2] - pz
+    if not (2.0 <= math.hypot(hx, hz) <= 16.0):
+        return False
+
+    if getattr(state, "inventory_dirty", False):
+        try:
+            state.refresh_inventory(ex.client)
+        except AttributeError:
+            pass
+    if total_placeable(state) < 2:
+        return False
+
+    dx, dz = ((1 if hx > 0 else -1), 0) if abs(hx) >= abs(hz) else (0, (1 if hz > 0 else -1))
+    floor_blk = _read_block(cache, ex.client, (fx + dx, fy - 1, fz + dz), dim)
+    foot_cell = (fx + dx, fy, fz + dz)
+    head_cell = (fx + dx, fy + 1, fz + dz)
+    foot_blk = _read_block(cache, ex.client, foot_cell, dim)
+    head_blk = _read_block(cache, ex.client, head_cell, dim)
+    if not (floor_blk and is_safe_solid_floor(floor_blk)):
+        return False
+    if not (foot_blk and head_blk and is_clear_space(foot_blk) and is_clear_space(head_blk)):
+        return False
+
+    placed = 0
+    for cell in (foot_cell, head_cell):
+        if eye_to_block_dist(st, cell) > PLACE_EYE_REACH or total_placeable(state) < 1:
+            break
+        block = pick_placeable(state)
+        cell_pos = list(cell)
+        ok = yield from _exec_step(
+            "place",
+            lambda b=block, p_pos=cell_pos: ex.place(b, pos=p_pos),
+            on_ok=lambda p_pos=cell_pos: cache.invalidate(p_pos, dimension=dim),
+            item=block,
+            pos=cell_pos,
+            skeleton_cover=True,
+        )
+        if not ok:
+            break
+        placed += 1
+        if getattr(state, "inventory_dirty", False):
+            try:
+                state.refresh_inventory(ex.client)
+            except AttributeError:
+                pass
+        st_next = _refresh_status(ex, state)
+        if st_next.get("pos"):
+            st = st_next
+    return placed >= 2
+
+
+def _look_at_hostile(ex: "Executor", h_pos: Optional[list[float]], to_mob_yaw: float) -> None:
+    if not hasattr(ex, "look"):
+        return
+    try:
+        if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
+            ex.look(pos=[float(h_pos[0]), float(h_pos[1]) + 0.9, float(h_pos[2])])
+        else:
+            ex.look(yaw=to_mob_yaw, pitch=0.0)
+    except (ApiError, Replan, AttributeError):
+        pass
+
+
 def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]:
     st = _refresh_status(ex, state)
     pos = st.get("pos")
@@ -604,27 +678,25 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     h_dist_raw = hostile.get("dist") if isinstance(hostile, dict) else None
     h_dist = float(h_dist_raw) if isinstance(h_dist_raw, (int, float)) and not isinstance(h_dist_raw, bool) else 99.0
     is_creeper = h_name == "creeper"
+    is_ranged = h_name in _RANGED_HOSTILES
     ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, hostile, cache, dim)
 
     away_yaw = math.atan2(-ux, -uz)
     to_mob_yaw = math.atan2(ux, uz)
     burst_blocked = False
+    if getattr(state, "inventory_dirty", False):
+        try:
+            state.refresh_inventory(ex.client)
+        except AttributeError:
+            pass
+    has_shield = _has_shield(state, st)
 
     # 苦力怕贴脸（<=3.5 格）且持盾时：先举盾朝向苦力怕后退挡爆，再收盾拉开至安全距离（>=7 格）
     if is_creeper and h_dist <= 3.5:
-        if state.inventory_dirty:
-            state.refresh_inventory(ex.client)
-        if _has_shield(state, st):
+        if has_shield:
             shield_up = _set_shield(ex, state, True)
             try:
-                if hasattr(ex, "look"):
-                    try:
-                        if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
-                            ex.look(pos=[float(h_pos[0]), float(h_pos[1]) + 0.9, float(h_pos[2])])
-                        else:
-                            ex.look(yaw=to_mob_yaw, pitch=0.0)
-                    except (ApiError, Replan, AttributeError):
-                        pass
+                _look_at_hostile(ex, h_pos, to_mob_yaw)
                 yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=500)
             finally:
                 if shield_up:
@@ -645,17 +717,45 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         hp_raw = st.get("health", 20)
         hp_val = float(hp_raw) if isinstance(hp_raw, (int, float)) and not isinstance(hp_raw, bool) else 20.0
         hp_risk = float(getattr(getattr(state, "config", None), "hp_risk", 14.0) or 14.0)
-        if h_name == "skeleton" and h_dist < 10.0 and (not has_equipped_armor(state) or hp_val < hp_risk):
-            cover = _find_skeleton_cover_cell(ex, px, py, pz, h_pos, cache, dim)
+        if is_ranged and h_dist < 16.0:
+            cover = (
+                _find_skeleton_cover_cell(ex, px, py, pz, h_pos, cache, dim)
+                if (h_dist < 10.0 and (has_shield or not has_equipped_armor(state) or hp_val < hp_risk))
+                else None
+            )
             if cover is not None:
-                moved_cover = yield from _move_to_bounded(
-                    ex, [cover[0] + 0.5, float(cover[1]), cover[2] + 0.5], rng=0, timeout=8.0, skeleton_cover=True,
-                )
+                shield_up = _set_shield(ex, state, True) if has_shield else False
+                try:
+                    if shield_up:
+                        _look_at_hostile(ex, h_pos, to_mob_yaw)
+                    moved_cover = yield from _move_to_bounded(
+                        ex, [cover[0] + 0.5, float(cover[1]), cover[2] + 0.5], rng=0, timeout=5.0, skeleton_cover=True,
+                    )
+                finally:
+                    if shield_up:
+                        _set_shield(ex, state, False)
                 if moved_cover:
                     st_after_cov = _refresh_status(ex, state)
                     ap = st_after_cov.get("pos") or [px, py, pz]
                     if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
                         return True
+            if has_shield:
+                # 持盾面对远程怪且无近处天然掩体：先举盾面向敌怪后撤格挡箭矢，再收盾拉脱
+                shield_up = _set_shield(ex, state, True)
+                try:
+                    _look_at_hostile(ex, h_pos, to_mob_yaw)
+                    yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=550)
+                finally:
+                    if shield_up:
+                        _set_shield(ex, state, False)
+                st_mid = _refresh_status(ex, state)
+                mid_pos = st_mid.get("pos")
+                if mid_pos and len(mid_pos) >= 3:
+                    px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+            elif (not has_equipped_armor(state) or hp_val < hp_risk):
+                barricaded = yield from _try_place_ranged_barricade(ex, state, st, h_pos, cache, dim)
+                if barricaded:
+                    return True
         if h_dist < 2.5:
             # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用防跳崖检查的原生疾跑跳脱离近战命中圈再补 move_to
             safe_burst_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, away_yaw, cache, dim)
@@ -682,9 +782,9 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     if math.dist(before_burst, (px, py, pz)) < 1.5:
                         burst_blocked = True
 
-    flee_stride = 16.0 if is_creeper else 18.0
+    flee_stride = 16.0 if is_creeper else 12.0
     moved = yield from _move_to_bounded(
-        ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=12.0,
+        ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=5.0,
     )
     if not moved:
         st_retry = _refresh_status(ex, state)
@@ -699,6 +799,15 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim)
         if safe_retry_yaw is not None:
             yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_retry_yaw, ms=800)
+        elif has_shield:
+            # 四周有悬崖/岩浆无法疾跑且寻路失败：持盾面向敌怪短暂格挡保命
+            shield_up = _set_shield(ex, state, True)
+            try:
+                _look_at_hostile(ex, h_pos, to_mob_yaw)
+                yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=450)
+            finally:
+                if shield_up:
+                    _set_shield(ex, state, False)
 
     st_after = _refresh_status(ex, state)
     after_hostile = st_after.get("nearest_hostile") or {}

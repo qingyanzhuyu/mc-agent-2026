@@ -1150,11 +1150,19 @@ class RulePlanner:
             if dep is not None:
                 return PlanDecision(dep, "rule", "携带高价值或满包富余物资，回营地箱存仓")
 
-        # 10. Post-Iron Shield Readiness Fast-Path (原木可自动拆板计入)
+        # 10. Shield Readiness Fast-Path（仅需 1 铁锭 + 6 木板；持铁镐/铁>=4 或夜间/地下/非满血仅有 1~2 铁时优先补盾防身）
+        iron_ingots = state.count("iron_ingot")
+        pos_val = st.get("pos")
+        underground_risk = isinstance(pos_val, (list, tuple)) and len(pos_val) >= 2 and float(pos_val[1]) < 58.0
+        early_shield_needed = (
+            1 <= iron_ingots <= 2
+            and state.count("raw_iron") < 3 - iron_ingots
+            and (day is False or hp < 16.0 or underground_risk)
+        )
         if (
             state.count("shield") < 1
-            and state.count("iron_ingot") >= 1
-            and (state.count("iron_pickaxe") >= 1 or state.count("iron_ingot") >= 4)
+            and iron_ingots >= 1
+            and (state.count("iron_pickaxe") >= 1 or iron_ingots >= 4 or early_shield_needed)
             and total_planks(state) + total_logs(state) * 4 >= 6
             and safe_12
         ):

@@ -20,6 +20,46 @@ _KITE_HOSTILES = frozenset({"creeper"})
 _TALL_HOSTILES = frozenset({"wither_skeleton", "enderman", "iron_golem"})
 _LOW_HOSTILES = frozenset({"spider", "cave_spider", "silverfish", "endermite", "slime", "magma_cube"})
 _BUNKER_REACH = 3.5
+_AXE_COOLDOWN_S: dict[str, float] = {
+    "wooden_axe": 1.25, "stone_axe": 1.25, "iron_axe": 1.12,
+    "golden_axe": 1.0, "diamond_axe": 1.0, "netherite_axe": 1.0,
+}
+
+
+def weapon_cooldown_s(item_name: str | None) -> float:
+    """§4.6 / §4.16 原版攻击冷却（秒），始终 >= 0.55s 以避开目标 0.5s 受击无敌帧。"""
+    name = bare(item_name or "").strip().lower()
+    if name in _AXE_COOLDOWN_S:
+        return _AXE_COOLDOWN_S[name]
+    if name.endswith("_sword"):
+        return 0.65
+    if name.endswith("_pickaxe"):
+        return 0.85
+    if name.endswith("_shovel"):
+        return 1.02
+    if name == "trident":
+        return 0.92
+    if name == "mace":
+        return 1.68
+    return 0.55
+
+
+def _held_weapon_name(state, st: dict) -> str:
+    for src in (st, getattr(state, "inventory", None)):
+        if isinstance(src, dict):
+            held = src.get("held")
+            if isinstance(held, dict) and held.get("name"):
+                return bare(held["name"])
+            if isinstance(held, str) and held:
+                return bare(held)
+    return ""
+
+
+def wait_attack_cooldown(last_hit_mono: float, cooldown_s: float) -> None:
+    """补足距上次挥击的剩余冷却时间，防止低 RTT 下连挥撞进 500ms 无敌帧或重置 1.9+ 冷却条。"""
+    remaining = cooldown_s - (time.monotonic() - last_hit_mono)
+    if remaining > 0.01:
+        time.sleep(min(remaining, 1.8))
 
 
 def _line_cells(start, end):
@@ -281,18 +321,34 @@ def pillar_up(ex, state, *, height: int = 3, item: str | None = None):
     ex.posture(jump=True)
     try:
         for step in range(height):
-            state.refresh_inventory(ex.client)
-            block = pick_placeable(state, item)
-            target_pos = [fx, fy + step, fz]
-            try:
-                res = ex.place(block, pos=target_pos)
-            except Replan as exc:
-                code, _ = failure(exc)
-                if code in ("blocked_by_self", "occupied", "no_support", "place_failed"):
-                    yield rec("place", None, item=block, pos=target_pos, tactic="pillar_up", error_code=code)
+            placed_step = False
+            for retry in range(2):
+                cur_st = state.refresh_status(ex.client, max_age_s=0) if (step > 0 or retry > 0) else st
+                if cur_st.get("pos"):
+                    cx, cy, cz = _cell(_position(cur_st.get("pos")))
+                    if abs(cx - fx) <= 1 and abs(cz - fz) <= 1:
+                        fx, fz = cx, cz
+                state.refresh_inventory(ex.client)
+                if total_placeable(state, item) < 1:
                     break
-                raise
-            yield rec("place", res, item=block, pos=target_pos, tactic="pillar_up")
+                block = pick_placeable(state, item)
+                target_pos = [fx, fy + step, fz]
+                try:
+                    res = ex.place(block, pos=target_pos)
+                except Replan as exc:
+                    code, _ = failure(exc)
+                    if code in ("blocked_by_self", "occupied", "no_support", "place_failed"):
+                        yield rec("place", None, item=block, pos=target_pos, tactic="pillar_up", error_code=code)
+                        if code == "blocked_by_self" and retry == 0:
+                            time.sleep(0.15)
+                            continue
+                        break
+                    raise
+                yield rec("place", res, item=block, pos=target_pos, tactic="pillar_up")
+                placed_step = True
+                break
+            if not placed_step:
+                break
     finally:
         if state.st.get("alive") is not False:
             try:
@@ -357,7 +413,7 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
     try:
         if resolved == "direct" and not has_shield:
             try:
-                receipt = ex.attack(target["id"], timeout_ms=timeout_ms, stop_on=("hurt", "death"))
+                receipt = ex.attack(target["id"], timeout_ms=timeout_ms, stop_on=("death",))
             except Replan as exc:
                 _translate_attack_replan(ex, state, target, exc)
             yield rec("attack", receipt, entity_id=target["id"])
@@ -372,8 +428,10 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                 raise Replan("本次近战未确认击杀")
         elif resolved == "direct":
             burst_timeout = min(timeout_ms, 3000)
+            last_hit_at = 0.0
             for round_idx in range(max_rounds):
                 if round_idx > 0:
+                    wait_attack_cooldown(last_hit_at, weapon_cooldown_s(_held_weapon_name(state, st)))
                     st = state.refresh_status(ex.client, max_age_s=0)
                     if _hp_critical(state, st):
                         raise Replan(f"近战期间血量危急（hp={st.get('health')}），中止交战")
@@ -386,9 +444,10 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                     shield_raised = _set_shield_guard(ex, state, False)
                 try:
                     receipt = ex.attack(target["id"], timeout_ms=burst_timeout, max_hits=2,
-                                        stop_on=("hurt", "death"))
+                                        stop_on=("death",))
                 except Replan as exc:
                     _translate_attack_replan(ex, state, target, exc)
+                last_hit_at = time.monotonic()
                 yield rec("attack", receipt, entity_id=target["id"], tactic="direct", max_hits=2)
                 st = state.refresh_status(ex.client, max_age_s=0)
                 after_inventory = state.refresh_inventory(ex.client)
@@ -398,6 +457,7 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                 if _check_killed(receipt, after, require_receipt_killed=False):
                     killed = True
                     break
+                _look_at_target(ex, eye_pos(st), after or target)
                 shield_raised = _set_shield_guard(ex, state, True)
                 if _hp_critical(state, st):
                     raise Replan(f"近战期间血量危急（hp={st.get('health')}），中止交战")
@@ -410,8 +470,10 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                 raise Replan("本次近战未确认击杀")
         elif resolved == "kite":
             burst_timeout = min(timeout_ms, 3000)
+            last_hit_at = 0.0
             for round_idx in range(max_rounds):
                 if round_idx > 0:
+                    wait_attack_cooldown(last_hit_at, weapon_cooldown_s(_held_weapon_name(state, st)))
                     st = state.refresh_status(ex.client, max_age_s=0)
                     if _hp_critical(state, st):
                         raise Replan(f"风筝近战期间血量危急（hp={st.get('health')}），中止交战")
@@ -424,9 +486,10 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                     shield_raised = _set_shield_guard(ex, state, False)
                 try:
                     receipt = ex.attack(target["id"], timeout_ms=burst_timeout, max_hits=1,
-                                        stop_on=("hurt", "death"))
+                                        stop_on=("death",))
                 except Replan as exc:
                     _translate_attack_replan(ex, state, target, exc)
+                last_hit_at = time.monotonic()
                 yield rec("attack", receipt, entity_id=target["id"], tactic="kite", max_hits=1)
                 st = state.refresh_status(ex.client, max_age_s=0)
                 after_inventory = state.refresh_inventory(ex.client)
@@ -459,8 +522,10 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                 raise Replan("风筝近战达到轮次上限，未确认击杀")
         else:  # bunker_hit: §4.16 + §4.17 定点无伤挥砍，绝不调 /attack 走下掩体
             consecutive_misses = 0
+            last_hit_at = 0.0
             for round_idx in range(max_rounds):
                 if round_idx > 0:
+                    wait_attack_cooldown(last_hit_at, weapon_cooldown_s(_held_weapon_name(state, st)))
                     st = state.refresh_status(ex.client, max_age_s=0)
                     if not _grounded(ex, st) or _hp_critical(state, st):
                         raise Replan("掩体近战期间站位失稳或血量危急，中止挥砍")
@@ -478,6 +543,7 @@ def combat_melee(ex, state, entity, *, retreat_pos, timeout_ms=8000, radius=8,
                 if not looked:
                     ctrl_kwargs.update(yaw=yaw, pitch=pitch)
                 receipt = ex.control(**ctrl_kwargs)
+                last_hit_at = time.monotonic()
                 yield rec("control", receipt, entity_id=target["id"], tactic="bunker_hit", hit=1)
                 st = state.refresh_status(ex.client, max_age_s=0)
                 after_inventory = state.refresh_inventory(ex.client)

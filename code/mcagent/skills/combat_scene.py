@@ -52,7 +52,7 @@ class Encounter:
     open_field: bool = False
 
 
-def gate_reason(state, status):
+def gate_reason(state, status, *, min_health: float = 14):
     if status.get("ready") is not True or not status.get("dimension") or status.get("alive") is not True:
         return "缺少就绪且存活的战斗状态"
     if state.in_safe_mode or status.get("on_ground") is not True or any(
@@ -61,18 +61,23 @@ def gate_reason(state, status):
             )):
         return "需要在干燥、有支撑且未持续跳跃的位置，并脱离安全模式"
     health = status.get("health")
-    if type(health) not in (int, float) or not math.isfinite(health) or health < 14:
-        return "战斗前至少需要 14 点生命"
+    if type(health) not in (int, float) or not math.isfinite(health) or health < min_health:
+        return f"战斗前至少需要 {min_health:g} 点生命"
     return ""
 
 
-def _safe_status(ex, state, previous=None, *, stay=False):
+def _safe_status(ex, state, previous=None, *, stay=False, allow_minor_hurt=False):
     status = state.refresh_status(ex.client, max_age_s=0)
-    reason = gate_reason(state, status)
+    reason = gate_reason(state, status, min_health=10 if allow_minor_hurt else 14)
     if reason or not _grounded(ex, status):
         raise Replan(reason or "无法复核当前脚下支撑")
+    hurt_blocked = (
+        (not allow_minor_hurt and status["health"] < previous["health"])
+        if previous is not None
+        else False
+    )
     if previous is not None and (
-        status["dimension"] != previous["dimension"] or status["health"] < previous["health"]
+        status["dimension"] != previous["dimension"] or hurt_blocked
         or (stay and _cell(status["pos"]) != _cell(previous["pos"]))
     ):
         raise Replan("交战期间受伤、换维度或离开已核对的站位，撤离重规划")
@@ -124,8 +129,10 @@ def _aim(entity):
 
 
 def _live_hostile(entity) -> bool:
+    if entity.get("type") != "hostile":
+        return False
     health = entity.get("health")
-    return entity.get("type") == "hostile" and type(health) in (int, float) and health > 0
+    return health is None or (type(health) in (int, float) and health > 0)
 
 
 def _hostiles_near(entities, target_id, origin):
@@ -263,7 +270,8 @@ def refresh_encounter(ex, state, scene, *, aimed=False):
     if target is not None:
         target = next((entity for entity in entities if entity["id"] == scene.target["id"]
                        and bare(entity.get("name")) == bare(scene.target.get("name"))
-                       and type(entity.get("health")) in (int, float) and entity["health"] > 0), None)
+                       and (entity.get("health") is None
+                            or (type(entity.get("health")) in (int, float) and entity["health"] > 0))), None)
         if target is None:
             raise Replan("交战目标已离开视野或死亡，停止动作")
     aim = _aim(target) if target is not None else scene.aim
@@ -286,8 +294,8 @@ def refresh_encounter(ex, state, scene, *, aimed=False):
     return current
 
 
-def check_after_action(ex, state, scene, *, stay=True):
-    return _safe_status(ex, state, scene.origin, stay=stay)
+def check_after_action(ex, state, scene, *, stay=True, allow_minor_hurt=False):
+    return _safe_status(ex, state, scene.origin, stay=stay, allow_minor_hurt=allow_minor_hurt)
 
 
 def prepared_scene(ex, state, scene, choose, *, aimed=False):

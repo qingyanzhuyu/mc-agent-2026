@@ -51,8 +51,10 @@ def _allowed_vanilla_hostiles():
 
 
 def _hostile(entity):
+    if entity.get("type") != "hostile":
+        return False
     health = entity.get("health")
-    return entity.get("type") == "hostile" and type(health) in (float, int) and health > 0
+    return health is None or (type(health) in (float, int) and health > 0)
 
 
 def _shield_source(entity):
@@ -119,7 +121,7 @@ def _melee_with_stop(ex, state, scene, *, tactic: str):
             ex, state, scene.target, retreat_pos=scene.retreat, timeout_ms=3000, radius=10, tactic=tactic)
     finally:
         stop_activity(ex, state, busy="attack")
-    check_after_action(ex, state, scene, stay=False)
+    check_after_action(ex, state, scene, stay=False, allow_minor_hurt=True)
     return evidence
 
 
@@ -206,7 +208,9 @@ class HuntMob(Skill):
                       if state.count(name) > count}
             yield rec("combat_drops", gained, source="attack_inventory_delta")
             if drop == "none":
-                progress_check = None if crowd_defended else (lambda: check_after_action(ex, state, scene, stay=False))
+                progress_check = None if crowd_defended else (
+                    lambda: check_after_action(ex, state, scene, stay=False, allow_minor_hurt=True)
+                )
                 yield from confirm_progress(ex, (KILL_MOB,), KILL_MOB, initial=initial, check=progress_check)
             elif state.count(drop) < quantity:
                 gained = yield from collect_drops(ex, state, drop, count=quantity - state.count(drop),

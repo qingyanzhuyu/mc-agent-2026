@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from ..client import ApiError
 from ..runtime import Replan
 from .base import rec
+from .encounter import wait_attack_cooldown, weapon_cooldown_s
 from .items import AIR, bare
 from .voxel_cache import voxel_cache_for
 
@@ -138,7 +140,7 @@ def evaluate_combat_power(state: "State", hostiles: Sequence[Mapping[str, Any]])
         dist = _num(mob.get("dist"), 4.0)
         if name in NEVER_MELEE_MOBS:
             force_flee, force_reason = True, f"高危敌怪 {name} 禁止近战硬刚"
-        elif name in RANGED_MOBS and (not shield or len(hostiles) > 1 or dist > 5.5):
+        elif name in RANGED_MOBS and (not shield or len(hostiles) > 1 or dist > 6.5):
             force_flee, force_reason = True, f"远程敌怪 {name}（无盾/远距/多怪）优先规避"
         default_hp, base_dps = _MOB_BASE_THREAT.get(name, (20.0, 4.0))
         raw_enemy += max(4.0, _num(mob.get("health"), default_hp)) * base_dps
@@ -226,14 +228,63 @@ def observe_nearby_hostiles(ex: "Executor", state: "State", *, radius: float = 1
     return out
 
 
+def _offhand_name(state: "State", st: Mapping[str, Any]) -> str:
+    for src in (st.get("offhand"), (getattr(state, "inventory", None) or {}).get("offhand")):
+        if isinstance(src, Mapping) and src.get("name"):
+            return bare(src.get("name"))
+    return ""
+
+
+def _set_shield_posture(ex: "Executor", state: "State", active: bool) -> bool:
+    """§4.11 不占动作锁的盾牌举盾/收盾；死亡或旧网关不支持时静默降级。"""
+    posture = getattr(ex, "posture", None)
+    if (not active and _state_snapshot(state).get("alive") is False) or not callable(posture):
+        return False
+    try:
+        res = posture(shield=active)
+        return bool(res.get("blocking", active)) if isinstance(res, Mapping) else active
+    except (ApiError, Replan, AttributeError):
+        return False
+
+
+def _look_at_mob(ex: "Executor", target: Mapping[str, Any]) -> None:
+    look = getattr(ex, "look", None)
+    if not callable(look):
+        return
+    try:
+        if target.get("id") is not None:
+            look(entity_id=target["id"])
+        elif isinstance(target.get("pos"), (list, tuple)) and len(target["pos"]) >= 3:
+            epos = target["pos"]
+            look(pos=[float(epos[0]), float(epos[1]) + 0.9, float(epos[2])])
+    except (ApiError, Replan, AttributeError):
+        pass
+
+
+def _split_hostile_rings(
+    all_hostiles: Sequence[dict[str, Any]], *, melee_radius: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    near = [e for e in all_hostiles if _num(e.get("dist"), 99.0) <= melee_radius]
+    outer_ranged = [
+        e for e in all_hostiles
+        if _num(e.get("dist"), 99.0) > melee_radius and bare(e.get("name")).strip().lower() in RANGED_MOBS
+    ]
+    return near, outer_ranged
+
+
+def _refresh_st(ex: "Executor", state: "State") -> dict[str, Any]:
+    return state.refresh_status(ex.client, max_age_s=0) if hasattr(state, "refresh_status") else _state_snapshot(state)
+
+
 def decide_combat_or_flee(ex: "Executor", state: "State", *, radius: float = 10.0) -> TacticalDecision:
     """综合双方战力与躲避可行性，决定当下反杀 (`fight`) 或躲避 (`flee`)。"""
     st = _state_snapshot(state)
-    hostiles = observe_nearby_hostiles(ex, state, radius=radius)
+    hostiles, outer_ranged = _split_hostile_rings(
+        observe_nearby_hostiles(ex, state, radius=max(radius, 16.0)), melee_radius=radius,
+    )
     power = evaluate_combat_power(state, hostiles)
     evasion = evaluate_evasion_feasibility(ex, state, hostiles)
-    target = hostiles[0] if hostiles else None
-    hp = _num(st.get("health"), 20.0)
+    target, hp = (hostiles[0] if hostiles else None), _num(st.get("health"), 20.0)
 
     if target is None or target.get("id") is None:
         return TacticalDecision("flee", None, target, power, evasion, "未获取可锁定敌怪实体 ID，执行规避")
@@ -245,8 +296,13 @@ def decide_combat_or_flee(ex: "Executor", state: "State", *, radius: float = 10.
         return TacticalDecision("flee", None, target, power, evasion, f"血量偏低 (hp={hp:.1f}<10)，优先撤离")
     if power.force_flee:
         return TacticalDecision("flee", None, target, power, evasion, power.reason)
+    if outer_ranged and not power.has_shield:
+        r0 = outer_ranged[0]
+        return TacticalDecision("flee", None, target, power, evasion,
+                                f"16 格内存在远程敌怪 {bare(r0.get('name')) or 'ranged'}({_num(r0.get('dist'), 16.0):.1f}m) 且无盾，禁止原地对砍")
 
-    if (power.best_weapon is not None and hp >= 12.0 and power.win_ratio >= 1.25
+    proactive_hp_floor = 12.0 if (power.has_shield or _armor_multiplier(st) > 1.0) else 14.0
+    if (power.best_weapon is not None and hp >= proactive_hp_floor and power.win_ratio >= 1.25
             and (power.enemy_count == 1 or (power.enemy_count == 2 and power.has_shield))):
         return TacticalDecision("fight", power.best_weapon, target, power, evasion,
                                 f"战力占优主动反杀：{power.best_weapon} ({power.reason})")
@@ -260,20 +316,16 @@ def decide_combat_or_flee(ex: "Executor", state: "State", *, radius: float = 10.
 
 
 def counterattack_hostile(
-    ex: "Executor",
-    state: "State",
-    decision: TacticalDecision,
-    *,
-    max_rounds: int = 5,
+    ex: "Executor", state: "State", decision: TacticalDecision, *, max_rounds: int = 5,
 ) -> Generator[dict, None, bool]:
-    """按战力决策执行有界反杀；掉血至 <10、刷出苦力怕或遭围攻立刻返回 False 交回逃生。"""
+    """按战力决策执行有界反杀：自动副手装盾+冷却期举盾格挡+满蓄攻速间隔，异常必收盾。"""
     if decision.action != "fight" or not decision.weapon or not decision.target or not hasattr(ex, "attack"):
         return False
     target_id = decision.target.get("id")
     if target_id is None:
         return False
 
-    st = state.refresh_status(ex.client, max_age_s=0) if hasattr(state, "refresh_status") else _state_snapshot(state)
+    st = _refresh_st(ex, state)
     held_name = bare((st.get("held") or {}).get("name")) if isinstance(st.get("held"), Mapping) else ""
     if held_name != decision.weapon and hasattr(ex, "equip"):
         try:
@@ -281,48 +333,77 @@ def counterattack_hostile(
         except (ApiError, Replan):
             return False
 
-    for _ in range(max_rounds):
-        st = state.refresh_status(ex.client, max_age_s=0) if hasattr(state, "refresh_status") else _state_snapshot(state)
-        if st.get("alive") is False or _num(st.get("health"), 20.0) < 10.0 or st.get("in_lava") or st.get("submerged"):
-            return False
+    has_shield = decision.power.has_shield or _has_shield(state, st)
+    if has_shield and _offhand_name(state, st) not in ("shield", "totem_of_undying") and hasattr(ex, "equip"):
+        try:
+            yield rec("equip", ex.equip("shield", "off-hand"), item="shield", slot="off-hand", tactical="counterattack")
+        except (ApiError, Replan):
+            pass
 
-        hostiles = observe_nearby_hostiles(ex, state, radius=10.0)
-        if not hostiles:
-            return True
-        if len(hostiles) >= 3 or any(
-            bare(h.get("name")).strip().lower() == "creeper" and _num(h.get("dist"), 99.0) <= 6.5 for h in hostiles
-        ):
-            return False
+    target_is_ranged = bare(decision.target.get("name")).strip().lower() in RANGED_MOBS
+    cooldown_s = weapon_cooldown_s(decision.weapon)
+    hits_per_round = 1 if (has_shield and (target_is_ranged or bare(decision.weapon).endswith("_axe"))) else 2
+    shield_raised, last_hit_at = False, 0.0
 
-        cur_target = next((h for h in hostiles if h.get("id") == target_id), None)
-        if cur_target is None:
-            return _num(hostiles[0].get("dist"), 99.0) >= 6.0
-
-        dist = _num(cur_target.get("dist"), 3.0)
-        if dist > 3.2:
-            if dist > 7.0 or not isinstance(cur_target.get("pos"), (list, tuple)) or not hasattr(ex, "move_to"):
+    try:
+        for round_idx in range(max_rounds):
+            if round_idx > 0:
+                wait_attack_cooldown(last_hit_at, max(cooldown_s, 0.85) if (shield_raised and target_is_ranged) else cooldown_s)
+            st = _refresh_st(ex, state)
+            if st.get("alive") is False or _num(st.get("health"), 20.0) < 10.0 or st.get("in_lava") or st.get("submerged"):
                 return False
-            tpos = [float(cur_target["pos"][0]), float(cur_target["pos"][1]), float(cur_target["pos"][2])]
+
+            hostiles, outer_ranged = _split_hostile_rings(observe_nearby_hostiles(ex, state, radius=16.0), melee_radius=10.0)
+            if not hostiles:
+                return True
+            if (len(hostiles) >= 3 or (outer_ranged and not has_shield)
+                    or any(bare(h.get("name")).strip().lower() == "creeper" and _num(h.get("dist"), 99.0) <= 6.5 for h in hostiles)):
+                return False
+
+            cur_target = next((h for h in hostiles if h.get("id") == target_id), None)
+            if cur_target is None:
+                return _num(hostiles[0].get("dist"), 99.0) >= 6.0
+
+            dist = _num(cur_target.get("dist"), 3.0)
+            if dist > 3.2:
+                if dist > 7.0 or not isinstance(cur_target.get("pos"), (list, tuple)) or not hasattr(ex, "move_to"):
+                    return False
+                if has_shield and target_is_ranged and not shield_raised:
+                    _look_at_mob(ex, cur_target)
+                    shield_raised = _set_shield_posture(ex, state, True)
+                elif shield_raised and not target_is_ranged:
+                    shield_raised = _set_shield_posture(ex, state, False)
+                tpos = [float(cur_target["pos"][0]), float(cur_target["pos"][1]), float(cur_target["pos"][2])]
+                try:
+                    try:
+                        mv = ex.move_to(pos=tpos, rng=2, timeout=4.0, retries=0, stop_on=("death",))
+                    except TypeError:
+                        mv = ex.move_to(pos=tpos, rng=2)
+                    yield rec("move_to", mv, tactical="close_gap")
+                except (ApiError, Replan):
+                    return False
+
+            if shield_raised:
+                shield_raised = _set_shield_posture(ex, state, False)
+
             try:
                 try:
-                    mv = ex.move_to(pos=tpos, rng=2, timeout=4.0, retries=0, stop_on=("death",))
+                    res = ex.attack(entity_id=target_id, max_hits=hits_per_round, stop_on=("death",))
                 except TypeError:
-                    mv = ex.move_to(pos=tpos, rng=2)
-                yield rec("move_to", mv, tactical="close_gap")
-            except (ApiError, Replan):
-                return False
+                    res = ex.attack(entity_id=target_id, max_hits=hits_per_round)
+            except (ApiError, Replan) as exc:
+                msg = str(exc).lower()
+                return "not_found" in msg or "gone" in msg or "invalid" in msg
+            last_hit_at = time.monotonic()
+            yield rec("attack", res, entity_id=target_id, weapon=decision.weapon, reason=decision.reason)
+            if isinstance(res, Mapping) and res.get("killed"):
+                nh = _refresh_st(ex, state).get("nearest_hostile")
+                return not isinstance(nh, Mapping) or _num(nh.get("dist"), 99.0) >= 6.0
 
-        try:
-            try:
-                res = ex.attack(entity_id=target_id, max_hits=2, interval_ms=600, stop_on=("death",))
-            except TypeError:
-                res = ex.attack(entity_id=target_id, max_hits=2, interval_ms=600)
-        except (ApiError, Replan) as exc:
-            msg = str(exc).lower()
-            return "not_found" in msg or "gone" in msg or "invalid" in msg
-        yield rec("attack", res, entity_id=target_id, weapon=decision.weapon, reason=decision.reason)
-        if isinstance(res, Mapping) and res.get("killed"):
-            st_end = state.refresh_status(ex.client, max_age_s=0) if hasattr(state, "refresh_status") else _state_snapshot(state)
-            nh = st_end.get("nearest_hostile")
-            return not isinstance(nh, Mapping) or _num(nh.get("dist"), 99.0) >= 6.0
+            if has_shield:
+                _look_at_mob(ex, cur_target)
+                shield_raised = _set_shield_posture(ex, state, True)
+    finally:
+        if shield_raised:
+            _set_shield_posture(ex, state, False)
     return False

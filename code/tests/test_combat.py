@@ -179,7 +179,7 @@ class HuntMobTests(CombatTestCase):
         self.assertEqual(state.count("string"), 2)
         self.assertEqual(progress_records(records), [{KILL_MOB: True}])
         attack = next(args for op, args in world.calls if op == "attack")
-        self.assertEqual((attack["entity_id"], attack["stop_on"]), (91, ("hurt", "death")))
+        self.assertEqual((attack["entity_id"], attack["stop_on"]), (91, ("death",)))
 
     def test_missing_sword_and_invalid_species(self):
         self.assert_replan(CombatWorld(), HuntMob(), "近战剑")
