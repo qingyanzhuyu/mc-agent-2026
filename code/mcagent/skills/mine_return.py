@@ -13,7 +13,17 @@ from typing import Any, Optional
 from ..client import ApiError
 from ..runtime import EnvBlocked, Executor, Replan, State
 from .base import failure, rec
-from .items import AIR, MINE_TRAILS, NAV_FAIL_CODES, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, best_pickaxe
+from .items import (
+    AIR,
+    MINE_TRAILS,
+    NAV_FAIL_CODES,
+    PICKAXE_ORDER,
+    STONE_OR_BETTER_PICKS,
+    bare,
+    best_pickaxe,
+    pick_placeable,
+    total_placeable,
+)
 from .mining import SOLID_SUPPORT, prepare_mining_pick
 from .recipes import RECIPES, craft_recipe
 from .sightline import STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
@@ -33,6 +43,12 @@ _UNSAFE_CLIMB: frozenset[str] = frozenset({
     "water", "lava", "flowing_water", "flowing_lava", "bedrock", "obsidian", "crying_obsidian", "crafting_table", "chest", "furnace",
 })
 _FALLING_ROOF: frozenset[str] = frozenset({"sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava"})
+_HAND_ESCAPE_ROCKS: frozenset[str] = frozenset({
+    "stone", "cobblestone", "andesite", "diorite", "granite", "tuff", "deepslate",
+    "cobbled_deepslate", "sandstone", "red_sandstone", "coal_ore", "copper_ore",
+    "iron_ore", "deepslate_coal_ore", "deepslate_copper_ore", "deepslate_iron_ore",
+    "calcite", "dripstone_block", "netherrack",
+})
 _ROUTE_ERRS: frozenset[str] = frozenset((*NAV_FAIL_CODES, "timeout"))
 _CEILING_CHECK_MAX_Y: float = 52.0
 
@@ -119,33 +135,81 @@ def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> lis
 
 
 def _climb_out_stairs(
-    ex: Executor, state: State, *, target_y: float, max_steps: int = 64,
+    ex: Executor,
+    state: State,
+    *,
+    target_y: float,
+    max_steps: int = 64,
+    allow_hand_rock: bool = False,
 ) -> Generator[dict, None, bool]:
-    """当既有矿井路径不通时，在安全实心岩体中向上开凿有界 1×2 阶梯脱困（允许木镐，无镐仅挖软土）。"""
+    """当既有矿井路径不通时，在安全实心岩体中向上开凿有界 1×2 阶梯脱困（支持垫块跨空与无镐防软锁徒手破岩）。"""
     vc = voxel_cache_for(state)
     for _ in range(max(1, int(max_steps))):
         st, cur, dim = _cur_status(ex, state)
         if st.get("alive") is False or float(cur[1]) >= target_y - 2.0:
             return float(cur[1]) >= target_y - 2.0
         has_pick = best_pickaxe(state) is not None
+        can_place = total_placeable(state) >= 1
         ix, fy, iz = block_cell(cur)
-        chosen: Optional[tuple[int, int]] = None
-        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nx, nz = ix + dx, iz + dz
-            floor_n = _probe_name(ex, (nx, fy, nz))
-            if not floor_n or floor_n in AIR or floor_n in _UNSAFE_CLIMB:
-                continue
-            head_n, s1_n, s2_n = _probe_name(ex, (ix, fy + 2, iz)), _probe_name(ex, (nx, fy + 1, nz)), _probe_name(ex, (nx, fy + 2, nz))
-            roof_n = _probe_name(ex, (nx, fy + 3, nz))
-            if roof_n in _FALLING_ROOF or any(n in _UNSAFE_CLIMB for n in (head_n, s1_n, s2_n)):
-                continue
-            if not has_pick and any(n and n not in AIR and n not in _SOFT_HAND_DIG and not n.endswith("_leaves") for n in (head_n, s1_n, s2_n)):
-                continue
-            chosen = (nx, nz)
-            break
+        chosen: Optional[tuple[int, int, bool, bool]] = None  # (nx, nz, need_place_step, hand_rock_mode)
+
+        def _can_clear(names: tuple[str, str, str], *, hand_rock: bool) -> bool:
+            if any(n in _UNSAFE_CLIMB for n in names):
+                return False
+            if has_pick:
+                return True
+            allowed = (_SOFT_HAND_DIG | _HAND_ESCAPE_ROCKS) if hand_rock else _SOFT_HAND_DIG
+            return all((not n) or n in AIR or n in allowed or n.endswith("_leaves") for n in names)
+
+        # Pass 1: 紧邻实心台阶 + 常规可挖通道；Pass 2: 空洞处放垫块造台阶；Pass 3: 无镐防软锁允许徒手破岩
+        passes: list[tuple[bool, bool]] = [(False, False)]
+        if can_place:
+            passes.append((True, False))
+        if allow_hand_rock and not has_pick:
+            passes.append((False, True))
+            if can_place:
+                passes.append((True, True))
+
+        for need_place, hand_rock in passes:
+            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, nz = ix + dx, iz + dz
+                floor_n = _probe_name(ex, (nx, fy, nz))
+                if need_place:
+                    if floor_n not in AIR:
+                        continue
+                    sub_n = _probe_name(ex, (nx, fy - 1, nz))
+                    if not sub_n or sub_n in AIR or sub_n in _UNSAFE_CLIMB:
+                        continue
+                else:
+                    if not floor_n or floor_n in AIR or floor_n in _UNSAFE_CLIMB:
+                        continue
+                head_n = _probe_name(ex, (ix, fy + 2, iz))
+                s1_n = _probe_name(ex, (nx, fy + 1, nz))
+                s2_n = _probe_name(ex, (nx, fy + 2, nz))
+                roof_n = _probe_name(ex, (nx, fy + 3, nz))
+                if roof_n in _FALLING_ROOF or not _can_clear((head_n, s1_n, s2_n), hand_rock=hand_rock):
+                    continue
+                chosen = (nx, nz, need_place, hand_rock)
+                break
+            if chosen is not None:
+                break
         if chosen is None:
             return False
-        nx, nz = chosen
+        nx, nz, need_place, hand_rock = chosen
+        if need_place:
+            step_cell = [nx, fy, nz]
+            blk = pick_placeable(state)
+            if not blk:
+                return False
+            try:
+                pres = ex.place(blk, pos=step_cell)
+            except Replan as err:
+                if _is_preemption(err):
+                    raise
+                yield rec("place", item=blk, pos=step_cell, error_code=failure(err)[0], reason="mine_return_climb")
+                return False
+            vc.invalidate(step_cell, dimension=dim); state.refresh_inventory(ex.client)
+            yield rec("place", pres, item=blk, pos=step_cell, reason="mine_return_climb")
         for cell in ([ix, fy + 2, iz], [nx, fy + 1, nz], [nx, fy + 2, nz]):
             bn = _probe_name(ex, cell)
             if not bn or bn in AIR:
@@ -157,7 +221,7 @@ def _climb_out_stairs(
                     if _is_preemption(err):
                         raise
                     return False
-            elif bn not in _SOFT_HAND_DIG and not bn.endswith("_leaves"):
+            elif bn not in _SOFT_HAND_DIG and not bn.endswith("_leaves") and not (hand_rock and bn in _HAND_ESCAPE_ROCKS):
                 return False
             try:
                 res = ex.dig(cell, collect=False)
@@ -260,9 +324,15 @@ def return_to_surface_from_mine(
                     return True
             break
 
-    # 3. 若矿井寻路受阻且仍处地下，安全向上挖有界阶梯脱困
+    # 3. 若矿井寻路受阻且仍处地下，安全向上挖有界阶梯脱困（初始已无镐时启用防软锁徒手破岩）
     if is_underground_in_mine(ex, state) and max_climb_steps > 0:
-        if (yield from _climb_out_stairs(ex, state, target_y=ref_y, max_steps=max_climb_steps)):
+        if (yield from _climb_out_stairs(
+            ex,
+            state,
+            target_y=ref_y,
+            max_steps=max_climb_steps,
+            allow_hand_rock=(best_pickaxe(state) is None),
+        )):
             return True
     _, cur_final, _ = _cur_status(ex, state)
     return float(cur_final[1]) >= ref_y - 3.0 or not is_underground_in_mine(ex, state)

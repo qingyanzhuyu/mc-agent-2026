@@ -21,6 +21,7 @@ from mcagent.loop import RulePlanner, reset_world_memo
 from mcagent.runtime import Executor, Safety, SafetyMonitor, State
 from mcagent.skills import base as skill_base
 from mcagent.skills.escape import _is_ranged_los_blocked, _resolve_flee_vector
+from mcagent.skills.mine_return import return_to_surface_from_mine
 from mcagent.skills.safety_escape import EmergencyEscape
 from mcagent.skills.testing import GridWorld, drive
 from mcagent.skills.voxel_cache import reset_all_voxel_caches, voxel_cache_for
@@ -369,6 +370,75 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         st_underground.set_inventory({"items": []})
         dec_ug = planner.choose_proactive_survival(st_underground)
         self.assertFalse(dec_ug is not None and dec_ug.source == "idle")
+
+    def test_return_to_surface_places_cobblestone_step_in_open_cave_without_pickaxe(self) -> None:
+        # 洞穴空腔内四周齐脚均为 air、脚下为 stone，背包无镐但有圆石 -> 必须放圆石台阶爬出而非秒返 False
+        blocks = {(x, 43, z): "stone" for x in range(-3, 5) for z in range(-3, 4)}
+        blocks[(0, 46, 0)] = "stone"  # 顶部岩盖触发 is_underground_in_mine
+
+        class _OpenCaveWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 44.0, 0.5], items={"cobblestone": 16})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20.0)
+                self.placed: list[list[int]] = []
+
+            def place(self, item, pos=None, **kwargs):
+                cell = tuple(int(v) for v in pos)
+                self.blocks[cell] = item
+                self.placed.append(list(cell))
+                return {"placed": item, "pos": list(cell)}
+
+            def dig(self, pos, **kwargs):
+                cell = tuple(int(v) for v in pos)
+                self.blocks[cell] = "air"
+                return {"dug": "stone"}
+
+        w = _OpenCaveWorld()
+        ex, state = w.session()
+        gen = return_to_surface_from_mine(ex, state, target_y=48.0, max_climb_steps=2)
+        steps = []
+        try:
+            while True:
+                steps.append(next(gen))
+        except StopIteration:
+            pass
+        self.assertTrue(w.placed, f"expected cobblestone step placed into cave air, steps={steps}")
+        self.assertGreaterEqual(w.st["pos"][1], 45.0)
+
+    def test_return_to_surface_hand_digs_stone_when_pickaxe_gone_preventing_softlock(self) -> None:
+        # 复现 seg-01 末尾 [-30, 44, 70] 断镐软锁：无镐且四周仅剩实心石头 -> 启用防软锁徒手破岩开阶脱困
+        blocks = {
+            (0, 43, 0): "stone",
+            (1, 44, 0): "stone",
+            (0, 46, 0): "stone",
+            (1, 45, 0): "stone",
+            (1, 46, 0): "stone",
+            (1, 47, 0): "stone",
+        }
+
+        class _StoneTrapWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 44.0, 0.5], items={"raw_iron": 8})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20.0)
+                self.dug: list[list[int]] = []
+
+            def dig(self, pos, **kwargs):
+                cell = tuple(int(v) for v in pos)
+                self.blocks[cell] = "air"
+                self.dug.append(list(cell))
+                return {"dug": "stone"}
+
+        w = _StoneTrapWorld()
+        ex, state = w.session()
+        gen = return_to_surface_from_mine(ex, state, target_y=48.0, max_climb_steps=1)
+        steps = []
+        try:
+            while True:
+                steps.append(next(gen))
+        except StopIteration:
+            pass
+        self.assertGreaterEqual(len(w.dug), 3, f"expected hand-dig stone anti-softlock climb out, steps={steps}")
+        self.assertGreaterEqual(w.st["pos"][1], 45.0)
 
 
 if __name__ == "__main__":
