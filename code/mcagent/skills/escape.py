@@ -405,6 +405,49 @@ def _resolve_flee_vector(
     return 1.0, 0.0, None
 
 
+def _is_sprint_yaw_safe(
+    ex: "Executor", px: float, py: float, pz: float, yaw: float, cache: Any, dim: str, *, lookahead: int = 5,
+) -> bool:
+    """检查沿 yaw 疾跑前冲 1..lookahead 格是否存在 >3 格深坑/悬崖或岩浆（仅在脚下实心可观测时启用）。"""
+    fx, fy, fz = block_cell([px, py, pz])
+    under = _read_block(cache, ex.client, (fx, fy - 1, fz), dim)
+    if not (under and is_safe_solid_floor(under)):
+        return True
+    dx, dz = -math.sin(yaw), -math.cos(yaw)
+    checked: set[tuple[int, int]] = {(fx, fz)}
+    for step in range(1, lookahead + 1):
+        cx, cz = math.floor(px + dx * step), math.floor(pz + dz * step)
+        if (cx, cz) in checked:
+            continue
+        checked.add((cx, cz))
+        has_floor = False
+        for dy in (1, 0, -1, -2, -3):
+            blk = _read_block(cache, ex.client, (cx, fy + dy, cz), dim)
+            if blk is None:
+                has_floor = True
+                break
+            bname = bare(blk.get("name"))
+            if bname in ("lava", "flowing_lava"):
+                return False
+            if is_safe_solid_floor(blk):
+                has_floor = True
+                break
+        if not has_floor:
+            return False
+    return True
+
+
+def _pick_cliff_safe_yaw(
+    ex: "Executor", px: float, py: float, pz: float, preferred_yaw: float, cache: Any, dim: str,
+) -> Optional[float]:
+    """若首选逃离方向前方有深坑/悬崖/岩浆，依次改选侧向 ±90°/±45°/±135°/180° 安全方向。"""
+    for offset in (0.0, math.pi / 2, -math.pi / 2, math.pi / 4, -math.pi / 4, 3 * math.pi / 4, -3 * math.pi / 4, math.pi):
+        cand = preferred_yaw + offset
+        if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim):
+            return cand
+    return None
+
+
 def _pick_alternate_escape_yaw(
     ex: "Executor", px: float, py: float, pz: float, ux: float, uz: float, cache: Any, dim: str,
 ) -> float:
@@ -614,9 +657,12 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
                         return True
         if h_dist < 2.5:
-            # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用原生疾跑跳脱离近战命中圈再补 move_to
+            # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用防跳崖检查的原生疾跑跳脱离近战命中圈再补 move_to
+            safe_burst_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, away_yaw, cache, dim)
             before_burst = (px, py, pz)
-            ok_burst, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=900)
+            ok_burst = False
+            if safe_burst_yaw is not None:
+                ok_burst, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_burst_yaw, ms=900)
             if ok_burst:
                 st_mid = _refresh_status(ex, state)
                 mid_hostile = st_mid.get("nearest_hostile") or {}
@@ -641,12 +687,18 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=12.0,
     )
     if not moved:
+        st_retry = _refresh_status(ex, state)
+        rpos = st_retry.get("pos")
+        if isinstance(rpos, (list, tuple)) and len(rpos) >= 3:
+            px, py, pz = float(rpos[0]), float(rpos[1]), float(rpos[2])
         retry_yaw = (
             _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
             if burst_blocked
             else away_yaw
         )
-        yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=retry_yaw, ms=800)
+        safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim)
+        if safe_retry_yaw is not None:
+            yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_retry_yaw, ms=800)
 
     st_after = _refresh_status(ex, state)
     after_hostile = st_after.get("nearest_hostile") or {}
@@ -662,8 +714,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         else:
             actual_d = 99.0
         if actual_d < 5.5:
-            # move_to 寻路禁疾跑，若结束时高速敌怪仍紧贴 <5.5 格，补一次疾跑跳拉脱
-            yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=900)
+            # move_to 寻路禁疾跑，若结束时高速敌怪仍紧贴 <5.5 格，补一次防跳崖疾跑跳拉脱
+            ap = after_pos_now if (isinstance(after_pos_now, (list, tuple)) and len(after_pos_now) >= 3) else [px, py, pz]
+            safe_follow_yaw = _pick_cliff_safe_yaw(ex, float(ap[0]), float(ap[1]), float(ap[2]), away_yaw, cache, dim)
+            if safe_follow_yaw is not None:
+                yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_follow_yaw, ms=900)
             st_after = _refresh_status(ex, state)
             after_hostile = st_after.get("nearest_hostile") or {}
     if not after_hostile:
