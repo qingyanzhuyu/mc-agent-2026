@@ -255,3 +255,32 @@ test("craft aborts promptly on stop, closes open window, and releases busy lock"
   assert.ok(closedWin && closedWin.id === 3, "expected open crafting window to be closed on abort");
   await craftRejected;
 });
+
+test("stop() and disconnect() release busy mutex when Mineflayer dig() hangs forever", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot._client = { on() {}, removeListener() {} };
+  const fakeBlock = { name: "stone", type: 1, stateId: 1, diggable: true, boundingBox: "block", position: new Vec3(1, 64, 0) };
+  bot.blockAt = () => fakeBlock;
+  bot.canDigBlock = () => true;
+  // Simulate Mineflayer bot.dig() hanging forever after stopDigging()/quit()
+  bot.dig = () => new Promise(() => {});
+
+  const digPromise = session.dig({ pos: [1, 64, 0] });
+  const digRejected = assert.rejects(digPromise, { code: "interrupted" });
+  assert.equal(session.busy, "dig");
+
+  const stopped = await session.stop();
+  assert.equal(stopped.action, "dig");
+  assert.equal(stopped.released, true);
+  assert.equal(session.busy, null);
+  await digRejected;
+
+  // Also test disconnect() during a hung dig() leaves session.busy === null for reconnect
+  const digPromise2 = session.dig({ pos: [1, 64, 0] });
+  const digRejected2 = assert.rejects(digPromise2, { code: "not_connected" });
+  assert.equal(session.busy, "dig");
+  session.disconnect();
+  assert.equal(session.busy, null);
+  await digRejected2;
+});

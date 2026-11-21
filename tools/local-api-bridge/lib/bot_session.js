@@ -499,6 +499,11 @@ class BotSession {
     if (this._currentAbort) {
       this._currentAbort("disconnected");
     }
+    this._actionToken = null;
+    this._currentAbort = null;
+    this._actionDone = null;
+    this.usingItemState = null;
+    this.busy = null;
     if (this.bot) {
       const b = this.bot;
       this.bot = null;
@@ -1042,6 +1047,8 @@ class BotSession {
       });
     }
 
+    const actionToken = Symbol(actionName);
+    this._actionToken = actionToken;
     this.busy = actionName;
     const stopSet = new Set(Array.isArray(stopOn) ? stopOn : ["hurt", "death"]);
     const controller = new AbortController();
@@ -1085,11 +1092,14 @@ class BotSession {
       } catch (error) {
         throw signal.aborted ? signal.reason : error;
       } finally {
-        this.usingItemState = null;
-        await this._applyPosture();
-        this._currentAbort = null;
-        this._actionDone = null;
-        this.busy = null;
+        if (this._actionToken === actionToken) {
+          this.usingItemState = null;
+          await this._applyPosture();
+          this._currentAbort = null;
+          this._actionDone = null;
+          this._actionToken = null;
+          this.busy = null;
+        }
       }
     })();
     this._actionDone = action.then(() => undefined, () => undefined);
@@ -1445,10 +1455,27 @@ class BotSession {
       };
       bot._client.on("block_change", onBlockChangePkt);
 
+      const digCancellable = (targetBlk) => {
+        signal.throwIfAborted();
+        const raw = Promise.resolve().then(() => bot.dig(targetBlk));
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            try { bot.stopDigging(); } catch (_) {}
+            raw.catch(() => {});
+            reject(signal.reason);
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          raw.then(
+            (val) => { signal.removeEventListener("abort", onAbort); resolve(val); },
+            (err) => { signal.removeEventListener("abort", onAbort); reject(err); }
+          );
+        });
+      };
+
       let digMs = 0;
       try {
         const t0 = Date.now();
-        await bot.dig(blk);
+        await digCancellable(blk);
         digMs = Date.now() - t0;
         await delay(150, undefined, { signal });
       } finally {
