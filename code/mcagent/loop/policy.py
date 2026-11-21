@@ -21,7 +21,7 @@ from ..skills import camp_plan as _camp_plan
 from ..skills.furnace_lease import best_fuel_for, lease_book_for
 from ..skills.items import best_pickaxe
 from ..skills.nether_portal import nether_preflight_missing
-from ..skills.survival_food import cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
+from ..skills.survival_food import COOKED_FOODS, cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
 from .context import DecisionContext, ObjectiveRecord, is_daytime
@@ -1080,11 +1080,32 @@ class RulePlanner:
                 return PlanDecision(sh_sk, "rule", "圆石充足，建造出生点 5x5 圆石防爆避难所(Tier 1)")
 
         # 7. Food Reserve Gate & Ready Food/Iron Lease Retrieval
-        if has_ready_food_lease(state) and safe_12:
+        cur_pos3 = st.get("pos") if (isinstance(st.get("pos"), (list, tuple)) and len(st["pos"]) >= 3) else None
+
+        def _lease_nearby(lease) -> bool:
+            lpos = getattr(lease, "pos", None)
+            if cur_pos3 is None or not isinstance(lpos, (list, tuple)) or len(lpos) < 3:
+                return True
+            try:
+                return (
+                    math.dist((float(cur_pos3[0]), float(cur_pos3[1]), float(cur_pos3[2])),
+                              (float(lpos[0]), float(lpos[1]), float(lpos[2]))) <= 48.0
+                    and abs(float(cur_pos3[1]) - float(lpos[1])) <= 18.0
+                )
+            except (TypeError, ValueError):
+                return True
+
+        ready_leases = lease_book_for(state).ready_leases(dimension=dim)
+        lease_hp_ok = hp >= 10.0 or has_equipped_armor(state)
+        has_near_food_lease = any(
+            (l.expected_output in COOKED_FOODS or l.consumer == "gather_food") and _lease_nearby(l)
+            for l in ready_leases
+        )
+        if has_near_food_lease and safe_12 and lease_hp_ok:
             gf_lease = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf_lease is not None:
                 return PlanDecision(gf_lease, "rule", "熟食熔炉租约已就绪，回炉取回熟肉防遗弃")
-        if any(l.expected_output == "iron_ingot" for l in lease_book_for(state).ready_leases(dimension=dim)) and safe_12:
+        if any(l.expected_output == "iron_ingot" and _lease_nearby(l) for l in ready_leases) and safe_12 and lease_hp_ok:
             ir_lease = self._try_make("smelt_iron", {"count": 12, "async_lease": True}, state)
             if ir_lease is not None:
                 return PlanDecision(ir_lease, "rule", "铁锭熔炉租约已就绪，回炉取回铁锭防遗弃")
