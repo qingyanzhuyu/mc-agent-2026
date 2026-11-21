@@ -274,11 +274,27 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
             elif control_unsupported:
                 break
             else:
-                yaw = _SWIM_YAWS[swim_idx % len(_SWIM_YAWS)]
-                swim_idx += 1
+                before_pos = _valid_vec3(st.get("pos"))
+                nh = st.get("nearest_hostile") if isinstance(st.get("nearest_hostile"), dict) else None
+                hp = _valid_vec3(nh.get("pos")) if nh else None
+                yaw_offset = _SWIM_YAWS[swim_idx % len(_SWIM_YAWS)]
+                if before_pos is not None and hp is not None and math.hypot(before_pos[0] - hp[0], before_pos[2] - hp[2]) <= 16.0:
+                    ux, uz = before_pos[0] - hp[0], before_pos[2] - hp[2]
+                    yaw = (math.atan2(-ux, -uz) + yaw_offset) if math.hypot(ux, uz) > 1e-4 else yaw_offset
+                else:
+                    yaw = yaw_offset
                 ok, err_code = yield from _control_step(ex, forward=True, jump=True, yaw=yaw, ms=600)
                 if not ok and err_code == "unsupported_api":
                     control_unsupported = True
+                else:
+                    st = _refresh_status(ex, state)
+                    after_pos = _valid_vec3(st.get("pos"))
+                    moved_xz = math.hypot(after_pos[0] - before_pos[0], after_pos[2] - before_pos[2]) if (before_pos and after_pos) else 0.0
+                    if not ok or moved_xz < 0.4:
+                        swim_idx += 1
+                    if not st.get("in_water") and not st.get("submerged"):
+                        return True
+                    continue
 
         st = _refresh_status(ex, state)
         if not st.get("in_water") and not st.get("submerged"):
