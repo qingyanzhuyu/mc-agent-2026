@@ -248,8 +248,8 @@ def craft_recipe(ex: Executor, state: State, item: str, *, goal_qty: int = 1) ->
         after = state.count(item)
         expected = min(variant.output for variant, batches in capacity.items() if batches > 0)
         if after - current < expected:
-            for _ in range(3):
-                time.sleep(0.15)
+            for _ in range(5):
+                time.sleep(0.05)
                 state.invalidate_inventory()
                 inventory = state.refresh_inventory(ex.client)
                 after = state.count(item)

@@ -320,7 +320,7 @@ def confirm_progress(ex, progress_ids, required, *, initial=(), await_all=False,
         if attempt:
             if check is not None:
                 check()
-            time.sleep(0.25)
+            time.sleep(0.1)
         seen.update(completed(ex))
         evidence = {key: bare(key) in seen for key in progress_ids}
         yield rec("combat_progress", evidence)

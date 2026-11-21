@@ -64,10 +64,10 @@ class Fatal(Exception):
 @dataclass(frozen=True)
 class RuntimeConfig:
     # 临时工程值，必须用官方 C1/寻路证据标定；不代表已验证的生存阈值。
-    poll_safe_s: float = 4.0
-    poll_risk_s: float = 1.0
-    observer_min_interval_s: float = 0.25
-    status_ttl_s: float = 1.0
+    poll_safe_s: float = 0.8
+    poll_risk_s: float = 0.2
+    observer_min_interval_s: float = 0.05
+    status_ttl_s: float = 0.2
     stop_cooldown_s: float = 10.0
     hp_crit: float = 8.0
     hp_risk: float = 14.0
@@ -1131,7 +1131,7 @@ class Executor:
         before_fp: Optional[dict[str, int]],
         verify_done: Optional[Callable[[dict[str, int], dict[str, int]], bool]],
         busy_polls: int = 3,
-        busy_interval_s: float = 0.4,
+        busy_interval_s: float = 0.1,
     ) -> tuple[str, Optional[dict]]:
         """网络超时/断流后核实服务端状态：先等 busy 结束，再比对背包确认副作用是否已发生。"""
         still_busy = False

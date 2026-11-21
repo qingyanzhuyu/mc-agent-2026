@@ -27,7 +27,7 @@ from .registry import register
 from .sightline import (
     API_DIG_EYE_REACH, DIG_EYE_REACH, STATION_EYE_REACH, can_reach_block, eye_to_block_dist,
 )
-from .voxel_cache import voxel_cache_for
+from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
 from .windows import window_amount, window_section, window_view
 from .world_memo import memo_for
 
@@ -66,7 +66,7 @@ PROSPECT_STEPS = 6
 SHALLOW_IRON_Y = 16
 MAX_PROSPECT_STEPS = 56
 MAX_ORE_ROUTE_FAILURES = 3
-POLL_SECONDS = 2.0
+POLL_SECONDS = 0.5
 # 同连接、维度、区块和生存阶段共享不可达矿点记忆，及水矿洞/已耗尽矿井区块黑名单。
 _SESSION_EXCLUDED = WeakKeyDictionary()
 _FLOODED_CHUNKS = WeakKeyDictionary()
@@ -790,11 +790,11 @@ class SmeltIron(Skill):
         dim = str((state.st or {}).get("dimension") or "overworld")
         stance = state.st if (state.st or {}).get("pos") is not None else state.pos
         found = ex.client.find_blocks(types=list(valid_stations), radius=16, limit=8).get("blocks") or []
+        valid_pos_list = [b.get("pos") for b in found if isinstance(b.get("pos"), list) and len(b.get("pos")) == 3]
+        if len(valid_pos_list) > 1 and has_batch_get_blocks(ex.client):
+            client_get_blocks_batch(ex.client, valid_pos_list)
         observed: list[tuple[str, list]] = []
-        for b in found:
-            pos = b.get("pos")
-            if not isinstance(pos, list) or len(pos) != 3:
-                continue
+        for pos in valid_pos_list:
             block_name = bare(ex.client.get_block(pos).get("name"))
             if block_name in valid_stations:
                 observed.append((block_name, pos))
@@ -813,6 +813,14 @@ class SmeltIron(Skill):
         x, y, z = map(math.floor, state.pos)
         valid_supports = SOLID_SUPPORT | {f"{w}_planks" for w in WOODS}
         # 先查平层与高一格台阶（适配 1x3 下行阶梯内转身往上一级台阶放炉），无需额外开凿。
+        if has_batch_get_blocks(ex.client):
+            client_get_blocks_batch(
+                ex.client,
+                [
+                    [x + dx, y + dy + k, z + dz]
+                    for dy in (0, 1) for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for k in (-1, 0, 1)
+                ],
+            )
         for dy in (0, 1):
             py = y + dy
             for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -832,6 +840,14 @@ class SmeltIron(Skill):
                 return pos
         # 地下狭窄矿井兜底：若四向皆为安全实心岩壁且有石级镐，侧向凿出 1x2 壁龛放炉。
         if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
+            if has_batch_get_blocks(ex.client):
+                client_get_blocks_batch(
+                    ex.client,
+                    [
+                        [x + dx, y + k, z + dz]
+                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for k in (-1, 0, 1, 2)
+                    ],
+                )
             for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 pos = [x + dx, y, z + dz]
                 if bare(ex.client.get_block([pos[0], y - 1, pos[2]]).get("name")) not in SOLID_SUPPORT:
@@ -973,7 +989,7 @@ class SmeltIron(Skill):
         # 有镐才顺路采煤，最多两块；没有则转用背包木材，不等待环境刷新。
         if (state.count("coal") + state.count("charcoal")) * 8 < count and best_pickaxe(state) in STONE_OR_BETTER_PICKS:
             for _ in range(2):
-                coal = ex.client.find_blocks(types=["coal_ore", "deepslate_coal_ore"], radius=8, limit=4).get("blocks") or []
+                coal = ex.client.find_blocks(types=["coal_ore", "deepslate_coal_ore"], radius=16, limit=12).get("blocks") or []
                 cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
                 nearby = [b["pos"] for b in coal if isinstance(b.get("pos"), list)
                           and len(b["pos"]) == 3 and not under_feet(cur, b["pos"])]

@@ -596,7 +596,7 @@ class TestHardModeSafetyAndEating(unittest.TestCase):
         state.set_inventory({"items": [{"name": "bread", "count": 2, "slot": 0}]})
         state.status_at = float("-inf")
         mon.tick()
-        self.assertEqual(mon.next_interval(), 1.0)
+        self.assertEqual(mon.next_interval(), 0.2)
         self.assertEqual(client.stops, 0)
         self.assertEqual(state.safety_intent["kind"], "eat")
         self.assertEqual(state.safety_intent["severity"], "soft")

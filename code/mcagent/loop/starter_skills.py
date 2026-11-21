@@ -141,6 +141,14 @@ def _get_block(ex: "Executor", vc, pos, dim: str = "overworld", *, force: bool =
     return vc.get_block(ex.client, pos, dimension=dim, force=force) if vc is not None else ex.client.get_block(pos)
 
 
+def _prefetch_blocks(ex: "Executor", vc, positions, dim: str = "overworld") -> None:
+    if vc is None:
+        return
+    from ..skills.voxel_cache import has_batch_get_blocks
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        vc.get_blocks_batch(ex.client, positions, dimension=dim)
+
+
 def _record_known_table(pos) -> None:
     if isinstance(pos, (list, tuple)) and len(pos) >= 3:
         pt = (float(pos[0]), float(pos[1]), float(pos[2]))
@@ -438,7 +446,7 @@ def _forget_stale_table(state: "State", table: object) -> None:
 
 
 def _wait_craft_inventory_sync(
-    ex: "Executor", state: "State", item: str, before: int, *, max_polls: int = 3, sleep_s: float = 0.15,
+    ex: "Executor", state: "State", item: str, before: int, *, max_polls: int = 6, sleep_s: float = 0.05,
 ) -> int:
     """实机 /craft 返回后服务端 set_slot 可能延迟 1-2 tick，短暂复查背包避免误判产出为 0。"""
     state.invalidate_inventory()
@@ -569,7 +577,7 @@ class ScoutIsland(Skill):
         st, cur = _refresh_stance(ex, state)
         scout_start_pos = list(cur)
         dim, memo, r = _dim_of(st), memo_for(state), int(self.args["radius"])
-        summary = ex.client.find_blocks(radius=r, limit=40)
+        summary = ex.client.find_blocks(radius=r, limit=64)
         memo.ingest_find_blocks(summary, dimension=dim, origin=st)
         hits = _scout_hits(summary)
         _record_scout_landmarks(memo, summary, hits, cur, dim)
@@ -687,6 +695,14 @@ class ScoutIsland(Skill):
                 ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                 chosen_dir = None
                 overhead_cells: list[list[int]] = [[ix, fy + 2, iz]]
+                _prefetch_blocks(
+                    ex, vc,
+                    [[ix, fy + 2, iz]] + [
+                        [ix + dx, fy + k, iz + dz]
+                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for k in (0, 1, 2, 3)
+                    ],
+                    dim,
+                )
                 for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     if _valid_step_dir(ix, fy, iz, dx, dz, bool(pick)):
                         chosen_dir = (ix + dx, fy, iz + dz)
@@ -1371,7 +1387,7 @@ class MineStone(Skill):
             dim = _dim_of(st)
             cur_cell = (math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2]))
             vc and vc.clear_stance_blacklist_if_moved(cur)
-            found_stones = ex.client.find_blocks(types=list(STONE_Targets), radius=16, limit=24)
+            found_stones = ex.client.find_blocks(types=list(STONE_Targets), radius=24, limit=48)
             vc and vc.ingest_find_blocks(found_stones, dimension=dim, client=ex.client)
             stones = found_stones.get("blocks") or []
             cands = [
@@ -1393,6 +1409,14 @@ class MineStone(Skill):
                 if stair_origin is None and stair_steps_taken < 6:
                     ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                     stair_columns.add((ix, iz))
+                    _prefetch_blocks(
+                        ex, vc,
+                        [
+                            [ix + dx, fy + k, iz + dz]
+                            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for k in (-2, 0, 2)
+                        ],
+                        dim,
+                    )
                     for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         sx1, sz1 = ix + dx, iz + dz
                         if (sx1, sz1) in stair_columns or _is_protected([sx1, fy - 1, sz1]) or memo.is_blocked([sx1, fy - 1, sz1], dimension=dim):
@@ -1417,11 +1441,11 @@ class MineStone(Skill):
                                 if bname in STONE_Targets:
                                     yield from self._prepare_pickaxe(ex, state)
                                 st_now = state.refresh_status(ex.client, max_age_s=0)
-                                for _ in range(2):
+                                for _ in range(4):
                                     if (st_now.get("on_ground") is not False or not st_now.get("alive", True)
                                             or st_now.get("in_water") or st_now.get("in_lava")):
                                         break
-                                    time.sleep(0.15)
+                                    time.sleep(0.05)
                                     st_now = state.refresh_status(ex.client, max_age_s=0)
                                 cur = st_now.get("pos") or state.pos
                                 if _is_under_feet(cur, [sx, clear_y, sz]):

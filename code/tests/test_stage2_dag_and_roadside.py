@@ -336,7 +336,7 @@ class RoadsideIncrementalScanTests(unittest.TestCase):
         self.assertEqual(len(world.find_blocks_calls), 1)
         self.assertEqual(len(world.get_entities_calls), 1)
         self.assertEqual(world.find_blocks_calls[0]["radius"], 16)
-        self.assertEqual(world.find_blocks_calls[0]["limit"], 16)
+        self.assertEqual(world.find_blocks_calls[0]["limit"], 64)
         self.assertEqual(world.get_entities_calls[0]["radius"], 16)
 
         # 再次立即调用（未过下一个 30s）：不触发

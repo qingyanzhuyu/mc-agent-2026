@@ -10,6 +10,7 @@ from .items import AIR, PLACEABLE_BLOCKS, bare
 from .mining import SOLID_SUPPORT, safe_mine_column
 from .observations import observe_block as _block
 from .sightline import can_reach_block
+from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks
 
 Cell = tuple[int, int, int]
 CARDINALS = ((1, 0), (0, 1), (-1, 0), (0, -1))
@@ -73,12 +74,29 @@ def _in_reach(ex, stand, target: Cell, *, reach: float) -> bool:
 
 def _safe_excavation(ex, origin: Cell, cuts, protected, *, landing: Cell | None = None) -> bool:
     """Check where to cut using current support, clearances and observed neighboring fluid."""
-    if not all(_standing(ex, cell) for cell in {origin, *protected[-2:]}):
-        return False
     preserved = {_above(cell, dy) for cell in {origin, *protected} for dy in (-1, 0, 1)}
     cuts = set(cuts)
     if cuts & preserved:
         return False
+    batch: dict[Cell, dict] = {}
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        probe: list[Cell] = []
+        for cell in {origin, *protected[-2:]}:
+            probe.extend((_above(cell, -1), _above(cell, 0), _above(cell, 1)))
+        if landing is not None:
+            lx, ly, lz = landing
+            probe.extend(((lx, ly - 1, lz), (lx, ly, lz), (lx, ly + 1, lz), (lx, ly + 2, lz), (lx, ly + 3, lz)))
+        for cut in cuts:
+            cx, cy, cz = cut
+            probe.append(cut)
+            probe.append(_above(cut, 1))
+            probe.extend((cx + dx, cy + dy, cz + dz) for dx, dy, dz in _FACES)
+        batch = client_get_blocks_batch(ex.client, probe)
+    read_blk = (lambda cell: batch[cell] if cell in batch else _block(ex, cell)) if batch else (lambda cell: _block(ex, cell))
+    for cell in {origin, *protected[-2:]}:
+        if not (_dry_name(read_blk(_above(cell, -1))) in _STABLE
+                and all(_dry_name(read_blk(_above(cell, dy))) in AIR for dy in (0, 1))):
+            return False
     if landing is not None:
         try:
             if not safe_mine_column(ex, landing):
@@ -89,11 +107,11 @@ def _safe_excavation(ex, origin: Cell, cuts, protected, *, landing: Cell | None 
             return False
     for cut in cuts:
         x, y, z = cut
-        if _dry_name(_block(ex, _above(cut, 1))) not in _STABLE | AIR:
+        if _dry_name(read_blk(_above(cut, 1))) not in _STABLE | AIR:
             return False
-        if not all(_dry_name(_block(ex, (x + dx, y + dy, z + dz))) for dx, dy, dz in _FACES):
+        if not all(_dry_name(read_blk((x + dx, y + dy, z + dz))) for dx, dy, dz in _FACES):
             return False
-        block = _block(ex, cut)
+        block = read_blk(cut)
         allowed = AIR | SOLID_SUPPORT if landing is not None else DIAMOND_ORES
         name = _dry_name(block)
         if name not in allowed or (name not in AIR and block.get("diggable") is False):

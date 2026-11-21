@@ -108,7 +108,7 @@ def _verify_advancement(ex, advancement, polls):
     for step in range(polls):
         if step:
             yield rec("wait_advancement", None, advancement=advancement)
-            time.sleep(0.5)
+            time.sleep(0.15)
         if _completed(ex, advancement):
             return True
     raise Replan(f"动作已发出，进度 {advancement} 在观测窗口内未确认")

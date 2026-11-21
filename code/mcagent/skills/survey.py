@@ -13,7 +13,7 @@ from .items import AIR, PASSABLE_COVER, bare
 from .observations import observe_block
 from .registry import register
 from .sightline import block_cell, eye_to_block_dist, feet_pos
-from .voxel_cache import voxel_cache_for
+from .voxel_cache import has_batch_get_blocks, voxel_cache_for
 from .world_memo import STRUCTURE_FINGERPRINTS, memo_for, structure_tags_for
 
 NETHER_BIOMES: frozenset[str] = frozenset({
@@ -182,7 +182,14 @@ def _pick_sector_waypoint(
     ox, oy, oz = origin
     base_y, cache = math.floor(oy), voxel_cache_for(state)
     dists = list(dict.fromkeys(d for d in (min(radius // 2, 24), min(radius // 3, 16), 8, 4) if 1 <= d <= radius))
-    for dist in dists or [max(1, min(radius, 4))]:
+    eff_dists = dists or [max(1, min(radius, 4))]
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        probe_cells = [
+            (math.floor(ox + dist * ux), base_y + dy + k, math.floor(oz + dist * uz))
+            for dist in eff_dists for dy in (0, 1, -1, 2, -2) for k in (-1, 0, 1)
+        ]
+        cache.get_blocks_batch(ex.client, probe_cells, dimension=dim)
+    for dist in eff_dists:
         wx, wz = math.floor(ox + dist * ux), math.floor(oz + dist * uz)
         for dy in (0, 1, -1, 2, -2):
             if _is_standable_dry(ex, cache, wx, base_y + dy, wz, dim):
@@ -193,7 +200,10 @@ def _pick_sector_waypoint(
 def _pick_approach_dest(ex: Any, state: Any, target_cell: tuple[int, int, int], dim: str) -> list[float]:
     tx, ty, tz = target_cell
     cache = voxel_cache_for(state)
-    for cx, cy, cz in [(tx, ty + 1, tz)] + [(tx + dx, ty + dy, tz + dz) for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for dy in (0, 1, -1)]:
+    cands = [(tx, ty + 1, tz)] + [(tx + dx, ty + dy, tz + dz) for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for dy in (0, 1, -1)]
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        cache.get_blocks_batch(ex.client, [(cx, cy + k, cz) for cx, cy, cz in cands for k in (-1, 0, 1)], dimension=dim)
+    for cx, cy, cz in cands:
         if _is_standable_dry(ex, cache, cx, cy, cz, dim):
             return [cx + 0.5, float(cy), cz + 0.5]
     return [tx + 0.5, float(ty + 1), tz + 0.5]

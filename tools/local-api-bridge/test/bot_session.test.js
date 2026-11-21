@@ -169,3 +169,38 @@ test("buildPathfinderMovements disables sprinting, parkour, towers, and hard-blo
   assert.equal(moves.blocksCantBreak.has(11), false);
   assert.equal(moves.blocksCantBreak.has(12), true);
 });
+
+test("windowView and windowAct classify mineflayer windowOpen timeout as retryable window_timeout", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.blockAt = (pos) => ({ name: "furnace", position: pos });
+  bot.openFurnace = async () => {
+    throw new Error("Event windowOpen did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.windowView({ target: { pos: [1, 64, 0] } }),
+    { code: "window_timeout" }
+  );
+  await assert.rejects(
+    session.windowAct({ target: { pos: [1, 64, 0] }, ops: [{ op: "take", from: "output" }] }),
+    { code: "window_timeout" }
+  );
+
+  bot.blockAt = (pos) => ({ name: "chest", position: pos });
+  bot.openContainer = async () => {
+    throw new Error("Event windowOpen did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.windowView({ target: { pos: [1, 64, 0] } }),
+    { code: "window_timeout" }
+  );
+
+  bot.entities[9] = { id: 9, name: "villager", position: new Vec3(1.5, 64, 0.5) };
+  bot.openVillager = async () => {
+    throw new Error("Event windowOpen did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.windowView({ target: { entity_id: 9 } }),
+    { code: "window_timeout" }
+  );
+});

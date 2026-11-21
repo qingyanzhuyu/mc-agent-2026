@@ -10,7 +10,7 @@ from ..runtime import Executor, Replan, State
 from .base import failure, rec
 from .items import AIR, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, block_name
 from .sightline import DIG_EYE_REACH
-from .voxel_cache import voxel_cache_for
+from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
 
 PEEL_SURFACE = frozenset(("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter"))
 SOLID_SUPPORT = frozenset((
@@ -43,6 +43,13 @@ def safe_mine_column(ex: Executor, pos: Sequence[int], *,
                      solid: frozenset[str] = SOLID_SUPPORT) -> bool:
     """Check support, roof and the three cells that would be cut."""
     x, y, z = pos
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        cells = [(x, y - 1, z), (x, y + 3, z), (x, y + 2, z), (x, y + 1, z), (x, y, z)]
+        batch = client_get_blocks_batch(ex.client, cells)
+        names = {c: bare((batch.get(c) or {}).get("name", "")) for c in cells}
+        return (names[(x, y - 1, z)] in solid
+                and names[(x, y + 3, z)] in AIR | solid
+                and all(names[(x, y + dy, z)] in AIR | solid for dy in (2, 1, 0)))
     return (block_name(ex, [x, y - 1, z]) in solid
             and block_name(ex, [x, y + 3, z]) in AIR | solid
             and all(block_name(ex, [x, y + dy, z]) in AIR | solid for dy in (2, 1, 0)))

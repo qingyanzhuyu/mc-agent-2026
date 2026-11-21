@@ -180,12 +180,12 @@ def move_local(ex, state, pos, *, rng=1, max_distance=16, require_move=False):
     if receipt.get("dimension_changed") or after.get("dimension") != before.get("dimension"):
         raise Replan("局部移动发生维度变化，需复核落地安全")
     # 下坡/跳跃瞬态：move_to 返回时可能尚在空中 (on_ground=False)，短暂等待重力落地再复核支撑。
-    for _ in range(3):
+    for _ in range(6):
         if (after.get("on_ground") is True or not after.get("alive", True)
                 or after.get("in_lava") or after.get("in_water")
                 or after.get("in_vehicle") or after.get("on_fire")):
             break
-        time.sleep(0.15)
+        time.sleep(0.05)
         after = state.refresh_status(ex.client, max_age_s=0)
     # 实机 mineflayer GoalNear 按格心/碰撞箱停步且 /status 保留 1 位小数，rng=1 常停在 1.1–1.4 格；
     # 给 0.65 格到达容差，由上层调用方（如 _approach）继续按眼距与视线精确复核交互可达性。

@@ -186,6 +186,43 @@ class VoxelCache:
                     self._evict_if_needed_locked(stored_at)
         return copy.deepcopy(res) if isinstance(res, dict) else res
 
+    def get_blocks_batch(
+        self, client: Any, positions: Sequence[Any], *, dimension: str = "overworld",
+        ttl_s: float = 15.0, force: bool = False, max_workers: int = 8,
+    ) -> dict[Cell, dict]:
+        """批量查块：先命中本地缓存，未命中走 client.get_blocks_batch（缺该方法自动优雅退化为循环 get_block）。"""
+        cells = list(dict.fromkeys(c for p in positions if (c := _norm_cell(p)) is not None))
+        if not cells:
+            return {}
+        dim, eff_ttl, now = _norm_dim(dimension), max(0.0, float(ttl_s)), self._clock()
+        out, missing = {}, []
+        with self._lock:
+            gen_before = self._sync_client_gen_locked(client)
+            for cell in cells:
+                key = (dim, cell[0], cell[1], cell[2])
+                if not force and eff_ttl > 0 and (entry := self._blocks.get(key)) is not None:
+                    if now < entry[0]:
+                        self._hits += 1
+                        out[cell] = copy.deepcopy(entry[2])
+                        continue
+                    self._blocks.pop(key, None)
+                self._misses += 1
+                missing.append(cell)
+        if not missing:
+            return out
+        fetched = client_get_blocks_batch(client, missing, max_workers=max_workers, use_cache=not force)
+        stored_at = self._clock()
+        with self._lock:
+            cur_gen = int(getattr(client, "_block_cache_gen", 0) or 0)
+            for cell in missing:
+                res = fetched.get(cell, {})
+                out[cell] = copy.deepcopy(res) if isinstance(res, dict) else {}
+                if eff_ttl > 0 and cur_gen == gen_before and isinstance(res, dict) and bare(res.get("name")):
+                    self._blocks[(dim, cell[0], cell[1], cell[2])] = (stored_at + eff_ttl, cur_gen, copy.deepcopy(res))
+            if eff_ttl > 0 and cur_gen == gen_before:
+                self._evict_if_needed_locked(stored_at)
+        return out
+
     def invalidate(self, pos: Any, *, dimension: str = "overworld") -> None:
         """使单格缓存立即失效。"""
         cell = _norm_cell(pos)
@@ -294,6 +331,38 @@ class VoxelCache:
                 "ingested": self._ingested,
                 "blacklisted": len(self._blacklist),
             }
+
+
+def has_batch_get_blocks(client: Any) -> bool:
+    """判断 client 是否显式提供可用的 get_blocks_batch（自动过滤未配置的 Mock 子属性）。"""
+    if client is None:
+        return False
+    if hasattr(client, "_mock_children") and "get_blocks_batch" not in getattr(client, "__dict__", {}) and "get_blocks_batch" not in getattr(client, "_mock_children", {}):
+        return False
+    return callable(getattr(client, "get_blocks_batch", None))
+
+
+def client_get_blocks_batch(client: Any, positions: Sequence[Any], *, max_workers: int = 8, use_cache: bool = True) -> dict[Cell, dict]:
+    """统一批量查块入口：有 get_blocks_batch 时并发查块，缺该方法时优雅退化为串行 get_block。"""
+    cells = list(dict.fromkeys(c for p in positions if (c := _norm_cell(p)) is not None))
+    if not cells:
+        return {}
+    if has_batch_get_blocks(client):
+        try:
+            raw = client.get_blocks_batch(cells, max_workers=max_workers, use_cache=use_cache)
+        except TypeError:
+            raw = client.get_blocks_batch(cells)
+        if isinstance(raw, Mapping):
+            out = {nk: (dict(v) if isinstance(v, Mapping) else {}) for k, v in raw.items() if (nk := _norm_cell(k)) is not None}
+            return {cell: out.get(cell, {}) for cell in cells}
+    out: dict[Cell, dict] = {}
+    for cell in cells:
+        try:
+            res = client.get_block(list(cell))
+            out[cell] = dict(res) if isinstance(res, Mapping) else {}
+        except Exception:
+            out[cell] = {}
+    return out
 
 
 _REGISTRY_LOCK = threading.Lock()

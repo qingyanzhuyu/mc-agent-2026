@@ -304,13 +304,13 @@ def traverse_portal(ex, state, entry):
                 if now.get("ready") is True:
                     break
                 if attempt + 1 < _POLL_LIMIT:
-                    time.sleep(0.5)
+                    time.sleep(0.15)
                     yield rec("wait_portal", reason="await_nether_ready")
                 continue
             if now.get("ready") and (_dimension(now) != "overworld" or _cell(_pos(now)) != entry.foot):
                 raise Replan("移动回执未确认站在传送门内，取消继续移动")
             if attempt + 1 < _POLL_LIMIT:
-                time.sleep(0.5)
+                time.sleep(0.15)
                 yield rec("wait_portal", reason="await_dimension")
         else:
             if _dimension(now) == "nether":

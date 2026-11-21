@@ -17,6 +17,7 @@ from .observations import refresh_inventory as _fresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
 from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, eye_to_block_dist
+from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks
 from .windows import is_storage_window, take_container_item, window_amount, window_view
 
 _ARMOR = ("diamond_boots", "diamond_chestplate", "diamond_helmet", "diamond_leggings")
@@ -28,9 +29,9 @@ _CLEAR_FAIL_CODES = frozenset({
     "timeout", "replan",
 })
 _MAX_DESCENT = 24
-_MAX_ORES = 16
+_MAX_ORES = 24
 _MIN_Y = -54
-_SCAN_RADIUS = 16
+_SCAN_RADIUS = 32
 
 LAPIS_ORES = frozenset(("lapis_ore", "deepslate_lapis_ore"))
 REDSTONE_ORES = frozenset(("redstone_ore", "deepslate_redstone_ore"))
@@ -89,14 +90,21 @@ def _record_station(state, kind: str, pos, dimension: str = "overworld") -> None
 
 def _safe_bonus_excavation(ex, origin, ore, protected) -> bool:
     """Verify stance support, dry neighbors, and non-preserved target for bonus ore digging."""
-    if not _standing(ex, origin):
-        return False
-    if protected and not all(_standing(ex, cell) for cell in protected[-2:]):
-        return False
     preserved = {_above(cell, dy) for cell in {origin, *protected} for dy in (-1, 0, 1)}
     if ore in preserved:
         return False
     x, y, z = ore
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        probe = [
+            _above(cell, dy)
+            for cell in (origin, *(protected[-2:] if protected else ()))
+            for dy in (-1, 0, 1)
+        ] + [ore, _above(ore, 1), *((x + dx, y + dy, z + dz) for dx, dy, dz in _FACES)]
+        client_get_blocks_batch(ex.client, probe)
+    if not _standing(ex, origin):
+        return False
+    if protected and not all(_standing(ex, cell) for cell in protected[-2:]):
+        return False
     if _dry_name(_block(ex, _above(ore, 1))) not in _BONUS_STABLE | AIR:
         return False
     if not all(_dry_name(_block(ex, (x + dx, y + dy, z + dz))) for dx, dy, dz in _FACES):

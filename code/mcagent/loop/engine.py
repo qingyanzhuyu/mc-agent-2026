@@ -30,8 +30,8 @@ class LoopConfig:
     max_steps: int = 0            # 0 = 不限步数（按时间或信号停止）
     max_seconds: float = 0.0      # 0 = 不限时（正式赛可设 28800 = 8h）
     max_deaths: int = 0           # 0 = 不限死亡次数（持续自愈重来）
-    idle_sleep_s: float = 1.0
-    respawn_poll_s: float = 1.0
+    idle_sleep_s: float = 0.2
+    respawn_poll_s: float = 0.1
     respawn_timeout_s: float = 90.0
     enable_monitor: bool = True
     disconnect_on_exit: bool = False
@@ -47,8 +47,10 @@ class LoopConfig:
     checkpoint_path: Optional[str] = None
     failure_cooldown_cap_s: Optional[float] = None
     enable_roadside_scan: bool = True
-    roadside_scan_interval_s: float = 30.0
-    roadside_scan_radius: int = 16
+    roadside_scan_interval_s: float = 5.0
+    roadside_scan_radius: int = 48
+    roadside_scan_limit: int = 64
+    roadside_scan_move_dist: float = 8.0
 
 
 # 会话级错误：交给 `_recover_session_or_respawn` 处理，而不是按瞬时故障退避
@@ -157,6 +159,10 @@ class MainLoop:
         self._relocated_cells: set[tuple[str, int, int]] = set()
         self._checkpoint_achieved_goals: set[str] = set()
         self._last_roadside_scan_at: float = float(self._clock())
+        self._last_roadside_scan_pos: Optional[tuple[float, float, float]] = self._pos_tuple(self.state)
+        self._last_roadside_scan_dim: Optional[str] = (
+            str(self.state.st.get("dimension") or "overworld") if self.state.st else None
+        )
 
     def _do_sleep(self, seconds: float) -> None:
         if self._custom_sleep is not None:
@@ -233,19 +239,33 @@ class MainLoop:
             self._save_checkpoint_if_configured()
 
     def _maybe_roadside_scan(self, force: bool = False) -> list[str]:
-        """技能完成边界的低频节流沿途增量扫描：探测附近结构指纹与高价值机会实体并记入台账。"""
+        """技能完成边界的沿途增量扫描：满足时间间隔或位移>=8格/切维度时探测附近结构指纹与高价值机会实体。"""
         if not self.config.enable_roadside_scan:
             return []
         if not self.state.ready or self._is_dead_now():
             return []
         now = float(self._clock())
+        dim = str(self.state.st.get("dimension") or "overworld")
+        cur_pos = self._pos_tuple(self.state)
+        if self._last_roadside_scan_pos is None and cur_pos is not None:
+            self._last_roadside_scan_pos = cur_pos
+            self._last_roadside_scan_dim = dim
+        move_dist = max(0.0, float(self.config.roadside_scan_move_dist))
+        moved_trigger = False
+        if move_dist > 0 and cur_pos is not None and self._last_roadside_scan_pos is not None:
+            if self._last_roadside_scan_dim is not None and dim != self._last_roadside_scan_dim:
+                moved_trigger = True
+            elif math.dist(cur_pos, self._last_roadside_scan_pos) >= move_dist:
+                moved_trigger = True
         interval_s = max(0.0, float(self.config.roadside_scan_interval_s))
-        if not force and (now - self._last_roadside_scan_at) < interval_s:
+        if not force and not moved_trigger and (now - self._last_roadside_scan_at) < interval_s:
             return []
         self._last_roadside_scan_at = now
+        self._last_roadside_scan_pos = cur_pos
+        self._last_roadside_scan_dim = dim
 
-        dim = str(self.state.st.get("dimension") or "overworld")
         radius = max(1, int(self.config.roadside_scan_radius))
+        limit = max(1, int(self.config.roadside_scan_limit))
         memo = memo_for(self.state)
         newly_recorded: list[str] = []
 
@@ -255,7 +275,7 @@ class MainLoop:
             if block_types:
                 resp = None
                 try:
-                    resp = find_blocks(types=block_types, radius=radius, limit=16)
+                    resp = find_blocks(types=block_types, radius=radius, limit=limit)
                 except ApiError as e:
                     if e.kind == FATAL:
                         raise
@@ -654,6 +674,9 @@ class MainLoop:
                 return RunResult(0, 0, 0, 0, round(time.monotonic() - started_mono, 2),
                                  stop_reason, self.transient_faults)
             self.state.set_status(st)
+            if self._last_roadside_scan_pos is None:
+                self._last_roadside_scan_pos = self._pos_tuple(self.state)
+                self._last_roadside_scan_dim = str(self.state.st.get("dimension") or "overworld")
             try:
                 self.state.refresh_inventory(self.client)
                 self.state.drain(self.client)

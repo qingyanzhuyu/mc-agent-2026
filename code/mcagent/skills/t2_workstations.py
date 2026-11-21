@@ -257,7 +257,7 @@ class BrewPotion(Skill):
     name, goal, verified = "brew_potion", "brew:{recipe}", "offline"
     description = "在酿造台放入药水与原料酿造平凡药水或虚弱药水"
     params = {"recipe": Param(str, "酿造配方", default="mundane", choices=("mundane", "weakness")), "radius": Param(int, "找酿造台半径", default=24, min=8, max=64)}
-    _max_polls, _poll_sleep_s, _sleep_fn = 12, 2.0, staticmethod(time.sleep)
+    _max_polls, _poll_sleep_s, _sleep_fn = 48, 0.5, staticmethod(time.sleep)
     _brew_result: Optional[dict] = None
     _primary_ingredient: Optional[str] = None
 

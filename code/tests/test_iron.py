@@ -419,8 +419,8 @@ class SmeltIronTests(unittest.TestCase):
                           views=[view(), view(input_count=3)])
         with self.assertRaisesRegex(Replan, "轮询上限"):
             self.run_skill(world)
-        self.assertEqual(sum(c[0] == "window_view" for c in world.calls), 27)
-        self.assertEqual(self.sleep.call_count, 25)
+        self.assertEqual(sum(c[0] == "window_view" for c in world.calls), 72)
+        self.assertEqual(self.sleep.call_count, 70)
 
     def test_busy_furnace_replans_before_mutation(self):
         world = IronWorld(items={"raw_iron": 3, "coal": 1}, blocks={(2, 64, 0): "furnace"},

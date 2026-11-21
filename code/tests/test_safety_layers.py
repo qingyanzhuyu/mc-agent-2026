@@ -245,15 +245,15 @@ class MonitorTests(unittest.TestCase):
 
     def test_risk_intervals(self):
         self.tick()
-        self.assertEqual(self.mon.next_interval(), 4)
+        self.assertEqual(self.mon.next_interval(), 0.8)
         for changes in ({"time_of_day": 18000}, {"dimension": "the_nether"},
                         {"nearest_hostile": {"dist": 16}}, {"health": 13}, {"in_water": True}):
             base = dict(self.c.st)
             self.tick(**changes)
-            self.assertEqual(self.mon.next_interval(), 1)
+            self.assertEqual(self.mon.next_interval(), 0.2)
             self.c.st = base
         self.s.set_risk_context(near_water=True)
-        self.assertEqual(self.mon.next_interval(), 1)
+        self.assertEqual(self.mon.next_interval(), 0.2)
 
     def test_void_guard_negative_coords_half_slab_and_unknown(self):
         self.s.set_risk_context(void_guard=True)
@@ -334,7 +334,7 @@ class RequestTests(unittest.TestCase):
         self.assertGreaterEqual(times[4]-times[0], 1)
 
     def test_invalid_config_rejected(self):
-        for rate in (0, 17, float("nan")):
+        for rate in (0, 100_001, float("nan")):
             with self.assertRaises(ValueError):
                 Config("unused", "", "", max_rps=rate)
         with patch.dict("os.environ", {"MC_STATUS_TTL_S": "nan"}):
@@ -864,7 +864,7 @@ class _ContinuousFakeClient(FakeClient):
 
 class ContinuousMonitorTests(unittest.TestCase):
     def test_runtime_config_observer_min_interval_s(self):
-        self.assertEqual(RuntimeConfig().observer_min_interval_s, 0.25)
+        self.assertEqual(RuntimeConfig().observer_min_interval_s, 0.05)
         with patch.dict("os.environ", {"MC_OBSERVER_MIN_INTERVAL_S": "0.12"}):
             self.assertEqual(RuntimeConfig.load().observer_min_interval_s, 0.12)
         for bad in ("0", "nan"):
@@ -974,10 +974,10 @@ class ContinuousMonitorTests(unittest.TestCase):
         ex = Executor(c, s, log=lambda *_: None)
         mon = SafetyMonitor(c, s, ex, continuous=True)
 
-        # Safe dry grounded daytime overworld state backs off to 3x min (0.75s < status_ttl_s=1.0).
+        # Safe dry grounded daytime overworld state backs off to 3x min (0.15s < status_ttl_s=0.2).
         s.set_status({"ready": True, "alive": True, "health": 20, "pos": [0, 64, 0],
                       "dimension": "overworld", "time_of_day": 6000, "on_ground": True})
-        self.assertAlmostEqual(mon.next_interval(), 0.75, places=6)
+        self.assertAlmostEqual(mon.next_interval(), 0.15, places=6)
 
         for patch_st, risk_ctx in (
             ({"in_water": True}, {}),
@@ -992,7 +992,7 @@ class ContinuousMonitorTests(unittest.TestCase):
                           "dimension": "overworld", "time_of_day": 6000, "on_ground": True, **patch_st})
             if risk_ctx:
                 s.set_risk_context(**risk_ctx)
-            self.assertAlmostEqual(mon.next_interval(), 0.25, places=6)
+            self.assertAlmostEqual(mon.next_interval(), 0.05, places=6)
 
     def test_executor_act_invalidates_block_cache_only_for_world_actions(self):
         c = FakeClient()

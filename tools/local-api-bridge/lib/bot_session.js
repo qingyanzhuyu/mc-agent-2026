@@ -2151,6 +2151,19 @@ class BotSession {
     return { kind: "block", pos };
   }
 
+  async _openWindow(openFn) {
+    try {
+      return await openFn();
+    } catch (err) {
+      if (err instanceof ApiBizError) throw err;
+      const msg = err && err.message ? err.message : String(err);
+      if (/windowOpen/i.test(msg) || /did not fire within timeout/i.test(msg)) {
+        throw new ApiBizError("window_timeout", msg);
+      }
+      throw err;
+    }
+  }
+
   async windowView(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("window/view", stopOn, async (ctx) => {
@@ -2162,7 +2175,7 @@ class BotSession {
         if (bot.entity.position.distanceTo(ent.position) > 3.5) {
           await this._gotoGoal(new goals.GoalFollow(ent, 2), 20000, ctx);
         }
-        const villager = await bot.openVillager(ent);
+        const villager = await this._openWindow(() => bot.openVillager(ent));
         try {
           return {
             window: "villager",
@@ -2187,7 +2200,7 @@ class BotSession {
       if (!blk) throw new ApiBizError("not_loaded", "Block not loaded");
 
       if (blk.name === "furnace" || blk.name === "blast_furnace" || blk.name === "smoker") {
-        const f = await bot.openFurnace(blk);
+        const f = await this._openWindow(() => bot.openFurnace(blk));
         try {
           const inp = f.inputItem();
           const fuel = f.fuelItem();
@@ -2211,7 +2224,7 @@ class BotSession {
         }
       }
 
-      const container = await bot.openContainer(blk);
+      const container = await this._openWindow(() => bot.openContainer(blk));
       try {
         return {
           window: blk.name,
@@ -2243,7 +2256,7 @@ class BotSession {
         if (bot.entity.position.distanceTo(ent.position) > 3.5) {
           await this._gotoGoal(new goals.GoalFollow(ent, 2), 20000, ctx);
         }
-        const villager = await bot.openVillager(ent);
+        const villager = await this._openWindow(() => bot.openVillager(ent));
         try {
           for (const op of ops) {
             signal.throwIfAborted();
@@ -2266,7 +2279,7 @@ class BotSession {
       if (!blk) throw new ApiBizError("not_loaded", "Block not loaded");
 
       if (blk.name === "furnace" || blk.name === "blast_furnace" || blk.name === "smoker") {
-        const f = await bot.openFurnace(blk);
+        const f = await this._openWindow(() => bot.openFurnace(blk));
         try {
           for (const op of ops) {
             signal.throwIfAborted();
@@ -2309,7 +2322,7 @@ class BotSession {
         }
       }
 
-      const container = await bot.openContainer(blk);
+      const container = await this._openWindow(() => bot.openContainer(blk));
       try {
         for (const op of ops) {
           signal.throwIfAborted();
