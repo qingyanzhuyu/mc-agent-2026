@@ -11,13 +11,15 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Collection, Mapping, Optional
 
-from ..runtime import State
+from ..runtime import State, has_equipped_armor
 from ..skills import REGISTRY, bind_args
 from ..skills.items import STONE_OR_BETTER_PICKS, best_pickaxe
+from ..skills.survival_food import cooked_food_count, inventory_food_restore
 from ..skills.world_memo import memo_for
 from . import subgoals
 from .starter_skills import (
@@ -2291,6 +2293,193 @@ def compute_goal_marginal_rois(
     return out
 
 
+_SWORD_ITEMS: tuple[str, ...] = ("stone_sword", "iron_sword", "diamond_sword", "netherite_sword")
+_IRON_PLUS_ARMOR_ITEMS: tuple[str, ...] = (
+    "iron_helmet",
+    "iron_chestplate",
+    "iron_leggings",
+    "iron_boots",
+    "diamond_helmet",
+    "diamond_chestplate",
+    "diamond_leggings",
+    "diamond_boots",
+    "netherite_helmet",
+    "netherite_chestplate",
+    "netherite_leggings",
+    "netherite_boots",
+)
+_WOOL_COLORS: tuple[str, ...] = (
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "light_gray",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+)
+_BED_ITEMS: tuple[str, ...] = tuple(f"{c}_bed" for c in _WOOL_COLORS)
+_WOOL_ITEMS: tuple[str, ...] = tuple(f"{c}_wool" for c in _WOOL_COLORS)
+_EARLY_RISKY_ROOT_GOALS: frozenset[str] = frozenset({
+    "kill_a_mob",
+    "shoot_arrow",
+    "ol_betsy",
+    "bullseye",
+    "sniper_duel",
+    "voluntary_exile",
+    "two_birds_one_arrow",
+    "arbalistic",
+    "hero_of_the_village",
+    "adventuring_time",
+    "explore_nether",
+    "find_fortress",
+    "find_bastion",
+    "minecraft_trials_edition",
+    "revaulting",
+})
+_NAKED_POST_IRON_RISKY_ROOTS: frozenset[str] = frozenset({
+    "mine_diamond",
+    "shiny_gear",
+    "prep_diamond_pickaxe",
+    "form_obsidian",
+    "enter_the_nether",
+    "lava_bucket",
+})
+_NIGHT_UNDERGROUND_GOALS: frozenset[str] = frozenset({
+    "smelt_iron",
+    "mine_diamond",
+    "form_obsidian",
+    "mine_stone",
+    "upgrade_tools",
+    "prep_furnace",
+    "iron_tools",
+    "obtain_armor",
+    "shiny_gear",
+    "prep_diamond_pickaxe",
+    "enchant_item",
+})
+_NIGHT_SURFACE_GOALS: frozenset[str] = frozenset({
+    "prep_wood",
+    "plant_seed",
+    "breed_an_animal",
+    "fishy_business",
+    "tactical_fishing",
+})
+_NIGHT_COMBAT_GOALS: frozenset[str] = frozenset({
+    "kill_a_mob",
+    "deflect_arrow",
+    "shoot_arrow",
+    "ol_betsy",
+    "bullseye",
+    "sniper_duel",
+    "voluntary_exile",
+})
+
+
+def _resolve_is_day(state: State, explicit: Optional[bool] = None) -> Optional[bool]:
+    """解析昼夜布尔态（优先使用显式参数，其次 state.st.is_day 或 time_of_day）。"""
+    if explicit is not None:
+        return bool(explicit)
+    st = state.st or {}
+    if isinstance(st.get("is_day"), bool):
+        return st["is_day"]
+    tod = st.get("time_of_day")
+    if isinstance(tod, (int, float)) and not isinstance(tod, bool) and math.isfinite(tod):
+        tick = float(tod) % 24000.0
+        return not (state.config.night_start <= tick < state.config.night_end)
+    return None
+
+
+def _has_sleep_bed_ready(state: State, memo: Any, dim: str) -> bool:
+    """判断背包内或记忆点位中是否已有可立即睡觉/成床的床或羊毛储备。"""
+    if any(state.count(bed) >= 1 for bed in _BED_ITEMS):
+        return True
+    if any(state.count(wool) >= 3 for wool in _WOOL_ITEMS):
+        return True
+    return memo is not None and hasattr(memo, "has_station") and memo.has_station("bed", dimension=dim)
+
+
+def survival_readiness_multiplier(
+    step_goal: GoalSpec,
+    root_goal: GoalSpec,
+    state: State,
+    completed_advs: Collection[str],
+    *,
+    active_goals_by_id: Optional[Mapping[str, GoalSpec]] = None,
+    memo: Any = None,
+    is_day: Optional[bool] = None,
+) -> float:
+    """计算生存就绪度门控与主世界昼夜双轨排序倍率（仅影响排序优先级，不修改原始 ROI 字段）。"""
+    st = state.st or {}
+    raw_hp = st.get("health", 20.0)
+    try:
+        hp = float(raw_hp) if raw_hp is not None and not isinstance(raw_hp, bool) else 20.0
+    except (TypeError, ValueError):
+        hp = 20.0
+    if not math.isfinite(hp):
+        hp = 20.0
+
+    dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+    resolved_memo = memo if memo is not None else memo_for(state)
+    resolved_day = _resolve_is_day(state, is_day)
+
+    has_sword = any(state.count(s) >= 1 for s in _SWORD_ITEMS)
+    has_food_reserve = cooked_food_count(state) >= 6 or inventory_food_restore(state) >= 18
+    has_iron_pick = any(state.count(p) >= 1 for p in IRON_OR_BETTER_PICKS)
+    has_shield = state.count("shield") >= 1
+    has_iron_armor = has_equipped_armor(state) or any(state.count(a) >= 1 for a in _IRON_PLUS_ARMOR_ITEMS)
+
+    mult = 1.0
+
+    # (a) Early Readiness Gate
+    if not (has_sword and has_food_reserve) and root_goal.id in _EARLY_RISKY_ROOT_GOALS:
+        mult *= 0.35
+
+    # (b) Post-Iron Survival Foundation Gate
+    lookup = active_goals_by_id if active_goals_by_id is not None else GOAL_MAP
+    smelt_iron_spec = lookup.get("smelt_iron") or GOAL_MAP.get("smelt_iron")
+    iron_stage_started = (
+        (smelt_iron_spec is not None and is_goal_achieved(smelt_iron_spec, state, completed_advs, memo=resolved_memo))
+        or state.count("iron_ingot") >= 1
+        or state.count("iron_pickaxe") >= 1
+    )
+    if iron_stage_started:
+        if root_goal.id == "iron_tools" and not has_iron_pick:
+            mult *= 3.5
+        elif root_goal.id == "obtain_armor" and has_iron_pick and not has_iron_armor:
+            mult *= 3.5
+        elif root_goal.id == "deflect_arrow" and has_iron_pick and not has_shield and hp >= 14.0:
+            mult *= 2.8
+        if not has_iron_armor and not has_shield and root_goal.id in _NAKED_POST_IRON_RISKY_ROOTS:
+            mult *= 0.2
+
+    # (c) Day/Night Dual-Track Weighting (Overworld only)
+    if resolved_day is not None and dim == "overworld":
+        if resolved_day is False:
+            if (step_goal.id == "sleep_in_bed" or root_goal.id == "sleep_in_bed") and _has_sleep_bed_ready(state, resolved_memo, dim):
+                mult *= 6.0
+            elif step_goal.id in _NIGHT_SURFACE_GOALS:
+                mult *= 0.15 if (not has_iron_armor and not has_shield) else 0.5
+            elif step_goal.id in _NIGHT_COMBAT_GOALS or root_goal.id in _NIGHT_COMBAT_GOALS:
+                if not (has_iron_armor and has_shield and hp >= 16.0):
+                    mult *= 0.15
+            elif step_goal.id in _NIGHT_UNDERGROUND_GOALS:
+                mult *= 1.6
+        elif resolved_day is True:
+            if step_goal.id == "sleep_in_bed" or root_goal.id == "sleep_in_bed":
+                mult *= 0.1
+
+    return mult
+
+
 def rank_actionable_goals(
     state: State,
     active_goals: tuple[GoalSpec, ...],
@@ -2302,6 +2491,7 @@ def rank_actionable_goals(
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     suspended_goals: Collection[str] = (),
     memo: Any = None,
+    is_day: Optional[bool] = None,
 ) -> list[GoalPlanStep]:
     """对所有尚未达成且未触发止损的目标计算未满足前置链，按共享子图边际性价比降序返回可执行步列表。"""
     resolved_memo = memo if memo is not None else memo_for(state)
@@ -2363,7 +2553,7 @@ def rank_actionable_goals(
                     node_downstream_score[x.id] = node_downstream_score.get(x.id, 0) + g.score
 
     # 第 2 遍：保留原始 path_score / path_cost / roi，同时按共享子图分摊成本计算 marginal_roi 排序
-    raw_candidates: list[tuple[tuple[int, int, float, float, int], GoalPlanStep]] = []
+    raw_candidates: list[tuple[tuple[int, int, int, float, float, int], GoalPlanStep]] = []
     for g, chain in actionable_chains:
         p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs, memo=resolved_memo))
         p_cost = sum(effective_goal_cost(x, telemetry) for x in chain)
@@ -2379,11 +2569,34 @@ def rank_actionable_goals(
         m_roi = p_score / max(1.0, amortized_cost) if p_score > 0 else 0.0
         step_shared = max(1, len(node_dependents.get(chain[0].id, ())))
 
+        if g.id in target_ids:
+            mult = 1.0
+        else:
+            mult = survival_readiness_multiplier(
+                chain[0],
+                g,
+                state,
+                completed_advs,
+                active_goals_by_id=by_id,
+                memo=resolved_memo,
+                is_day=is_day,
+            )
+        sleep_prio = (
+            1
+            if (
+                g.id not in target_ids
+                and g.id == "sleep_in_bed"
+                and chain[0].id == "sleep_in_bed"
+                and mult >= 5.0
+            )
+            else 0
+        )
         prio = (
             1 if g.id in target_ids else 0,
+            sleep_prio,
             1 if p_score > 0 else 0,
-            round(m_roi, 6),
-            round(roi, 6),
+            round(m_roi * mult, 6),
+            round(roi * mult, 6),
             -order_idx[g.id],
         )
         step = GoalPlanStep(

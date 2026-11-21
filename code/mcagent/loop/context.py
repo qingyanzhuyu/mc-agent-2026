@@ -21,8 +21,9 @@ from ..planner.objective import (
     render_objective_menu,
     render_suspended_section,
 )
-from ..runtime import State, _inv_fingerprint
+from ..runtime import State, _inv_fingerprint, has_equipped_armor
 from ..skills.items import best_pickaxe
+from ..skills.survival_food import inventory_food_restore
 from ..skills.world_memo import memo_for
 from .goals import GOALS, GoalSpec
 from .starter_skills import best_axe, best_food, total_cobble, total_logs, total_planks
@@ -154,6 +155,29 @@ class ObjectiveRecord:
         return f"- {self.goal_id}: 结果={self.outcome} | 失败分类={self.failure_kind} | 用时={self.elapsed_s:.0f}s{tail}"
 
 
+_ARMOR_BAG_ITEMS: tuple[str, ...] = (
+    "iron_helmet", "iron_chestplate", "iron_leggings", "iron_boots",
+    "diamond_helmet", "diamond_chestplate", "diamond_leggings", "diamond_boots",
+    "netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots",
+    "leather_helmet", "leather_chestplate", "leather_leggings", "leather_boots",
+    "golden_helmet", "golden_chestplate", "golden_leggings", "golden_boots",
+    "chainmail_helmet", "chainmail_chestplate", "chainmail_leggings", "chainmail_boots",
+    "turtle_helmet",
+)
+
+
+def _summarize_armor(state: State) -> str:
+    """生成紧凑的护甲与盾牌佩戴/背包状态摘要。"""
+    equipped = has_equipped_armor(state)
+    bag_armor = any(state.count(item) >= 1 for item in _ARMOR_BAG_ITEMS)
+    has_shield = state.count("shield") >= 1
+    if equipped:
+        return "已穿戴+盾" if has_shield else "已穿戴"
+    if bag_armor:
+        return "背包有甲+盾" if has_shield else "背包有甲"
+    return "仅盾" if has_shield else "无"
+
+
 def summarize_inventory_and_status(state: State, *, max_items: int = 16) -> str:
     """生成不含坐标与实体 id 的生存及背包物资摘要。"""
     st = state.st or {}
@@ -166,7 +190,9 @@ def summarize_inventory_and_status(state: State, *, max_items: int = 16) -> str:
 
     pick = best_pickaxe(state) or "无"
     axe = best_axe(state) or "无"
+    armor_str = _summarize_armor(state)
     edible = best_food(state) or "无"
+    food_restore = inventory_food_restore(state)
     logs_n = total_logs(state)
     planks_n = total_planks(state)
     cobble_n = total_cobble(state)
@@ -183,7 +209,7 @@ def summarize_inventory_and_status(state: State, *, max_items: int = 16) -> str:
 
     return (
         f"状态：维度={dim} | 血量={hp} | 饱食={food} | 安全模式={'是' if state.in_safe_mode else '否'} | 邻近威胁={threat}\n"
-        f"关键装备与汇总：最优镐={pick} | 最优斧={axe} | 食物={edible} | 原木={logs_n} | 木板={planks_n} | 圆石={cobble_n}\n"
+        f"关键装备与汇总：最优镐={pick} | 最优斧={axe} | 护甲={armor_str} | 食物={edible} | 食物量={food_restore} | 原木={logs_n} | 木板={planks_n} | 圆石={cobble_n}\n"
         f"背包明细：{bag_str}"
     )
 
@@ -261,6 +287,17 @@ def format_world_landmarks(world_landmarks: Optional[Mapping[str, Any]]) -> str:
             parts.append(f"{label}=已发现")
     if portal_active:
         parts.append("传送门=已激活")
+    if world_landmarks.get("has_camp"):
+        raw_stored = world_landmarks.get("camp_stored_count", 0)
+        stored_cnt = (
+            int(raw_stored)
+            if isinstance(raw_stored, (int, float)) and not isinstance(raw_stored, bool)
+            else 0
+        )
+        if stored_cnt > 0:
+            parts.append(f"营地=已建(存箱={stored_cnt}件)")
+        else:
+            parts.append("营地=已建")
     if isinstance(resource_counts, Mapping):
         res_parts: list[str] = []
         for res, cnt in resource_counts.items():

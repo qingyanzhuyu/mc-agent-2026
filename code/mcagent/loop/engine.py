@@ -596,6 +596,21 @@ class MainLoop:
         cause = str(ld.get("cause") or "")
         death_pos = ld.get("pos")
         after_fp = _inv_fingerprint(inv) or {}
+        lost_items = {
+            k: int(v) - int(after_fp.get(k, 0))
+            for k, v in (pre_death_inv or {}).items()
+            if int(v) > int(after_fp.get(k, 0))
+        }
+        if isinstance(death_pos, (list, tuple)) and len(death_pos) >= 3:
+            try:
+                memo_for(self.state).record_death(
+                    death_pos,
+                    cause=cause,
+                    lost_items=lost_items,
+                    dimension=str(self.state.st.get("dimension") or "overworld"),
+                )
+            except Exception:
+                pass
         self.log(f"[loop] 重生就绪 ({respawn_ms:.0f}ms) pos={self.state.pos} cause={cause!r}")
 
         if self.observer is not None:

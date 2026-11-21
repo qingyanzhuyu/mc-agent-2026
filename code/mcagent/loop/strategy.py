@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 DEFAULT_STRATEGY_REVIEW_S: float = 600.0
 DEFAULT_LANDMARK_COOLDOWN_S: float = 15.0
+_UTILITY_SURVIVAL_SKILLS: frozenset[str] = frozenset({
+    "eat_food", "scout_island", "survey_island", "gather_food", "manage_camp_chest",
+})
 
 
 def env_float(name: str, default: float) -> float:
@@ -210,10 +213,12 @@ class StrategyOrchestrator:
         if elapsed_s > 0.0:
             self._objective_skill_elapsed_s += float(elapsed_s)
         spec = self.planner.rules.ledger_map.get(gid)
+        is_utility = skill_name in _UTILITY_SURVIVAL_SKILLS and (spec is None or spec.skill != skill_name)
         if not ok:
-            self._consecutive_goal_fails[gid] = self._consecutive_goal_fails.get(gid, 0) + 1
-            self._last_failure_kind.setdefault(gid, "other_replan")
-        elif (spec is not None and spec.skill == skill_name) or skill_name not in ("eat_food", "scout_island", "survey_island"):
+            if not is_utility:
+                self._consecutive_goal_fails[gid] = self._consecutive_goal_fails.get(gid, 0) + 1
+                self._last_failure_kind.setdefault(gid, "other_replan")
+        elif not is_utility:
             self._consecutive_goal_fails[gid] = 0
 
     def _detect_trigger(
@@ -344,7 +349,7 @@ class StrategyOrchestrator:
         elif landmark_discovered:
             invalidate_pending_async(self, "landmark_opportunity")
 
-        if (urgent := p.rules.choose_survival_or_safe_mode(state)) is not None:
+        if (urgent := p.rules.choose_urgent_survival_or_safe_mode(state)) is not None:
             if state.in_safe_mode:
                 invalidate_pending_async(self, "safe_mode")
             if died_since_last:
@@ -370,6 +375,15 @@ class StrategyOrchestrator:
         )) is not None:
             fired_trigger, old_outcome, f_kind = trig_info
             self._switch_objective(state, trigger=fired_trigger, old_outcome=old_outcome, failure_kind=f_kind, now=now)
+
+        if (proactive := p.rules.choose_proactive_survival(state)) is not None:
+            p._last_selected_goal_id = None
+            return PlanDecision(
+                proactive.skill, proactive.source, proactive.reason, objective=self.current_objective,
+                objective_source=self.current_objective.source if self.current_objective else None,
+                objective_trigger=fired_trigger,
+                safety_escape=proactive.safety_escape,
+            )
 
         if self.current_objective is not None:
             if (expanded := self._try_expand_current(state, fired_trigger)) is not None:

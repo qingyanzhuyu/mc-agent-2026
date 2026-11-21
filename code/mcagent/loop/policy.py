@@ -14,13 +14,15 @@ from ..planner import skill_choice
 from ..planner.llm import LLMClient
 from ..planner.objective import Objective
 from ..planner.scheduler import DecisionScheduler
-from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint
+from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint, effective_hostile_flee_dist
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills import base as skill_base
+from ..skills.camp_base import has_surplus_for_deposit, is_near_camp, needs_camp_withdraw
 from ..skills.items import best_pickaxe
+from ..skills.survival_food import cooked_food_count, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
-from .context import DecisionContext, ObjectiveRecord
+from .context import DecisionContext, ObjectiveRecord, is_daytime
 from .goals import (
     DEFAULT_CAMPAIGN_STAGES, GOALS, HUB_DOWNSTREAM_THRESHOLD, OFFICIAL_CAMPAIGN_STAGES,
     STONE_OR_BETTER_PICKS, GoalSpec,
@@ -37,6 +39,13 @@ if TYPE_CHECKING:
 STRATEGIES: tuple[str, ...] = ("legacy", "rule", "llm")
 _SAFETY_INTENT_DEFAULT_TTL_S: float = 15.0
 _ESCAPE_INTENT_KINDS: frozenset[str] = frozenset({"flee", "douse", "surface", "escape_lava", "lava", "void_risk"})
+_SURVIVAL_SWORDS: tuple[str, ...] = ("stone_sword", "iron_sword", "diamond_sword", "netherite_sword")
+_WOOL_COLORS: tuple[str, ...] = (
+    "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+    "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black",
+)
+_BED_ITEMS: tuple[str, ...] = tuple(f"{c}_bed" for c in _WOOL_COLORS)
+_WOOL_ITEMS: tuple[str, ...] = tuple(f"{c}_wool" for c in _WOOL_COLORS)
 DEFAULT_HUB_COOLDOWN_S: float = 180.0
 DEFAULT_HUB_WAKE_MOVE_DIST: float = 32.0
 DEFAULT_HUB_MAX_RESTARTS: int = 8
@@ -100,9 +109,11 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
         return norm, why or norm
     if kind == "heal":
         hostile = st.get("nearest_hostile") or {}
-        flee_dist = float(getattr(state.config, "hostile_flee_dist", 6.0))
-        if hostile and float(hostile.get("dist", 99.0)) < flee_dist:
-            return "flee", f"{why} + {hostile.get('name')} 距离 {hostile.get('dist')}"
+        if isinstance(hostile, Mapping) and hostile:
+            hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
+            flee_dist = effective_hostile_flee_dist(state, hname)
+            if float(hostile.get("dist", 99.0)) < flee_dist:
+                return "flee", f"{why} + {hostile.get('name')} 距离 {hostile.get('dist')}"
 
     # 直接物理险情兜底（即使后台 monitor 未启动或尚未刷出 safety_intent）
     if st.get("in_lava"):
@@ -111,7 +122,7 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
     if isinstance(hostile, Mapping) and hostile:
         hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
         creeper_dist = float(getattr(state.config, "creeper_urgent_dist", 5.0))
-        flee_dist = float(getattr(state.config, "hostile_flee_dist", 6.0))
+        flee_dist = effective_hostile_flee_dist(state, hname)
         try:
             hdist = float(hostile.get("dist", 99.0))
         except (TypeError, ValueError):
@@ -802,7 +813,7 @@ class RulePlanner:
 
         return None, "；".join(reasons[:3]) or f"目标 {ranked[0].step_goal.id} 无可启动技能"
 
-    def choose_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
+    def choose_urgent_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
         """在一切目标之上的致命抢占脱险、生存补给、`safe_mode` 避险与软安全意图处理。"""
         # 致命物理险情（岩浆/濒溺/近身苦力怕 <5 格）必须先于进食与 safe_mode 脱险
         if _is_urgent_escape_hazard(state):
@@ -836,6 +847,99 @@ class RulePlanner:
         if escape is not None:
             return escape
         return None
+
+    def choose_proactive_survival(self, state: State) -> Optional[PlanDecision]:
+        """Sprint 1.4 主动生存策略层（营地存取、受控捡尸、食物底仓、夜宿跳过、铁盾补齐）。"""
+        if self.target_goal:
+            return None
+
+        st = state.snapshot()
+        hp = float(st.get("health", 20))
+        food = float(st.get("food", 20))
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        day = is_daytime(state)
+        memo = memo_for(state)
+
+        hostile = st.get("nearest_hostile") or {}
+        hdist = 99.0
+        if isinstance(hostile, Mapping) and hostile:
+            try:
+                raw_hdist = float(hostile.get("dist", 99.0))
+                if math.isfinite(raw_hdist):
+                    hdist = raw_hdist
+            except (TypeError, ValueError):
+                pass
+        safe_10 = hdist >= 10.0
+        safe_12 = hdist >= 12.0
+        safe_gt_12 = hdist > 12.0
+
+        # 5. Camp Chest Withdraw (Respawn Re-kit)
+        if needs_camp_withdraw(state) and is_near_camp(state, max_dist=64.0):
+            wd = self._try_make("manage_camp_chest", {"mode": "withdraw"}, state)
+            if wd is not None:
+                return PlanDecision(wd, "rule", "重生/缺装回营地箱取装备")
+
+        # 6. Controlled Corpse Recovery
+        if not state.in_safe_mode and hp >= 14.0 and safe_10 and st.get("pos") is not None:
+            try:
+                should_recover = bool(memo.should_attempt_corpse_recovery(st.get("pos"), dimension=dim)[0])
+            except Exception:
+                should_recover = False
+            if should_recover:
+                rec_sk = self._try_make("manage_camp_chest", {"mode": "recover_corpse"}, state)
+                if rec_sk is not None:
+                    return PlanDecision(rec_sk, "rule", "受控捡尸回收铁器以上物资")
+
+        # 7. Food Reserve Gate
+        restore = inventory_food_restore(state)
+        has_sword = any(state.count(s) >= 1 for s in _SURVIVAL_SWORDS)
+        needs_food_now = food <= 17.0 or hp < 18.0
+        proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
+        if restore < 10 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
+            gf = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+            if gf is not None:
+                return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<10)，白天补粮")
+        if raw_meat_count(state) >= 2 and cooked_food_count(state) < 4 and memo.has_station("furnace", dimension=dim) and safe_12:
+            gf_cook = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+            if gf_cook is not None:
+                return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})，烤肉熟化补仓")
+
+        # 8. Night Bed Sleep Fast-Path
+        has_bed_ready = (
+            any(state.count(b) >= 1 for b in _BED_ITEMS)
+            or any(state.count(w) >= 3 for w in _WOOL_ITEMS)
+            or memo.has_station("bed", dimension=dim)
+        )
+        if day is False and dim == "overworld" and safe_gt_12 and has_bed_ready:
+            sleep_sk = self._try_make("sleep_in_bed", {}, state)
+            if sleep_sk is not None:
+                return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
+
+        # 9. Camp Surplus Deposit
+        if has_surplus_for_deposit(state) and is_near_camp(state, max_dist=32.0) and safe_12:
+            dep = self._try_make("manage_camp_chest", {"mode": "deposit"}, state)
+            if dep is not None:
+                return PlanDecision(dep, "rule", "携带高价值富余物资，回营地箱存仓")
+
+        # 10. Post-Iron Shield Readiness Fast-Path
+        if (
+            state.count("shield") < 1
+            and state.count("iron_ingot") >= 1
+            and (state.count("iron_pickaxe") >= 1 or state.count("iron_ingot") >= 4)
+            and total_planks(state) >= 6
+            and safe_12
+        ):
+            sh = self._try_make("craft_iron_gear", {"item": "shield"}, state)
+            if sh is not None:
+                return PlanDecision(sh, "rule", "铁器底座补齐盾牌防身")
+
+        return None
+
+    def choose_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
+        urgent = self.choose_urgent_survival_or_safe_mode(state)
+        if urgent is not None:
+            return urgent
+        return self.choose_proactive_survival(state)
 
     def choose_for_objective(self, state: State) -> PlanDecision:
         """战术层入口：先处理生存补给与 `safe_mode`，再针对 `target_goal` 展开下一技能。"""
