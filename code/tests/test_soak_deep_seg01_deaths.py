@@ -991,6 +991,81 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
             drive(SurveyIsland(dimension="overworld", sectors=2, radius=16), ex, state)
         self.assertEqual(w.find_blocks_after_move, 0, "must abort post-move find_blocks scan when creeper is <7m")
 
+    def test_main_loop_reconnects_after_3_unreleased_busy_stops(self) -> None:
+        # 复现 seg-08：服务端出现挂死的 busy:dig 锁（/stop 持续返回 released=False），
+        # MainLoop 连续 3 次未释放后必须自动执行 /disconnect + /connect + wait_ready 自愈，而非整场僵死
+        from mcagent.client import ApiError
+        from mcagent.loop.engine import LoopConfig, MainLoop
+        from mcagent.loop.policy import PlanDecision
+        from mcagent.skills.base import Skill
+
+        class _AlwaysBusySkill(Skill):
+            name = "busy_probe"
+            description = "probe"
+            goal = "probe:busy"
+            cooldown_s = 0.0
+            verified = "offline"
+
+            def run(self, ex, state):
+                if False:
+                    yield {}
+                raise ApiError("busy", "Another action (dig) is currently executing", {"busy": "dig"})
+
+        class _StuckBusyClient:
+            def __init__(self):
+                self.disconnects = 0
+                self.connects = 0
+                self.stops = 0
+                self.st = {"ready": True, "alive": True, "health": 20.0, "food": 20, "dimension": "overworld", "pos": [0.5, 64.0, 0.5]}
+
+            def status(self):
+                return dict(self.st)
+
+            def inventory(self):
+                return {"items": [], "empty_slots": 36}
+
+            def events(self, since=0, limit=200):
+                return {"events": [], "last_seq": since}
+
+            def stop(self):
+                self.stops += 1
+                return {"stopped": True, "action": "dig", "released": False, "wait_ms": 5000}
+
+            def disconnect(self):
+                self.disconnects += 1
+                return {"ok": True}
+
+            def connect(self, timeout=20):
+                self.connects += 1
+                return {"ok": True}
+
+            def wait_ready(self, timeout=60):
+                return dict(self.st)
+
+        class _FixedPlanner:
+            mode = "campaign"
+            def __init__(self):
+                self.calls = 0
+            def select(self, state, recent_failures=None):
+                self.calls += 1
+                if self.calls <= 3:
+                    return PlanDecision(_AlwaysBusySkill(), "rule", "probe")
+                return PlanDecision(None, "idle", "done", stop_episode=True)
+
+        client = _StuckBusyClient()
+        state = State()
+        ex = Executor(client, state, log=lambda *_: None)
+        loop = MainLoop(
+            client, state, ex, _FixedPlanner(),
+            config=LoopConfig(max_steps=10, max_seconds=30, enable_roadside_scan=False, idle_sleep_s=0.0),
+            log=lambda *_: None,
+            sleep=lambda *_: None,
+        )
+        loop.run()
+        self.assertGreaterEqual(client.stops, 3)
+        self.assertEqual(client.disconnects, 1, "expected /disconnect self-heal after 3 unreleased busy stops")
+        self.assertEqual(client.connects, 1, "expected /connect self-heal after /disconnect")
+
 
 if __name__ == "__main__":
     unittest.main()

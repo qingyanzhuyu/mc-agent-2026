@@ -171,6 +171,41 @@ class MainLoop:
         self._last_roadside_scan_dim: Optional[str] = (
             str(self.state.st.get("dimension") or "overworld") if self.state.st else None
         )
+        self._unreleased_busy_streak: int = 0
+
+    def _recover_stuck_busy_session(self) -> bool:
+        """连续多次 /stop 仍未释放服务端 busy 锁时，执行 /disconnect + 重连自愈，防整场僵死。"""
+        disconnect_fn = getattr(self.client, "disconnect", None)
+        connect_fn = getattr(self.client, "connect", None)
+        wait_fn = getattr(self.client, "wait_ready", None)
+        if not (callable(disconnect_fn) and callable(connect_fn) and callable(wait_fn)):
+            return False
+        self.log(
+            f"[loop] 连续 {self._unreleased_busy_streak} 次 /stop 未释放服务端 busy 锁，执行 /disconnect + 重连自愈..."
+        )
+        try:
+            disconnect_fn()
+        except Exception as e:
+            self.log(f"[loop] 自愈断开忽略异常: {e}")
+        try:
+            connect_fn(timeout=20)
+            st = wait_fn(timeout=60)
+            if isinstance(st, dict) and st:
+                self.state.set_status(st)
+            self.state.invalidate_inventory()
+            self.state.refresh_inventory(self.client)
+            self.state.drain(self.client)
+            self._unreleased_busy_streak = 0
+            self.log(f"[loop] busy 死锁重连自愈完成: pos={self.state.pos}")
+            return True
+        except ApiError as e:
+            if e.kind == FATAL:
+                raise
+            self.log(f"[loop] busy 死锁重连失败，交由下一拍继续恢复: {e}")
+            return False
+        except Exception as e:
+            self.log(f"[loop] busy 死锁重连异常，交由下一拍继续恢复: {e}")
+            return False
 
     def _do_sleep(self, seconds: float) -> None:
         if self._custom_sleep is not None:
@@ -1125,10 +1160,32 @@ class MainLoop:
                                     self._note_outage(refresh_err)
                         if not is_death_err and code in ("interrupted", "busy"):
                             stop_fn = getattr(self.executor, "stop", None)
-                            if callable(stop_fn):
-                                stop_fn(raise_on_error=False)
-                            if code == "interrupted":
-                                self._maybe_set_hurt_flee_intent(failed_name, extra)
+                            if code == "busy":
+                                busy_unreleased = False
+                                if callable(stop_fn):
+                                    try:
+                                        stop_fn(raise_on_error=True)
+                                    except TypeError:
+                                        stop_fn()
+                                    except ApiError as stop_err:
+                                        if stop_err.code == "busy":
+                                            busy_unreleased = True
+                                    except Exception:
+                                        pass
+                                if busy_unreleased:
+                                    self._unreleased_busy_streak += 1
+                                    if self._unreleased_busy_streak >= 3:
+                                        self._recover_stuck_busy_session()
+                                else:
+                                    self._unreleased_busy_streak = 0
+                            else:
+                                self._unreleased_busy_streak = 0
+                                if callable(stop_fn):
+                                    stop_fn(raise_on_error=False)
+                                if code == "interrupted":
+                                    self._maybe_set_hurt_flee_intent(failed_name, extra)
+                        elif not is_death_err:
+                            self._unreleased_busy_streak = 0
                         if failed_name == "emergency_escape" or getattr(decision, "safety_escape", False):
                             self._acknowledge_safety_intent(completed=False)
                         environment = e if isinstance(e, EnvBlocked) and not is_death_err else None
@@ -1211,6 +1268,7 @@ class MainLoop:
                     break
 
                 if skill_done and active_skill is not None:
+                    self._unreleased_busy_streak = 0
                     skill_dt = max(0.0, time.monotonic() - skill_t0)
                     finished_skill = active_skill
                     active_skill = None
