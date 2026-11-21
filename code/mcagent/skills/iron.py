@@ -347,6 +347,11 @@ class SmeltIron(Skill):
         if has_ready_iron_lease(state):
             return ""
         has_iron_input = state.count("raw_iron") >= 1 or state.count("raw_iron_block") >= 1
+        dim = bare((state.st or {}).get("dimension") or "overworld").strip().lower() or "overworld"
+        if not has_iron_input and any(
+            lease.expected_output == "iron_ingot" for lease in lease_book_for(state).active_leases(dimension=dim)
+        ):
+            return "铁锭异步熔炉租约冶炼中，尚未就绪"
         if not has_iron_input and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包无粗铁且缺石镐或更好的镐（木镐、金镐不能采铁）"
         if not any(state.count(n) for n, _ in _fuels_for(state)) and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
