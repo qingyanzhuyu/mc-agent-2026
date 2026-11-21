@@ -7,7 +7,7 @@ from .interaction import use_item_on
 from .nether_mining import _durable_pick, _gather_flint, _harvest_obsidian, _take_available
 from .nether_portal import (
     Entry, _choose_build_plan, _find_activated_portal, _material_scaffold, build_pattern,
-    traverse_portal, verify_portal_landing,
+    nether_preflight_missing, traverse_portal, verify_portal_landing,
 )
 from .nether_site import (
     OBSIDIAN, PORTAL, _cell, _dimension, _ground, _name, _near, _pos, _standing, _walk,
@@ -15,6 +15,8 @@ from .nether_site import (
 from .observations import completed_advancements
 from .observations import refresh_inventory as _inventory
 from .registry import register
+from .spawn_shelter import _blast_block_count, build_nether_bunker_flow
+from .world_memo import memo_for
 
 
 def cast_obsidian_cell(ex, state, pos):
@@ -74,6 +76,8 @@ class BuildAndEnterPortal(Skill):
         "prepare_flint": Param(bool, "仅补一份燧石供打火石制作", default=False),
         "allow_casting": Param(bool, "浇铸备选开关，待实测", default=False),
         "allow_lava_ignition": Param(bool, "岩浆引火备选开关，待实测", default=False),
+        "strict_preflight": Param(bool, "跨门进下界前是否强制执行七项行前检查清单", default=False),
+        "auto_bunker": Param(bool, "落地后是否立即建 3x3 圆石防恶魂碉堡", default=False),
     }
     goal = "route:nether:prepare_flint={prepare_flint}"
     verified = "offline"
@@ -110,20 +114,31 @@ class BuildAndEnterPortal(Skill):
         if status.get("ready") is not True:
             raise Replan("世界加载尚未就绪（ready=false），请等新世界区块和实体到齐后再重试")
         if _dimension(status) == "nether" and not self.args["prepare_flint"]:
-            verify_portal_landing(ex, state)
+            landing = verify_portal_landing(ex, state)
+            if isinstance(landing, dict) and landing.get("pos"):
+                memo_for(state).record_active_portal(landing["pos"], dimension="the_nether")
             return
         if _dimension(status) != "overworld" or not _standing(ex, status, through_portal=True):
             raise Replan("未确认主世界的安全站位，请先离开流体或危险边缘")
         if self.args["prepare_flint"]:
             yield from _gather_flint(ex, state, "overworld")
             return
+        if self.args.get("strict_preflight"):
+            missing = nether_preflight_missing(state)
+            if missing:
+                raise Replan(f"下界远征行前检查未通过，缺少：{', '.join(missing)}")
         start = _cell(_pos(status))
         entry = _find_activated_portal(ex, state, start)
         if entry is None:
             entry = yield from self._prepare_portal(ex, state, start)
         landing = yield from traverse_portal(ex, state, entry)
+        memo = memo_for(state)
+        if isinstance(landing, dict) and landing.get("pos"):
+            memo.record_active_portal(landing["pos"], dimension="the_nether")
         yield rec("portal_landing", landing, source_dimension="overworld", source_portal=list(entry.foot),
                   advancement_confirmed="story/enter_the_nether" in completed_advancements(ex, require_ready=False))
+        if self.args.get("auto_bunker") and _blast_block_count(state) >= 20:
+            yield from build_nether_bunker_flow(ex, state, memo, skill_name=self.name)
 
     def _prepare_portal(self, ex, state, start):
         if self.args["allow_casting"]:

@@ -1698,6 +1698,11 @@ class WaveCLedgerAndContractTests(_WaveCTestBase):
 
     def test_rank_actionable_goals_3way_shared_subgraph_amortization_for_prep_ominous_bottle(self) -> None:
         st = _state_with(items=[])
+        from mcagent.skills.world_memo import memo_for
+        memo = memo_for(st)
+        memo.record_landmark("village", [40, 64, 40], dimension="overworld")
+        memo.record_landmark("pillager_outpost", [80, 64, 80], dimension="overworld")
+        memo.record_landmark("trial_chambers", [120, 40, 120], dimension="overworld")
         wave_c_subgraph = (
             GOAL_MAP["prep_ominous_bottle"],
             GOAL_MAP["revaulting"],

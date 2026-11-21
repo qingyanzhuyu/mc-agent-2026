@@ -15,6 +15,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional, Sequence
 
 from ..runtime import State
+from ..skills.world_memo import memo_for
 from .llm import LLMClient, LLMError
 
 if TYPE_CHECKING:
@@ -194,6 +195,38 @@ def _format_hub_suspension_info(goal: "GoalSpec", susp: Any) -> SuspendedGoalInf
     )
 
 
+def _unmet_chain_landmarks(
+    goal: "GoalSpec",
+    state: State,
+    ledger_map: Mapping[str, "GoalSpec"],
+    completed_advs: Collection[str],
+    memo: Any,
+    goals_mod: Any,
+) -> tuple[str, ...]:
+    """收集目标自身及其未满足传递前置链上尚未在 WorldResourceMemo 中探明的地标/群系先验。"""
+    visited: set[str] = set()
+    missing: list[str] = []
+    seen_reqs: set[str] = set()
+
+    def _walk(node: "GoalSpec", is_root: bool) -> None:
+        if node.id in visited:
+            return
+        visited.add(node.id)
+        if not is_root and goals_mod.is_prereq_satisfied(node, state, completed_advs, memo=memo):
+            return
+        for req in goals_mod.unmet_required_landmarks(node, memo):
+            if req not in seen_reqs:
+                seen_reqs.add(req)
+                missing.append(req)
+        for pid in node.prereq_goals:
+            parent = ledger_map.get(pid)
+            if parent is not None:
+                _walk(parent, False)
+
+    _walk(goal, True)
+    return tuple(missing)
+
+
 def collect_objective_candidates(
     state: State, *, ledger: Optional[Sequence["GoalSpec"]] = None, registry: Optional[dict] = None,
     min_verified: str = "offline", include_stages: Optional[Collection[str]] = None,
@@ -218,22 +251,27 @@ def collect_objective_candidates(
         g for g in all_goals
         if (g.id in focus_ids if focus_ids is not None else g.stage in allowed_stage_set)
     )
+    memo = memo_for(state)
     susp_hub_map = dict(hub_suspensions or {})
     abandoned_set = set(abandoned_goals or ())
     marginal_rois = goals_mod.compute_goal_marginal_rois(
         state,
         active_pool,
         completed_advs=completed_advs,
+        target_goal=focus_goals,
         ep_goal_fails=ep_goal_fails,
         ep_goal_elapsed=ep_goal_elapsed,
         telemetry=telemetry,
         suspended_goals=set(susp_hub_map) | abandoned_set,
+        memo=memo,
     )
 
     eligible: list[ObjectiveCandidate] = []
     suspended: list[SuspendedGoalInfo] = []
     for g in active_pool:
-        if goals_mod.is_goal_achieved(g, state, completed_advs):
+        if goals_mod.is_goal_achieved(g, state, completed_advs, memo=memo):
+            continue
+        if focus_ids is None and _unmet_chain_landmarks(g, state, ledger_map, completed_advs, memo, goals_mod):
             continue
         if g.id in susp_hub_map:
             suspended.append(_format_hub_suspension_info(g, susp_hub_map[g.id]))
@@ -375,6 +413,11 @@ def resolve_objective(
     if hub_suspensions and goal_id in hub_suspensions:
         info = _format_hub_suspension_info(goal, hub_suspensions[goal_id])
         return None, [f"目标 {goal_id} 当前处于枢纽临时挂起（唤醒条件={info.wake_on}），请改选其他平行目标"]
+    if not focus_goals:
+        memo = memo_for(state)
+        unmet = _unmet_chain_landmarks(goal, state, ledger_map, completed_advs, memo, goals_mod)
+        if unmet:
+            return None, [f"目标 {goal_id} 依赖尚未探明的地标 {list(unmet)}，请先通过岛体检或探索发现后再选"]
 
     probe = _make_probe_planner(goal_id, **common_kw)
     probe.refresh_environment_blocks(state)

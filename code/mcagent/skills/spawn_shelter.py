@@ -20,17 +20,13 @@ if TYPE_CHECKING:
     from ..runtime import Executor, State
 
 _BLAST_BLOCKS: tuple[str, ...] = ("cobblestone", "cobbled_deepslate", "stone_bricks", "blackstone")
-_DOORS: tuple[str, ...] = (
-    "oak_door", "spruce_door", "birch_door", "jungle_door", "acacia_door",
-    "dark_oak_door", "mangrove_door", "cherry_door", "bamboo_door", "pale_oak_door",
-)
+_DOORS: tuple[str, ...] = ("oak_door", "spruce_door", "birch_door", "jungle_door", "acacia_door",
+                           "dark_oak_door", "mangrove_door", "cherry_door", "bamboo_door", "pale_oak_door")
 _PASSABLE = AIR | PASSABLE_COVER
 _BED_SET: frozenset[str] = frozenset(BED_BLOCKS)
 _RING_RADII: tuple[int, ...] = (10, 14, 18, 22, 26, 32)
-_RING_DIRS: tuple[tuple[float, float], ...] = (
-    (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-    (0.707, 0.707), (-0.707, 0.707), (0.707, -0.707), (-0.707, -0.707),
-)
+_RING_DIRS: tuple[tuple[float, float], ...] = ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+                                              (0.707, 0.707), (-0.707, 0.707), (0.707, -0.707), (-0.707, -0.707))
 _MIN_SHELTER_COBBLE, _MIN_BUNKER_COBBLE = 36, 20
 
 
@@ -86,9 +82,7 @@ def _select_shelter_center(ex: "Executor", state: "State", dim: str) -> tuple[in
         candidates.append(block_cell(camp["pos"]))
     candidates.append(cur)
     anchor = block_cell(spawn) if spawn is not None else cur
-    for r in _RING_RADII:
-        for ux, uz in _RING_DIRS:
-            candidates.append((anchor[0] + round(r * ux), anchor[1], anchor[2] + round(r * uz)))
+    candidates.extend((anchor[0] + round(r * ux), anchor[1], anchor[2] + round(r * uz)) for r in _RING_RADII for ux, uz in _RING_DIRS)
     seen: set[tuple[int, int, int]] = set()
     for cand in candidates:
         if cand in seen:
@@ -96,12 +90,8 @@ def _select_shelter_center(ex: "Executor", state: "State", dim: str) -> tuple[in
         seen.add(cand)
         if _site_is_valid(ex, cand[0], cand[1], cand[2], radius=2):
             return cand
-    raise EnvBlocked(
-        "出生点保护区外缘 r=10..32 环带未找到平坦干燥 5×5 避难所地基",
-        missing_predicate="shelter_flat_site",
-        searched_volume="出生点环带 r=10..32 5×5 地基",
-        wake_on="chunk_moved",
-    )
+    raise EnvBlocked("出生点保护区外缘 r=10..32 环带未找到平坦干燥 5×5 避难所地基",
+                     missing_predicate="shelter_flat_site", searched_volume="出生点环带 r=10..32 5×5 地基", wake_on="chunk_moved")
 
 
 def _approach_cell(ex: "Executor", state: "State", cell: tuple[int, int, int], *, reach: float = STATION_EYE_REACH):
@@ -135,9 +125,7 @@ def _clear_if_needed(ex: "Executor", state: "State", cell: tuple[int, int, int],
         return False
 
 
-def _place_structural(
-    ex: "Executor", state: "State", cell: tuple[int, int, int], item: str, *, memo: Any, dim: str,
-) -> Any:
+def _place_structural(ex: "Executor", state: "State", cell: tuple[int, int, int], item: str, *, memo: Any, dim: str) -> Any:
     st = state.refresh_status(ex.client, max_age_s=0)
     px, py, pz = block_cell(st.get("pos"))
     if cell[0] == px and cell[2] == pz and abs(cell[1] - py) <= 1:
@@ -166,12 +154,8 @@ def _place_structural(
 def shelter_blueprint(cx: int, cy: int, cz: int) -> dict[str, Any]:
     """生成 docs/15 §三 的 5×5×4 圆石防爆避难所几何坐标蓝图（保证箱顶 y+1 为 AIR）。"""
     door_cells = ((cx, cy, cz + 2), (cx, cy + 1, cz + 2))
-    wall_cells: list[tuple[int, int, int]] = []
-    for dy in (0, 1):
-        for dx in range(-2, 3):
-            for dz in range(-2, 3):
-                if max(abs(dx), abs(dz)) == 2 and (cx + dx, cy + dy, cz + dz) not in door_cells:
-                    wall_cells.append((cx + dx, cy + dy, cz + dz))
+    wall_cells = [(cx + dx, cy + dy, cz + dz) for dy in (0, 1) for dx in range(-2, 3) for dz in range(-2, 3)
+                  if max(abs(dx), abs(dz)) == 2 and (cx + dx, cy + dy, cz + dz) not in door_cells]
     roof_cells = [(cx + dx, cy + 2, cz + dz) for dx in range(-2, 3) for dz in range(-2, 3)]
     # 箱子坐标独立非相邻（kit 与 vault 隔 1 格防合大箱，bulk 在对角），上方 cy+1 严格保持 AIR
     chests = {"kit": (cx - 1, cy, cz - 1), "vault": (cx + 1, cy, cz - 1), "bulk": (cx + 1, cy, cz + 1)}
@@ -183,9 +167,7 @@ def shelter_blueprint(cx: int, cy: int, cz: int) -> dict[str, Any]:
     }
 
 
-def _place_shelter_facilities(
-    ex: "Executor", state: "State", bp: Mapping[str, Any], dim: str, memo: Any,
-) -> Any:
+def _place_shelter_facilities(ex: "Executor", state: "State", bp: Mapping[str, Any], dim: str, memo: Any) -> Any:
     placed_stations: dict[str, list[int]] = {}
     placed_chests: dict[str, list[int]] = {}
     camp = memo.get_camp(dimension=dim) or {}
@@ -252,13 +234,59 @@ def _place_shelter_facilities(
     return placed_chests, placed_stations
 
 
+def build_nether_bunker_flow(ex: "Executor", state: "State", memo: Any, *, skill_name: str = "build_spawn_shelter"):
+    """在下界门或当前位置周围建造 3×3 内腔圆石碉堡，并按需合成/放置应急补给箱。"""
+    st = state.refresh_status(ex.client, max_age_s=0)
+    cx, cy, cz = block_cell(st.get("pos"))
+    scan = scan_blocks(ex, state, ("nether_portal",), radius=12, limit=4, skill_name=skill_name)
+    if scan.get("ready") is True and (blks := scan.get("blocks") or ()):
+        pcell = block_cell(blks[0]["pos"])
+        cx, cy, cz = pcell[0], min(pcell[1], cy) if abs(pcell[1] - cy) <= 2 else pcell[1], pcell[2]
+    placed = 0
+    # 3×3 围墙 + 封顶，严禁覆盖 nether_portal / obsidian，留一侧出口
+    door = {(cx, cy, cz + 2), (cx, cy + 1, cz + 2)}
+    cells = [
+        (cx + dx, cy + dy, cz + dz) for dy in (0, 1) for dx in range(-2, 3) for dz in range(-2, 3)
+        if max(abs(dx), abs(dz)) == 2 and (cx + dx, cy + dy, cz + dz) not in door
+    ] + [(cx + dx, cy + 2, cz + dz) for dx in range(-1, 2) for dz in range(-1, 2)]
+    for cell in cells:
+        if (blk := _pick_blast_block(state)) is None:
+            break
+        if bare(_observed_block(ex, cell).get("name")) in ("nether_portal", "obsidian"):
+            continue
+        if (yield from _place_structural(ex, state, cell, blk, memo=memo, dim="the_nether")):
+            placed += 1
+    chest_pos: Optional[tuple[int, int, int]] = None
+    refresh_inventory(ex, state)
+    if state.count("chest") < 1:
+        planks = sum(int(r.get("count", 0) or 0) for r in ((state.inventory or {}).get("items") or ())
+                     if bare(r.get("name")).endswith("_planks"))
+        if planks >= 8 and (
+            any(math.dist(c, (cx, cy, cz)) <= 6.0 for c in memo.stations("crafting_table", dimension="the_nether"))
+            or bool(scan_blocks(ex, state, ("crafting_table",), radius=6, limit=1, skill_name=skill_name).get("blocks"))
+        ):
+            try:
+                yield rec("craft", ex.craft("chest", 1), item="chest", count=1)
+            except Replan:
+                pass
+            refresh_inventory(ex, state)
+    if state.count("chest") >= 1:
+        for cand in ((cx - 1, cy, cz - 1), (cx + 1, cy, cz - 1), (cx - 1, cy, cz + 1), (cx + 1, cy, cz + 1)):
+            if bare(_observed_block(ex, cand).get("name")) in AIR and bare(_observed_block(ex, (cand[0], cand[1] + 1, cand[2])).get("name")) in AIR:
+                if (yield from _place_structural(ex, state, cand, "chest", memo=memo, dim="the_nether")):
+                    chest_pos = cand
+                    memo.record_landmark("nether_portal_depot", cand, dimension="the_nether", meta={"block": "chest"})
+                    break
+    memo.set_camp([cx, cy, cz], dimension="the_nether", chest=list(chest_pos) if chest_pos else None,
+                  shelter_tier=1, chest_role="kit" if chest_pos else None)
+    return {"mode": "nether_bunker", "center": [cx, cy, cz], "placed": placed, "chest": list(chest_pos) if chest_pos else None}
+
+
 @register
 class BuildSpawnShelter(Skill):
     name = "build_spawn_shelter"
     description = "在出生点保护区外缘建造5x5圆石防爆避难所或下界门3x3圆石碉堡"
-    params = {
-        "mode": Param(str, "避难所建造模式", default="tier1_shelter", choices=("tier1_shelter", "nether_bunker")),
-    }
+    params = {"mode": Param(str, "避难所建造模式", default="tier1_shelter", choices=("tier1_shelter", "nether_bunker"))}
     goal = "camp:shelter:{mode}"
     verified = "offline"
     cooldown_s = 20.0
@@ -286,44 +314,15 @@ class BuildSpawnShelter(Skill):
             return dim == "the_nether" and _blast_block_count(state) >= _MIN_BUNKER_COBBLE
         if dim != "overworld":
             return False
+        pos = state_snap(state).get("pos")
+        if isinstance(pos, Sequence) and len(pos) >= 2:
+            try:
+                if float(pos[1]) < 55.0:
+                    return False
+            except (TypeError, ValueError):
+                pass
         camp = memo_for(state).get_camp(dimension="overworld")
         return not (isinstance(camp, Mapping) and int(camp.get("shelter_tier", 0)) >= 1)
-
-    def _run_nether_bunker(self, ex: "Executor", state: "State", memo: Any):
-        st = state.refresh_status(ex.client, max_age_s=0)
-        cx, cy, cz = block_cell(st.get("pos"))
-        scan = scan_blocks(ex, state, ("nether_portal",), radius=12, limit=4, skill_name=self.name)
-        if scan.get("ready") is True and (blks := scan.get("blocks") or ()):
-            pcell = block_cell(blks[0]["pos"])
-            cx, cy, cz = pcell[0], pcell[1], pcell[2]
-        placed = 0
-        # 3×3 围墙 + 封顶，严禁覆盖 nether_portal / obsidian，留一侧出口
-        door = {(cx, cy, cz + 2), (cx, cy + 1, cz + 2)}
-        cells = [
-            (cx + dx, cy + dy, cz + dz)
-            for dy in (0, 1) for dx in range(-2, 3) for dz in range(-2, 3)
-            if max(abs(dx), abs(dz)) == 2 and (cx + dx, cy + dy, cz + dz) not in door
-        ] + [(cx + dx, cy + 2, cz + dz) for dx in range(-1, 2) for dz in range(-1, 2)]
-        for cell in cells:
-            if (blk := _pick_blast_block(state)) is None:
-                break
-            bname = bare(_observed_block(ex, cell).get("name"))
-            if bname in ("nether_portal", "obsidian"):
-                continue
-            if (yield from _place_structural(ex, state, cell, blk, memo=memo, dim="the_nether")):
-                placed += 1
-        chest_pos: Optional[tuple[int, int, int]] = None
-        refresh_inventory(ex, state)
-        if state.count("chest") >= 1:
-            for cand in ((cx - 1, cy, cz - 1), (cx + 1, cy, cz - 1), (cx - 1, cy, cz + 1), (cx + 1, cy, cz + 1)):
-                if bare(_observed_block(ex, cand).get("name")) in AIR and bare(_observed_block(ex, (cand[0], cand[1] + 1, cand[2])).get("name")) in AIR:
-                    if (yield from _place_structural(ex, state, cand, "chest", memo=memo, dim="the_nether")):
-                        chest_pos = cand
-                        memo.record_landmark("nether_portal_depot", cand, dimension="the_nether", meta={"block": "chest"})
-                        break
-        memo.set_camp([cx, cy, cz], dimension="the_nether", chest=list(chest_pos) if chest_pos else None,
-                      shelter_tier=1, chest_role="kit" if chest_pos else None)
-        self._build_result = {"mode": "nether_bunker", "center": [cx, cy, cz], "placed": placed, "chest": list(chest_pos) if chest_pos else None}
 
     def run(self, ex: "Executor", state: "State"):
         self._build_result: Optional[dict[str, Any]] = None
@@ -334,7 +333,7 @@ class BuildSpawnShelter(Skill):
         if self.args["mode"] == "nether_bunker":
             if dim != "the_nether":
                 raise Replan("nether_bunker 模式仅在下界执行")
-            yield from self._run_nether_bunker(ex, state, memo)
+            self._build_result = yield from build_nether_bunker_flow(ex, state, memo, skill_name=self.name)
             return
         if dim != "overworld":
             raise Replan("tier1_shelter 模式仅在主世界执行")
@@ -365,10 +364,8 @@ class BuildSpawnShelter(Skill):
         placed = 1
         # 先清室内净空（保证中心与箱顶均为 AIR），再砌墙封顶
         skip_keep = frozenset({"chest", "furnace", "crafting_table", "torch"}) | _BED_SET
-        for dx in (-1, 0, 1):
-            for dz in (-1, 0, 1):
-                for dy in (0, 1):
-                    yield from _clear_if_needed(ex, state, (center[0] + dx, center[1] + dy, center[2] + dz), skip_names=skip_keep)
+        for dx, dz, dy in ((dx, dz, dy) for dx in (-1, 0, 1) for dz in (-1, 0, 1) for dy in (0, 1)):
+            yield from _clear_if_needed(ex, state, (center[0] + dx, center[1] + dy, center[2] + dz), skip_names=skip_keep)
         for cell in (*bp["wall_cells"][1:], *bp["roof_cells"]):
             if (blk := _pick_blast_block(state)) is None:
                 break
@@ -378,10 +375,8 @@ class BuildSpawnShelter(Skill):
         tier = 2 if len(placed_chests) >= 3 else 1
         memo.set_camp(list(center), dimension=dim, chests=placed_chests or None,
                       shelter_tier=tier, mine_entry=list(bp["mine_entry"]), **placed_stations)
-        self._build_result = {
-            "mode": "tier1_shelter", "center": list(center), "placed": placed,
-            "shelter_tier": tier, "chests": placed_chests, "mine_entry": list(bp["mine_entry"]),
-        }
+        self._build_result = {"mode": "tier1_shelter", "center": list(center), "placed": placed,
+                              "shelter_tier": tier, "chests": placed_chests, "mine_entry": list(bp["mine_entry"])}
 
     def verify_done(self, state: "State", before_counts: Optional[dict[str, int]] = None) -> str:
         dim = "the_nether" if self.args["mode"] == "nether_bunker" else "overworld"

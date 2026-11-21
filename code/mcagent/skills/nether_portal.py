@@ -3,23 +3,31 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import islice
 
 from ..runtime import EnvBlocked, Replan
 from .base import failure, rec
 from .field import equip_item, place_block, scan_blocks
-from .items import AIR, PLACEABLE_BLOCKS, best_pickaxe
+from .items import AIR, PLACEABLE_BLOCKS, bare, best_pickaxe
 from .nether_site import (
     OBSIDIAN, PORTAL, SCAFFOLDS, _above, _approach, _cell, _center, _dimension, _ground,
     _hazard, _name, _near, _neighbors, _pos, _stable, _standable, _standing, _walk,
 )
+from .survival_food import cooked_food_count
+from .world_memo import memo_for
 
 _HAND_SCAFFOLDS = frozenset({"dirt", *(b for b in PLACEABLE_BLOCKS if b.endswith("_planks"))})
 
 _RING = ((1, 0), (2, 0), (0, 1), (3, 1), (0, 2), (3, 2), (0, 3), (3, 3), (1, 4), (2, 4))
 _FRAME_LIMIT = 16
 _POLL_LIMIT = 12
+_PROTECTION_ARMOR = frozenset(
+    f"{t}_{s}" for t in ("iron", "diamond", "netherite") for s in ("helmet", "chestplate", "leggings", "boots")
+)
+_PIGLIN_GOLD_ARMOR = ("golden_boots", "golden_helmet")
+_PREFLIGHT_BLAST_BLOCKS = ("cobblestone", "cobbled_deepslate", "stone_bricks", "blackstone")
 
 
 @dataclass(frozen=True)
@@ -336,3 +344,42 @@ def traverse_portal(ex, state, entry):
     finally:
         if not stopped:
             ex.stop()
+
+
+def _equipped_item_names(state) -> set[str]:
+    """Read bare lowercase equipped armor and offhand item names from state."""
+    st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
+    inv = getattr(state, "inventory", None) or {}
+    names: set[str] = set()
+    for src in (st, inv):
+        if not isinstance(src, Mapping):
+            continue
+        armor = src.get("armor")
+        entries = armor.values() if isinstance(armor, Mapping) else (armor if isinstance(armor, (list, tuple)) else ())
+        for entry in (*entries, src.get("offhand")):
+            raw = entry.get("name") if isinstance(entry, Mapping) else (entry if isinstance(entry, str) else None)
+            if isinstance(raw, str):
+                name = bare(raw.strip().lower())
+                if name:
+                    names.add(name)
+    return names
+
+
+def nether_preflight_missing(state) -> list[str]:
+    """Return missing mandatory Nether expedition pre-flight checklist item codes."""
+    equipped = _equipped_item_names(state)
+    checks = (
+        ("iron_armor", bool(equipped & _PROTECTION_ARMOR) or any(state.count(a) >= 1 for a in _PROTECTION_ARMOR)),
+        ("gold_armor", any(a in equipped or state.count(a) >= 1 for a in _PIGLIN_GOLD_ARMOR)),
+        ("shield", state.count("shield") >= 1 or "shield" in equipped),
+        ("cooked_food>=24", cooked_food_count(state) >= 24),
+        ("cobblestone>=96", sum(state.count(b) for b in _PREFLIGHT_BLAST_BLOCKS) >= 96),
+        ("flint_and_steel", state.count("flint_and_steel") >= 1),
+        ("camp_kit_backup", memo_for(state).camp_has_recovery_kit(dimension="overworld")),
+    )
+    return [code for code, ok in checks if not ok]
+
+
+def nether_preflight_ready(state) -> bool:
+    """Return True when all 7 Nether expedition pre-flight items are satisfied."""
+    return not nether_preflight_missing(state)

@@ -1532,6 +1532,9 @@ class WaveBLedgerAndROIContractTests(_WaveBTestBase):
             GOAL_MAP["summon_wither"],
         )
 
+        from mcagent.skills.world_memo import memo_for
+        memo_for(st).record_landmark("nether_fortress", [40, 64, 40], dimension="the_nether")
+        memo_for(st).record_landmark("village", [40, 64, 40], dimension="overworld")
         ranked_shared = rank_actionable_goals(st, wither_subgraph)
         ranked_solo = rank_actionable_goals(st, solo_subgraph)
         by_step_shared = {step.step_goal.id: step for step in ranked_shared}

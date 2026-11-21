@@ -20,6 +20,7 @@ from ..skills import base as skill_base
 from ..skills import camp_plan as _camp_plan
 from ..skills.furnace_lease import best_fuel_for, lease_book_for
 from ..skills.items import best_pickaxe
+from ..skills.nether_portal import nether_preflight_missing
 from ..skills.survival_food import cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
@@ -201,6 +202,11 @@ def _supplies(goal: GoalSpec, state: State):
             yield requirement, name, dict(args)
             if not goal.gather_when_blocked:
                 return
+
+
+def _nether_blast_blocks(state: State) -> int:
+    """Count blast-resistant blocks usable for a Nether portal bunker."""
+    return total_cobble(state) + state.count("stone_bricks") + state.count("blackstone")
 
 
 @dataclass
@@ -748,6 +754,82 @@ class RulePlanner:
                         return rec_inst, rec_why
         return None, ""
 
+    def _apply_nether_preflight(
+        self,
+        state: State,
+        skill_name: str,
+        args: Optional[Mapping[str, Any]],
+    ) -> tuple[Optional[Skill], str, dict[str, Any]]:
+        """Enforce overworld pre-flight readiness before entering a Nether portal."""
+        eff_args = dict(args or {})
+        if skill_name != "build_and_enter_portal" or eff_args.get("prepare_flint"):
+            return None, "", eff_args
+        st = state.snapshot()
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        if dim != "overworld":
+            return None, "", eff_args
+
+        missing = nether_preflight_missing(state)
+        if not missing:
+            cls = self.registry.get("build_and_enter_portal")
+            cls_params = getattr(cls, "params", {}) or {} if cls is not None else {}
+            if "strict_preflight" in cls_params:
+                eff_args["strict_preflight"] = True
+            if "auto_bunker" in cls_params:
+                eff_args["auto_bunker"] = True
+            return None, "", eff_args
+
+        if "camp_kit_backup" in missing:
+            if _camp_plan.is_near_camp(state, max_dist=96.0) and _camp_plan.has_surplus_for_deposit(
+                state, reservations=self.reservations
+            ):
+                cand, _, _ = self._diagnose_skill("manage_camp_chest", {"mode": "deposit"}, state)
+                if cand is not None:
+                    return cand, "下界行前检查：先向主世界营地热备箱存仓备份", eff_args
+            else:
+                ow_camp = memo_for(state).get_camp(dimension="overworld")
+                if not (isinstance(ow_camp, Mapping) and (ow_camp.get("chest") or ow_camp.get("chests"))) and _camp_plan.has_chest_or_materials(state):
+                    cand, _, _ = self._diagnose_skill("manage_camp_chest", {"mode": "setup"}, state)
+                    if cand is not None:
+                        return cand, "下界行前检查：先建立主世界营地热备箱", eff_args
+
+        if "flint_and_steel" in missing:
+            if state.count("iron_ingot") >= 1 and state.count("flint") >= 1:
+                cand, _, _ = self._diagnose_skill("craft_iron_gear", {"item": "flint_and_steel"}, state)
+                if cand is not None:
+                    return cand, "下界行前检查：先合成打火石", eff_args
+            elif state.count("flint") < 1:
+                cand, _, _ = self._diagnose_skill("build_and_enter_portal", {"prepare_flint": True}, state)
+                if cand is not None:
+                    return cand, "下界行前检查：先采掘砂砾补齐燧石", eff_args
+
+        if "shield" in missing:
+            if state.count("iron_ingot") >= 1 and (total_planks(state) + total_logs(state) * 4) >= 6:
+                cand, _, _ = self._diagnose_skill("craft_iron_gear", {"item": "shield"}, state)
+                if cand is not None:
+                    return cand, "下界行前检查：先合成盾牌防恶魂与近战", eff_args
+
+        if "iron_armor" in missing:
+            for piece, need in (("iron_chestplate", 8), ("iron_leggings", 7), ("iron_helmet", 5), ("iron_boots", 4)):
+                if state.count("iron_ingot") >= need:
+                    cand, _, _ = self._diagnose_skill("craft_iron_gear", {"item": piece}, state)
+                    if cand is not None:
+                        return cand, f"下界行前检查：先合成铁甲({piece})", eff_args
+
+        if "cooked_food>=24" in missing:
+            if is_daytime(state) is not False:
+                cand, _, _ = self._diagnose_skill("gather_food", {"target_restore": 64, "cook": True}, state)
+                if cand is not None:
+                    return cand, "下界行前检查：白天补足熟食至 24 份以上", eff_args
+
+        if "cobblestone>=96" in missing:
+            if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
+                cand, _, _ = self._diagnose_skill("mine_stone", {"count": 32}, state)
+                if cand is not None:
+                    return cand, "下界行前检查：补挖圆石至 96 块以上", eff_args
+
+        return None, "", eff_args
+
     def expand_objective_skill(self, state: State) -> tuple[Optional[Skill], str]:
         """针对 `target_goal` 展开下一个可启动技能；无法展开时返回 `(None, 明确原因)`。"""
         self._last_selected_goal_id = None
@@ -774,7 +856,11 @@ class RulePlanner:
             g = step.step_goal
             ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
             if ready:
-                inst, why_not, cooling_only = self._diagnose_skill(g.skill, g.args_dict, state)
+                rem_inst, rem_why, eff_args = self._apply_nether_preflight(state, g.skill, g.args_dict)
+                if rem_inst is not None:
+                    self._last_selected_goal_id = g.id
+                    return rem_inst, rem_why
+                inst, why_not, cooling_only = self._diagnose_skill(g.skill, eff_args, state)
                 if inst is not None:
                     self._last_selected_goal_id = g.id
                     return inst, f"推进目标 {g.id}（{g.title}）"
@@ -814,6 +900,31 @@ class RulePlanner:
 
         return None, "；".join(reasons[:3]) or f"目标 {ranked[0].step_goal.id} 无可启动技能"
 
+    def _choose_nether_landing_bunker(self, state: State) -> Optional[PlanDecision]:
+        """Prioritize building a 3x3 blast-resistant portal bunker immediately after Nether arrival."""
+        st = state.snapshot()
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        if dim != "the_nether":
+            return None
+        hostile = st.get("nearest_hostile") or {}
+        hdist = 99.0
+        if isinstance(hostile, Mapping) and hostile:
+            try:
+                raw_hdist = float(hostile.get("dist", 99.0))
+                if math.isfinite(raw_hdist):
+                    hdist = raw_hdist
+            except (TypeError, ValueError):
+                pass
+        if hdist < 12.0:
+            return None
+        nether_camp = memo_for(state).get_camp(dimension="the_nether")
+        nether_tier = int(nether_camp.get("shelter_tier", 0)) if isinstance(nether_camp, Mapping) else 0
+        if nether_tier < 1 and _nether_blast_blocks(state) >= 20:
+            nb_sk = self._try_make("build_spawn_shelter", {"mode": "nether_bunker"}, state)
+            if nb_sk is not None:
+                return PlanDecision(nb_sk, "rule", "刚入下界尚未建防恶魂碉堡，优先在传送门周圈建 3×3 圆石碉堡与应急箱")
+        return None
+
     def choose_urgent_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
         """在一切目标之上的致命抢占脱险、生存补给、`safe_mode` 避险与软安全意图处理。"""
         # 致命物理险情（岩浆/濒溺/近身苦力怕 <5 格）必须先于进食与 safe_mode 脱险
@@ -847,12 +958,19 @@ class RulePlanner:
         escape = self._choose_safety_escape(state)
         if escape is not None:
             return escape
+        bunker = self._choose_nether_landing_bunker(state)
+        if bunker is not None:
+            return bunker
         return None
 
     def choose_proactive_survival(self, state: State) -> Optional[PlanDecision]:
         """Sprint 1.4 主动生存策略层（营地存取、受控捡尸、食物底仓、夜宿跳过、铁盾补齐）。"""
         if self.target_goal:
             return None
+
+        bunker = self._choose_nether_landing_bunker(state)
+        if bunker is not None:
+            return bunker
 
         st = state.snapshot()
         hp = float(st.get("health", 20))
@@ -910,16 +1028,12 @@ class RulePlanner:
             if setup_sk is not None:
                 return PlanDecision(setup_sk, "rule", "冷启动石镐与熔炉就绪，自动建出生点营地箱(Tier 0)")
 
-        # 6.6 Tier 1 Blast-Proof Spawn Shelter / Nether Portal Bunker Auto Upgrade
+        # 6.6 Tier 1 Blast-Proof Spawn Shelter Auto Upgrade
         shelter_tier = int(camp.get("shelter_tier", 0)) if isinstance(camp, Mapping) else 0
         if dim == "overworld" and safe_12 and shelter_tier < 1 and total_cobble(state) >= 48:
             sh_sk = self._try_make("build_spawn_shelter", {"mode": "tier1_shelter"}, state)
             if sh_sk is not None:
                 return PlanDecision(sh_sk, "rule", "圆石充足，建造出生点 5x5 圆石防爆避难所(Tier 1)")
-        if dim == "the_nether" and safe_12 and shelter_tier < 1 and total_cobble(state) >= 24:
-            nb_sk = self._try_make("build_spawn_shelter", {"mode": "nether_bunker"}, state)
-            if nb_sk is not None:
-                return PlanDecision(nb_sk, "rule", "下界门旁建造 3x3 防恶魂圆石碉堡")
 
         # 7. Food Reserve Gate & Ready Food/Iron Lease Retrieval
         if has_ready_food_lease(state) and safe_12:
@@ -1139,7 +1253,11 @@ class RulePlanner:
                 g = step.step_goal
                 ready = all(check_item_expr(state, expr) for expr in g.prereq_items)
                 if ready:
-                    inst, _, cooling_only = self._diagnose_skill(g.skill, g.args_dict, state)
+                    rem_inst, rem_why, eff_args = self._apply_nether_preflight(state, g.skill, g.args_dict)
+                    if rem_inst is not None:
+                        self._last_selected_goal_id = g.id
+                        return PlanDecision(rem_inst, "rule", rem_why)
+                    inst, _, cooling_only = self._diagnose_skill(g.skill, eff_args, state)
                     if inst is not None:
                         self._last_selected_goal_id = g.id
                         return PlanDecision(inst, "rule", f"推进目标 {g.id}（{g.title}）")

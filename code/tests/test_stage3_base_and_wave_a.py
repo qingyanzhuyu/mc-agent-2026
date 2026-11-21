@@ -1701,6 +1701,9 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
                 {"name": "iron_ingot", "count": 8},
             ],
         )
+        memo = memo_for(st)
+        for lm in ("village", "pillager_outpost", "trial_chambers", "meadow"):
+            memo.record_landmark(lm, [100, 64, 100], dimension="overworld")
         ranked = rank_actionable_goals(st, active, completed_advs=completed)
         by_step = {step.step_goal.id: step for step in ranked}
 

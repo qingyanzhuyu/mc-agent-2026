@@ -14,7 +14,7 @@ import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Collection, Mapping, Optional
+from typing import Any, Collection, Mapping, Optional, Sequence
 
 from ..runtime import State, has_equipped_armor
 from ..skills import REGISTRY, bind_args
@@ -68,6 +68,7 @@ class GoalSpec:
     held_items: tuple[str, ...] = ()            # 下游所需实物，未指定时沿用 done_items
     gather_when_blocked: bool = False          # 允许主技能先观察复用场景，无法启动时再尝试补料
     done_predicates: tuple[str, ...] = ()      # 子目标/世界记忆复合达成谓词表达式
+    requires_landmarks: tuple[str, ...] = ()   # 静默地标/群系先验门控（支持 "a|b" OR 表达式）
 
     @property
     def args_dict(self) -> dict[str, Any]:
@@ -674,6 +675,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=320.0,
         stage="draft",
+        requires_landmarks=("stronghold",),
     ),
     GoalSpec(
         id="find_fortress",
@@ -718,6 +720,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=180.0,
         stage="draft",
+        requires_landmarks=("trial_chambers",),
     ),
     GoalSpec(
         id="explore_nether",
@@ -748,6 +751,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=150.0,
         stage="draft",
+        requires_landmarks=("village",),
     ),
     GoalSpec(
         id="trim_with_any_armor_pattern",
@@ -776,6 +780,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=240.0,
         stage="draft",
+        requires_landmarks=("bastion_remnant",),
     ),
     GoalSpec(
         id="brew_potion",
@@ -791,6 +796,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=150.0,
         stage="draft",
+        requires_landmarks=("nether_fortress",),
     ),
     GoalSpec(
         id="cure_zombie_villager",
@@ -805,6 +811,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=320.0,
         stage="draft",
+        requires_landmarks=("village",),
     ),
 
     # ---- Stage 2 Batch 2B：下界核心线（7 goals / 230 pts） ----
@@ -837,6 +844,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=180.0,
         stage="draft",
+        requires_landmarks=("nether_fortress",),
     ),
     GoalSpec(
         id="loot_bastion",
@@ -851,6 +859,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=200.0,
         stage="draft",
+        requires_landmarks=("bastion_remnant",),
     ),
     GoalSpec(
         id="charge_respawn_anchor",
@@ -911,6 +920,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=360.0,
         stage="draft",
+        requires_landmarks=("nether_fortress",),
     ),
 
     # ---- Stage 2 Batch 2C：主世界 T2 顺手高分项（14 goals / 260 pts） ----
@@ -974,6 +984,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=180.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("lush_caves",),
     ),
     GoalSpec(
         id="tactical_fishing",
@@ -1021,6 +1032,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=140.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("bee_nest",),
     ),
     GoalSpec(
         id="wax_on",
@@ -1037,6 +1049,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=140.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("bee_nest",),
     ),
     GoalSpec(
         id="wax_off",
@@ -1053,6 +1066,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=100.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("bee_nest",),
     ),
     GoalSpec(
         id="avoid_vibration",
@@ -1068,6 +1082,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("deep_dark",),
     ),
     GoalSpec(
         id="brush_armadillo",
@@ -1083,6 +1098,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("savanna|badlands",),
     ),
     GoalSpec(
         id="walk_on_powder_snow_with_leather_boots",
@@ -1098,6 +1114,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("powder_snow",),
     ),
     GoalSpec(
         id="place_dried_ghast_in_water",
@@ -1114,6 +1131,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("dried_ghast|soul_sand_valley",),
     ),
     GoalSpec(
         id="whos_the_pillager_now",
@@ -1130,6 +1148,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
     ),
 
     # ---- Stage 2 Batch 2D：末地冲刺线（4 goals / 210 pts） ----
@@ -1209,6 +1228,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=200.0,
         stage="draft",
         editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("trial_chambers",),
     ),
     GoalSpec(
         id="who_needs_rockets",
@@ -1224,6 +1244,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=180.0,
         stage="draft",
         editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("trial_chambers",),
     ),
     GoalSpec(
         id="lighten_up",
@@ -1239,6 +1260,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=150.0,
         stage="draft",
         editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("trial_chambers",),
     ),
     GoalSpec(
         id="read_power_of_chiseled_bookshelf",
@@ -1269,6 +1291,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=200.0,
         stage="draft",
         editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("pale_garden",),
     ),
 
     # ---- Stage 2 Batch 2F：群系与生态专项 T3 线（10 goals / 270 pts） ----
@@ -1286,6 +1309,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=260.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("deep_dark",),
     ),
     GoalSpec(
         id="kill_axolotl_target",
@@ -1301,6 +1325,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=260.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("lush_caves",),
     ),
     GoalSpec(
         id="remove_wolf_armor",
@@ -1317,6 +1342,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=220.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("savanna|badlands",),
     ),
     GoalSpec(
         id="repair_wolf_armor",
@@ -1333,6 +1359,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=220.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("savanna|badlands",),
     ),
     GoalSpec(
         id="allay_deliver_item_to_player",
@@ -1348,6 +1375,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=240.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
     ),
     GoalSpec(
         id="ride_a_boat_with_a_goat",
@@ -1363,6 +1391,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=240.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("jagged_peaks|frozen_peaks|snowy_slopes|meadow",),
     ),
     GoalSpec(
         id="silk_touch_nest",
@@ -1378,6 +1407,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=260.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("bee_nest",),
     ),
     GoalSpec(
         id="tadpole_in_a_bucket",
@@ -1393,6 +1423,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=220.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("swamp|mangrove_swamp",),
     ),
     GoalSpec(
         id="spyglass_at_ghast",
@@ -1425,6 +1456,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=200.0,
         stage="draft",
         editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("jungle",),
     ),
 
     # ---- Stage 3 (Wave A, T4_PREP + T4)：高分收口与巧取（2 项准备 + 7 项计分，全部 stage="draft"） ----
@@ -1443,6 +1475,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("pillager_outpost|trial_chambers",),
     ),
     GoalSpec(
         id="prep_two_cakes",
@@ -1460,6 +1493,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=130.0,
         stage="draft",
         editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("village",),
     ),
     GoalSpec(
         id="crafters_crafting_crafters",
@@ -1490,6 +1524,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=180.0,
         stage="draft",
         editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("trial_chambers|archaeology",),
     ),
     GoalSpec(
         id="play_jukebox_in_meadows",
@@ -1505,6 +1540,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=200.0,
         stage="draft",
         editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("meadow",),
     ),
     GoalSpec(
         id="voluntary_exile",
@@ -1520,6 +1556,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=180.0,
         stage="draft",
         editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
     ),
     GoalSpec(
         id="allay_deliver_cake_to_note_block",
@@ -1535,6 +1572,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=190.0,
         stage="draft",
         editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
     ),
     GoalSpec(
         id="elytra",
@@ -1584,6 +1622,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=220.0,
         stage="draft",
         editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+        requires_landmarks=("village",),
     ),
     GoalSpec(
         id="prep_piercing_iv_crossbow",
@@ -1649,6 +1688,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=300.0,
         stage="draft",
         editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+        requires_landmarks=("nether_fortress",),
     ),
     GoalSpec(
         id="prep_nether_star",
@@ -1683,6 +1723,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=340.0,
         stage="draft",
         editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+        requires_landmarks=("bastion_remnant",),
     ),
     GoalSpec(
         id="trade_at_world_height",
@@ -1698,6 +1739,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=180.0,
         stage="draft",
         editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+        requires_landmarks=("village",),
     ),
     GoalSpec(
         id="arbalistic",
@@ -1734,6 +1776,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=120.0,
         stage="draft",
         editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+        requires_landmarks=("bastion_remnant",),
     ),
     GoalSpec(
         id="summon_wither",
@@ -1783,6 +1826,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=160.0,
         stage="draft",
         editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("village",),
     ),
     GoalSpec(
         id="revaulting",
@@ -1798,6 +1842,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=240.0,
         stage="draft",
         editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("trial_chambers",),
     ),
     GoalSpec(
         id="hero_of_the_village",
@@ -1813,6 +1858,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=280.0,
         stage="draft",
         editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("village",),
     ),
     GoalSpec(
         id="totem_of_undying",
@@ -1828,6 +1874,7 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=140.0,
         stage="draft",
         editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("village",),
     ),
 
     # ---- Stage 3 (Wave D, T4)：炽足兽跨维度骑行与三叉戟机会投掷（3 项计分，+150 分，全部 stage="draft"） ----
@@ -2072,6 +2119,61 @@ def is_prereq_satisfied(
     return is_goal_achieved(goal, state, completed_advs, memo=memo)
 
 
+_LANDMARK_DIMS: tuple[str, ...] = ("overworld", "the_nether", "the_end")
+
+
+def _biome_matches(alt: str, visited_biome: str) -> bool:
+    """支持精确群系名与子变种前缀/后缀匹配（如 savanna -> windswept_savanna / savanna_plateau）。"""
+    b = str(visited_biome).removeprefix("minecraft:").strip().lower()
+    if not b or not alt:
+        return False
+    return b == alt or b.startswith(f"{alt}_") or b.endswith(f"_{alt}") or f"_{alt}_" in b
+
+
+def _landmark_req_satisfied(req: str, memo: Any) -> bool:
+    alts = [a.strip().lower() for a in str(req).split("|") if a.strip()]
+    if not alts:
+        return True
+    if memo is None:
+        return False
+    has_lm = getattr(memo, "has_landmark", None)
+    get_biomes = getattr(memo, "biomes", None)
+    for dim in _LANDMARK_DIMS:
+        if callable(has_lm):
+            for alt in alts:
+                if has_lm(alt, dimension=dim):
+                    return True
+        if callable(get_biomes):
+            visited = get_biomes(dimension=dim) or ()
+            for alt in alts:
+                if any(_biome_matches(alt, vb) for vb in visited):
+                    return True
+    return False
+
+
+def goal_landmarks_satisfied(goal: GoalSpec, memo: Any) -> bool:
+    """检查目标所需的全部结构地标/生物群系先验是否已在 WorldResourceMemo 中探明。"""
+    if not goal.requires_landmarks:
+        return True
+    if memo is None:
+        return False
+    return all(_landmark_req_satisfied(req, memo) for req in goal.requires_landmarks)
+
+
+def unmet_required_landmarks(goal: GoalSpec, memo: Any) -> tuple[str, ...]:
+    """返回目标当前尚未在 WorldResourceMemo 中探明的地标/群系先验表达式元组。"""
+    if not goal.requires_landmarks:
+        return ()
+    if memo is None:
+        return tuple(goal.requires_landmarks)
+    return tuple(req for req in goal.requires_landmarks if not _landmark_req_satisfied(req, memo))
+
+
+def chain_landmarks_satisfied(chain: Sequence[GoalSpec], memo: Any) -> bool:
+    """检查未满足前置链路上的每个目标节点是否都满足地标/群系先验。"""
+    return all(goal_landmarks_satisfied(node, memo) for node in chain)
+
+
 # ============================================================================
 # 台账契约核验、阶段过滤与链路性价比排序
 # ============================================================================
@@ -2284,6 +2386,7 @@ def compute_goal_marginal_rois(
     active_goals: Collection[GoalSpec],
     *,
     completed_advs: Collection[str] = (),
+    target_goal: Any = None,
     ep_goal_fails: Optional[Mapping[str, int]] = None,
     ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -2294,6 +2397,7 @@ def compute_goal_marginal_rois(
     resolved_memo = memo if memo is not None else memo_for(state)
     goals_tuple = tuple(active_goals)
     by_id = {g.id: g for g in goals_tuple}
+    target_ids = set(normalize_goal_ids(target_goal))
 
     def _unmet_chain(root: GoalSpec) -> Optional[list[GoalSpec]]:
         chain: list[GoalSpec] = []
@@ -2323,6 +2427,8 @@ def compute_goal_marginal_rois(
             continue
         chain = _unmet_chain(g)
         if not chain:
+            continue
+        if g.id not in target_ids and not chain_landmarks_satisfied(chain, resolved_memo):
             continue
         chains.append((g, chain))
         if g.score > 0:
@@ -2612,6 +2718,8 @@ def rank_actionable_goals(
             continue
         chain = _unmet_chain(g)
         if not chain:
+            continue
+        if g.id not in target_ids and not chain_landmarks_satisfied(chain, resolved_memo):
             continue
         actionable_chains.append((g, chain))
         if g.score > 0:

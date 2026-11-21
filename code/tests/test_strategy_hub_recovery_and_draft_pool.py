@@ -138,7 +138,11 @@ class DraftPoolAndContextTests(unittest.TestCase):
         self.assertIn("strategy=llm", txt)
 
         # 构造带真实坐标的满台账上下文，验证严格 <= 2000 字、零裸坐标、按边际 ROI 截断 Top-K 且保留挂起区
+        from mcagent.skills.world_memo import memo_for
         st = _starter_done_state(pos=(-128.75, 64.0, 419.25))
+        memo = memo_for(st)
+        for lm in ("village", "stronghold", "trial_chambers", "pillager_outpost", "deep_dark", "bee_nest", "lush_caves", "meadow", "powder_snow"):
+            memo.record_landmark(lm, [100, 64, 100], dimension="overworld")
         cp = CampaignPlanner(mode="campaign", strategy="llm", min_verified="offline", include_stages=GOAL_STAGES)
         cp.rules.completed_advancements.update({"minecraft:story/mine_stone", "minecraft:story/upgrade_tools"})
         cp.abandon_goal("smelt_iron", state=st)

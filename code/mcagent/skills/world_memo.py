@@ -71,6 +71,7 @@ STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "trial_vault_ominous": ("vault", "trial_spawner", "chiseled_tuff_bricks"),
 }
 VALID_STATUSES: tuple[str, ...] = ("untested", "reachable", "unreachable", "protected", "depleted")
+SPIRAL_RING_RADII: tuple[int, ...] = (48, 96, 160, 240, 320)
 
 _BLOCK_TO_CATEGORY: dict[str, str] = {b: c for c, bs in CATEGORY_BLOCKS.items() for b in bs}
 _CATEGORY_LABELS: dict[str, str] = {
@@ -112,6 +113,24 @@ def _parse_cell(value: Any) -> Optional[Cell]:
     if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
         return None
     return (int(value[0]), int(value[1]), int(value[2]))
+
+
+def _parse_pair2(value: Any) -> Optional[tuple[int, int]]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+        return None
+    return (int(value[0]), int(value[1]))
+
+
+def _extract_xz(pos: Any) -> tuple[float, float]:
+    if not isinstance(pos, Sequence) or isinstance(pos, (str, bytes, bytearray)) or len(pos) not in (2, 3):
+        raise ValueError(f"非法平面坐标: {pos!r}")
+    x = _finite_float(pos[0])
+    z = _finite_float(pos[-1])
+    if x is None or z is None:
+        raise ValueError(f"非法平面坐标: {pos!r}")
+    return (x, z)
 
 
 def _normalize_stored_items(items: Optional[Mapping[str, Any]]) -> dict[str, int]:
@@ -293,6 +312,10 @@ class WorldResourceMemo:
         self._mine_shafts: dict[str, dict[str, Any]] = {}
         self._last_deaths: dict[str, dict[str, Any]] = {}
         self._spawn_pos: dict[str, Cell] = {}
+        self._visited_grid: dict[str, set[tuple[int, int]]] = {}
+        self._spiral_cursor: dict[str, dict[str, int]] = {}
+        self._spiral_rings_completed: dict[str, int] = {}
+        self._void_edges: dict[str, list[tuple[int, int]]] = {}
         self.landmark_version: int = 0
 
     def __len__(self) -> int:
@@ -312,6 +335,10 @@ class WorldResourceMemo:
             self._mine_shafts.clear()
             self._last_deaths.clear()
             self._spawn_pos.clear()
+            self._visited_grid.clear()
+            self._spiral_cursor.clear()
+            self._spiral_rings_completed.clear()
+            self._void_edges.clear()
             self.landmark_version = 0
 
     def set_spawn(self, pos: Any, *, dimension: str = "overworld", overwrite: bool = False) -> list[int]:
@@ -586,6 +613,89 @@ class WorldResourceMemo:
         dim = _norm_dim(dimension)
         with self._lock:
             return set(self.survey_sectors_done.get(dim, ()))
+
+    def mark_grid_visited(self, pos: Any, *, dimension: str = "overworld") -> tuple[int, int]:
+        """将给定坐标所在的 32×32 粗网格单元标记为已访问并返回单元索引 `(gx, gz)`。"""
+        dim = _norm_dim(dimension)
+        x, z = _extract_xz(pos)
+        cell = (math.floor(x) // 32, math.floor(z) // 32)
+        with self._lock:
+            self._visited_grid.setdefault(dim, set()).add(cell)
+            return cell
+
+    def visited_grid_cells(self, *, dimension: str = "overworld") -> set[tuple[int, int]]:
+        """返回指定维度已访问 32×32 粗网格单元集合的防御性副本。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return set(self._visited_grid.get(dim, ()))
+
+    def is_grid_visited(self, pos: Any, *, dimension: str = "overworld") -> bool:
+        """判断给定坐标所在的 32×32 粗网格单元在指定维度是否已访问。"""
+        dim = _norm_dim(dimension)
+        x, z = _extract_xz(pos)
+        cell = (math.floor(x) // 32, math.floor(z) // 32)
+        with self._lock:
+            return cell in self._visited_grid.get(dim, ())
+
+    def get_spiral_cursor(self, *, dimension: str = "overworld") -> dict[str, int]:
+        """返回指定维度当前螺旋环探索游标 `{"ring", "sector", "radius"}`。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            cur = self._spiral_cursor.get(dim) or {}
+            ring = int(cur.get("ring", 0))
+            sector = int(cur.get("sector", 0))
+            return {"ring": ring, "sector": sector, "radius": SPIRAL_RING_RADII[ring]}
+
+    def advance_spiral_cursor(self, *, dimension: str = "overworld", sectors_per_ring: int = 8) -> dict[str, int]:
+        """推进指定维度的螺旋环探索游标并在完成整环时递增已完成环数与外扩环索引。"""
+        dim = _norm_dim(dimension)
+        n_sec = max(1, int(sectors_per_ring))
+        with self._lock:
+            cur = self._spiral_cursor.get(dim) or {}
+            ring = int(cur.get("ring", 0))
+            sector = int(cur.get("sector", 0))
+            sector += 1
+            if sector >= n_sec:
+                sector = 0
+                self._spiral_rings_completed[dim] = max(self._spiral_rings_completed.get(dim, ring), ring) + 1
+                ring = min(ring + 1, len(SPIRAL_RING_RADII) - 1)
+            self._spiral_cursor[dim] = {"ring": ring, "sector": sector}
+            return {"ring": ring, "sector": sector, "radius": SPIRAL_RING_RADII[ring]}
+
+    def spiral_rings_completed(self, *, dimension: str = "overworld") -> int:
+        """返回指定维度已完成的螺旋环数。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return int(self._spiral_rings_completed.get(dim, (self._spiral_cursor.get(dim) or {}).get("ring", 0)))
+
+    def record_void_edge(self, pos: Any, *, dimension: str = "overworld") -> bool:
+        """记录虚空/悬崖边界点（每维度上限 64 点，12 格内去重）。"""
+        dim = _norm_dim(dimension)
+        x, z = _extract_xz(pos)
+        pt = (math.floor(x), math.floor(z))
+        with self._lock:
+            edges = self._void_edges.get(dim, ())
+            if len(edges) >= 64 or any(math.hypot(pt[0] - ex, pt[1] - ez) <= 12.0 for ex, ez in edges):
+                return False
+            self._void_edges.setdefault(dim, []).append(pt)
+            return True
+
+    def void_edges(self, *, dimension: str = "overworld") -> list[tuple[int, int]]:
+        """返回指定维度已记录虚空边界点列表的防御性副本。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return list(self._void_edges.get(dim, ()))
+
+    def is_near_void_edge(self, pos: Any, *, dimension: str = "overworld", margin: float = 12.0) -> bool:
+        """判断给定平面位置是否靠近已记录的虚空边界点。"""
+        try:
+            x, z = _extract_xz(pos)
+        except ValueError:
+            return False
+        dim = _norm_dim(dimension)
+        lim = float(margin)
+        with self._lock:
+            return any(math.hypot(x - ex, z - ez) < lim for ex, ez in self._void_edges.get(dim, ()))
 
     def record_blocked_region(self, skill_name: str, chunk: tuple, *, ttl_s: float = 120.0) -> None:
         """记录指定技能在目标区块上的临时受阻标记（带 TTL 冷却）。"""
@@ -1069,6 +1179,12 @@ class WorldResourceMemo:
             if shaft := self._mine_shafts.get(dim):
                 summary["has_mine_shaft"] = True
                 summary["mine_shaft_lowest_y"] = int(shaft["lowest_y"])
+            if grid := self._visited_grid.get(dim):
+                summary["visited_grid_count"] = len(grid)
+            if (cursor := self._spiral_cursor.get(dim)) and int(cursor.get("ring", 0)) > 0:
+                summary["spiral_ring"] = int(cursor["ring"])
+            if edges := self._void_edges.get(dim):
+                summary["void_edges_count"] = len(edges)
             return summary
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
@@ -1118,6 +1234,12 @@ class WorldResourceMemo:
                 "primary_mine_shafts": {dim: _copy_shaft(s) for dim, s in self._mine_shafts.items()},
                 "last_deaths": {dim: _copy_death(death) for dim, death in self._last_deaths.items()},
                 "spawn_positions": {dim: list(cell) for dim, cell in self._spawn_pos.items()},
+                "visited_grid": {dim: [list(c) for c in sorted(cells)] for dim, cells in self._visited_grid.items() if cells},
+                "spiral_cursor": {
+                    dim: {"ring": int(cur["ring"]), "sector": int(cur["sector"])}
+                    for dim, cur in self._spiral_cursor.items()
+                },
+                "void_edges": {dim: [list(pt) for pt in edges] for dim, edges in self._void_edges.items() if edges},
             }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1463,6 +1585,61 @@ class WorldResourceMemo:
                         "branch_index": branch_index_out,
                     }
 
+            new_visited_grid: dict[str, set[tuple[int, int]]] = {}
+            if "visited_grid" in data:
+                grid_raw = data["visited_grid"]
+                if not isinstance(grid_raw, Mapping):
+                    return False
+                for raw_dim, cells_raw in grid_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(cells_raw, list):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    parsed_grid: set[tuple[int, int]] = set()
+                    for item in cells_raw:
+                        pair = _parse_pair2(item)
+                        if pair is None:
+                            return False
+                        parsed_grid.add(pair)
+                    if parsed_grid:
+                        new_visited_grid.setdefault(dim, set()).update(parsed_grid)
+
+            new_spiral_cursor: dict[str, dict[str, int]] = {}
+            new_rings_completed: dict[str, int] = {}
+            if "spiral_cursor" in data:
+                cursor_raw = data["spiral_cursor"]
+                if not isinstance(cursor_raw, Mapping):
+                    return False
+                for raw_dim, cur_raw in cursor_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(cur_raw, Mapping):
+                        return False
+                    ring = cur_raw.get("ring")
+                    sector = cur_raw.get("sector")
+                    if isinstance(ring, bool) or not isinstance(ring, int) or not (0 <= ring < len(SPIRAL_RING_RADII)):
+                        return False
+                    if isinstance(sector, bool) or not isinstance(sector, int) or sector < 0:
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    new_spiral_cursor[dim] = {"ring": int(ring), "sector": int(sector)}
+                    new_rings_completed[dim] = int(ring)
+
+            new_void_edges: dict[str, list[tuple[int, int]]] = {}
+            if "void_edges" in data:
+                edges_raw = data["void_edges"]
+                if not isinstance(edges_raw, Mapping):
+                    return False
+                for raw_dim, pts_raw in edges_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(pts_raw, list):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    parsed_pts: list[tuple[int, int]] = []
+                    for item in pts_raw:
+                        pair = _parse_pair2(item)
+                        if pair is None:
+                            return False
+                        parsed_pts.append(pair)
+                    if parsed_pts:
+                        new_void_edges[dim] = parsed_pts[:64]
+
             with self._lock:
                 self._entries = new_entries
                 self._stations = new_stations
@@ -1474,6 +1651,10 @@ class WorldResourceMemo:
                 self._mine_shafts = new_mine_shafts
                 self._last_deaths = new_last_deaths
                 self._spawn_pos = new_spawn_pos
+                self._visited_grid = new_visited_grid
+                self._spiral_cursor = new_spiral_cursor
+                self._spiral_rings_completed = new_rings_completed
+                self._void_edges = new_void_edges
                 self.landmark_version = lv
             return True
         except Exception:
@@ -1520,7 +1701,7 @@ def format_memo_summary(state: Any, **kwargs: Any) -> str:
 
 
 __all__ = [
-    "ALL_LOG_BLOCKS", "BED_BLOCKS", "CATEGORY_BLOCKS", "STRUCTURE_FINGERPRINTS", "VALID_STATUSES",
+    "ALL_LOG_BLOCKS", "BED_BLOCKS", "CATEGORY_BLOCKS", "SPIRAL_RING_RADII", "STRUCTURE_FINGERPRINTS", "VALID_STATUSES",
     "ResourceEntry", "WorldResourceMemo", "classify_block", "structure_tags_for",
     "memo_for", "reset_all_world_memos", "format_memo_summary",
 ]

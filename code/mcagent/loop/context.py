@@ -17,6 +17,7 @@ from ..planner.objective import (
     ObjectiveCandidate,
     SuspendedGoalInfo,
     collect_objective_candidates,
+    effective_include_stages,
     format_objective_candidate_line,
     render_objective_menu,
     render_suspended_section,
@@ -25,7 +26,14 @@ from ..runtime import State, _inv_fingerprint, has_equipped_armor
 from ..skills.items import best_pickaxe
 from ..skills.survival_food import inventory_food_restore
 from ..skills.world_memo import memo_for
-from .goals import GOALS, GoalSpec
+from .goals import (
+    GOALS,
+    GoalSpec,
+    goal_landmarks_satisfied,
+    is_goal_achieved,
+    is_prereq_satisfied,
+    resolve_active_goals,
+)
 from .starter_skills import best_axe, best_food, total_cobble, total_logs, total_planks
 from .subgoals import evaluate_all_subgoals
 
@@ -60,6 +68,19 @@ _LANDMARK_LABELS: dict[str, str] = {
     "deep_dark": "深暗之域",
     "archaeology": "遗迹",
     "powder_snow": "细雪",
+    "pillager_outpost": "前哨站",
+    "nether_fortress": "下界要塞",
+    "bastion_remnant": "堡垒遗迹",
+    "end_city": "末地城",
+    "lush_caves": "繁茂洞穴",
+    "amethyst_geode": "紫水晶晶洞",
+    "pale_garden": "苍白之园",
+    "meadow": "草甸",
+    "swamp": "沼泽",
+    "mangrove_swamp": "红树林沼泽",
+    "dried_ghast": "失水恶魂",
+    "cold_biome": "寒带群系",
+    "trial_vault_ominous": "不祥宝库",
 }
 _RESOURCE_LABELS: dict[str, str] = {
     "wood": "原木",
@@ -265,6 +286,41 @@ def format_subgoal_summary(predicates: Optional[Mapping[str, Any]]) -> str:
     return joined if len(joined) <= 260 else joined[:257] + "..."
 
 
+def count_pending_landmark_goals(
+    active_goals: Sequence[GoalSpec],
+    state: State,
+    completed_advs: Collection[str] = (),
+    memo: Any = None,
+) -> int:
+    """统计激活目标中（自身或未满足前置链）仍缺地标/群系先验的目标数量（零坐标）。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
+    by_id = {g.id: g for g in active_goals}
+    pending = 0
+    for g in active_goals:
+        if is_goal_achieved(g, state, completed_advs, memo=resolved_memo):
+            continue
+        seen: set[str] = set()
+        stack: list[tuple[GoalSpec, bool]] = [(g, True)]
+        needs_landmark = False
+        while stack:
+            node, is_root = stack.pop()
+            if node.id in seen:
+                continue
+            seen.add(node.id)
+            if not is_root and is_prereq_satisfied(node, state, completed_advs, memo=resolved_memo):
+                continue
+            if not goal_landmarks_satisfied(node, resolved_memo):
+                needs_landmark = True
+                break
+            for pid in node.prereq_goals:
+                parent = by_id.get(pid)
+                if parent is not None and parent.id not in seen:
+                    stack.append((parent, False))
+        if needs_landmark:
+            pending += 1
+    return pending
+
+
 def format_world_landmarks(world_landmarks: Optional[Mapping[str, Any]]) -> str:
     """将世界资源与地标摘要格式化为脱敏中文单行（空世界返回空串，长度 <= 200 字符）。"""
     if not world_landmarks or not isinstance(world_landmarks, Mapping):
@@ -307,6 +363,10 @@ def format_world_landmarks(world_landmarks: Optional[Mapping[str, Any]]) -> str:
                     res_parts.append(f"{res_label}={int(cnt)}")
         if res_parts:
             parts.append(f"资源({', '.join(res_parts)})")
+
+    raw_pending = world_landmarks.get("pending_landmark_goals", 0)
+    if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) and raw_pending > 0:
+        parts.append(f"待勘探目标={raw_pending}项")
 
     if not parts:
         return ""
@@ -523,6 +583,12 @@ def build_decision_context(
         if world_landmarks is not None
         else (dict(memo.summary_for_context(dimension=dim)) if hasattr(memo, "summary_for_context") else {})
     )
+    if world_landmarks is None and not focus_goals:
+        eff_stages = effective_include_stages(min_verified, include_stages)
+        active_pool = resolve_active_goals(tuple(ledger), include_stages=eff_stages)
+        pending_cnt = count_pending_landmark_goals(active_pool, state, completed_advs, memo)
+        if pending_cnt > 0:
+            resolved_landmarks["pending_landmark_goals"] = pending_cnt
     subgoal_summary_str = format_subgoal_summary(resolved_subgoals)
 
     return DecisionContext(

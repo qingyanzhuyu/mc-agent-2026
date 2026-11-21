@@ -577,6 +577,8 @@ class ScoutIsland(Skill):
         st, cur = _refresh_stance(ex, state)
         scout_start_pos = list(cur)
         dim, memo, r = _dim_of(st), memo_for(state), int(self.args["radius"])
+        if _is_valid_pos3(cur):
+            memo.mark_grid_visited(cur, dimension=dim)
         summary = ex.client.find_blocks(radius=r, limit=64)
         memo.ingest_find_blocks(summary, dimension=dim, origin=st)
         hits = _scout_hits(summary)
@@ -587,6 +589,7 @@ class ScoutIsland(Skill):
             trail = MINE_TRAILS[-1]
             indices = list(range(len(trail) - 1, -1, -10)) + ([0] if (len(trail) - 1) % 10 != 0 else [])
             trail_nav_failed = False
+            moved_trail = False
             for idx in indices:
                 if idx == len(trail) - 1:
                     continue
@@ -600,8 +603,11 @@ class ScoutIsland(Skill):
                     trail_nav_failed = True
                     yield rec("move_to", pos=wp, fingerprints=hits, error_code=code)
                     break
+                moved_trail = True
                 yield rec("move_to", moved_up, pos=wp, fingerprints=hits)
             st, cur = _refresh_stance(ex, state)
+            if moved_trail and _is_valid_pos3(cur):
+                memo.mark_grid_visited(cur, dimension=dim)
             if MINE_TRAILS and MINE_TRAILS[-1] is trail and (cur[1] >= trail[0][1] - 1.5 or (trail_nav_failed and cur[1] >= 62.0)):
                 MINE_TRAILS.pop()
 
@@ -613,15 +619,31 @@ class ScoutIsland(Skill):
 
         # limit 适度放大至 250~350 以覆盖近处地表之外的远端陆地（bot_session.js 上限 500）
         land = ex.client.find_blocks(types=list(SAFE_GROUND), radius=min(r, 28), limit=min(350, max(250, r * 7)))
+        visited_grid = memo.visited_grid_cells(dimension=dim)
+        cursor = memo.get_spiral_cursor(dimension=dim)
+        theta = 2.0 * math.pi * (int(cursor["sector"]) % 8) / 8.0
+        sux, suz = math.cos(theta), math.sin(theta)
+        spawn = memo.get_spawn(dimension=dim)
+        if spawn is not None:
+            vx = float(spawn[0]) + float(cursor["radius"]) * sux - float(cur[0])
+            vz = float(spawn[2]) + float(cursor["radius"]) * suz - float(cur[2])
+            if (vlen := math.hypot(vx, vz)) >= 4.0:
+                sux, suz = vx / vlen, vz / vlen
         recent_anchors = VISITED_ANCHORS[-24:]
         cands, climb_cands = [], []
         for b in (land.get("blocks") or []):
             p = b.get("pos")
             if not (isinstance(p, list) and len(p) == 3) or _is_protected(p, radius=8.0):
                 continue
+            if memo.is_near_void_edge(p, dimension=dim, margin=8.0):
+                continue
             dist = math.hypot(p[0] - cur[0], p[2] - cur[2])
             visited_pen = sum(2 if d < 8.0 else (1 if d < 14.0 else 0)
                               for vx, vz in recent_anchors for d in (math.hypot(p[0] - vx, p[2] - vz),))
+            in_visited_grid = (math.floor(p[0]) // 32, math.floor(p[2]) // 32) in visited_grid
+            # 仅对远距候选（>=12 格）优先奖励未访 32x32 粗网格，避免贴着网格边界的 5-9 格碎步压过 20+ 格远移
+            grid_visited_pen = 0 if (not in_visited_grid and dist >= 12.0) else 1
+            spiral_proj = (p[0] - cur[0]) * sux + (p[2] - cur[2]) * suz
             if target_wood is not None:
                 cw = eye_to_block_dist({"pos": [p[0] + 0.5, p[1] + 1.0, p[2] + 0.5], "sneaking": st.get("sneaking")}, target_wood.pos)
                 closer_to_wood = 0 if cw < cur_wood_dist - 8.0 else 1
@@ -629,9 +651,9 @@ class ScoutIsland(Skill):
             else:
                 closer_to_wood, wood_order = 1, -dist
             if dist >= 5.0 and abs(p[1] - cur[1]) <= 10.0:
-                cands.append((visited_pen, -dist, closer_to_wood, wood_order, p))
+                cands.append((grid_visited_pen, visited_pen, -dist, closer_to_wood, wood_order, -spiral_proj, p))
             elif dist >= 3.0 and 10.0 < (p[1] - cur[1]) <= 28.0:
-                climb_cands.append((visited_pen, p[1] - cur[1], closer_to_wood, wood_order, p))
+                climb_cands.append((grid_visited_pen, visited_pen, p[1] - cur[1], closer_to_wood, wood_order, -spiral_proj, p))
 
         attempted_recovery, attempted_water_escape = False, False
 
@@ -646,6 +668,8 @@ class ScoutIsland(Skill):
             st, cur = _refresh_stance(ex, state)
             if esc_res or not st.get("in_water") or math.dist(cur, before_esc) >= 0.8:
                 VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
+                if _is_valid_pos3(cur):
+                    memo.mark_grid_visited(cur, dimension=dim)
                 return True
             return False
 
@@ -813,6 +837,8 @@ class ScoutIsland(Skill):
             if escaped_up:
                 RECENT_RECOVERY_LANDINGS.clear()
                 VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
+                if _is_valid_pos3(cur):
+                    memo.mark_grid_visited(cur, dimension=dim)
             return escaped_up
 
         def _recover_with_guard(dest_hint) -> Generator[dict, None, bool]:
@@ -830,6 +856,8 @@ class ScoutIsland(Skill):
                     return True
                 raise
             VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
+            if _is_valid_pos3(arrived):
+                memo.mark_grid_visited(arrived, dimension=dim)
             return True
 
         def _try_underground_surface_escape() -> Generator[dict, None, bool]:
@@ -870,6 +898,8 @@ class ScoutIsland(Skill):
                 yield rec("move_to", moved_s, pos=dest, fingerprints=hits)
                 st, cur = _refresh_stance(ex, state)
                 VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
+                if _is_valid_pos3(cur):
+                    memo.mark_grid_visited(cur, dimension=dim)
                 return True
 
             # 2) 若周边全封死在地下或地表凹坑且背包有镐，安全向上开 1~2 级 1x2 阶梯脱困
@@ -884,11 +914,15 @@ class ScoutIsland(Skill):
                 return
             raise Replan("周边未找到可安全落脚的新陆地方块（防虚空不盲走）")
 
-        # 落水时先找最近的干燥落脚点；在陆地上优先低惩罚组，缺木时同组优先靠近已知远木，否则优先未访问远端。
-        cands.sort(key=(lambda x: (-x[1], x[0])) if st.get("in_water") else (lambda x: (x[0], x[2], x[3], x[1])))
-        climb_cands.sort(key=lambda x: (x[0], x[1]))
+        # 落水时先找最近的干燥落脚点；在陆地上优先低惩罚组，缺木时同组优先靠近已知远木，否则优先沿螺旋外推方向探索未访问 32x32 网格。
+        cands.sort(
+            key=(lambda x: (-x[2], x[1]))
+            if st.get("in_water")
+            else (lambda x: (x[3], x[0], x[1], x[4] if target_wood is not None else x[5], x[2]))
+        )
+        climb_cands.sort(key=lambda x: (x[0], x[1], x[2]))
         checked, attempts, last_nav_err = [], 0, None
-        for _, _, _, _, chosen in cands + climb_cands:
+        for *_, chosen in cands + climb_cands:
             dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
             if any(math.dist(dest, old) < 3.0 for old in checked):
                 continue
@@ -924,6 +958,8 @@ class ScoutIsland(Skill):
             yield rec("move_to", moved, pos=dest, fingerprints=hits)
             arrived = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
             VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
+            if _is_valid_pos3(arrived):
+                memo.mark_grid_visited(arrived, dimension=dim)
             return
 
         if (yield from _try_water_escape()):
@@ -931,10 +967,10 @@ class ScoutIsland(Skill):
         if attempts == 0 and (yield from _try_underground_surface_escape()):
             return
         if not attempted_recovery:
-            fallback_dest = cands[0][4] if cands else (list(target_wood.pos) if target_wood is not None else None)
+            fallback_dest = cands[0][-1] if cands else (list(target_wood.pos) if target_wood is not None else None)
             if (yield from _recover_with_guard(fallback_dest)):
                 return
-        if any(c[4][1] > cur[1] + 1.5 for c in cands + climb_cands):
+        if any(c[-1][1] > cur[1] + 1.5 for c in cands + climb_cands):
             if (yield from _try_staircase_climb_out(allow_above_sea=True)):
                 return
         if last_nav_err is not None:
