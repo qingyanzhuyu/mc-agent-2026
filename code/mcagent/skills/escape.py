@@ -1031,7 +1031,12 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     h_dist_raw = hostile.get("dist") if isinstance(hostile, dict) else None
     h_dist = float(h_dist_raw) if isinstance(h_dist_raw, (int, float)) and not isinstance(h_dist_raw, bool) else 99.0
     is_creeper = h_name == "creeper"
-    is_ranged = h_name in _RANGED_HOSTILES
+    recent_hurt_info = state.get_recent_hurt(max_age_s=6.0) if hasattr(state, "get_recent_hurt") else None
+    hurt_src_now = str(recent_hurt_info.get("source") or "").strip().lower() if isinstance(recent_hurt_info, dict) else ""
+    hurt_ent_now = recent_hurt_info.get("source_entity") if isinstance(recent_hurt_info, dict) and isinstance(recent_hurt_info.get("source_entity"), dict) else {}
+    hurt_ent_name = bare(hurt_ent_now.get("name")).strip().lower() if hurt_ent_now else ""
+    recent_hurt_ranged = hurt_src_now in ("arrow", "trident") or hurt_ent_name in _RANGED_HOSTILES
+    is_ranged = (h_name in _RANGED_HOSTILES) or recent_hurt_ranged
 
     # 无敌对生物时的 void_risk 脱险：禁止执行盲目 12 格 move_to + 悬崖疾跑跳，仅就近踏上已确认实心干地
     if not hostile and not _collect_nearby_hostiles(ex, px, py, pz, hostile, radius=18):
@@ -1546,7 +1551,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     )
                     away_yaw = math.atan2(-ux, -uz)
 
-    flee_stride = 16.0 if is_creeper else 12.0
+    flee_stride = 18.0 if (is_ranged and not has_shield) else (16.0 if is_creeper else 12.0)
     if not (st_cur.get("in_water") or st_cur.get("submerged")):
         # 干地逃离若远端落点伸入河道，收缩落点到入水前的干地岸段，防止 move_to 把角色带下水
         if _path_enters_water(ex, px, py, pz, ux, uz, cache, dim, probes=(6, 8, 10, 12, int(flee_stride))):
@@ -1582,7 +1587,40 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         )
         safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim)
         if safe_retry_yaw is not None:
-            yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_retry_yaw, ms=800)
+            before_retry = (px, py, pz)
+            ok_rt, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_retry_yaw, ms=800)
+            # 无盾遭远程弓箭/三叉戟追射（骷髅仇恨/射程 16~20 格）：若首段兜底疾跑通畅（>=2m）但敌怪仍在 18m 内且无掩体遮挡，
+            # 顺势补第二段 800ms 疾跑跳一次性拉断 16m 仇恨链，避免停在 14.8m 空地 4s 后再挨箭
+            if ok_rt and is_ranged and not has_shield:
+                st_rt2 = _refresh_status(ex, state)
+                if st_rt2.get("alive") is False:
+                    return False
+                rt2_pos = st_rt2.get("pos")
+                rt2_nh = st_rt2.get("nearest_hostile") or {}
+                rt2_d = rt2_nh.get("dist") if isinstance(rt2_nh, dict) else None
+                if (
+                    isinstance(rt2_pos, (list, tuple))
+                    and len(rt2_pos) >= 3
+                    and math.dist(before_retry, (float(rt2_pos[0]), float(rt2_pos[1]), float(rt2_pos[2]))) >= 2.0
+                    and isinstance(rt2_d, (int, float))
+                    and not isinstance(rt2_d, bool)
+                    and float(rt2_d) < 18.0
+                ):
+                    px2, py2, pz2 = float(rt2_pos[0]), float(rt2_pos[1]), float(rt2_pos[2])
+                    in_w2 = bool(st_rt2.get("in_water") or st_rt2.get("submerged"))
+                    ux2, uz2, hpos2 = _resolve_flee_vector(
+                        ex, px2, py2, pz2, rt2_nh, cache, dim, state=state,
+                        avoid_water=not in_w2, in_water=in_w2,
+                    )
+                    if not (hpos2 is not None and _is_ranged_los_blocked(ex, px2, py2, pz2, hpos2, cache, dim)):
+                        yaw2 = (
+                            _pick_alternate_escape_yaw(ex, px2, py2, pz2, ux2, uz2, cache, dim, tried_yaws=tried_yaws)
+                            if _is_yaw_wall_blocked(ex, px2, py2, pz2, ux2, uz2, cache, dim)
+                            else math.atan2(-ux2, -uz2)
+                        )
+                        safe_yaw2 = _pick_cliff_safe_yaw(ex, px2, py2, pz2, yaw2, cache, dim)
+                        if safe_yaw2 is not None:
+                            yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_yaw2, ms=800)
         elif has_shield:
             # 四周有悬崖/岩浆无法疾跑且寻路失败：持盾面向敌群最优方向短暂格挡保命
             shield_up = _set_shield(ex, state, True)

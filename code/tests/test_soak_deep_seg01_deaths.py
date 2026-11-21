@@ -1580,6 +1580,65 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         st_obj.set_safety_intent({"kind": "flee", "severity": "urgent", "why": "近身苦力怕"})
         self.assertTrue(_has_active_threat(st_obj, st_snap))
 
+    def test_seg15_arrow_hurt_chains_second_sprint_burst_to_break_skeleton_16m_range(self) -> None:
+        # 复现 seg-15 INC-001（t=45..78s）：空手无盾夜间被骷髅 155783 远射（source="arrow"），
+        # move_to(2.2s) 超时后首段兜底疾跑仍停在 14.8m 空地（<18m 射程内），必须顺势补第二段 800ms 疾跑跳一次性拉断 16m 仇恨
+        from mcagent.client import ApiError
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks = {(x, 70, z): "grass_block" for x in range(-80, -30) for z in range(-5, 30)}
+
+        class _HilltopSkeletonWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-64.0, 71.0, 12.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=16.0, food=20, armor_points=0,
+                    is_day=False,
+                    nearest_hostile={"id": 156003, "name": "zombie", "dist": 9.4, "pos": [-73.4, 71.0, 12.5]},
+                )
+                self.controls = 0
+                self.move_targets: list[list[float]] = []
+
+            def move_to(self, *args, **kwargs):
+                pos = kwargs.get("pos") or (args[0] if args else None)
+                if pos:
+                    self.move_targets.append(list(pos))
+                # 模拟 2.2s 超时前走了 7m
+                self.st["pos"] = [-57.0, 71.0, 12.5]
+                self.st["nearest_hostile"] = {"id": 155783, "name": "skeleton", "dist": 12.0, "pos": [-69.0, 71.0, 12.5]}
+                raise ApiError("timeout", "timeout")
+
+            def control(self, **kwargs):
+                self.controls += 1
+                if self.controls == 1:
+                    self.st["pos"] = [-52.5, 71.0, 12.5]
+                    self.st["nearest_hostile"] = {"id": 155783, "name": "skeleton", "dist": 16.5, "pos": [-69.0, 71.0, 12.5]}
+                    return {"pos": list(self.st["pos"]), "moved": 4.5}
+                self.st["pos"] = [-47.5, 71.0, 12.5]
+                self.st["nearest_hostile"] = {"id": 155783, "name": "skeleton", "dist": 21.5, "pos": [-69.0, 71.0, 12.5]}
+                return {"pos": list(self.st["pos"]), "moved": 5.0}
+
+        w = _HilltopSkeletonWorld()
+        ex, state = w.session()
+        state.last_hurt_at = time.monotonic()
+        state.last_hurt_info = {
+            "source": "arrow",
+            "damage": 4,
+            "source_entity": {"id": 155783, "name": "skeleton"},
+        }
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(w.controls, 2, "must chain second 800ms sprint burst while still inside 18m arrow range")
+        # 确认无盾受箭时 flee_stride 已扩展为 18.0m（相对起点 -64.0 落点 ~ -46.0）
+        self.assertTrue(w.move_targets)
+        self.assertGreaterEqual(abs(w.move_targets[0][0] - (-64.0)), 17.5)
+
 
 if __name__ == "__main__":
     unittest.main()
