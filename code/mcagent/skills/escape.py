@@ -23,6 +23,7 @@ PLACE_EYE_REACH: float = DIG_EYE_REACH
 _WATER_BLOCKS = frozenset({"water", "flowing_water", "bubble_column"})
 _FLUID_OR_FIRE = _WATER_BLOCKS | {"lava", "flowing_lava", "fire", "soul_fire"}
 _RANGED_HOSTILES = frozenset({"skeleton", "stray", "bogged", "pillager", "parched"})
+_FAST_PURSUERS = frozenset({"spider", "cave_spider", "baby_zombie"})
 _SOFT_OVERHANG = frozenset({
     "dirt", "grass_block", "coarse_dirt", "rooted_dirt",
     "sand", "red_sand", "clay", "mud", "gravel", "snow", "snow_block",
@@ -1026,6 +1027,51 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
                     if math.dist(before_burst, (px, py, pz)) < 1.5:
                         burst_blocked = True
+
+    # 高速追击怪（蜘蛛/洞穴蜘蛛/小僵尸，移速高于 move_to 步行 4.3m/s）：禁止用 5s 慢速 move_to 站桩挨咬，直接连续防跳崖疾跑跳拉脱
+    if h_name in _FAST_PURSUERS and h_dist < 8.5:
+        sprint_supported = True
+        fast_safe_dist = max(10.0, effective_hostile_flee_dist(state, h_name))
+        for _ in range(3):
+            if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim) or burst_blocked:
+                cand_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+            else:
+                cand_yaw = away_yaw
+            safe_fast_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, cand_yaw, cache, dim)
+            if safe_fast_yaw is None:
+                sprint_supported = False
+                break
+            before_fast = (px, py, pz)
+            ok_fast, err_fast = yield from _control_step(
+                ex, forward=True, sprint=True, jump=True, yaw=safe_fast_yaw, ms=900,
+            )
+            if not ok_fast and err_fast == "unsupported_api":
+                sprint_supported = False
+                break
+            st_mid = _refresh_status(ex, state)
+            if st_mid.get("alive") is False:
+                return False
+            mid_pos = st_mid.get("pos")
+            if isinstance(mid_pos, (list, tuple)) and len(mid_pos) >= 3:
+                px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+                burst_blocked = math.dist(before_fast, (px, py, pz)) < 1.5
+            mid_hostile = st_mid.get("nearest_hostile") or {}
+            if not isinstance(mid_hostile, dict) or not mid_hostile:
+                return True
+            md = mid_hostile.get("dist")
+            if isinstance(md, (int, float)) and not isinstance(md, bool) and float(md) >= fast_safe_dist:
+                return True
+            ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, mid_hostile, cache, dim, state=state)
+            away_yaw = math.atan2(-ux, -uz)
+        if sprint_supported:
+            st_after_fast = _refresh_status(ex, state)
+            ah = st_after_fast.get("nearest_hostile") or {}
+            if not isinstance(ah, dict) or not ah:
+                return True
+            ad = ah.get("dist")
+            if isinstance(ad, (int, float)) and not isinstance(ad, bool) and float(ad) >= effective_hostile_flee_dist(state, h_name):
+                return True
+            return math.dist((px, py, pz), [float(pos[0]), float(pos[1]), float(pos[2])]) >= 3.0
 
     flee_stride = 16.0 if is_creeper else 12.0
     moved = yield from _move_to_bounded(

@@ -95,18 +95,34 @@ class Soak5hSeg05SurvivalTests(unittest.TestCase):
         self.assertTrue(st_pit.get_support().get("risk"))
 
     def test_flee_adds_sprint_burst_when_spider_still_close_after_move_to(self) -> None:
-        """move_to 寻路禁疾跑被高速蜘蛛紧追（<5.5 格）时，必须补一次疾跑跳拉脱。"""
-        world = EscapeWorld(
+        """高速蜘蛛近距追击直接用连续疾跑跳拉脱；普通敌怪 move_to 结束后仍紧贴（<5.5 格）时补一次疾跑跳拉脱。"""
+        # 1) 高速蜘蛛（6m/s > move_to 4.3m/s）：跳过慢速 move_to 直接疾跑跳拉脱
+        world_spider = EscapeWorld(
             pos=(0.5, 64.0, 0.5),
             nearest_hostile={"name": "spider", "pos": [0.5, 64.0, 3.5], "dist": 3.0},
         )
-        # 模拟 move_to 走完但蜘蛛一路追上，落点距蜘蛛仍仅 3.2 格
+        world_spider.on_control = lambda _: world_spider.st.update({
+            "pos": [0.5, 64.0, -25.5],
+            "nearest_hostile": {"name": "spider", "pos": [0.5, 64.0, -14.3], "dist": 11.2},
+        })
+        ex_s, state_s = world_spider.session()
+        ok_s, _ = _drive_result(escape_hazard_step(ex_s, state_s, "flee"), ex_s)
+        self.assertTrue(ok_s)
+        self.assertEqual(ex_s.acts, ["control"])
+        self.assertTrue(world_spider.control_requests[0]["sprint"])
+        self.assertTrue(world_spider.control_requests[0]["jump"])
+
+        # 2) 普通敌怪 move_to 走完仍紧追（<5.5 格）：补一次疾跑跳拉脱
+        world = EscapeWorld(
+            pos=(0.5, 64.0, 0.5),
+            nearest_hostile={"name": "zombie", "pos": [0.5, 64.0, 3.5], "dist": 3.0},
+        )
         world.on_move = lambda dest: world.st.update({
-            "nearest_hostile": {"name": "spider", "pos": [dest[0], dest[1], dest[2] + 3.2], "dist": 3.2},
+            "nearest_hostile": {"name": "zombie", "pos": [dest[0], dest[1], dest[2] + 3.2], "dist": 3.2},
         })
         world.on_control = lambda _: world.st.update({
             "pos": [0.5, 64.0, -25.5],
-            "nearest_hostile": {"name": "spider", "pos": [0.5, 64.0, -14.3], "dist": 11.2},
+            "nearest_hostile": {"name": "zombie", "pos": [0.5, 64.0, -14.3], "dist": 11.2},
         })
         ex, state = world.session()
 

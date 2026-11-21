@@ -427,7 +427,9 @@ def counterattack_hostile(
         except (ApiError, Replan):
             pass
 
-    target_is_ranged = bare(decision.target.get("name")).strip().lower() in RANGED_MOBS
+    target_name = bare(decision.target.get("name")).strip().lower()
+    target_is_ranged = target_name in RANGED_MOBS
+    target_is_fast_melee = target_name in ("spider", "cave_spider")
     cooldown_s = weapon_cooldown_s(decision.weapon)
     hits_per_round = 1 if (has_shield and (target_is_ranged or bare(decision.weapon).endswith("_axe"))) else 2
     shield_raised, last_hit_at = False, 0.0
@@ -437,7 +439,9 @@ def counterattack_hostile(
             if round_idx > 0:
                 wait_attack_cooldown(last_hit_at, max(cooldown_s, 0.85) if (shield_raised and target_is_ranged) else cooldown_s)
             st = _refresh_st(ex, state)
-            if st.get("alive") is False or _num(st.get("health"), 20.0) < 10.0 or st.get("in_lava") or st.get("submerged"):
+            hp_now = _num(st.get("health"), 20.0)
+            hard_hp_floor = 6.0 if (round_idx >= 1 and target_is_fast_melee) else 10.0
+            if st.get("alive") is False or hp_now < hard_hp_floor or st.get("in_lava") or st.get("submerged"):
                 return False
 
             all_hostiles = observe_nearby_hostiles(ex, state, radius=16.0)
@@ -446,6 +450,9 @@ def counterattack_hostile(
                 return True
             if (len(hostiles) >= 3 or (outer_ranged and not has_shield)
                     or any(bare(h.get("name")).strip().lower() == "creeper" and _num(h.get("dist"), 99.0) <= 6.5 for h in hostiles)):
+                return False
+            # 仅当面对单只已被打残的高速蜘蛛且无远程支援时允许 6..10 HP 补刀击杀，避免转身慢跑被咬死
+            if hp_now < 10.0 and not (round_idx >= 1 and target_is_fast_melee and len(hostiles) == 1 and not outer_ranged):
                 return False
 
             cur_target = next((h for h in hostiles if h.get("id") == target_id), None)

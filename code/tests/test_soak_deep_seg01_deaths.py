@@ -20,6 +20,7 @@ from mcagent.client import ApiError
 from mcagent.loop import RulePlanner, reset_world_memo
 from mcagent.runtime import Executor, Safety, SafetyMonitor, State
 from mcagent.skills import base as skill_base
+from mcagent.skills.combat_eval import TacticalDecision, counterattack_hostile, decide_combat_or_flee
 from mcagent.skills.escape import _is_ranged_los_blocked, _resolve_flee_vector
 from mcagent.skills.mine_return import return_to_surface_from_mine
 from mcagent.skills.safety_escape import EmergencyEscape
@@ -439,6 +440,97 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
             pass
         self.assertGreaterEqual(len(w.dug), 3, f"expected hand-dig stone anti-softlock climb out, steps={steps}")
         self.assertGreaterEqual(w.st["pos"][1], 45.0)
+
+    def test_flee_fast_pursuer_spider_uses_sprint_bursts_not_slow_move_to(self) -> None:
+        # 复现 seg-02 t=817s 蜘蛛追杀：蜘蛛移速 6m/s 高于 move_to 4.3m/s，近距逃跑必须用连续疾跑跳而非慢速 move_to
+        blocks = {(x, 63, z): "grass_block" for x in range(-25, 25) for z in range(-25, 25)}
+
+        class _SpiderChaseWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 64.0, 0.5], items={})
+                self.move_calls = 0
+                self.control_calls = 0
+                self.st.update(
+                    dimension="overworld",
+                    ready=True,
+                    alive=True,
+                    health=7.5,
+                    nearest_hostile={"id": 119482, "name": "spider", "dist": 4.0, "pos": [0.5, 64.0, -3.5]},
+                )
+
+            def get_entities(self, radius=32, types=None):
+                d = math.dist(self.st["pos"][:3], [0.5, 64.0, -3.5])
+                return {"entities": [{"id": 119482, "type": "hostile", "name": "spider", "pos": [0.5, 64.0, -3.5], "dist": d}]}
+
+            def move_to(self, *args, **kwargs):
+                self.move_calls += 1
+                return super().move_to(*args, **kwargs)
+
+            def control(self, **kwargs):
+                self.control_calls += 1
+                yaw = float(kwargs.get("yaw", 0.0))
+                self.st["pos"] = [
+                    self.st["pos"][0] - math.sin(yaw) * 4.5,
+                    64.0,
+                    self.st["pos"][2] - math.cos(yaw) * 4.5,
+                ]
+                d = math.dist(self.st["pos"][:3], [0.5, 64.0, -3.5])
+                self.st["nearest_hostile"] = {"id": 119482, "name": "spider", "dist": d, "pos": [0.5, 64.0, -3.5]}
+                return {"ms": kwargs.get("ms", 900), "pos": list(self.st["pos"]), "moved": 4.5}
+
+        w = _SpiderChaseWorld()
+        ex, state = w.session()
+        drive(EmergencyEscape(intent="flee"), ex, state)
+        self.assertEqual(w.move_calls, 0, "must not use slow non-sprinting move_to while chased by spider")
+        self.assertGreaterEqual(w.control_calls, 2)
+
+    def test_counterattack_finishes_wounded_lone_spider_at_7_5_hp(self) -> None:
+        # 复现 seg-02 t=808s：石剑首轮已重创蜘蛛至残血，次轮 hp=7.5 时面对落单蜘蛛应直接补刀击杀而非转身被咬死
+        from unittest.mock import patch
+
+        class _FinishSpiderWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks={(x, 63, z): "grass_block" for x in range(-5, 6) for z in range(-5, 6)},
+                                 pos=[0.5, 64.0, 0.5], items={"stone_sword": 1})
+                self.attack_rounds = 0
+                self.spider_alive = True
+                self.st.update(
+                    dimension="overworld",
+                    ready=True,
+                    alive=True,
+                    health=14.0,
+                    held={"name": "stone_sword", "count": 1},
+                    nearest_hostile={"id": 119482, "name": "spider", "dist": 2.0, "pos": [2.5, 64.0, 0.5]},
+                )
+
+            def get_entities(self, radius=32, types=None):
+                if not self.spider_alive:
+                    return {"entities": []}
+                return {"entities": [{"id": 119482, "type": "hostile", "name": "spider", "pos": [2.5, 64.0, 0.5], "dist": 2.0}]}
+
+            def attack(self, entity_id, timeout_ms=20000, **kwargs):
+                self.attack_rounds += 1
+                if self.attack_rounds == 1:
+                    self.st["health"] = 7.5
+                    return {"killed": False, "hits": 2}
+                self.spider_alive = False
+                self.st["nearest_hostile"] = None
+                return {"killed": True, "hits": 2}
+
+        w = _FinishSpiderWorld()
+        ex, state = w.session()
+        dec = decide_combat_or_flee(ex, state)
+        self.assertEqual(dec.action, "fight")
+        with patch("mcagent.skills.combat_eval.wait_attack_cooldown", return_value=None):
+            gen = counterattack_hostile(ex, state, dec)
+            ok = False
+            try:
+                while True:
+                    next(gen)
+            except StopIteration as stop:
+                ok = bool(stop.value)
+        self.assertTrue(ok, "expected counterattack_hostile to finish lone wounded spider at 7.5 HP")
+        self.assertEqual(w.attack_rounds, 2)
 
 
 if __name__ == "__main__":
