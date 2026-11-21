@@ -1830,7 +1830,25 @@ class BotSession {
         }
         const foodBefore = bot.food;
         const healthBefore = round1(bot.health);
-        await bot.consume();
+        try {
+          await bot.consume();
+        } catch (err) {
+          try { bot.deactivateItem(); } catch (_) {}
+          if (signal.aborted) {
+            signal.throwIfAborted();
+          }
+          if (err instanceof ApiBizError) {
+            throw err;
+          }
+          const msg = String(err && err.message ? err.message : err || "");
+          if (/timed?\s*out/i.test(msg)) {
+            throw new ApiBizError("timeout", `Consume timed out: ${msg}`);
+          }
+          if (/aborted|interrupt|cancelled|canceled|stopped/i.test(msg)) {
+            throw new ApiBizError("interrupted", `Consume interrupted: ${msg}`);
+          }
+          throw err;
+        }
         return {
           used: itemName,
           food_before: foodBefore,

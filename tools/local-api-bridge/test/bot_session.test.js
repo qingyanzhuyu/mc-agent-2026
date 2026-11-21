@@ -284,3 +284,24 @@ test("stop() and disconnect() release busy mutex when Mineflayer dig() hangs for
   assert.equal(session.busy, null);
   await digRejected2;
 });
+
+test("useItem(food) maps Mineflayer consume 'Promise timed out.' to timeout (not bad_args)", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.food = 14;
+  bot.health = 10;
+  let deactivated = false;
+  bot.deactivateItem = () => { deactivated = true; };
+  bot.equip = async () => {};
+  bot.inventory.items = () => [{ name: "chicken", count: 2, slot: 36 }];
+  bot.consume = async () => {
+    throw new Error("Promise timed out.");
+  };
+
+  await assert.rejects(
+    session.useItem({ item: "chicken" }),
+    (err) => err && err.code === "timeout"
+  );
+  assert.equal(deactivated, true);
+  assert.equal(session.busy, null);
+});
