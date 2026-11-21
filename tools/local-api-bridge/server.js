@@ -359,7 +359,7 @@ function createBridgeServer(opts = {}) {
       const errMsg = err && err.message ? err.message : String(err);
       const fallbackCode = (/windowOpen/i.test(errMsg) || /did not fire within timeout/i.test(errMsg))
         ? "window_timeout"
-        : "bad_args";
+        : (/Digging aborted/i.test(errMsg) ? "interrupted" : "bad_args");
       return sendJson(res, 200, {
         ok: false,
         ms,
