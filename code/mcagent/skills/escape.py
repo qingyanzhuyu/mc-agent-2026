@@ -146,20 +146,21 @@ def _move_to_bounded(
     return False
 
 
-def _control_step(ex: "Executor", **kwargs: Any) -> Generator[dict, None, tuple[bool, str]]:
+def _control_step(ex: "Executor", *, record_extra: Optional[dict[str, Any]] = None, **kwargs: Any) -> Generator[dict, None, tuple[bool, str]]:
     kwargs.setdefault("stop_on", ("death",))
+    extra = dict(record_extra or {})
     try:
         res = ex.control(**kwargs)
-        yield rec("control", res, **{k: v for k, v in kwargs.items() if k in ("yaw", "ms")})
+        yield rec("control", res, **{k: v for k, v in kwargs.items() if k in ("yaw", "ms")}, **extra)
         return True, ""
     except AttributeError:
-        yield rec("control", error_code="unsupported_api")
+        yield rec("control", error_code="unsupported_api", **extra)
         return False, "unsupported_api"
     except Replan as err:
         if _is_preemption(err):
             raise
         code, _ = failure(err)
-        yield rec("control", error_code=code)
+        yield rec("control", error_code=code, **extra)
         return False, code
 
 
@@ -652,14 +653,49 @@ def _try_place_ranged_barricade(
     return placed >= 2
 
 
-def _look_at_hostile(ex: "Executor", h_pos: Optional[list[float]], to_mob_yaw: float) -> None:
+def _strafe_control_keys(dx: float, dz: float, face_yaw: float) -> dict[str, bool]:
+    """保持面敌 face_yaw 不转身的前提下，将目标水平位移 (dx, dz) 映射到 Mineflayer 前后左右键。"""
+    norm = math.hypot(dx, dz)
+    if norm < 1e-6:
+        return {"back": True}
+    # prismarine-physics: forward=(-sin(yaw), -cos(yaw)), right=(cos(yaw), -sin(yaw))
+    proj_fwd = dx * (-math.sin(face_yaw)) + dz * (-math.cos(face_yaw))
+    proj_right = dx * math.cos(face_yaw) + dz * (-math.sin(face_yaw))
+    thresh = 0.25 * norm
+    keys: dict[str, bool] = {}
+    if proj_fwd > thresh:
+        keys["forward"] = True
+    elif proj_fwd < -thresh:
+        keys["back"] = True
+    if proj_right > thresh:
+        keys["right"] = True
+    elif proj_right < -thresh:
+        keys["left"] = True
+    return keys or {"back": True}
+
+
+def _resolve_shield_guard_yaw(
+    ex: "Executor", state: "State", px: float, py: float, pz: float, fallback_yaw: float,
+) -> tuple[float, Optional[int]]:
+    """融合 16 格内敌群加权角平分线与最近 hurt 偷袭者，算出最优举盾朝向。"""
+    from .combat_eval import observe_nearby_hostiles, recent_hurt_attacker_id, shield_guard_yaw
+
+    attacker_id = recent_hurt_attacker_id(state)
+    hostiles = observe_nearby_hostiles(ex, state, radius=16.0)
+    yaw = shield_guard_yaw([px, py, pz], hostiles, preferred_attacker_id=attacker_id)
+    return (yaw if yaw is not None else fallback_yaw), attacker_id
+
+
+def _look_at_hostile(
+    ex: "Executor", h_pos: Optional[list[float]], face_yaw: float, *, prefer_yaw: bool = False,
+) -> None:
     if not hasattr(ex, "look"):
         return
     try:
-        if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
+        if not prefer_yaw and isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
             ex.look(pos=[float(h_pos[0]), float(h_pos[1]) + 0.9, float(h_pos[2])])
         else:
-            ex.look(yaw=to_mob_yaw, pitch=0.0)
+            ex.look(yaw=face_yaw, pitch=0.0)
     except (ApiError, Replan, AttributeError):
         pass
 
@@ -690,14 +726,20 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         except AttributeError:
             pass
     has_shield = _has_shield(state, st)
+    shield_yaw, hurt_attacker_id = (
+        _resolve_shield_guard_yaw(ex, state, px, py, pz, to_mob_yaw)
+        if has_shield
+        else (to_mob_yaw, None)
+    )
+    use_bisector = has_shield and (abs(shield_yaw - to_mob_yaw) > 0.15 or hurt_attacker_id is not None)
 
     # 苦力怕贴脸（<=3.5 格）且持盾时：先举盾朝向苦力怕后退挡爆，再收盾拉开至安全距离（>=7 格）
     if is_creeper and h_dist <= 3.5:
         if has_shield:
             shield_up = _set_shield(ex, state, True)
             try:
-                _look_at_hostile(ex, h_pos, to_mob_yaw)
-                yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=500)
+                _look_at_hostile(ex, h_pos, shield_yaw, prefer_yaw=use_bisector)
+                yield from _control_step(ex, back=True, yaw=shield_yaw, ms=500)
             finally:
                 if shield_up:
                     _set_shield(ex, state, False)
@@ -724,27 +766,44 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 else None
             )
             if cover is not None:
-                shield_up = _set_shield(ex, state, True) if has_shield else False
-                try:
-                    if shield_up:
-                        _look_at_hostile(ex, h_pos, to_mob_yaw)
-                    moved_cover = yield from _move_to_bounded(
-                        ex, [cover[0] + 0.5, float(cover[1]), cover[2] + 0.5], rng=0, timeout=5.0, skeleton_cover=True,
-                    )
-                finally:
-                    if shield_up:
-                        _set_shield(ex, state, False)
+                cx, cy, cz = cover[0] + 0.5, float(cover[1]), cover[2] + 0.5
+                same_y = cover[1] == block_cell([px, py, pz])[1]
+                horiz_to_cover = math.hypot(cx - px, cz - pz)
+                if has_shield and same_y and horiz_to_cover <= 2.2:
+                    # 持盾进入同高近处掩体：用 /control 锁面敌 yaw 横移/倒退，避免 move_to 转身把后背露给骷髅
+                    move_keys = _strafe_control_keys(cx - px, cz - pz, shield_yaw)
+                    shield_up = _set_shield(ex, state, True)
+                    try:
+                        _look_at_hostile(ex, h_pos, shield_yaw, prefer_yaw=use_bisector)
+                        ok_strafe, _ = yield from _control_step(
+                            ex,
+                            record_extra={"skeleton_cover": True},
+                            yaw=shield_yaw,
+                            ms=650,
+                            **move_keys,
+                        )
+                    finally:
+                        if shield_up:
+                            _set_shield(ex, state, False)
+                    if ok_strafe:
+                        st_after_cov = _refresh_status(ex, state)
+                        ap = st_after_cov.get("pos") or [px, py, pz]
+                        if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
+                            return True
+                moved_cover = yield from _move_to_bounded(
+                    ex, [cx, cy, cz], rng=0, timeout=5.0, skeleton_cover=True,
+                )
                 if moved_cover:
                     st_after_cov = _refresh_status(ex, state)
                     ap = st_after_cov.get("pos") or [px, py, pz]
                     if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
                         return True
             if has_shield:
-                # 持盾面对远程怪且无近处天然掩体：先举盾面向敌怪后撤格挡箭矢，再收盾拉脱
+                # 持盾面对远程怪且无近处天然掩体：锁威胁方向举盾后撤格挡箭矢，再收盾拉脱
                 shield_up = _set_shield(ex, state, True)
                 try:
-                    _look_at_hostile(ex, h_pos, to_mob_yaw)
-                    yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=550)
+                    _look_at_hostile(ex, h_pos, shield_yaw, prefer_yaw=use_bisector)
+                    yield from _control_step(ex, back=True, yaw=shield_yaw, ms=550)
                 finally:
                     if shield_up:
                         _set_shield(ex, state, False)
@@ -756,6 +815,19 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 barricaded = yield from _try_place_ranged_barricade(ex, state, st, h_pos, cache, dim)
                 if barricaded:
                     return True
+        elif has_shield and hurt_attacker_id is not None and h_dist < 10.0:
+            # 刚被偷袭受伤且持盾：立刻转向攻击者举盾短后撤挡下第二击，再收盾拉脱
+            shield_up = _set_shield(ex, state, True)
+            try:
+                _look_at_hostile(ex, h_pos, shield_yaw, prefer_yaw=True)
+                yield from _control_step(ex, back=True, yaw=shield_yaw, ms=500)
+            finally:
+                if shield_up:
+                    _set_shield(ex, state, False)
+            st_mid = _refresh_status(ex, state)
+            mid_pos = st_mid.get("pos")
+            if mid_pos and len(mid_pos) >= 3:
+                px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
         if h_dist < 2.5:
             # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用防跳崖检查的原生疾跑跳脱离近战命中圈再补 move_to
             safe_burst_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, away_yaw, cache, dim)
@@ -800,11 +872,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         if safe_retry_yaw is not None:
             yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_retry_yaw, ms=800)
         elif has_shield:
-            # 四周有悬崖/岩浆无法疾跑且寻路失败：持盾面向敌怪短暂格挡保命
+            # 四周有悬崖/岩浆无法疾跑且寻路失败：持盾面向敌群最优方向短暂格挡保命
             shield_up = _set_shield(ex, state, True)
             try:
-                _look_at_hostile(ex, h_pos, to_mob_yaw)
-                yield from _control_step(ex, back=True, yaw=to_mob_yaw, ms=450)
+                _look_at_hostile(ex, h_pos, shield_yaw, prefer_yaw=True)
+                yield from _control_step(ex, back=True, yaw=shield_yaw, ms=450)
             finally:
                 if shield_up:
                     _set_shield(ex, state, False)

@@ -261,6 +261,93 @@ def _look_at_mob(ex: "Executor", target: Mapping[str, Any]) -> None:
         pass
 
 
+def recent_hurt_attacker_id(state: "State") -> Optional[int]:
+    """从最近事件流提取最新一次受击的攻击者实体 ID（遇到 spawn/death 即止）。"""
+    events = getattr(state, "events", None)
+    if not events:
+        return None
+    for idx, ev in enumerate(reversed(events)):
+        if idx >= 20 or not isinstance(ev, Mapping):
+            break
+        etype = ev.get("type")
+        if etype in ("spawn", "death"):
+            break
+        if etype == "hurt":
+            for key in ("source_entity", "likely_attacker"):
+                src = ev.get(key)
+                if isinstance(src, Mapping) and isinstance(src.get("id"), int) and not isinstance(src.get("id"), bool):
+                    return int(src["id"])
+            return None
+    return None
+
+
+def shield_guard_yaw(
+    player_pos: Any,
+    hostiles: Sequence[Mapping[str, Any]],
+    *,
+    preferred_attacker_id: Optional[int] = None,
+) -> Optional[float]:
+    """计算面向敌群的最优举盾 yaw（多怪取威胁加权角平分线，前后夹击时锁定最高危目标/偷袭者）。"""
+    if not isinstance(player_pos, (list, tuple)) or len(player_pos) < 3:
+        return None
+    px, pz = float(player_pos[0]), float(player_pos[2])
+    wx, wz = 0.0, 0.0
+    best_weight, best_vec = 0.0, None
+
+    for mob in hostiles:
+        if not isinstance(mob, Mapping):
+            continue
+        epos = mob.get("pos")
+        if not isinstance(epos, (list, tuple)) or len(epos) < 3:
+            continue
+        dx, dz = float(epos[0]) - px, float(epos[2]) - pz
+        d = math.hypot(dx, dz)
+        if d < 1e-6:
+            continue
+        name = bare(mob.get("name")).strip().lower()
+        if name == "creeper" and d <= 7.0:
+            w = 5.0 / max(1.0, d)
+        elif name in RANGED_MOBS and d <= 16.5:
+            w = 3.5 / max(1.5, d)
+        elif d <= 8.5:
+            w = 2.0 / max(1.0, d)
+        else:
+            continue
+        if preferred_attacker_id is not None and mob.get("id") == preferred_attacker_id:
+            w *= 2.5
+        ux, uz = dx / d, dz / d
+        wx += ux * w
+        wz += uz * w
+        if w > best_weight:
+            best_weight, best_vec = w, (ux, uz)
+
+    if best_vec is None:
+        return None
+    # 前后 180° 夹击导致向量抵消时，放弃指向空侧方，改锁最高威胁单目标确保 100% 格挡主威胁
+    if math.hypot(wx, wz) < 0.25 * best_weight:
+        wx, wz = best_vec
+    return math.atan2(-wx, -wz)
+
+
+def _look_for_shield(
+    ex: "Executor",
+    player_pos: Any,
+    hostiles: Sequence[Mapping[str, Any]],
+    fallback_target: Mapping[str, Any],
+    *,
+    preferred_attacker_id: Optional[int] = None,
+) -> None:
+    if len(hostiles) > 1 or preferred_attacker_id is not None:
+        yaw = shield_guard_yaw(player_pos, hostiles, preferred_attacker_id=preferred_attacker_id)
+        if yaw is not None and callable(getattr(ex, "look", None)):
+            try:
+                ex.look(yaw=yaw, pitch=0.0)
+                return
+            except (ApiError, Replan, AttributeError):
+                pass
+    _look_at_mob(ex, fallback_target)
+
+
 def _split_hostile_rings(
     all_hostiles: Sequence[dict[str, Any]], *, melee_radius: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -353,7 +440,8 @@ def counterattack_hostile(
             if st.get("alive") is False or _num(st.get("health"), 20.0) < 10.0 or st.get("in_lava") or st.get("submerged"):
                 return False
 
-            hostiles, outer_ranged = _split_hostile_rings(observe_nearby_hostiles(ex, state, radius=16.0), melee_radius=10.0)
+            all_hostiles = observe_nearby_hostiles(ex, state, radius=16.0)
+            hostiles, outer_ranged = _split_hostile_rings(all_hostiles, melee_radius=10.0)
             if not hostiles:
                 return True
             if (len(hostiles) >= 3 or (outer_ranged and not has_shield)
@@ -369,7 +457,8 @@ def counterattack_hostile(
                 if dist > 7.0 or not isinstance(cur_target.get("pos"), (list, tuple)) or not hasattr(ex, "move_to"):
                     return False
                 if has_shield and target_is_ranged and not shield_raised:
-                    _look_at_mob(ex, cur_target)
+                    _look_for_shield(ex, st.get("pos"), all_hostiles, cur_target,
+                                     preferred_attacker_id=recent_hurt_attacker_id(state))
                     shield_raised = _set_shield_posture(ex, state, True)
                 elif shield_raised and not target_is_ranged:
                     shield_raised = _set_shield_posture(ex, state, False)
@@ -401,7 +490,8 @@ def counterattack_hostile(
                 return not isinstance(nh, Mapping) or _num(nh.get("dist"), 99.0) >= 6.0
 
             if has_shield:
-                _look_at_mob(ex, cur_target)
+                _look_for_shield(ex, st.get("pos"), all_hostiles, cur_target,
+                                 preferred_attacker_id=recent_hurt_attacker_id(state))
                 shield_raised = _set_shield_posture(ex, state, True)
     finally:
         if shield_raised:

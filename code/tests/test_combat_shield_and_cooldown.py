@@ -11,10 +11,15 @@ from mcagent.loop import RulePlanner, reset_world_memo
 from mcagent.runtime import RuntimeConfig, State
 from mcagent.skills.base import _COOLDOWN
 from mcagent.skills.combat import HuntMob
-from mcagent.skills.combat_eval import counterattack_hostile, decide_combat_or_flee
+from mcagent.skills.combat_eval import (
+    counterattack_hostile,
+    decide_combat_or_flee,
+    recent_hurt_attacker_id,
+    shield_guard_yaw,
+)
 from mcagent.skills.combat_scene import KILL_MOB, crowd_melee_hostiles
 from mcagent.skills.encounter import pillar_up, weapon_cooldown_s
-from mcagent.skills.escape import escape_hazard_step
+from mcagent.skills.escape import _strafe_control_keys, escape_hazard_step
 from mcagent.skills.iron_gear import CraftIronGear
 from mcagent.skills.safety_escape import EmergencyEscape
 from mcagent.skills.scripted_world import ScriptedWorld
@@ -337,6 +342,60 @@ class CombatShieldAndCooldownTests(unittest.TestCase):
         self.assertEqual([s.get("error_code") for s in steps], ["blocked_by_self", None, None])
         self.assertFalse(w.st.get("jumping"))
         w.assert_exhausted()
+
+    def test_shield_guard_yaw_bisects_multi_mobs_handles_flank_and_prioritizes_hurt_attacker(self):
+        origin = [0.5, 64.0, 0.5]
+        # 1) 两只僵尸分别在正北偏东 45° 与偏西 45° -> 角平分线正北 (-Z, yaw=0)
+        z_ne = _real_server_mob("zombie", eid=1, pos=(3.5, 64.0, -2.5), dist=4.2)
+        z_nw = _real_server_mob("zombie", eid=2, pos=(-2.5, 64.0, -2.5), dist=4.2)
+        yaw_bi = shield_guard_yaw(origin, [z_ne, z_nw])
+        self.assertIsNotNone(yaw_bi)
+        self.assertAlmostEqual(yaw_bi, 0.0, places=3)
+
+        # 2) 前后 180° 夹击（南侧僵尸、北侧苦力怕）：不指空侧方，锁最高危苦力怕 (-Z, yaw=0)
+        z_south = _real_server_mob("zombie", eid=3, pos=(0.5, 64.0, 4.5), dist=4.0)
+        c_north = _real_server_mob("creeper", eid=4, pos=(0.5, 64.0, -3.5), dist=4.0)
+        yaw_flank = shield_guard_yaw(origin, [z_south, c_north])
+        self.assertAlmostEqual(yaw_flank, 0.0, places=3)
+
+        # 3) 最近 hurt 事件指出背后 (-X) 骷髅偷袭 -> 优先锁偷袭者方向 (+pi/2)
+        st = State(RuntimeConfig())
+        st.events.append({"type": "hurt", "source": "arrow", "source_entity": {"id": 99, "name": "skeleton"}})
+        self.assertEqual(recent_hurt_attacker_id(st), 99)
+        s_west = _real_server_mob("skeleton", eid=99, pos=(-5.5, 64.0, 0.5), dist=6.0)
+        z_east = _real_server_mob("zombie", eid=5, pos=(4.5, 64.0, 0.5), dist=4.0)
+        yaw_atk = shield_guard_yaw(origin, [z_east, s_west], preferred_attacker_id=99)
+        self.assertAlmostEqual(yaw_atk, math.pi / 2, places=3)
+
+    def test_strafe_into_same_y_skeleton_cover_keeps_shield_facing_skeleton(self):
+        # 校验相对位移键映射：面向 +X (yaw=-pi/2) 时，向 +Z 移动对应 right=True，向 -Z 对应 left=True
+        self.assertEqual(_strafe_control_keys(0.0, 1.0, -math.pi / 2), {"right": True})
+        self.assertEqual(_strafe_control_keys(0.0, -1.0, -math.pi / 2), {"left": True})
+        self.assertEqual(_strafe_control_keys(-1.0, 0.0, -math.pi / 2), {"back": True})
+
+        # 玩家在 (0.5, 64, 0.5)，骷髅在正东 (+X: 6.5, 64, 0.5)，侧前方 (2, 65, 1) 有石柱掩体 -> (0, 64, 1) 可遮挡箭线
+        skel = _real_server_mob("skeleton", eid=404, pos=(6.5, 64.0, 0.5), dist=6.0)
+        wall = {(2, 64, 1): "stone", (2, 65, 1): "stone"}
+        w = _ShieldCombatWorld(items={"shield": 1}, blocks=wall, health=14.0, entities=[skel])
+
+        def strafe_move(**kwargs):
+            w.control_reqs.append(dict(kwargs))
+            w.calls.append(("control", dict(kwargs)))
+            self.assertTrue(w.st.get("blocking"), "横移进掩体全程必须保持举盾")
+            self.assertAlmostEqual(kwargs["yaw"], -math.pi / 2, places=2)
+            self.assertTrue(kwargs.get("right"), "面向东 (+X) 往南 (+Z) 进掩体应按 right 横移不转身")
+            w.st["pos"] = [0.5, 64.0, 1.5]
+            return {"moved": 1.0, "pos": [0.5, 64.0, 1.5]}
+
+        w.control = strafe_move
+        ex, state = w.session()
+        esc = EmergencyEscape(intent="flee")
+        ok, steps = _drive_result(esc.run(ex, state), ex)
+        self.assertTrue(ok)
+        self.assertEqual(ex.acts, ["control"])
+        self.assertFalse(w.st.get("blocking"))
+        self.assertTrue(any(s.get("skeleton_cover") for s in steps))
+        self.assertEqual(esc.verify_done(state), "")
 
 
 if __name__ == "__main__":
