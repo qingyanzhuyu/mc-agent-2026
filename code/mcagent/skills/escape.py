@@ -237,7 +237,7 @@ def _find_step_cell(ex: "Executor", st: dict, cache: Any, dim: str, tried_places
 
 
 def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10) -> Generator[dict, None, bool]:
-    """水中/水下受困脱困：软顶破拆 -> 确认干岸移动 -> 浅盆垫脚 -> 主动上浮游泳。"""
+    """水中/水下受困脱困：软顶破拆 -> 确认干岸移动 -> 浅盆垫脚 -> 主动上浮游泳；遇敌怪时改短超时避敌登岸或切入水中逃敌。"""
     st = _refresh_status(ex, state)
     if not st.get("in_water") and not st.get("submerged"):
         return True
@@ -248,54 +248,86 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
 
     for _ in range(max(0, int(max_steps))):
         dim = str(st.get("dimension") or "overworld")
+        nh_cur = st.get("nearest_hostile") if isinstance(st.get("nearest_hostile"), dict) else None
+        nh_dist_raw = nh_cur.get("dist") if nh_cur else None
+        nh_dist = float(nh_dist_raw) if isinstance(nh_dist_raw, (int, float)) and not isinstance(nh_dist_raw, bool) else 99.0
+        recent_hurt = state.get_recent_hurt(max_age_s=6.0) if hasattr(state, "get_recent_hurt") else None
+        under_hostile_fire = (nh_cur is not None and nh_dist <= 16.0) or isinstance(recent_hurt, dict)
+        # 已浮出水面且正受敌怪近身/远程射击威胁：立即转入敌怪感知的水中疾跑逃离，禁止在 15s 慢速 move_to 中原地吃箭
+        if under_hostile_fire and not st.get("submerged") and (nh_dist <= 12.0 or isinstance(recent_hurt, dict)):
+            return (yield from _flee_hostile(ex, state))
         if (dig_cell := _find_soft_overhang(ex, st, cache, dim, tried_digs)) is not None:
             tried_digs.add(dig_cell)
             dig_pos = list(dig_cell)
             yield from _exec_step(
                 "dig", lambda: ex.dig(dig_pos), on_ok=lambda: cache.invalidate(dig_pos, dimension=dim), pos=dig_pos,
             )
-        elif shore_fails < 2 and (shore := _find_dry_shore(ex, st, cache, dim, tried_shores)) is not None:
-            tried_shores.add(shore)
-            moved_shore = yield from _move_to_bounded(ex, [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5], rng=1, timeout=15.0)
-            shore_fails = 0 if moved_shore else (shore_fails + 1)
         else:
-            state.refresh_inventory(ex.client)
-            step_cell = _find_step_cell(ex, st, cache, dim, tried_places) if total_placeable(state) >= 1 else None
-            if step_cell is not None:
-                tried_places.add(step_cell)
-                step_pos = list(step_cell)
-                block = pick_placeable(state)
-                yield from _exec_step(
-                    "place",
-                    lambda: ex.place(block, pos=step_pos),
-                    on_ok=lambda: cache.invalidate(step_pos, dimension=dim),
-                    item=block,
-                    pos=step_pos,
+            shore = None
+            if shore_fails < 2:
+                if under_hostile_fire:
+                    p_cur = _valid_vec3(st.get("pos"))
+                    if p_cur is not None:
+                        ents = _collect_nearby_hostiles(ex, p_cur[0], p_cur[1], p_cur[2], nh_cur or {}, radius=18)
+                        threats: list[tuple[float, float, str, float, Optional[int]]] = []
+                        for ent in ents:
+                            ep = _valid_vec3(ent.get("pos"))
+                            if ep is None:
+                                continue
+                            threats.append((
+                                ep[0], ep[2],
+                                bare(ent.get("name")).strip().lower(),
+                                math.hypot(p_cur[0] - ep[0], p_cur[2] - ep[2]),
+                                ent.get("id") if isinstance(ent.get("id"), int) and not isinstance(ent.get("id"), bool) else None,
+                            ))
+                        shore = _find_safe_dry_shore_away(ex, st, cache, dim, threats, tried_shores=tried_shores)
+                if shore is None:
+                    shore = _find_dry_shore(ex, st, cache, dim, tried_shores)
+            if shore is not None:
+                tried_shores.add(shore)
+                shore_timeout = 2.2 if under_hostile_fire else 15.0
+                moved_shore = yield from _move_to_bounded(
+                    ex, [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5], rng=1, timeout=shore_timeout,
                 )
-            elif control_unsupported:
-                break
+                shore_fails = 0 if moved_shore else (shore_fails + 1)
             else:
-                before_pos = _valid_vec3(st.get("pos"))
-                nh = st.get("nearest_hostile") if isinstance(st.get("nearest_hostile"), dict) else None
-                hp = _valid_vec3(nh.get("pos")) if nh else None
-                yaw_offset = _SWIM_YAWS[swim_idx % len(_SWIM_YAWS)]
-                if before_pos is not None and hp is not None and math.hypot(before_pos[0] - hp[0], before_pos[2] - hp[2]) <= 16.0:
-                    ux, uz = before_pos[0] - hp[0], before_pos[2] - hp[2]
-                    yaw = (math.atan2(-ux, -uz) + yaw_offset) if math.hypot(ux, uz) > 1e-4 else yaw_offset
+                state.refresh_inventory(ex.client)
+                step_cell = _find_step_cell(ex, st, cache, dim, tried_places) if total_placeable(state) >= 1 else None
+                if step_cell is not None:
+                    tried_places.add(step_cell)
+                    step_pos = list(step_cell)
+                    block = pick_placeable(state)
+                    yield from _exec_step(
+                        "place",
+                        lambda: ex.place(block, pos=step_pos),
+                        on_ok=lambda: cache.invalidate(step_pos, dimension=dim),
+                        item=block,
+                        pos=step_pos,
+                    )
+                elif control_unsupported:
+                    break
                 else:
-                    yaw = yaw_offset
-                ok, err_code = yield from _control_step(ex, forward=True, jump=True, yaw=yaw, ms=600)
-                if not ok and err_code == "unsupported_api":
-                    control_unsupported = True
-                else:
-                    st = _refresh_status(ex, state)
-                    after_pos = _valid_vec3(st.get("pos"))
-                    moved_xz = math.hypot(after_pos[0] - before_pos[0], after_pos[2] - before_pos[2]) if (before_pos and after_pos) else 0.0
-                    if not ok or moved_xz < 0.4:
-                        swim_idx += 1
-                    if not st.get("in_water") and not st.get("submerged"):
-                        return True
-                    continue
+                    before_pos = _valid_vec3(st.get("pos"))
+                    nh = st.get("nearest_hostile") if isinstance(st.get("nearest_hostile"), dict) else None
+                    hp = _valid_vec3(nh.get("pos")) if nh else None
+                    yaw_offset = _SWIM_YAWS[swim_idx % len(_SWIM_YAWS)]
+                    if before_pos is not None and hp is not None and math.hypot(before_pos[0] - hp[0], before_pos[2] - hp[2]) <= 16.0:
+                        ux, uz = before_pos[0] - hp[0], before_pos[2] - hp[2]
+                        yaw = (math.atan2(-ux, -uz) + yaw_offset) if math.hypot(ux, uz) > 1e-4 else yaw_offset
+                    else:
+                        yaw = yaw_offset
+                    ok, err_code = yield from _control_step(ex, forward=True, jump=True, yaw=yaw, ms=600)
+                    if not ok and err_code == "unsupported_api":
+                        control_unsupported = True
+                    else:
+                        st = _refresh_status(ex, state)
+                        after_pos = _valid_vec3(st.get("pos"))
+                        moved_xz = math.hypot(after_pos[0] - before_pos[0], after_pos[2] - before_pos[2]) if (before_pos and after_pos) else 0.0
+                        if not ok or moved_xz < 0.4:
+                            swim_idx += 1
+                        if not st.get("in_water") and not st.get("submerged"):
+                            return True
+                        continue
 
         st = _refresh_status(ex, state)
         if not st.get("in_water") and not st.get("submerged"):
@@ -671,23 +703,36 @@ def _is_ranged_los_blocked(
 
 
 def _is_sprint_yaw_safe(
-    ex: "Executor", px: float, py: float, pz: float, yaw: float, cache: Any, dim: str, *, lookahead: int = 5,
+    ex: "Executor",
+    px: float,
+    py: float,
+    pz: float,
+    yaw: float,
+    cache: Any,
+    dim: str,
+    *,
+    lookahead: int = 5,
+    avoid_water: bool = False,
 ) -> bool:
-    """检查沿 yaw 疾跑前冲 1..lookahead 格是否存在 >3 格深坑/悬崖或岩浆（仅在脚下实心可观测时启用）。"""
+    """检查沿 yaw 疾跑前冲 1..lookahead 格是否存在 >3 格深坑/悬崖、岩浆或（干地逃敌时）水面。"""
     fx, fy, fz = block_cell([px, py, pz])
     under = _read_block(cache, ex.client, (fx, fy - 1, fz), dim)
     if under is None or not bare(under.get("name")):
         return True
     if not is_safe_solid_floor(under):
-        # 脚下悬空/边缘下落（如刚滑出峡谷崖壁）时，只要周邻存在可观测实心地形，仍必须做前方深坑/岩浆检查，
-        # 禁止跳过护栏导致滞空疾跑跳直接冲进深坑；纯空壳单测世界则保持兼容返回 True。
+        # 脚下悬空/起跳滞空（如刚跳到峡谷崖壁边 Y+1/+2）时，向下扩探至 dy=-6 与邻列实心/水体，
+        # 防止把真实深崖滞空误判为空壳单测世界而放行冲崖入水。
         probe_cells = (
-            (fx + 1, fy - 1, fz), (fx - 1, fy - 1, fz),
-            (fx, fy - 1, fz + 1), (fx, fy - 1, fz - 1),
-            (fx, fy - 2, fz), (fx, fy, fz),
+            (fx, fy, fz),
+            (fx, fy - 2, fz), (fx, fy - 3, fz), (fx, fy - 4, fz), (fx, fy - 5, fz), (fx, fy - 6, fz),
+            (fx + 1, fy - 1, fz), (fx - 1, fy - 1, fz), (fx, fy - 1, fz + 1), (fx, fy - 1, fz - 1),
+            (fx + 1, fy - 2, fz), (fx - 1, fy - 2, fz), (fx, fy - 2, fz + 1), (fx, fy - 2, fz - 1),
+            (fx + 1, fy - 3, fz), (fx - 1, fy - 3, fz), (fx, fy - 3, fz + 1), (fx, fy - 3, fz - 1),
+            (fx + 1, fy - 4, fz), (fx - 1, fy - 4, fz), (fx, fy - 4, fz + 1), (fx, fy - 4, fz - 1),
         )
         has_terrain = any(
-            (nb := _read_block(cache, ex.client, cell, dim)) is not None and is_safe_solid_floor(nb)
+            (nb := _read_block(cache, ex.client, cell, dim)) is not None
+            and (is_safe_solid_floor(nb) or _is_water_cell(nb))
             for cell in probe_cells
         )
         if not has_terrain:
@@ -708,6 +753,8 @@ def _is_sprint_yaw_safe(
             bname = bare(blk.get("name"))
             if bname in ("lava", "flowing_lava"):
                 return False
+            if avoid_water and _is_water_cell(blk):
+                return False
             if is_safe_solid_floor(blk):
                 has_floor = True
                 break
@@ -717,12 +764,26 @@ def _is_sprint_yaw_safe(
 
 
 def _pick_cliff_safe_yaw(
-    ex: "Executor", px: float, py: float, pz: float, preferred_yaw: float, cache: Any, dim: str,
+    ex: "Executor",
+    px: float,
+    py: float,
+    pz: float,
+    preferred_yaw: float,
+    cache: Any,
+    dim: str,
+    *,
+    avoid_water: bool = False,
 ) -> Optional[float]:
-    """若首选逃离方向前方有深坑/悬崖/岩浆，依次改选侧向 ±90°/±45°/±135°/180° 安全方向。"""
-    for offset in (0.0, math.pi / 2, -math.pi / 2, math.pi / 4, -math.pi / 4, 3 * math.pi / 4, -3 * math.pi / 4, math.pi):
+    """若首选逃离方向前方有深坑/悬崖/岩浆（干地时兼避水面），依次改选侧向 ±90°/±45°/±135°/180° 安全方向。"""
+    offsets = (0.0, math.pi / 2, -math.pi / 2, math.pi / 4, -math.pi / 4, 3 * math.pi / 4, -3 * math.pi / 4, math.pi)
+    if avoid_water:
+        for offset in offsets:
+            cand = preferred_yaw + offset
+            if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=True):
+                return cand
+    for offset in offsets:
         cand = preferred_yaw + offset
-        if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim):
+        if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=False):
             return cand
     return None
 
@@ -1663,7 +1724,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         cur_d_blk = cur_nh_blk.get("dist") if isinstance(cur_nh_blk, dict) else h_dist
         if isinstance(cur_d_blk, (int, float)) and not isinstance(cur_d_blk, bool) and float(cur_d_blk) <= 5.0:
             blk_alt_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
-            safe_blk_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, blk_alt_yaw, cache, dim)
+            safe_blk_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, blk_alt_yaw, cache, dim, avoid_water=True)
             if safe_blk_yaw is not None:
                 before_blk = (px, py, pz)
                 ok_blk, _ = yield from _control_step(
@@ -1727,7 +1788,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             if (burst_blocked or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
             else away_yaw
         )
-        safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim)
+        safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim, avoid_water=not in_w_retry)
         if safe_retry_yaw is not None:
             before_retry = (px, py, pz)
             ok_rt, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_retry_yaw, ms=800)
@@ -1760,7 +1821,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                             if _is_yaw_wall_blocked(ex, px2, py2, pz2, ux2, uz2, cache, dim)
                             else math.atan2(-ux2, -uz2)
                         )
-                        safe_yaw2 = _pick_cliff_safe_yaw(ex, px2, py2, pz2, yaw2, cache, dim)
+                        safe_yaw2 = _pick_cliff_safe_yaw(ex, px2, py2, pz2, yaw2, cache, dim, avoid_water=not in_w2)
                         if safe_yaw2 is not None:
                             yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_yaw2, ms=800)
         elif has_shield:

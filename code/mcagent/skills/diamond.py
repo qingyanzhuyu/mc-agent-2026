@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Generator
 import math
 
-from ..runtime import EnvBlocked, Replan
+from ..runtime import EnvBlocked, Replan, has_equipped_armor
 from .base import Param, Skill, failure, rec
 from .diamond_site import (
     CARDINALS, CONTAINERS, DIAMOND_ORES, _above, _approach, _block, _cell,
@@ -318,7 +318,18 @@ class MineDiamond(Skill):
 
     @classmethod
     def blocked(cls, state) -> str:
-        return "" if state.count("diamond") else _world_block(state)
+        if state.count("diamond"):
+            return ""
+        wb = _world_block(state)
+        if wb:
+            return wb
+        st_snap = state.snapshot() or {}
+        raw_hp = st_snap.get("health", 20.0)
+        hp_val = float(raw_hp) if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp) else 20.0
+        unprotected = not has_equipped_armor(state) and state.count("shield") < 1
+        if hp_val <= 8.0 and unprotected:
+            return f"低血量无甲无盾(hp={hp_val:.1f}<=8.0)，暂缓下探深层采钻，优先补粮回血"
+        return ""
 
     @classmethod
     def material_plan(cls, args: dict, state) -> tuple[tuple[str, int, str], ...]:

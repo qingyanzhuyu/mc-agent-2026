@@ -1768,6 +1768,116 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
             pass
         self.assertTrue(w.dug, "expected _flee_hostile to dig a soft bank block after 2 water-pit horizontal stalls")
 
+    def test_seg18_crit_hp_unarmored_close_hostile_emits_urgent_flee(self) -> None:
+        # 复现 seg-18 Death #1（t=1216.0s, [-40.5, 2, 77.4]）：残血 hp=2.7 无甲时僵尸距 2.3m 必须触发 urgent 抢占，
+        # 绝不允许仅发 soft flee 放任 mine_diamond 继续挖块走入僵尸一击毙命
+        from mcagent.runtime import Safety, State
+
+        s = State()
+        s.st = {
+            "ready": True, "alive": True, "dimension": "overworld",
+            "pos": [-40.5, 3.0, 78.5], "health": 2.7, "food": 13, "armor_points": 0,
+            "nearest_hostile": {"id": 169414, "name": "zombie", "dist": 2.3},
+        }
+        hazards = Safety().hazards(s)
+        flee_h = [h for h in hazards if h.get("kind") == "flee"]
+        self.assertTrue(flee_h, f"expected flee hazard, got {hazards}")
+        self.assertEqual(flee_h[0].get("severity"), "urgent")
+
+    def test_seg18_mine_diamond_blocked_at_low_hp_unarmored_unshielded(self) -> None:
+        # 复现 seg-18 Death #1：hp=2.7 无甲无盾且无钻石时，MineDiamond.blocked() 必须拒绝下探深矿
+        from mcagent.runtime import State
+        from mcagent.skills.diamond import MineDiamond
+
+        s = State()
+        s.st = {
+            "ready": True, "alive": True, "dimension": "overworld",
+            "pos": [-34.5, 38.0, 70.5], "health": 2.7, "food": 13, "armor_points": 0,
+        }
+        reason = MineDiamond.blocked(s)
+        self.assertTrue(reason, "MineDiamond.blocked() must refuse deep mining at hp=2.7 unarmored/unshielded")
+
+    def test_seg18_airborne_cliff_over_water_rejects_plunge_and_avoids_water(self) -> None:
+        # 复现 seg-18 Death #2（t=1292.26s, [-33.7, 68.2, -17]）：起跳滞空于 9 格深水峡谷崖边（实心地形在 y=65、水在 y=62）时，
+        # _is_sprint_yaw_safe 绝不可把真实滞空误判为空壳单测世界，且干地逃敌须避开水体与深崖
+        from mcagent.skills.escape import _is_sprint_yaw_safe, _pick_cliff_safe_yaw
+        from mcagent.skills.voxel_cache import voxel_cache_for
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        # 玩家在 (-34, 68, -17) 滞空：-z 方向是 9 格深峡谷（y=62 为 water，上方全 air），+z 与 ±x 方向 y=65 为 sand 干地
+        for x in range(-42, -26):
+            for z in range(-25, -10):
+                for y in range(60, 71):
+                    blocks[(x, y, z)] = "air"
+                if z <= -18:
+                    blocks[(x, 62, z)] = "water"
+                    blocks[(x, 61, z)] = "water"
+                    blocks[(x, 60, z)] = "sand"
+                else:
+                    blocks[(x, 65, z)] = "sand"
+                    blocks[(x, 64, z)] = "sandstone"
+
+        w = GridWorld(blocks=blocks, pos=[-33.7, 68.2, -17.0])
+        w.st.update(dimension="overworld", on_ground=False, in_water=False, submerged=False)
+        ex, state = w.session()
+        cache = voxel_cache_for(state)
+        # 朝 -z 冲入深水峡谷（yaw = 0.0 -> dx=0, dz=-1）必须被判不安全
+        self.assertFalse(_is_sprint_yaw_safe(ex, -33.7, 68.2, -17.0, 0.0, cache, "overworld", avoid_water=True))
+        # 改选方向应避开 -z 峡谷并落向 +z 实心干地
+        safe_yaw = _pick_cliff_safe_yaw(ex, -33.7, 68.2, -17.0, 0.0, cache, "overworld", avoid_water=True)
+        self.assertIsNotNone(safe_yaw)
+        assert safe_yaw is not None
+        self.assertGreater(-math.cos(safe_yaw), -0.3, f"must not steer toward -z cliff plunge, got yaw={safe_yaw}")
+
+    def test_seg18_escape_water_under_skeleton_fire_caps_timeout_and_hands_off(self) -> None:
+        # 复现 seg-18 Death #2（t=1299s）：水下遭骷髅 5.9m 射击时 escape_water_to_shore 严禁发起 15s 长 move_to 站桩吃箭，
+        # 超时必须压紧至 <=2.2s
+        from mcagent.skills.escape import escape_water_to_shore
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        for x in range(-38, -30):
+            for z in range(-25, -17):
+                blocks[(x, 60, z)] = "dirt"
+                blocks[(x, 61, z)] = "water"
+                blocks[(x, 62, z)] = "water"
+                blocks[(x, 63, z)] = "air"
+        # 西侧有干岸 (-36, 63, -21)
+        blocks[(-36, 62, -21)] = "grass_block"
+        blocks[(-36, 63, -21)] = "air"
+        blocks[(-36, 64, -21)] = "air"
+
+        timeouts: list[float] = []
+
+        class _WaterFireWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-33.4, 61.0, -21.0])
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=10.3, food=17,
+                    in_water=True, submerged=True, on_ground=False,
+                    nearest_hostile={"id": 169608, "name": "skeleton", "dist": 5.9, "pos": [-33.0, 63.0, -15.5]},
+                )
+
+            def move_to(self, x=None, z=None, *, y=None, entity_id=None, rng=1, pos=None, timeout=None, **kwargs):
+                if timeout is not None:
+                    timeouts.append(float(timeout))
+                target = pos if pos is not None else [x, y if y is not None else self.st["pos"][1], z]
+                self.st["pos"] = [float(target[0]), float(target[1]), float(target[2])]
+                self.st["in_water"] = False
+                self.st["submerged"] = False
+                self.st["on_ground"] = True
+                return {"pos": list(self.st["pos"])}
+
+        w = _WaterFireWorld()
+        ex, state = w.session()
+        gen = escape_water_to_shore(ex, state, max_steps=3)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(timeouts, "expected shore move_to call")
+        self.assertLessEqual(max(timeouts), 2.5, f"expected hostile-aware water shore timeout <=2.5s, got {timeouts}")
+
 
 if __name__ == "__main__":
     unittest.main()

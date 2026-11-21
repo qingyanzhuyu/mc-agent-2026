@@ -1067,10 +1067,20 @@ class Safety:
                 add("eat", f"低饱食度 {food:g}", sev, food=food, has_food=can_eat)
         flee_threshold = effective_hostile_flee_dist(s, hostile_name)
         if not emitted_flee and hostile and hostile_dist < flee_threshold:
+            ranged_urgent_names = ("skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast")
+            lethal_proximity_urgent = (
+                not s.get_active_escape()
+                and not has_equipped_armor(s)
+                and hp <= self.config.hp_crit
+                and (
+                    hostile_dist <= 4.5
+                    or (hostile_name in ranged_urgent_names and hostile_dist <= 8.0)
+                )
+            )
             add(
                 "flee",
                 f"{hostile.get('name')} 距离 {hostile.get('dist')}",
-                "soft",
+                "urgent" if lethal_proximity_urgent else "soft",
                 hostile=hostile.get("name"),
                 dist=hostile.get("dist"),
             )
