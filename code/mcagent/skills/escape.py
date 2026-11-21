@@ -977,13 +977,18 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         hp_val = float(hp_raw) if isinstance(hp_raw, (int, float)) and not isinstance(hp_raw, bool) else 20.0
         hp_risk = float(getattr(getattr(state, "config", None), "hp_risk", 14.0) or 14.0)
         if is_ranged and h_dist < 16.0:
-            # 若刚建完挡箭墙或已处于实心掩体后方（射界已切断且无贴身近战威胁），沿背敌安全轴退离，切忌走出掩体吃箭
-            if (
-                h_dist >= 3.0
-                and h_pos is not None
-                and _is_ranged_los_blocked(ex, px, py, pz, h_pos, cache, dim)
-            ):
-                safe_hold_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, away_yaw, cache, dim)
+            already_los_blocked = bool(
+                h_pos is not None and _is_ranged_los_blocked(ex, px, py, pz, h_pos, cache, dim)
+            )
+            # 若刚建完挡箭墙或已处于实心掩体后方（射界已切断且无贴身近战威胁），沿背敌避墙安全轴退离；
+            # 若被角落/墙体卡住导致位移 <0.5 格，绝不原位假完成刷屏，直接落入完整脱离逻辑换向拉脱。
+            if already_los_blocked and h_dist >= 3.0:
+                hold_pref_yaw = (
+                    _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+                    if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim)
+                    else away_yaw
+                )
+                safe_hold_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, hold_pref_yaw, cache, dim)
                 if safe_hold_yaw is not None:
                     yield from _control_step(
                         ex,
@@ -993,10 +998,21 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                         yaw=safe_hold_yaw,
                         ms=450,
                     )
-                    return True
+                    st_hold = _refresh_status(ex, state)
+                    if st_hold.get("alive") is False:
+                        return False
+                    hp_after = st_hold.get("pos") or [px, py, pz]
+                    if math.hypot(float(hp_after[0]) - px, float(hp_after[2]) - pz) >= 0.5:
+                        return True
+                    px, py, pz = float(hp_after[0]), float(hp_after[1]), float(hp_after[2])
+                    burst_blocked = True
             cover = (
                 _find_skeleton_cover_cell(ex, px, py, pz, h_pos, cache, dim)
-                if (h_dist < 10.0 and (has_shield or not has_equipped_armor(state) or hp_val < hp_risk))
+                if (
+                    not already_los_blocked
+                    and h_dist < 10.0
+                    and (has_shield or not has_equipped_armor(state) or hp_val < hp_risk)
+                )
                 else None
             )
             if cover is not None:
@@ -1024,7 +1040,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                         ap = st_after_cov.get("pos") or [px, py, pz]
                         if (
                             math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5
-                            or _is_ranged_los_blocked(ex, float(ap[0]), float(ap[1]), float(ap[2]), h_pos, cache, dim)
+                            or (not already_los_blocked and _is_ranged_los_blocked(ex, float(ap[0]), float(ap[1]), float(ap[2]), h_pos, cache, dim))
                         ):
                             return True
                 moved_cover = yield from _move_to_bounded(
@@ -1035,7 +1051,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     ap = st_after_cov.get("pos") or [px, py, pz]
                     if (
                         math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5
-                        or _is_ranged_los_blocked(ex, float(ap[0]), float(ap[1]), float(ap[2]), h_pos, cache, dim)
+                        or (not already_los_blocked and _is_ranged_los_blocked(ex, float(ap[0]), float(ap[1]), float(ap[2]), h_pos, cache, dim))
                     ):
                         return True
             if has_shield:
@@ -1051,7 +1067,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 mid_pos = st_mid.get("pos")
                 if mid_pos and len(mid_pos) >= 3:
                     px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
-            elif (not has_equipped_armor(state) or hp_val < hp_risk):
+            elif (not already_los_blocked and (not has_equipped_armor(state) or hp_val < hp_risk)):
                 barricaded = yield from _try_place_ranged_barricade(ex, state, st, h_pos, cache, dim)
                 if barricaded:
                     return True

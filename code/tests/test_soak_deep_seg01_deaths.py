@@ -817,6 +817,99 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertGreaterEqual(len(w.controls), 2, f"expected immediate alternate sprint after burst_blocked, got {w.controls}")
         self.assertEqual(w.move_calls, 0, "should escape via alternate corridor sprint without stalling in move_to")
 
+    def test_skeleton_behind_cover_pinned_against_wall_falls_through_instead_of_looping(self) -> None:
+        # 复现 seg-06 INC-001 Cluster 1（102x 刷屏）：掩体后背靠墙体时短疾跑位移 <0.5 格，绝不可原位返回 True 假完成，必须落入完整脱离
+        blocks = {(x, 67, z): "stone" for x in range(-10, 11) for z in range(-10, 11)}
+        # 骷髅在 +Z (0.5, 68, 8.5)，掩体墙在 (0, 68..69, 2) 切断射界
+        blocks[(0, 68, 2)] = "stone"
+        blocks[(0, 69, 2)] = "stone"
+
+        class _PinnedCoverWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 68.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=15.0,
+                    nearest_hostile={"id": 88, "name": "skeleton", "dist": 8.0, "pos": [0.5, 68.0, 8.5]},
+                )
+                self.controls = 0
+                self.moves = 0
+
+            def control(self, **kwargs):
+                self.controls += 1
+                # 模拟被地形角落卡住：短疾跑位移 0.0 格
+                return {"pos": list(self.st["pos"]), "moved": 0.0}
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                self.st["pos"] = [0.5, 68.0, -11.5]
+                self.st["nearest_hostile"] = {"id": 88, "name": "skeleton", "dist": 20.0, "pos": [0.5, 68.0, 8.5]}
+                return {"pos": list(self.st["pos"])}
+
+        w = _PinnedCoverWorld()
+        ex, state = w.session()
+        steps = drive(EmergencyEscape(intent="flee"), ex, state)
+        self.assertGreaterEqual(w.controls, 1)
+        self.assertGreaterEqual(w.moves, 1, f"pinned cover sprint must fall through to real move_to escape, steps={steps}")
+
+    def test_skeleton_close_already_los_blocked_skips_zero_disp_cover_loop(self) -> None:
+        # 复现 seg-06 INC-001 Cluster 2（332x 刷屏）：骷髅距 2.4 格且已在拐角掩体后（already_los_blocked=True），
+        # 不得再走 0 位移 cover move_to 假完成，必须直接触发贴脸疾跑/远逃
+        blocks = {(x, 68, z): "stone" for x in range(-10, 11) for z in range(-10, 11)}
+        # 拐角石柱在 (0, 69..70, 1) 阻断玩家 (0.5, 69, 0.5) 与近距骷髅 (0.5, 69, 2.9) 的直线
+        blocks[(0, 69, 1)] = "stone"
+        blocks[(0, 70, 1)] = "stone"
+
+        class _CloseCornerSkelWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 69.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=7.3,
+                    nearest_hostile={"id": 89, "name": "skeleton", "dist": 2.4, "pos": [0.5, 69.0, 2.9]},
+                )
+                self.cover_moves = 0
+                self.controls = 0
+
+            def control(self, **kwargs):
+                self.controls += 1
+                self.st["pos"] = [0.5, 69.0, -7.5]
+                self.st["nearest_hostile"] = {"id": 89, "name": "skeleton", "dist": 10.4, "pos": [0.5, 69.0, 2.9]}
+                return {"pos": list(self.st["pos"]), "moved": 8.0}
+
+            def move_to(self, *args, **kwargs):
+                if kwargs.get("rng") == 0:
+                    self.cover_moves += 1
+                    return {"pos": list(self.st["pos"])}
+                return super().move_to(*args, **kwargs)
+
+        w = _CloseCornerSkelWorld()
+        ex, state = w.session()
+        steps = drive(EmergencyEscape(intent="flee"), ex, state)
+        self.assertEqual(w.cover_moves, 0, f"must not enter 0-disp skeleton cover move_to when already LOS-blocked: {steps}")
+        self.assertGreaterEqual(w.controls, 1, "expected immediate close-range sprint burst away from skeleton")
+
+    def test_eat_food_passes_when_use_item_confirms_food_increase_despite_laggy_inventory(self) -> None:
+        # 复现 seg-06 INC-002：use_item 返回 food_before=17 -> food=19，但服务端背包槽位扣减包延迟 1 拍仍显示 chicken=1
+        from mcagent.loop.starter_skills import EatFood
+
+        class _LaggyEatWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks={(0, 63, 0): "stone"}, pos=[0.5, 64.0, 0.5], items={"chicken": 1})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=10.3, food=17)
+
+            def use_item(self, item, **kwargs):
+                self.st["food"] = 19
+                # 故意延迟扣减 self.items["chicken"]，模拟 Mineflayer set_slot 晚于 consume resolve
+                return {"used": item, "food_before": 17, "food": 19, "health_before": 10.3, "health": 10.3}
+
+        w = _LaggyEatWorld()
+        ex, state = w.session()
+        state.refresh_inventory(ex.client)
+        before_counts = {"chicken": state.count("chicken")}
+        sk = EatFood()
+        drive(sk, ex, state)
+        self.assertEqual(sk.verify_done(state, before_counts), "")
+        self.assertTrue(state.inventory_dirty, "must mark inventory_dirty when slot sync lagged behind confirmed eat")
+
 
 if __name__ == "__main__":
     unittest.main()

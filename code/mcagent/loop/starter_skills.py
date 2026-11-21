@@ -553,19 +553,47 @@ class EatFood(Skill):
         return "饱食度已满" if float(state.st.get("food", 20)) >= 20 else ("" if best_food(state) else "背包没有可食用食物")
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
+        self._food_before: Optional[float] = None
+        self._ate_confirmed: bool = False
         state.refresh_inventory(ex.client)
         item = best_food(state)
         if not item:
             raise Replan("背包没有可食用食物")
-        yield rec("use_item", ex.use_item(item), item=item)
+        before_cnt = sum(state.count(f) for f in EDIBLE_FOODS)
+        raw_food_before = (state.st or {}).get("food")
+        if isinstance(raw_food_before, (int, float)) and not isinstance(raw_food_before, bool):
+            self._food_before = float(raw_food_before)
+        res = ex.use_item(item)
+        if isinstance(res, dict):
+            fb, fa = res.get("food_before"), res.get("food")
+            if (
+                isinstance(fb, (int, float)) and not isinstance(fb, bool)
+                and isinstance(fa, (int, float)) and not isinstance(fa, bool)
+                and float(fa) > float(fb)
+            ):
+                self._ate_confirmed = True
+        yield rec("use_item", res, item=item)
         state.invalidate_inventory()
         state.refresh_inventory(ex.client)
+        # 若服务端回执已确认进食且饱食上升，但 Mineflayer 槽位扣减包延迟 50~150ms 未同步，
+        # 标脏背包避免下一拍用旧槽位重发 use_item 撞上 missing_item。
+        if self._ate_confirmed and sum(state.count(f) for f in EDIBLE_FOODS) >= before_cnt:
+            state.invalidate_inventory()
         state.refresh_status(ex.client, max_age_s=0)
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         before_food = sum(before_counts.get(f, 0) for f in EDIBLE_FOODS)
         after_food = sum(state.count(f) for f in EDIBLE_FOODS)
-        return "eat_food 结束但食物未消耗且饱食度未满" if (after_food >= before_food and float(state.st.get("food", 0)) < 20) else ""
+        cur_food = float((state.st or {}).get("food", 0))
+        ate_by_food_delta = (
+            getattr(self, "_ate_confirmed", False)
+            or (getattr(self, "_food_before", None) is not None and cur_food > float(self._food_before))
+        )
+        return (
+            "eat_food 结束但食物未消耗且饱食度未满"
+            if (after_food >= before_food and cur_food < 20 and not ate_by_food_delta)
+            else ""
+        )
 
 
 @register
