@@ -1021,6 +1021,10 @@ class MainLoop:
                                     real_death_from_refresh = refresh_err.code in ("dead", "death_loop_cooldown")
                                 else:
                                     self._note_outage(refresh_err)
+                        if not is_death_err and code in ("interrupted", "busy"):
+                            stop_fn = getattr(self.executor, "stop", None)
+                            if callable(stop_fn):
+                                stop_fn(raise_on_error=False)
                         if failed_name == "emergency_escape" or getattr(decision, "safety_escape", False):
                             self._acknowledge_safety_intent(completed=False)
                         environment = e if isinstance(e, EnvBlocked) and not is_death_err else None
@@ -1036,7 +1040,9 @@ class MainLoop:
                                 streak = 0
                                 self._path_failures.pop(active_skill.goal, None)
                             cap = self.config.failure_cooldown_cap_s
-                            if streak >= 3:
+                            if failed_name == "emergency_escape" and code == "busy":
+                                pass
+                            elif streak >= 3:
                                 if cap is not None:
                                     active_skill.mark_failed(cooldown_s=min(cap, active_skill.cooldown_s * 1.5))
                                 else:

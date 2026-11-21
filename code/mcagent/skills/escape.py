@@ -109,28 +109,40 @@ def _exec_step(
         return False
 
 
+def _call_move_once(ex: "Executor", target_pos: list[float], *, rng: float, timeout: float) -> dict:
+    try:
+        return ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0, stop_on=("death",))
+    except TypeError:
+        try:
+            return ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0)
+        except TypeError:
+            return ex.move_to(pos=target_pos, rng=rng)
+
+
 def _move_to_bounded(
     ex: "Executor", target_pos: list[float], *, rng: float = 1, timeout: float = 15.0, **fields: Any,
 ) -> Generator[dict, None, bool]:
     # 脱困移动必须使用 stop_on=("death",)：逃离怪群/岩浆/火焰时挨一下或受灼烧绝不能中途停步
-    try:
+    for attempt in range(2):
         try:
-            res = ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0, stop_on=("death",))
-        except TypeError:
-            try:
-                res = ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0)
-            except TypeError:
-                res = ex.move_to(pos=target_pos, rng=rng)
-        yield rec("move_to", res, pos=target_pos, **fields)
-        return True
-    except Replan as err:
-        if _is_preemption(err):
+            res = _call_move_once(ex, target_pos, rng=rng, timeout=timeout)
+            yield rec("move_to", res, pos=target_pos, **fields)
+            return True
+        except Replan as err:
+            if _is_preemption(err):
+                raise
+            code, _ = failure(err)
+            if code == "busy" and attempt == 0:
+                yield rec("move_to", pos=target_pos, error_code="busy", **fields)
+                stop_fn = getattr(ex, "stop", None)
+                if callable(stop_fn):
+                    stop_fn(raise_on_error=False)
+                continue
+            if code in NAV_FAIL_CODES or code == "timeout":
+                yield rec("move_to", pos=target_pos, error_code=code, **fields)
+                return False
             raise
-        code, _ = failure(err)
-        if code in NAV_FAIL_CODES or code == "timeout":
-            yield rec("move_to", pos=target_pos, error_code=code, **fields)
-            return False
-        raise
+    return False
 
 
 def _control_step(ex: "Executor", **kwargs: Any) -> Generator[dict, None, tuple[bool, str]]:

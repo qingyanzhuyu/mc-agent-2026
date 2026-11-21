@@ -558,6 +558,9 @@ class EatFood(Skill):
         if not item:
             raise Replan("背包没有可食用食物")
         yield rec("use_item", ex.use_item(item), item=item)
+        state.invalidate_inventory()
+        state.refresh_inventory(ex.client)
+        state.refresh_status(ex.client, max_age_s=0)
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         before_food = sum(before_counts.get(f, 0) for f in EDIBLE_FOODS)
