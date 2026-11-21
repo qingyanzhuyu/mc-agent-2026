@@ -2114,6 +2114,66 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(w.controls, 0, "must not bounce into _flee_hostile control loop when enderman is outside flee_dist")
         self.assertGreaterEqual(w.moves, 1)
 
+    def test_seg22_enclosed_dry_stone_pocket_breaches_one_block_instead_of_looping(self) -> None:
+        # 复现 seg-22 INC-002（166× SKILL_POSTCONDITION_FAIL，(-83, 62, 17)）：
+        # 角色被四面 y=62 实心石/圆石墙且 y=64 顶石围困在 1×1 干地凹坑中，背包有 stone_pickaxe 时，
+        # _flee_hostile 在零位移受阻后必须速破 1 格脚部方块（如 (-84, 62, 17) cobblestone）开出 2 格门洞逃离，严禁原地撞墙 166 轮
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {
+            (-83, 61, 17): "stone",
+            (-83, 62, 17): "air",
+            (-83, 63, 17): "air",
+            (-83, 64, 17): "air",
+            (-83, 65, 17): "stone",
+        }
+        # 四面 y=62 均为实心墙，y=63 为空气，y=64 顶石封顶（无法一步走上台阶）
+        for (dx, dz), mat in (((-1, 0), "cobblestone"), ((1, 0), "stone"), ((0, -1), "stone"), ((0, 1), "stone")):
+            blocks[(-83 + dx, 61, 17 + dz)] = "stone"
+            blocks[(-83 + dx, 62, 17 + dz)] = mat
+            blocks[(-83 + dx, 63, 17 + dz)] = "air"
+            blocks[(-83 + dx, 64, 17 + dz)] = "stone"
+
+        class _StonePocketWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-82.7, 62.0, 17.7], items={"stone_pickaxe": 1, "cobblestone": 15})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=7.7, food=12, armor_points=0,
+                    on_ground=True, in_water=False, submerged=False,
+                    nearest_hostile={"id": 177001, "name": "creeper", "dist": 6.5, "pos": [-76.5, 64.0, 17.7]},
+                )
+                self.dug: list[list[int]] = []
+
+            def move_to(self, *args, **kwargs):
+                from mcagent.client import ApiError
+                raise ApiError("path_not_found", "no path out of 1x1 pocket")
+
+            def control(self, **kwargs):
+                if not self.dug:
+                    return {"pos": list(self.st["pos"]), "moved": 0.0, "on_ground": True}
+                # 破墙后顺利迈出门洞脱困
+                self.st["pos"] = [-85.5, 62.0, 17.5]
+                self.st["nearest_hostile"] = {"id": 177001, "name": "creeper", "dist": 9.5, "pos": [-76.5, 64.0, 17.7]}
+                return {"pos": list(self.st["pos"]), "moved": 2.8, "on_ground": True}
+
+            def dig(self, pos, **kwargs):
+                self.dug.append([int(pos[0]), int(pos[1]), int(pos[2])])
+                self.blocks[(int(pos[0]), int(pos[1]), int(pos[2]))] = "air"
+                return {"dug": "cobblestone", "pos": list(pos)}
+
+        w = _StonePocketWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(w.dug, "expected _flee_hostile to dig a 1-block doorway breach out of enclosed dry stone pocket")
+        self.assertEqual(w.dug[0], [-84, 62, 17], f"expected breach away from east creeper at (-84,62,17), got {w.dug}")
+        self.assertTrue(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

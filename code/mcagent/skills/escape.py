@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, Any, Callable, Generator, Optional
 from ..client import ApiError
 from ..runtime import Replan, effective_hostile_flee_dist, has_equipped_armor
 from .base import failure, rec
-from .items import AIR, NAV_FAIL_CODES, bare, is_clear_space, is_safe_solid_floor, pick_placeable, total_placeable
+from .items import (
+    AIR, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, is_safe_solid_floor, pick_placeable, total_placeable,
+)
 from .sightline import DIG_EYE_REACH, block_cell, eye_to_block_dist, voxel_line_cells
 from .voxel_cache import voxel_cache_for
 
@@ -973,6 +975,102 @@ def _pick_alternate_escape_yaw(
     return math.atan2(uz, -ux)  # 右旋 90° 保底
 
 
+def _needs_step_jump(
+    ex: "Executor", px: float, py: float, pz: float, yaw: float, cache: Any, dim: str,
+) -> bool:
+    """检查沿 yaw 紧邻前 1 格是否为可一步跳上的 1 格实心台阶（脚部实心且头顶净空），避免禁跳卡在 1 格台阶前。"""
+    dx, dz = -math.sin(yaw), -math.cos(yaw)
+    sx, sz = int(round(dx)), int(round(dz))
+    if (sx, sz) == (0, 0):
+        return False
+    fx, fy, fz = block_cell([px, py, pz])
+    foot = _read_block(cache, ex.client, (fx + sx, fy, fz + sz), dim)
+    head = _read_block(cache, ex.client, (fx + sx, fy + 1, fz + sz), dim)
+    above = _read_block(cache, ex.client, (fx + sx, fy + 2, fz + sz), dim)
+    return bool(
+        _is_solid_wall_block(foot)
+        and head is not None and is_clear_space(head)
+        and (above is None or is_clear_space(above))
+    )
+
+
+def _is_fast_breachable(blk: Optional[dict], has_pick: bool) -> bool:
+    if blk is None or blk.get("diggable") is False:
+        return False
+    name = bare(blk.get("name"))
+    if not name or name in AIR or name in _FLUID_OR_FIRE or name in ("bedrock", "obsidian", "crying_obsidian"):
+        return False
+    if _is_soft_overhang(name) or name.endswith("_leaves") or name.endswith("_planks") or name.endswith("_log"):
+        return True
+    if has_pick and (
+        name in ("stone", "cobblestone", "deepslate", "cobbled_deepslate", "andesite", "diorite", "granite", "tuff", "sandstone", "netherrack")
+        or name.endswith("_bricks") or name.endswith("_ore")
+    ):
+        return True
+    return False
+
+
+def _find_dry_pocket_breach_cell(
+    ex: "Executor",
+    st: dict,
+    state: "State",
+    cache: Any,
+    dim: str,
+    *,
+    away_dir: Optional[tuple[float, float]] = None,
+) -> Optional[Cell]:
+    """干地逃敌陷入四面封堵的 1×1 凹坑/石穴（四向均无平步 2 格出口）时，寻找 1 格速破出口方块。"""
+    pos = _valid_vec3(st.get("pos"))
+    if pos is None:
+        return None
+    fx, fy, fz = block_cell(pos)
+    # 若四向任一方向存在 2 格高平步通道，则并非封闭 1×1 坑，无需破墙
+    for dx, dz in _CARDINALS:
+        f_blk = _read_block(cache, ex.client, (fx + dx, fy, fz + dz), dim)
+        h_blk = _read_block(cache, ex.client, (fx + dx, fy + 1, fz + dz), dim)
+        if f_blk is None or h_blk is None:
+            return None
+        if is_clear_space(f_blk) and is_clear_space(h_blk):
+            return None
+
+    has_pick = bool(best_pickaxe(state))
+    ax, az = away_dir if away_dir is not None else (0.0, 0.0)
+    scored: list[tuple[float, Cell]] = []
+    for dx, dz in _CARDINALS:
+        foot_cell = (fx + dx, fy, fz + dz)
+        head_cell = (fx + dx, fy + 1, fz + dz)
+        ceil_cell = (fx + dx, fy + 2, fz + dz)
+        under_cell = (fx + dx, fy - 1, fz + dz)
+        f_blk = _read_block(cache, ex.client, foot_cell, dim)
+        h_blk = _read_block(cache, ex.client, head_cell, dim)
+        c_blk = _read_block(cache, ex.client, ceil_cell, dim)
+        u_blk = _read_block(cache, ex.client, under_cell, dim)
+        if u_blk is not None and bare(u_blk.get("name")) in ("lava", "flowing_lava"):
+            continue
+        align = dx * ax + dz * az
+        # 优先 A：挖掉脚部 1 格即成 2 格高平步门洞（如自封的圆石/泥土墙）
+        if (
+            _is_fast_breachable(f_blk, has_pick)
+            and h_blk is not None and is_clear_space(h_blk)
+            and eye_to_block_dist(st, foot_cell) <= DIG_EYE_REACH
+        ):
+            soft_bonus = 2.0 if _is_soft_overhang(bare(f_blk.get("name"))) else 0.0
+            scored.append((10.0 + soft_bonus + align, foot_cell))
+        # 次选 B：脚部为 1 格台阶、中间空、头顶 y+2 顶石卡头 -> 挖掉 y+2 即可一步上台阶
+        elif (
+            _is_solid_wall_block(f_blk)
+            and h_blk is not None and is_clear_space(h_blk)
+            and _is_fast_breachable(c_blk, has_pick)
+            and eye_to_block_dist(st, ceil_cell) <= DIG_EYE_REACH
+        ):
+            soft_bonus = 2.0 if _is_soft_overhang(bare(c_blk.get("name"))) else 0.0
+            scored.append((5.0 + soft_bonus + align, ceil_cell))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
 def _find_soft_bank_dig_cell(
     ex: "Executor", st: dict, cache: Any, dim: str, tried_digs: set[Cell],
 ) -> Optional[Cell]:
@@ -1873,9 +1971,41 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             return total_sw_xz >= 2.5
 
     # 若掩体退离/前序疾跑刚撞墙或遇服务端隐形边界回弹（burst_blocked / zero_stall）：
-    # 在敌怪 <=5.0 格或零位移回弹时先沿避开 tried_yaws 的防跳崖替代角（零位移时优先切反半球且禁跳防持续回弹）脱困，
-    # 避免直接落入撞向同一隐形边界的 2.2s move_to 原地挨打。
+    # 1) 若四面被实心方块围困于 1×1 干地凹坑/石穴，优先速破 1 格墙体开出 2 格门洞；
+    # 2) 否则在敌怪 <=5.0 格或零位移回弹时沿避开 tried_yaws 的防跳崖替代角（零位移平地禁跳防回弹，遇 1 格台阶仍允许跳）脱困。
     if (burst_blocked or zero_stall) and not (st_cur.get("in_water") or st_cur.get("submerged")):
+        breach_cell = (
+            _find_dry_pocket_breach_cell(ex, st_cur, state, cache, dim, away_dir=(ux, uz))
+            if zero_stall
+            else None
+        )
+        if breach_cell is not None:
+            breach_pos = list(breach_cell)
+            ok_br = yield from _exec_step(
+                "dig",
+                lambda bp=breach_pos: ex.dig(bp),
+                on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
+                pos=breach_pos,
+            )
+            st_br = _refresh_status(ex, state)
+            if st_br.get("alive") is False:
+                return False
+            st_cur = st_br
+            if ok_br:
+                tried_yaws.clear()
+                setattr(state, "_escape_blocked_yaws", None)
+                zero_stall = False
+                burst_blocked = False
+                b_yaw = math.atan2(-((breach_cell[0] + 0.5) - px), -((breach_cell[2] + 0.5) - pz))
+                yield from _control_step(
+                    ex, forward=True, sprint=True, jump=True, yaw=b_yaw, ms=700,
+                )
+                st_cur = _refresh_status(ex, state)
+                if st_cur.get("alive") is False:
+                    return False
+                cpos_br = st_cur.get("pos")
+                if isinstance(cpos_br, (list, tuple)) and len(cpos_br) >= 3:
+                    px, py, pz = float(cpos_br[0]), float(cpos_br[1]), float(cpos_br[2])
         cur_nh_blk = st_cur.get("nearest_hostile") or hostile
         cur_d_blk = cur_nh_blk.get("dist") if isinstance(cur_nh_blk, dict) else h_dist
         if zero_stall or (isinstance(cur_d_blk, (int, float)) and not isinstance(cur_d_blk, bool) and float(cur_d_blk) <= 5.0):
@@ -1884,12 +2014,17 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     ex, px, py, pz, ux, uz, cache, dim,
                     tried_yaws=tried_yaws, prefer_opposite=zero_stall,
                 )
-                safe_blk_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, blk_alt_yaw, cache, dim, avoid_water=True)
+                safe_blk_yaw = _pick_cliff_safe_yaw(
+                    ex, px, py, pz, blk_alt_yaw, cache, dim,
+                    avoid_water=True,
+                    hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                )
                 if safe_blk_yaw is None:
                     break
                 before_blk = (px, py, pz)
+                blk_jump = (not zero_stall) or _needs_step_jump(ex, px, py, pz, safe_blk_yaw, cache, dim)
                 ok_blk, _ = yield from _control_step(
-                    ex, forward=True, sprint=True, jump=not zero_stall, yaw=safe_blk_yaw, ms=800,
+                    ex, forward=True, sprint=True, jump=blk_jump, yaw=safe_blk_yaw, ms=800,
                 )
                 if not ok_blk:
                     break
@@ -1977,6 +2112,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     break
     # 脱险寻路超时上限压紧至 2.2s（原 5.0s）：一旦地形/矿洞墙体导致 pathfinder 原地重算卡滞，
     # 最多 2.2s 即中止并转入实时换向疾跑跳，严禁原地站桩 5s 连吃 3~4 箭/刀致死。
+    before_mt = (px, py, pz)
     moved = yield from _move_to_bounded(
         ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=2.2,
     )
@@ -1994,19 +2130,41 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 avoid_water=not in_w_retry, in_water=in_w_retry,
             )
             away_yaw = math.atan2(-ux, -uz)
-        retry_yaw = (
-            _pick_alternate_escape_yaw(
-                ex, px, py, pz, ux, uz, cache, dim,
-                tried_yaws=tried_yaws, prefer_opposite=zero_stall,
+        breached_pocket = False
+        if not in_w_retry and math.hypot(px - before_mt[0], pz - before_mt[2]) < 0.35:
+            breach_mt = _find_dry_pocket_breach_cell(ex, st_retry, state, cache, dim, away_dir=(ux, uz))
+            if breach_mt is not None:
+                breach_pos = list(breach_mt)
+                ok_br_mt = yield from _exec_step(
+                    "dig",
+                    lambda bp=breach_pos: ex.dig(bp),
+                    on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
+                    pos=breach_pos,
+                )
+                if ok_br_mt:
+                    tried_yaws.clear()
+                    setattr(state, "_escape_blocked_yaws", None)
+                    br_yaw = math.atan2(-((breach_mt[0] + 0.5) - px), -((breach_mt[2] + 0.5) - pz))
+                    yield from _control_step(
+                        ex, forward=True, sprint=True, jump=True, yaw=br_yaw, ms=700,
+                    )
+                    breached_pocket = True
+        if not breached_pocket:
+            retry_yaw = (
+                _pick_alternate_escape_yaw(
+                    ex, px, py, pz, ux, uz, cache, dim,
+                    tried_yaws=tried_yaws, prefer_opposite=zero_stall,
+                )
+                if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
+                else away_yaw
             )
-            if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
-            else away_yaw
-        )
-        safe_retry_yaw = _pick_cliff_safe_yaw(
-            ex, px, py, pz, retry_yaw, cache, dim,
-            avoid_water=not in_w_retry,
-            hostile_dir=(-ux, -uz) if h_pos is not None else None,
-        )
+            safe_retry_yaw = _pick_cliff_safe_yaw(
+                ex, px, py, pz, retry_yaw, cache, dim,
+                avoid_water=not in_w_retry,
+                hostile_dir=(-ux, -uz) if h_pos is not None else None,
+            )
+        else:
+            safe_retry_yaw = None
         if safe_retry_yaw is not None:
             before_retry = (px, py, pz)
             ok_rt, _ = yield from _control_step(
@@ -2023,18 +2181,45 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     else 0.0
                 )
                 if moved_rt_xz < 0.35:
-                    # 兜底疾跑遇隐形边界/墙体零位移回弹：记录受阻角并立即反半球不跳疾跑脱墙
-                    tried_yaws.append(safe_retry_yaw)
-                    _record_blocked_yaw(state, dim, px, pz, safe_retry_yaw)
-                    pivot_yaw = _pick_alternate_escape_yaw(
-                        ex, px, py, pz, ux, uz, cache, dim,
-                        tried_yaws=tried_yaws, prefer_opposite=True,
+                    # 兜底疾跑遇封闭 1×1 石坑或隐形边界零位移回弹：先检测是否四面被方块封堵可速破 1 格脱坑，
+                    # 否则记录受阻角并立即反半球脱墙
+                    breach_rt = (
+                        _find_dry_pocket_breach_cell(ex, st_rt_chk, state, cache, dim, away_dir=(ux, uz))
+                        if not in_w_retry
+                        else None
                     )
-                    safe_pivot = _pick_cliff_safe_yaw(ex, px, py, pz, pivot_yaw, cache, dim, avoid_water=not in_w_retry)
-                    if safe_pivot is not None:
-                        yield from _control_step(
-                            ex, forward=True, sprint=True, jump=False, yaw=safe_pivot, ms=700,
+                    if breach_rt is not None:
+                        breach_pos = list(breach_rt)
+                        ok_br_rt = yield from _exec_step(
+                            "dig",
+                            lambda bp=breach_pos: ex.dig(bp),
+                            on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
+                            pos=breach_pos,
                         )
+                        if ok_br_rt:
+                            tried_yaws.clear()
+                            setattr(state, "_escape_blocked_yaws", None)
+                            br_yaw = math.atan2(-((breach_rt[0] + 0.5) - px), -((breach_rt[2] + 0.5) - pz))
+                            yield from _control_step(
+                                ex, forward=True, sprint=True, jump=True, yaw=br_yaw, ms=700,
+                            )
+                    else:
+                        tried_yaws.append(safe_retry_yaw)
+                        _record_blocked_yaw(state, dim, px, pz, safe_retry_yaw)
+                        pivot_yaw = _pick_alternate_escape_yaw(
+                            ex, px, py, pz, ux, uz, cache, dim,
+                            tried_yaws=tried_yaws, prefer_opposite=True,
+                        )
+                        safe_pivot = _pick_cliff_safe_yaw(
+                            ex, px, py, pz, pivot_yaw, cache, dim,
+                            avoid_water=not in_w_retry,
+                            hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                        )
+                        if safe_pivot is not None:
+                            piv_jump = _needs_step_jump(ex, px, py, pz, safe_pivot, cache, dim)
+                            yield from _control_step(
+                                ex, forward=True, sprint=True, jump=piv_jump, yaw=safe_pivot, ms=700,
+                            )
             # 无盾遭远程弓箭/三叉戟追射（骷髅仇恨/射程 16~20 格）：若首段兜底疾跑通畅（>=2m）但敌怪仍在 18m 内且无掩体遮挡，
             # 顺势补第二段 800ms 疾跑跳一次性拉断 16m 仇恨链，避免停在 14.8m 空地 4s 后再挨箭
             if ok_rt and is_ranged and not has_shield:
