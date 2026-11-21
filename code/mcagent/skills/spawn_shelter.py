@@ -9,11 +9,16 @@ from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
 from .camp_plan import is_protected_cell, record_protected_cell, state_dim, state_snap
 from .field import _observed_block, place_block, scan_blocks
-from .items import AIR, PASSABLE_COVER, bare, is_safe_solid_floor
+from .items import AIR, PASSABLE_COVER, bare
 from .observations import refresh_inventory
 from .registry import register
+from .shelter_site import (
+    evaluate_shelter_site,
+    is_clearable_cover,
+    level_shelter_footprint,
+    select_shelter_center,
+)
 from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
-from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks
 from .world_memo import BED_BLOCKS, memo_for
 
 if TYPE_CHECKING:
@@ -24,9 +29,6 @@ _DOORS: tuple[str, ...] = ("oak_door", "spruce_door", "birch_door", "jungle_door
                            "dark_oak_door", "mangrove_door", "cherry_door", "bamboo_door", "pale_oak_door")
 _PASSABLE = AIR | PASSABLE_COVER
 _BED_SET: frozenset[str] = frozenset(BED_BLOCKS)
-_RING_RADII: tuple[int, ...] = (10, 14, 18, 22, 26, 32)
-_RING_DIRS: tuple[tuple[float, float], ...] = ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-                                              (0.707, 0.707), (-0.707, 0.707), (0.707, -0.707), (-0.707, -0.707))
 _MIN_SHELTER_COBBLE, _MIN_BUNKER_COBBLE = 36, 20
 
 
@@ -46,62 +48,39 @@ def _bounded_move_to(ex: "Executor", pos: Sequence[float], *, rng: int = 2, time
         return ex.move_to(pos=dest, rng=rng)
 
 
-def _read_blocks(ex: "Executor", cells: Sequence[tuple[int, int, int]]) -> dict[tuple[int, int, int], dict]:
-    if has_batch_get_blocks(getattr(ex, "client", None)):
-        return client_get_blocks_batch(ex.client, cells)
-    return {c: _observed_block(ex, c) for c in cells}
-
-
 def _site_is_valid(ex: "Executor", cx: int, cy: int, cz: int, *, radius: int = 2) -> bool:
-    if is_protected_cell((cx, cy, cz)):
-        return False
-    floor_cells = [(cx + dx, cy - 1, cz + dz) for dx in range(-radius, radius + 1) for dz in range(-radius, radius + 1)]
-    head_cells = [(cx + dx, cy + dy, cz + dz) for dx in (-1, 0, 1) for dz in (-1, 0, 1) for dy in (0, 1)]
-    snap = _read_blocks(ex, [*floor_cells, *head_cells])
-    for fc in floor_cells:
-        if is_protected_cell(fc) or not is_safe_solid_floor(snap.get(fc, {})):
-            return False
-    blocked = 0
-    for hc in head_cells:
-        bname = bare((snap.get(hc) or {}).get("name"))
-        if bname in ("water", "lava", "flowing_water", "flowing_lava", "bedrock"):
-            return False
-        if bname and bname not in _PASSABLE:
-            blocked += 1
-    return blocked <= 6
+    return evaluate_shelter_site(ex, cx, cy, cz, radius=radius) is not None
 
 
 def _select_shelter_center(ex: "Executor", state: "State", dim: str) -> tuple[int, int, int]:
-    st = state.refresh_status(ex.client, max_age_s=0)
-    cur = block_cell(st.get("pos"))
-    memo = memo_for(state)
-    camp = memo.get_camp(dimension=dim)
-    spawn = memo.get_spawn(dimension=dim)
-    candidates: list[tuple[int, int, int]] = []
-    if isinstance(camp, Mapping) and camp.get("pos"):
-        candidates.append(block_cell(camp["pos"]))
-    candidates.append(cur)
-    anchor = block_cell(spawn) if spawn is not None else cur
-    candidates.extend((anchor[0] + round(r * ux), anchor[1], anchor[2] + round(r * uz)) for r in _RING_RADII for ux, uz in _RING_DIRS)
-    seen: set[tuple[int, int, int]] = set()
-    for cand in candidates:
-        if cand in seen:
-            continue
-        seen.add(cand)
-        if _site_is_valid(ex, cand[0], cand[1], cand[2], radius=2):
-            return cand
-    raise EnvBlocked("出生点保护区外缘 r=10..32 环带未找到平坦干燥 5×5 避难所地基",
-                     missing_predicate="shelter_flat_site", searched_volume="出生点环带 r=10..32 5×5 地基", wake_on="chunk_moved")
+    return select_shelter_center(ex, state, dim)
 
 
-def _approach_cell(ex: "Executor", state: "State", cell: tuple[int, int, int], *, reach: float = STATION_EYE_REACH):
+def _approach_cell(
+    ex: "Executor",
+    state: "State",
+    cell: tuple[int, int, int],
+    *,
+    reach: float = STATION_EYE_REACH,
+    avoid_overlap: bool = False,
+):
     st = state.refresh_status(ex.client, max_age_s=0)
     if can_reach_block(ex, st, cell, reach=reach) or eye_to_block_dist(st, cell) <= reach:
         return True
+    dest: list[float] = [float(cell[0]), float(cell[1]), float(cell[2])]
+    if avoid_overlap:
+        cur = st.get("pos") or state.pos
+        dx, dz = float(cur[0]) - (cell[0] + 0.5), float(cur[2]) - (cell[2] + 0.5)
+        horiz = math.hypot(dx, dz)
+        if horiz >= 0.5:
+            step = min(1.5, horiz)
+            dest = [round(cell[0] + 0.5 + dx / horiz * step, 2), float(cur[1]), round(cell[2] + 0.5 + dz / horiz * step, 2)]
+        else:
+            dest = [cell[0] + 1.5, float(cell[1] + 1), cell[2] + 0.5]
     try:
-        yield rec("move_to", _bounded_move_to(ex, cell, rng=2, timeout=30.0), pos=list(cell))
+        yield rec("move_to", _bounded_move_to(ex, dest, rng=2, timeout=30.0), pos=dest)
     except Replan as exc:
-        yield rec("move_to", pos=list(cell), error_code=failure(exc)[0])
+        yield rec("move_to", pos=dest, error_code=failure(exc)[0])
         return False
     return True
 
@@ -134,10 +113,14 @@ def _place_structural(ex: "Executor", state: "State", cell: tuple[int, int, int]
     if cur_name == bare(item) or cur_name in _BLAST_BLOCKS:
         return True
     if cur_name and cur_name not in AIR:
-        return False
+        if is_clearable_cover(cur_name):
+            if not (yield from _clear_if_needed(ex, state, cell)):
+                return False
+        else:
+            return False
     if state.count(item) < 1:
         return False
-    if not (yield from _approach_cell(ex, state, cell, reach=STATION_EYE_REACH)):
+    if not (yield from _approach_cell(ex, state, cell, reach=STATION_EYE_REACH, avoid_overlap=True)):
         return False
     try:
         yield from place_block(ex, state, item, cell)
@@ -339,17 +322,31 @@ class BuildSpawnShelter(Skill):
             raise Replan("tier1_shelter 模式仅在主世界执行")
 
         center = None
+        probe_cell = None
+        chosen_eval: Optional[dict[str, Any]] = None
         for _attempt in range(3):
             cand_center = _select_shelter_center(ex, state, dim)
             bp = shelter_blueprint(*cand_center)
-            # 试放第一块外墙，若触发 protected_region 则记录保护区并外移重试
-            probe_cell = bp["wall_cells"][0]
+            ev = evaluate_shelter_site(ex, *cand_center, radius=2) or {}
+            pad_set = set(ev.get("pad_cells") or ())
+            trim_set = set(ev.get("trim_cells") or ())
+            # 优先选择地基已平实且无需削平的外墙格试放，验证非保护区
+            probe_cell = next(
+                (wc for wc in bp["wall_cells"]
+                 if wc[1] == cand_center[1] and (wc[0], wc[1] - 1, wc[2]) not in pad_set and wc not in trim_set),
+                bp["wall_cells"][0],
+            )
             blk = _pick_blast_block(state)
             if blk is None:
                 raise Replan("防爆建材已耗尽")
             try:
+                if (probe_cell[0], probe_cell[1] - 1, probe_cell[2]) in pad_set:
+                    yield from _place_structural(ex, state, (probe_cell[0], probe_cell[1] - 1, probe_cell[2]), blk, memo=memo, dim=dim)
+                if probe_cell in trim_set:
+                    yield from _clear_if_needed(ex, state, probe_cell)
                 yield from _place_structural(ex, state, probe_cell, blk, memo=memo, dim=dim)
                 center = cand_center
+                chosen_eval = ev
                 break
             except Replan as exc:
                 if failure(exc)[0] != "protected_region":
@@ -361,12 +358,19 @@ class BuildSpawnShelter(Skill):
             raise EnvBlocked("出生点周边多次试放均命中保护区，暂无法锁定避难所坐标", missing_predicate="shelter_flat_site", searched_volume="出生点外缘环带", wake_on="chunk_moved")
 
         bp = shelter_blueprint(*center)
+        # 轻量整平 5×5 基座（清草/花/低叶、削平 1 格凸起、垫平 1 格低洼，绝不破坏既有营地箱/台/炉/床）
+        skip_probe = [probe_cell] if probe_cell is not None else []
+        yield from level_shelter_footprint(
+            ex, state, center, memo=memo, dim=dim, clear_fn=_clear_if_needed, place_fn=_place_structural,
+            site_eval=chosen_eval, skip_cells=skip_probe,
+        )
         placed = 1
-        # 先清室内净空（保证中心与箱顶均为 AIR），再砌墙封顶
+        # 再清室内净空（保证中心与箱顶均为 AIR），随后砌墙封顶
         skip_keep = frozenset({"chest", "furnace", "crafting_table", "torch"}) | _BED_SET
         for dx, dz, dy in ((dx, dz, dy) for dx in (-1, 0, 1) for dz in (-1, 0, 1) for dy in (0, 1)):
             yield from _clear_if_needed(ex, state, (center[0] + dx, center[1] + dy, center[2] + dz), skip_names=skip_keep)
-        for cell in (*bp["wall_cells"][1:], *bp["roof_cells"]):
+        remaining_walls = [c for c in bp["wall_cells"] if c != probe_cell]
+        for cell in (*remaining_walls, *bp["roof_cells"]):
             if (blk := _pick_blast_block(state)) is None:
                 break
             if (yield from _place_structural(ex, state, cell, blk, memo=memo, dim=dim)):

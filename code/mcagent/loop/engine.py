@@ -30,6 +30,7 @@ class LoopConfig:
     max_steps: int = 0            # 0 = 不限步数（按时间或信号停止）
     max_seconds: float = 0.0      # 0 = 不限时（正式赛可设 28800 = 8h）
     max_deaths: int = 0           # 0 = 不限死亡次数（持续自愈重来）
+    stop_on_death: bool = False   # True = 检测到真实死亡时记录死亡上下文并立即干净退出
     idle_sleep_s: float = 0.2
     respawn_poll_s: float = 0.1
     respawn_timeout_s: float = 90.0
@@ -645,6 +646,70 @@ class MainLoop:
             )
         return True
 
+    def _record_death_and_stop(
+        self,
+        pre_death_inv: dict[str, int],
+        *,
+        initial_err: Optional[ApiError] = None,
+        cause_hint: str = "",
+    ) -> None:
+        """在 `--stop-on-death` 模式下记录完整死亡上下文（不等待重生），随后交给主循环干净退出。"""
+        last_st = self.state.snapshot()
+        try:
+            st_now = self.client.status()
+            if isinstance(st_now, dict) and st_now:
+                self.state.set_status(st_now)
+                last_st = st_now
+        except Exception:
+            pass
+        try:
+            self.state.drain(self.client)
+        except Exception:
+            pass
+        self._seen_deaths_len = len(self.state.deaths)
+
+        ld = (last_st.get("last_death") or {}) if isinstance(last_st, dict) else {}
+        ev_death = self.state.deaths[-1] if self.state.deaths else {}
+        cause = str(
+            ld.get("cause")
+            or (ev_death.get("cause") if isinstance(ev_death, dict) else "")
+            or cause_hint
+            or (str(initial_err) if initial_err is not None else "")
+        )
+        death_pos = (
+            ld.get("pos")
+            or (ev_death.get("pos") if isinstance(ev_death, dict) else None)
+            or last_st.get("pos")
+            or self.state.pos
+        )
+        dim = str(last_st.get("dimension") or "overworld")
+        triggered_death_loop = bool(initial_err is not None and initial_err.code == "death_loop_cooldown")
+
+        if isinstance(death_pos, (list, tuple)) and len(death_pos) >= 3:
+            try:
+                memo_for(self.state).record_death(
+                    death_pos,
+                    cause=cause,
+                    lost_items=dict(pre_death_inv or {}),
+                    dimension=dim,
+                )
+            except Exception:
+                pass
+        self.log(
+            f"[loop] 触发 --stop-on-death：检测到真实死亡，立即记录上下文并退出 "
+            f"(pos={death_pos}, dim={dim}, hp={last_st.get('health')}, food={last_st.get('food')}, cause={cause!r})"
+        )
+        if self.observer is not None:
+            self.observer.on_death_recovered(
+                self.state,
+                respawn_ms=0.0,
+                cause=cause,
+                death_pos=death_pos,
+                before_inv_fp=pre_death_inv,
+                after_inv_fp={},
+                triggered_death_loop=triggered_death_loop,
+            )
+
     def run(self) -> RunResult:
         started_mono = time.monotonic()
         steps = 0
@@ -728,6 +793,10 @@ class MainLoop:
                 except ApiError as e:
                     if e.code not in SESSION_CODES:
                         raise  # 只剩致命错误
+                    if self.config.stop_on_death and (e.code in ("dead", "death_loop_cooldown") or self._is_dead_now()):
+                        self._record_death_and_stop(pre_inv_fp, initial_err=e, cause_hint=str(e))
+                        stop_reason = "death_stopped"
+                        break
                     if self._recover_guarded(pre_inv_fp, initial_err=e):
                         deaths_recovered += 1
                     elif self._outage_exceeded():
@@ -742,6 +811,10 @@ class MainLoop:
                     continue
 
                 if self._is_dead_now():
+                    if self.config.stop_on_death:
+                        self._record_death_and_stop(pre_inv_fp, cause_hint="status_dead")
+                        stop_reason = "death_stopped"
+                        break
                     if self._recover_guarded(pre_inv_fp):
                         deaths_recovered += 1
                     elif self._outage_exceeded():
@@ -935,6 +1008,7 @@ class MainLoop:
                         )
                         self.recent_failures.append(f"{active_skill.name}: {e}")
                         self.log(f"[loop] 技能中断 {active_skill}: {e}")
+                        real_death_from_refresh = False
                         if not is_death_err:
                             try:
                                 self.state.refresh_status(self.client, max_age_s=0)
@@ -944,6 +1018,7 @@ class MainLoop:
                                 # 会话类错误按死亡/断线恢复；网关抖动不算死亡，留给下一拍退避刷新
                                 if refresh_err.code in SESSION_CODES:
                                     is_death_err = True
+                                    real_death_from_refresh = refresh_err.code in ("dead", "death_loop_cooldown")
                                 else:
                                     self._note_outage(refresh_err)
                         if failed_name == "emergency_escape" or getattr(decision, "safety_escape", False):
@@ -1001,6 +1076,20 @@ class MainLoop:
                         active_skill = None
                         if is_death_err:
                             init_api_err = e if isinstance(e, ApiError) else None
+                            is_real_death = (
+                                died_during_skill
+                                or real_death_from_refresh
+                                or code in ("dead", "death_loop_cooldown")
+                                or (
+                                    code == "interrupted"
+                                    and extra.get("cause", extra.get("interrupted_by")) == "death"
+                                )
+                                or self._is_dead_now()
+                            )
+                            if self.config.stop_on_death and is_real_death:
+                                self._record_death_and_stop(pre_inv_fp, initial_err=init_api_err, cause_hint=str(e))
+                                stop_reason = "death_stopped"
+                                break
                             if self._recover_guarded(pre_inv_fp, initial_err=init_api_err):
                                 deaths_recovered += 1
                 except Fatal as e:

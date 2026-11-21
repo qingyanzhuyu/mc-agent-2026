@@ -1,0 +1,393 @@
+"""地下矿道回地表/营地与就地临时工作台 L2 原语。
+
+遵守 AGENTS.md §9 全部约束：
+- 纯 L2 原语，禁止 `@register`、禁止继承 `Skill`、禁止导入 `mcagent.loop`；
+- 每次阻塞动作立即 `yield rec(...)`，复用 `skills.sightline` 与 `voxel_cache`。
+"""
+from __future__ import annotations
+
+import math
+from collections.abc import Generator, Mapping, Sequence
+from typing import Any, Optional
+
+from ..client import ApiError
+from ..runtime import EnvBlocked, Executor, Replan, State
+from .base import failure, rec
+from .items import AIR, MINE_TRAILS, NAV_FAIL_CODES, STONE_OR_BETTER_PICKS, bare, best_pickaxe
+from .mining import SOLID_SUPPORT, prepare_mining_pick
+from .recipes import RECIPES, craft_recipe
+from .sightline import STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
+from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
+from .world_memo import ALL_LOG_BLOCKS, memo_for
+
+Cell = tuple[int, int, int]
+_PLANK_ITEMS: tuple[str, ...] = tuple(item for item in RECIPES if item.endswith("_planks"))
+_VALID_TABLE_SUPPORTS: frozenset[str] = SOLID_SUPPORT | frozenset(_PLANK_ITEMS) | frozenset({
+    "grass_block", "dirt", "coarse_dirt", "sandstone", "oak_log", "birch_log", "spruce_log",
+})
+_UNSAFE_CLIMB: frozenset[str] = frozenset({
+    "water", "lava", "flowing_water", "flowing_lava", "bedrock", "crafting_table", "chest", "furnace",
+})
+_FALLING_ROOF: frozenset[str] = frozenset({"sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava"})
+_ROUTE_ERRS: frozenset[str] = frozenset((*NAV_FAIL_CODES, "timeout"))
+_CEILING_CHECK_MAX_Y: float = 52.0
+
+
+def _is_preemption(err: BaseException) -> bool:
+    return isinstance(err, EnvBlocked) or failure(err)[0] == "interrupted" or "抢占" in str(err)
+
+
+def _bounded_move_to(ex: Executor, pos: Sequence[float | int], *, rng: int = 2, timeout: float = 30.0) -> dict:
+    dest = list(pos)
+    try:
+        return ex.move_to(pos=dest, rng=rng, timeout=timeout, retries=0)
+    except TypeError:
+        return ex.move_to(pos=dest, rng=rng)
+
+
+def _cur_status(ex: Executor, state: State) -> tuple[dict[str, Any], list[float], str]:
+    st = state.refresh_status(ex.client, max_age_s=0) or {}
+    return st, list(st.get("pos") or state.pos), bare(st.get("dimension")).strip().lower() or "overworld"
+
+
+def _probe_name(ex: Executor, pos: Sequence[int]) -> str:
+    try:
+        return bare(ex.client.get_block(list(pos)).get("name"))
+    except ApiError as exc:
+        if exc.code in ("not_loaded", "not_ready"):
+            return ""
+        raise
+
+
+def _reference_surface_y(state: State, dim: str) -> Optional[float]:
+    memo = memo_for(state)
+    ys: list[float] = []
+    shaft = memo.get_mine_shaft(dimension=dim)
+    if isinstance(shaft, Mapping) and isinstance(shaft.get("entry"), (list, tuple)) and len(shaft["entry"]) >= 3:
+        ys.append(float(shaft["entry"][1]))
+    camp = memo.get_camp(dimension=dim)
+    if isinstance(camp, Mapping):
+        ys.extend(float(camp[k][1]) for k in ("pos", "crafting_table", "mine_entry")
+                  if isinstance(camp.get(k), (list, tuple)) and len(camp[k]) >= 3)
+    spawn = memo.get_spawn(dimension=dim)
+    if isinstance(spawn, (list, tuple)) and len(spawn) >= 3:
+        ys.append(float(spawn[1]))
+    if MINE_TRAILS and MINE_TRAILS[-1]:
+        ys.append(float(MINE_TRAILS[-1][0][1]))
+    return max(ys) if ys else None
+
+
+def is_underground_in_mine(ex: Executor, state: State) -> bool:
+    """判断角色是否身处主世界地下矿道（明显低于地表/营地/井口，或低海拔且头顶有实心岩顶）。"""
+    st = state.st if isinstance(state.st, Mapping) and state.st.get("pos") is not None else state.refresh_status(ex.client, max_age_s=0)
+    if not isinstance(st, Mapping) or (bare(st.get("dimension")).strip().lower() or "overworld") != "overworld":
+        return False
+    pos = st.get("pos") or state.pos
+    if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+        return False
+    py = float(pos[1])
+    ref_y = _reference_surface_y(state, "overworld")
+    if ref_y is not None and py <= ref_y - 8.0:
+        return True
+    if py >= _CEILING_CHECK_MAX_Y:
+        return False
+    cx, cy, cz = block_cell(pos)
+    cells = [(cx, cy + dy, cz) for dy in (2, 3, 4, 5, 6)]
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        snap = client_get_blocks_batch(ex.client, cells)
+        names = [bare((snap.get(c) or {}).get("name")) for c in cells]
+    else:
+        names = [_probe_name(ex, c) for c in cells]
+    return any(n and n not in AIR and not n.endswith("_leaves") for n in names)
+
+
+def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> list[list[float]]:
+    """沿矿井起止点构造分段上升路点，避免深井跨 30+ 格一次寻路超时或 path_not_found。"""
+    dest = [float(entry[0]) + (0.5 if float(entry[0]).is_integer() else 0.0),
+            float(entry[1]),
+            float(entry[2]) + (0.5 if float(entry[2]).is_integer() else 0.0)]
+    dist = math.dist(cur, entry)
+    if dist <= 18.0:
+        return [dest]
+    segs = max(2, min(5, int(math.ceil(dist / 12.0))))
+    return [[round(float(cur[i]) + (dest[i] - float(cur[i])) * (k / segs), 2) for i in range(3)]
+            for k in range(1, segs + 1)]
+
+
+def _climb_out_stairs(
+    ex: Executor, state: State, *, target_y: float, max_steps: int = 8,
+) -> Generator[dict, None, bool]:
+    """当既有矿井路径不通时，在安全实心岩体中向上开凿有界 1×2 阶梯脱困。"""
+    pick = best_pickaxe(state)
+    if pick is None:
+        return False
+    vc = voxel_cache_for(state)
+    for _ in range(max(1, int(max_steps))):
+        st, cur, dim = _cur_status(ex, state)
+        if st.get("alive") is False or float(cur[1]) >= target_y - 2.0:
+            return float(cur[1]) >= target_y - 2.0
+        ix, fy, iz = block_cell(cur)
+        chosen: Optional[tuple[int, int]] = None
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, nz = ix + dx, iz + dz
+            floor_n = _probe_name(ex, (nx, fy, nz))
+            if not floor_n or floor_n in AIR or floor_n in _UNSAFE_CLIMB:
+                continue
+            head_n = _probe_name(ex, (ix, fy + 2, iz))
+            s1_n = _probe_name(ex, (nx, fy + 1, nz))
+            s2_n = _probe_name(ex, (nx, fy + 2, nz))
+            roof_n = _probe_name(ex, (nx, fy + 3, nz))
+            if roof_n in _FALLING_ROOF or any(n in _UNSAFE_CLIMB for n in (head_n, s1_n, s2_n)):
+                continue
+            chosen = (nx, nz)
+            break
+        if chosen is None:
+            return False
+        nx, nz = chosen
+        for cell in ([ix, fy + 2, iz], [nx, fy + 1, nz], [nx, fy + 2, nz]):
+            bn = _probe_name(ex, cell)
+            if not bn or bn in AIR:
+                continue
+            yield from prepare_mining_pick(ex, state)
+            try:
+                res = ex.dig(cell, collect=False)
+            except Replan as err:
+                if _is_preemption(err):
+                    raise
+                yield rec("dig", pos=cell, error_code=failure(err)[0], reason="mine_return_climb")
+                return False
+            vc.invalidate(cell, dimension=dim)
+            yield rec("dig", res, pos=cell, reason="mine_return_climb")
+        up = [nx + 0.5, float(fy + 1), nz + 0.5]
+        try:
+            res = _bounded_move_to(ex, up, rng=1, timeout=20.0)
+        except Replan as err:
+            if _is_preemption(err):
+                raise
+            yield rec("move_to", pos=up, error_code=failure(err)[0], reason="mine_return_climb")
+            return False
+        yield rec("move_to", res, pos=up, reason="mine_return_climb")
+    _, cur_end, _ = _cur_status(ex, state)
+    return float(cur_end[1]) >= target_y - 2.0
+
+
+def return_to_surface_from_mine(
+    ex: Executor,
+    state: State,
+    *,
+    target_y: Optional[float] = None,
+    max_climb_steps: int = 8,
+) -> Generator[dict, None, bool]:
+    """沿 `MINE_TRAILS` / `primary_mine_shaft` / 营地锚点安全返回地表，失败时尝试有界阶梯抬升。"""
+    st, cur, dim = _cur_status(ex, state)
+    if dim != "overworld":
+        return True
+    memo = memo_for(state)
+    ref_y = float(target_y) if target_y is not None else (_reference_surface_y(state, dim) or 62.0)
+    if float(cur[1]) >= ref_y - 3.0:
+        return True
+
+    # 1. 若有当前会话记录的阶梯轨迹且起点在上方，先分段原路退回井口
+    if MINE_TRAILS and MINE_TRAILS[-1] and MINE_TRAILS[-1][0][1] > cur[1] + 2.0:
+        trail = MINE_TRAILS[-1]
+        if math.dist(cur, trail[-1]) <= 24.0:
+            indices = list(range(len(trail) - 1, -1, -8))
+            if indices[-1] != 0:
+                indices.append(0)
+            for idx in indices:
+                if idx == len(trail) - 1:
+                    continue
+                wp = list(trail[idx])
+                try:
+                    moved = _bounded_move_to(ex, wp, rng=2, timeout=30.0)
+                except Replan as err:
+                    if _is_preemption(err) or failure(err)[0] not in _ROUTE_ERRS:
+                        raise
+                    yield rec("move_to", pos=wp, error_code=failure(err)[0], reason="return_mine_trail")
+                    break
+                yield rec("move_to", moved, pos=wp, reason="return_mine_trail")
+                _, cur, _ = _cur_status(ex, state)
+                if float(cur[1]) >= ref_y - 3.0:
+                    if MINE_TRAILS and MINE_TRAILS[-1] is trail:
+                        MINE_TRAILS.pop()
+                    return True
+            if MINE_TRAILS and MINE_TRAILS[-1] is trail and float(cur[1]) >= float(trail[0][1]) - 2.0:
+                MINE_TRAILS.pop()
+
+    # 2. 沿持久化 primary_mine_shaft 井口与营地/出生点锚点返回地表
+    anchors: list[tuple[str, list[float]]] = []
+    shaft = memo.get_mine_shaft(dimension=dim)
+    if isinstance(shaft, Mapping) and isinstance(shaft.get("entry"), (list, tuple)) and len(shaft["entry"]) >= 3:
+        anchors.append(("primary_mine_shaft", [float(v) for v in shaft["entry"][:3]]))
+    camp = memo.get_camp(dimension=dim)
+    if isinstance(camp, Mapping):
+        for key in ("crafting_table", "pos"):
+            val = camp.get(key)
+            if isinstance(val, (list, tuple)) and len(val) >= 3:
+                anchors.append((f"camp_{key}", [float(v) for v in val[:3]]))
+    spawn = memo.get_spawn(dimension=dim)
+    if isinstance(spawn, (list, tuple)) and len(spawn) >= 3:
+        anchors.append(("spawn", [float(v) for v in spawn[:3]]))
+
+    seen_anchors: set[Cell] = set()
+    for label, anchor in anchors:
+        acell = block_cell(anchor)
+        if acell in seen_anchors or float(anchor[1]) <= float(cur[1]) + 2.0:
+            continue
+        seen_anchors.add(acell)
+        if math.dist(cur, anchor) > 96.0:
+            continue
+        wps = _shaft_return_waypoints(cur, anchor)
+        nav_ok = True
+        for wp in wps:
+            try:
+                moved = _bounded_move_to(ex, wp, rng=2, timeout=30.0)
+            except Replan as err:
+                if _is_preemption(err) or failure(err)[0] not in _ROUTE_ERRS:
+                    raise
+                yield rec("move_to", pos=wp, error_code=failure(err)[0], reason=f"return_{label}")
+                nav_ok = False
+                break
+            yield rec("move_to", moved, pos=wp, reason=f"return_{label}")
+            _, cur, _ = _cur_status(ex, state)
+            if float(cur[1]) >= ref_y - 3.0:
+                return True
+        if nav_ok and float(cur[1]) >= ref_y - 3.0:
+            return True
+
+    # 3. 若矿井寻路受阻且仍处地下，安全向上挖有界阶梯脱困
+    if is_underground_in_mine(ex, state) and max_climb_steps > 0:
+        if (yield from _climb_out_stairs(ex, state, target_y=ref_y, max_steps=max_climb_steps)):
+            return True
+    _, cur_final, _ = _cur_status(ex, state)
+    return float(cur_final[1]) >= ref_y - 3.0 or not is_underground_in_mine(ex, state)
+
+
+def _find_adjacent_table_spot(ex: Executor, state: State) -> Optional[list[int]]:
+    _, cur, _ = _cur_status(ex, state)
+    x, y, z = block_cell(cur)
+    probe = [[x + dx, y + dy + k, z + dz] for dy in (0, 1) for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for k in (-1, 0)]
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        client_get_blocks_batch(ex.client, probe)
+    for dy in (0, 1):
+        py = y + dy
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            pos = [x + dx, py, z + dz]
+            support = _probe_name(ex, (pos[0], py - 1, pos[2]))
+            spot = _probe_name(ex, pos)
+            if support in _VALID_TABLE_SUPPORTS and (not spot or spot in AIR):
+                return pos
+    return None
+
+
+def _place_local_crafting_table(ex: Executor, state: State) -> Generator[dict, None, Optional[list[int]]]:
+    st, cur, dim = _cur_status(ex, state)
+    memo = memo_for(state)
+    vc = voxel_cache_for(state)
+    pos = _find_adjacent_table_spot(ex, state)
+    if pos is None and best_pickaxe(state) in STONE_OR_BETTER_PICKS:
+        x, y, z = block_cell(cur)
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            cand = [x + dx, y, z + dz]
+            sup = _probe_name(ex, (cand[0], y - 1, cand[2]))
+            roof = _probe_name(ex, (cand[0], y + 2, cand[2]))
+            b0 = _probe_name(ex, cand)
+            b1 = _probe_name(ex, (cand[0], y + 1, cand[2]))
+            if sup in SOLID_SUPPORT and roof in SOLID_SUPPORT and b0 in (AIR | SOLID_SUPPORT) and b1 in (AIR | SOLID_SUPPORT):
+                for cell in ([cand[0], y + 1, cand[2]], cand):
+                    if _probe_name(ex, cell) not in AIR:
+                        yield from prepare_mining_pick(ex, state)
+                        dug = ex.dig(cell, collect=True)
+                        vc.invalidate(cell, dimension=dim)
+                        yield rec("dig", dug, pos=cell, reason="carve_table_niche")
+                pos = cand
+                break
+    if pos is None:
+        return None
+    try:
+        placed = ex.place("crafting_table", pos=pos)
+    except Replan as err:
+        if _is_preemption(err):
+            raise
+        yield rec("place", item="crafting_table", pos=pos, error_code=failure(err)[0])
+        return None
+    vc.invalidate(pos, dimension=dim)
+    yield rec("place", placed, item="crafting_table", pos=pos, reason="temp_crafting_table")
+    state.refresh_inventory(ex.client)
+    if _probe_name(ex, pos) == "crafting_table":
+        memo.record_station("crafting_table", pos, dimension=dim)
+        memo.mark_reachable(pos, dimension=dim, category="station", block="crafting_table")
+        return pos
+    return None
+
+
+def ensure_crafting_table_ready(
+    ex: Executor,
+    state: State,
+    *,
+    reserve_planks: int = 0,
+    skip_nearby_scan: bool = False,
+) -> Generator[dict, None, Optional[list[int]]]:
+    """确保 16 格内有可用工作台：地下/缺台时优先用富余木材就地合成放置，否则沿主矿井回营地工作台。"""
+    st, cur, dim = _cur_status(ex, state)
+    if not skip_nearby_scan:
+        observed = ex.client.find_blocks(types=["crafting_table"], radius=16, limit=5) or {}
+        if observed.get("blocks"):
+            return None
+
+    underground = is_underground_in_mine(ex, state)
+    memo = memo_for(state)
+    camp = memo.get_camp(dimension=dim)
+    known_tables: list[list[int]] = []
+    if isinstance(camp, Mapping) and isinstance(camp.get("crafting_table"), (list, tuple)) and len(camp["crafting_table"]) >= 3:
+        known_tables.append([int(v) for v in camp["crafting_table"][:3]])
+    for spos in memo.stations("crafting_table", dimension=dim):
+        c = [int(v) for v in spos[:3]]
+        if c not in known_tables:
+            known_tables.append(c)
+
+    # 1. 若背包已有工作台，或扣除目标配方所需木板后仍有 >=4 木板等价木材，优先就地合成并放置登记
+    state.refresh_inventory(ex.client)
+    planks_now = sum(state.count(p) for p in _PLANK_ITEMS)
+    logs_now = sum(state.count(lg) for lg in ALL_LOG_BLOCKS)
+    can_make_local = state.count("crafting_table") >= 1 or (planks_now + logs_now * 4 - max(0, int(reserve_planks))) >= 4
+    if not underground and not known_tables and not can_make_local:
+        return None
+    if can_make_local:
+        if state.count("crafting_table") < 1:
+            if planks_now < 4 + max(0, int(reserve_planks)):
+                log = next((lg for lg in ALL_LOG_BLOCKS if state.count(lg) >= 1), None)
+                if log is not None:
+                    plank = log.removesuffix("_log") + "_planks"
+                    yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 4)
+                    state.refresh_inventory(ex.client)
+            if sum(state.count(p) for p in _PLANK_ITEMS) >= 4 + max(0, int(reserve_planks)):
+                yield from craft_recipe(ex, state, "crafting_table", goal_qty=1)
+                state.refresh_inventory(ex.client)
+        if state.count("crafting_table") >= 1:
+            placed_pos = yield from _place_local_crafting_table(ex, state)
+            if placed_pos is not None:
+                return placed_pos
+
+    # 2. 无法就地放台时：先沿共享主矿井/阶梯返回地表，再走向营地/已知工作台
+    if underground:
+        yield from return_to_surface_from_mine(ex, state)
+        st, cur, dim = _cur_status(ex, state)
+
+    for tpos in sorted(known_tables, key=lambda p: eye_to_block_dist(st, p)):
+        if math.dist(cur, tpos) > 96.0:
+            continue
+        if can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
+            return tpos
+        try:
+            moved = _bounded_move_to(ex, tpos, rng=2, timeout=30.0)
+        except Replan as err:
+            if _is_preemption(err) or failure(err)[0] not in _ROUTE_ERRS:
+                raise
+            yield rec("move_to", pos=tpos, error_code=failure(err)[0], reason="return_camp_table")
+            continue
+        yield rec("move_to", moved, pos=tpos, reason="return_camp_table")
+        st, cur, dim = _cur_status(ex, state)
+        if can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH) or eye_to_block_dist(st, tpos) <= 16.0:
+            return tpos
+    return None

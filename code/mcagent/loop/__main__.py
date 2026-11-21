@@ -116,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=0, help="最大动作步数（0=不限）")
     p.add_argument("--max-seconds", type=float, default=0.0, help="最大运行秒数（0=不限，正式赛可设 28800）")
     p.add_argument("--max-deaths", type=int, default=0, help="最大自愈重生次数（0=不限）")
+    p.add_argument("--stop-on-death", action="store_true",
+                   help="检测到真实死亡时记录死亡上下文并立即干净退出（配合 --disconnect-on-exit 立即释放连接）")
     p.add_argument("--user", default=None, help="联调网关覆盖 MC_USER（自动隔离内存 token，不覆盖 .token.json）")
     p.add_argument("--local-target", action="store_true", help="确认连接的是队内本地/局域网联调网关")
     p.add_argument("--live", action="store_true", help="确认已在 docs/05 账号表占位并授权登录官方端点")
@@ -312,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
                 "include_stages": list(include_stages) if include_stages is not None else None,
                 "max_steps": args.max_steps,
                 "max_seconds": args.max_seconds,
+                "stop_on_death": bool(args.stop_on_death),
                 "checkpoint_path": args.checkpoint,
                 "base": cfg.base,
                 "bot_user": cfg.username,
@@ -340,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=args.max_steps,
         max_seconds=args.max_seconds,
         max_deaths=args.max_deaths,
+        stop_on_death=args.stop_on_death,
         disconnect_on_exit=args.disconnect_on_exit,
         target_goal=args.goal,
         stop_on_goal=stop_on_goal,

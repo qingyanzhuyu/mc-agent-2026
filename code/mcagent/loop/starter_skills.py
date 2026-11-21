@@ -19,6 +19,7 @@ from ..runtime import EnvBlocked, Replan
 from ..skills import nav
 from ..skills.base import Param, Skill, failure, rec
 from ..skills.items import AIR, MINE_TRAILS, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, pick_placeable
+from ..skills.mine_return import is_underground_in_mine, return_to_surface_from_mine
 from ..skills.recipes import craft_recipe
 from ..skills.registry import register
 from ..skills.sightline import (
@@ -999,6 +1000,19 @@ class GatherWood(Skill):
         if axe and bare((state.st.get("held") or {}).get("name")) != axe:
             yield rec("equip", ex.equip(axe, "hand"), item=axe)
 
+        st0, cur0 = _refresh_stance(ex, state)
+        if is_underground_in_mine(ex, state):
+            near_logs = ex.client.find_blocks(types=list(ALL_LOGS), radius=10, limit=8) or {}
+            has_level_log = any(
+                isinstance(b.get("pos"), list) and len(b["pos"]) == 3
+                and abs(float(b["pos"][1]) - float(cur0[1])) <= 4.0
+                for b in (near_logs.get("blocks") or [])
+            )
+            if not has_level_log:
+                returned = yield from return_to_surface_from_mine(ex, state)
+                if not returned and is_underground_in_mine(ex, state):
+                    raise Replan("身处地下矿道且尚未沿主矿井返回地表，停止盲搜地表原木")
+
         preferred_species: Optional[str] = next((lg for lg in ALL_LOGS if state.count(lg) >= 1), None)
         bad_positions: set[tuple[int, int, int]] = set()
         last_nav_err: Optional[Replan] = None
@@ -1231,34 +1245,37 @@ class CraftGear(Skill):
         if hasattr(memo, "stations"):
             for spos in memo.stations("crafting_table", dimension=dim):
                 _add_table_cand(spos, from_memo=True)
+        camp = memo.get_camp(dimension=dim) if hasattr(memo, "get_camp") else None
+        if isinstance(camp, dict) and camp.get("crafting_table") is not None:
+            _add_table_cand(camp["crafting_table"], from_memo=True)
         for kpos in KNOWN_TABLES:
             _add_table_cand(kpos, from_memo=True)
         valid_tables.sort(key=lambda b: eye_to_block_dist(st, b["pos"]))
 
         cur_pos_now = st.get("pos") or state.pos
-        if (
+        underground_now = is_underground_in_mine(ex, state)
+        local_level_tables = [
+            tb for tb in valid_tables
+            if abs(float(tb["pos"][1]) - float(cur_pos_now[1])) <= 6.0
+            and eye_to_block_dist(st, tb["pos"]) <= 16.0
+            and (not tb.get("from_memo") or _probe_block_name(ex, tb["pos"]) == "crafting_table")
+        ]
+        if underground_now and not local_level_tables:
+            if can_afford_gear(state, target, assume_no_table=True):
+                # 地下有富余木材或随身工作台时优先就地放台登记，避免长途折返地表
+                valid_tables = []
+            elif valid_tables and any(float(tb["pos"][1]) > float(cur_pos_now[1]) + 2.0 for tb in valid_tables):
+                yield from return_to_surface_from_mine(ex, state)
+                st, cur_pos_now = _refresh_stance(ex, state)
+        elif (
             valid_tables
             and MINE_TRAILS
             and math.dist(cur_pos_now, MINE_TRAILS[-1][-1]) <= 16.0
             and MINE_TRAILS[-1][0][1] > cur_pos_now[1] + 2.0
             and any(tb["pos"][1] > cur_pos_now[1] + 2.0 for tb in valid_tables)
         ):
-            trail = MINE_TRAILS[-1]
-            for idx in list(range(len(trail) - 1, -1, -10)) + ([0] if (len(trail) - 1) % 10 != 0 else []):
-                if idx == len(trail) - 1:
-                    continue
-                wp = list(trail[idx])
-                try:
-                    moved_up = _bounded_move_to(ex, wp, rng=2, timeout=30.0)
-                except Replan as e:
-                    if failure(e)[0] not in NAV_FAIL_CODES:
-                        raise
-                    yield rec("move_to", pos=wp, error_code=failure(e)[0])
-                    break
-                yield rec("move_to", moved_up, pos=wp)
+            yield from return_to_surface_from_mine(ex, state)
             st, cur_pos_now = _refresh_stance(ex, state)
-            if cur_pos_now[1] >= trail[0][1] - 1.5 and MINE_TRAILS and MINE_TRAILS[-1] is trail:
-                MINE_TRAILS.pop()
 
         table_ready = False
         active_table_pos: Optional[list] = None

@@ -1,7 +1,9 @@
 """Craft exact iron equipment using the shared vanilla recipe table."""
 from __future__ import annotations
 
+from ..runtime import EnvBlocked
 from .base import Param, Skill
+from .mine_return import ensure_crafting_table_ready
 from .recipes import RECIPES, _ingredient_items, craft_recipe
 from .registry import register
 from .world_memo import ALL_LOG_BLOCKS
@@ -75,7 +77,20 @@ class CraftIronGear(Skill):
                     break
                 plank = log.removesuffix("_log") + "_planks"
                 yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 4)
-        yield from craft_recipe(ex, state, item, goal_qty=1)
+        try:
+            yield from craft_recipe(ex, state, item, goal_qty=1)
+        except EnvBlocked as err:
+            if err.missing_predicate != "station_ready:crafting_table":
+                raise
+            ready_pos = yield from ensure_crafting_table_ready(
+                ex,
+                state,
+                reserve_planks=(6 if item == "shield" else 0),
+                skip_nearby_scan=True,
+            )
+            if ready_pos is None:
+                raise
+            yield from craft_recipe(ex, state, item, goal_qty=1)
 
     def verify_done(self, state, before_counts):
         item = self.args["item"]
