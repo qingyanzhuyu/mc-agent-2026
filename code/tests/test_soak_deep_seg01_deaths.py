@@ -1878,6 +1878,108 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertTrue(timeouts, "expected shore move_to call")
         self.assertLessEqual(max(timeouts), 2.5, f"expected hostile-aware water shore timeout <=2.5s, got {timeouts}")
 
+    def test_seg19_invisible_border_zero_stall_pivots_to_opposite_hemisphere(self) -> None:
+        # 复现 seg-19 Death #1（t=640.9s, [-151.9, 74, 32.3]）：Z=32.0 存在服务端隐形边界（方块视角全空气），
+        # 朝 -Z 冲刺发生服务端 forcedMove 回弹（moved=0）时，必须记录受阻角并切入 +Z 反半球不跳脱墙
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        for x in range(-160, -144):
+            for z in range(24, 42):
+                blocks[(x, 73, z)] = "grass_block"
+                blocks[(x, 74, z)] = "air"
+                blocks[(x, 75, z)] = "air"
+
+        class _InvisibleBorderWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-151.9, 74.0, 32.3])
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=5.0, food=15, armor_points=0,
+                    on_ground=True, in_water=False, submerged=False,
+                    nearest_hostile={"id": 172555, "name": "spider", "dist": 1.4, "pos": [-150.8, 74.0, 33.2]},
+                )
+                self.controls: list[dict] = []
+
+            def get_entities(self, radius=18, types=None, **kwargs):
+                return {"entities": [dict(self.st["nearest_hostile"])]}
+
+            def control(self, **kwargs):
+                yaw = float(kwargs.get("yaw", 0.0))
+                self.controls.append(dict(kwargs))
+                dx, dz = -math.sin(yaw), -math.cos(yaw)
+                # 凡推向 Z <= 32.0（dz <= 0.1）均触发服务端隐形边界 forcedMove 回弹，moved=0
+                if dz <= 0.1:
+                    return {"pos": list(self.st["pos"]), "moved": 0.0, "on_ground": False}
+                # 切入 +Z 半球后脱离边界并甩开蜘蛛
+                nx = self.st["pos"][0] + dx * 6.0
+                nz = self.st["pos"][2] + dz * 6.0
+                self.st["pos"] = [nx, 74.0, nz]
+                d_sp = math.hypot(nx - (-150.8), nz - 33.2)
+                self.st["nearest_hostile"] = {"id": 172555, "name": "spider", "dist": round(d_sp, 2), "pos": [-150.8, 74.0, 33.2]}
+                return {"pos": list(self.st["pos"]), "moved": 6.0, "on_ground": True}
+
+        w = _InvisibleBorderWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok, f"expected escape past Z=32.0 invisible border, controls={w.controls}")
+        self.assertGreater(w.st["pos"][2], 34.0, f"expected bot to move into +Z hemisphere, pos={w.st['pos']}")
+        self.assertTrue(
+            any(c.get("jump") is False for c in w.controls[1:]),
+            f"expected non-jumping sprint pivot after zero-stall rubberband, controls={w.controls}",
+        )
+
+    def test_seg19_blocked_yaw_memory_persists_across_escape_calls_at_same_pos(self) -> None:
+        # 复现 seg-19 跨轮受阻角记忆：同位置记录朝 -Z（yaw=0.0）受阻后，下一轮 _flee_hostile 必须避开 -Z 不再反复撞墙
+        from mcagent.skills.escape import _flee_hostile, _record_blocked_yaw
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        for x in range(-160, -144):
+            for z in range(24, 42):
+                blocks[(x, 73, z)] = "grass_block"
+                blocks[(x, 74, z)] = "air"
+                blocks[(x, 75, z)] = "air"
+
+        class _MemWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-151.9, 74.0, 32.3])
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=5.0, food=15, armor_points=0,
+                    on_ground=True, in_water=False, submerged=False,
+                    nearest_hostile={"id": 172555, "name": "spider", "dist": 1.4, "pos": [-151.9, 74.0, 33.7]},
+                )
+                self.yaws: list[float] = []
+
+            def get_entities(self, radius=18, types=None, **kwargs):
+                return {"entities": [dict(self.st["nearest_hostile"])]}
+
+            def control(self, **kwargs):
+                yaw = float(kwargs.get("yaw", 0.0))
+                self.yaws.append(yaw)
+                dx, dz = -math.sin(yaw), -math.cos(yaw)
+                self.st["pos"] = [self.st["pos"][0] + dx * 6.0, 74.0, self.st["pos"][2] + dz * 6.0]
+                self.st["nearest_hostile"] = {"id": 172555, "name": "spider", "dist": 10.0, "pos": [-151.9, 74.0, 33.7]}
+                return {"pos": list(self.st["pos"]), "moved": 6.0, "on_ground": True}
+
+        w = _MemWorld()
+        ex, state = w.session()
+        # 模拟上一轮朝 -Z（yaw=0.0）撞隐形边界受阻
+        _record_blocked_yaw(state, "overworld", -151.9, 32.3, 0.0)
+        gen = _flee_hostile(ex, state)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(w.yaws)
+        first_diff = abs(math.atan2(math.sin(w.yaws[0] - 0.0), math.cos(w.yaws[0] - 0.0)))
+        self.assertGreaterEqual(first_diff, 0.65, f"must not re-ram remembered blocked yaw=0.0, got {w.yaws}")
+
 
 if __name__ == "__main__":
     unittest.main()
