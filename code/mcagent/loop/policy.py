@@ -1029,7 +1029,16 @@ class RulePlanner:
                 cur_pos_y = float(st["pos"][1])
             except (TypeError, ValueError):
                 cur_pos_y = None
-        near_surface_for_camp = cur_pos_y is None or cur_pos_y >= 52.0
+        shaft = memo.get_mine_shaft(dimension=dim) if dim == "overworld" else None
+        shaft_entry_y = None
+        if isinstance(shaft, Mapping) and isinstance(shaft.get("entry"), (list, tuple)) and len(shaft["entry"]) >= 2:
+            try:
+                shaft_entry_y = float(shaft["entry"][1])
+            except (TypeError, ValueError):
+                shaft_entry_y = None
+        near_surface_for_camp = cur_pos_y is None or (
+            cur_pos_y >= 52.0 and (shaft_entry_y is None or cur_pos_y >= shaft_entry_y - 6.0)
+        )
         if (
             dim == "overworld"
             and safe_12
@@ -1046,7 +1055,7 @@ class RulePlanner:
 
         # 6.6 Tier 1 Blast-Proof Spawn Shelter Auto Upgrade
         shelter_tier = int(camp.get("shelter_tier", 0)) if isinstance(camp, Mapping) else 0
-        if dim == "overworld" and safe_12 and shelter_tier < 1 and total_cobble(state) >= 48:
+        if dim == "overworld" and safe_12 and near_surface_for_camp and shelter_tier < 1 and total_cobble(state) >= 48:
             sh_sk = self._try_make("build_spawn_shelter", {"mode": "tier1_shelter"}, state)
             if sh_sk is not None:
                 return PlanDecision(sh_sk, "rule", "圆石充足，建造出生点 5x5 圆石防爆避难所(Tier 1)")

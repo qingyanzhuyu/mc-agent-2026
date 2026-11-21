@@ -13,7 +13,7 @@ from typing import Any, Optional
 from ..client import ApiError
 from ..runtime import EnvBlocked, Executor, Replan, State
 from .base import failure, rec
-from .items import AIR, MINE_TRAILS, NAV_FAIL_CODES, STONE_OR_BETTER_PICKS, bare, best_pickaxe
+from .items import AIR, MINE_TRAILS, NAV_FAIL_CODES, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, best_pickaxe
 from .mining import SOLID_SUPPORT, prepare_mining_pick
 from .recipes import RECIPES, craft_recipe
 from .sightline import STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
@@ -22,11 +22,15 @@ from .world_memo import ALL_LOG_BLOCKS, memo_for
 
 Cell = tuple[int, int, int]
 _PLANK_ITEMS: tuple[str, ...] = tuple(item for item in RECIPES if item.endswith("_planks"))
+_ANY_PICKAXE: frozenset[str] = frozenset(PICKAXE_ORDER)
+_SOFT_HAND_DIG: frozenset[str] = frozenset({
+    "dirt", "grass_block", "coarse_dirt", "rooted_dirt", "podzol", "mud", "clay", "gravel", "sand", "red_sand", "snow_block", "moss_block",
+})
 _VALID_TABLE_SUPPORTS: frozenset[str] = SOLID_SUPPORT | frozenset(_PLANK_ITEMS) | frozenset({
     "grass_block", "dirt", "coarse_dirt", "sandstone", "oak_log", "birch_log", "spruce_log",
 })
 _UNSAFE_CLIMB: frozenset[str] = frozenset({
-    "water", "lava", "flowing_water", "flowing_lava", "bedrock", "crafting_table", "chest", "furnace",
+    "water", "lava", "flowing_water", "flowing_lava", "bedrock", "obsidian", "crying_obsidian", "crafting_table", "chest", "furnace",
 })
 _FALLING_ROOF: frozenset[str] = frozenset({"sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava"})
 _ROUTE_ERRS: frozenset[str] = frozenset((*NAV_FAIL_CODES, "timeout"))
@@ -117,15 +121,13 @@ def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> lis
 def _climb_out_stairs(
     ex: Executor, state: State, *, target_y: float, max_steps: int = 8,
 ) -> Generator[dict, None, bool]:
-    """当既有矿井路径不通时，在安全实心岩体中向上开凿有界 1×2 阶梯脱困。"""
-    pick = best_pickaxe(state)
-    if pick is None:
-        return False
+    """当既有矿井路径不通时，在安全实心岩体中向上开凿有界 1×2 阶梯脱困（允许木镐，无镐仅挖软土）。"""
     vc = voxel_cache_for(state)
     for _ in range(max(1, int(max_steps))):
         st, cur, dim = _cur_status(ex, state)
         if st.get("alive") is False or float(cur[1]) >= target_y - 2.0:
             return float(cur[1]) >= target_y - 2.0
+        has_pick = best_pickaxe(state) is not None
         ix, fy, iz = block_cell(cur)
         chosen: Optional[tuple[int, int]] = None
         for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -133,11 +135,11 @@ def _climb_out_stairs(
             floor_n = _probe_name(ex, (nx, fy, nz))
             if not floor_n or floor_n in AIR or floor_n in _UNSAFE_CLIMB:
                 continue
-            head_n = _probe_name(ex, (ix, fy + 2, iz))
-            s1_n = _probe_name(ex, (nx, fy + 1, nz))
-            s2_n = _probe_name(ex, (nx, fy + 2, nz))
+            head_n, s1_n, s2_n = _probe_name(ex, (ix, fy + 2, iz)), _probe_name(ex, (nx, fy + 1, nz)), _probe_name(ex, (nx, fy + 2, nz))
             roof_n = _probe_name(ex, (nx, fy + 3, nz))
             if roof_n in _FALLING_ROOF or any(n in _UNSAFE_CLIMB for n in (head_n, s1_n, s2_n)):
+                continue
+            if not has_pick and any(n and n not in AIR and n not in _SOFT_HAND_DIG and not n.endswith("_leaves") for n in (head_n, s1_n, s2_n)):
                 continue
             chosen = (nx, nz)
             break
@@ -148,7 +150,10 @@ def _climb_out_stairs(
             bn = _probe_name(ex, cell)
             if not bn or bn in AIR:
                 continue
-            yield from prepare_mining_pick(ex, state)
+            if best_pickaxe(state) is not None:
+                yield from prepare_mining_pick(ex, state, allowed=_ANY_PICKAXE)
+            elif bn not in _SOFT_HAND_DIG and not bn.endswith("_leaves"):
+                return False
             try:
                 res = ex.dig(cell, collect=False)
             except Replan as err:
@@ -169,6 +174,18 @@ def _climb_out_stairs(
         yield rec("move_to", res, pos=up, reason="mine_return_climb")
     _, cur_end, _ = _cur_status(ex, state)
     return float(cur_end[1]) >= target_y - 2.0
+
+
+def _try_move_wp(ex: Executor, state: State, wp: Sequence[float], *, reason: str, rng: int = 2, timeout: float = 30.0) -> Generator[dict, None, tuple[bool, list[float]]]:
+    try:
+        moved = _bounded_move_to(ex, wp, rng=rng, timeout=timeout)
+    except Replan as err:
+        if _is_preemption(err) or failure(err)[0] not in _ROUTE_ERRS:
+            raise
+        yield rec("move_to", pos=list(wp), error_code=failure(err)[0], reason=reason)
+        return False, _cur_status(ex, state)[1]
+    yield rec("move_to", moved, pos=list(wp), reason=reason)
+    return True, _cur_status(ex, state)[1]
 
 
 def return_to_surface_from_mine(
@@ -197,16 +214,9 @@ def return_to_surface_from_mine(
             for idx in indices:
                 if idx == len(trail) - 1:
                     continue
-                wp = list(trail[idx])
-                try:
-                    moved = _bounded_move_to(ex, wp, rng=2, timeout=30.0)
-                except Replan as err:
-                    if _is_preemption(err) or failure(err)[0] not in _ROUTE_ERRS:
-                        raise
-                    yield rec("move_to", pos=wp, error_code=failure(err)[0], reason="return_mine_trail")
+                ok, cur = yield from _try_move_wp(ex, state, trail[idx], reason="return_mine_trail")
+                if not ok:
                     break
-                yield rec("move_to", moved, pos=wp, reason="return_mine_trail")
-                _, cur, _ = _cur_status(ex, state)
                 if float(cur[1]) >= ref_y - 3.0:
                     if MINE_TRAILS and MINE_TRAILS[-1] is trail:
                         MINE_TRAILS.pop()
@@ -232,28 +242,21 @@ def return_to_surface_from_mine(
     seen_anchors: set[Cell] = set()
     for label, anchor in anchors:
         acell = block_cell(anchor)
-        if acell in seen_anchors or float(anchor[1]) <= float(cur[1]) + 2.0:
+        if acell in seen_anchors or float(anchor[1]) <= float(cur[1]) + 2.0 or math.dist(cur, anchor) > 96.0:
             continue
         seen_anchors.add(acell)
-        if math.dist(cur, anchor) > 96.0:
-            continue
         wps = _shaft_return_waypoints(cur, anchor)
-        nav_ok = True
-        for wp in wps:
-            try:
-                moved = _bounded_move_to(ex, wp, rng=2, timeout=30.0)
-            except Replan as err:
-                if _is_preemption(err) or failure(err)[0] not in _ROUTE_ERRS:
-                    raise
-                yield rec("move_to", pos=wp, error_code=failure(err)[0], reason=f"return_{label}")
-                nav_ok = False
-                break
-            yield rec("move_to", moved, pos=wp, reason=f"return_{label}")
-            _, cur, _ = _cur_status(ex, state)
-            if float(cur[1]) >= ref_y - 3.0:
-                return True
-        if nav_ok and float(cur[1]) >= ref_y - 3.0:
-            return True
+        for idx, wp in enumerate(wps):
+            ok, cur = yield from _try_move_wp(ex, state, wp, reason=f"return_{label}")
+            if ok:
+                if float(cur[1]) >= ref_y - 3.0:
+                    return True
+                continue
+            if idx < len(wps) - 1 and math.dist(cur, anchor) <= 64.0:
+                ok2, cur = yield from _try_move_wp(ex, state, wps[-1], reason=f"return_{label}_direct")
+                if ok2 and float(cur[1]) >= ref_y - 3.0:
+                    return True
+            break
 
     # 3. 若矿井寻路受阻且仍处地下，安全向上挖有界阶梯脱困
     if is_underground_in_mine(ex, state) and max_climb_steps > 0:
