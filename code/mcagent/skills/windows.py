@@ -13,17 +13,20 @@ PendingVerifier = Callable[[tuple[dict, ...], dict, State], bool]
 
 _STORAGE_WINDOWS = frozenset({
     "generic_9x3", "generic_9x6", "generic_3x3", "hopper", "shulker_box",
+    "chest", "trapped_chest", "barrel", "ender_chest", "dispenser", "dropper",
+    "large_chest", "double_chest",
 })
 
 
 def is_storage_window(view: dict, expected_block: str | None = None) -> bool:
-    """§4.9：箱子/木桶/陷阱箱等容器 window 为 generic_9x3 等，target 为方块名，分区为 container。"""
+    """§4.9：箱子/木桶/陷阱箱等容器 window 为 generic_9x3 或容器方块名，target 为方块名，分区为 container。"""
     sections = view.get("sections") or {}
     if not isinstance(sections.get("container"), list):
         return False
     win = bare(view.get("window"))
     expected = bare(expected_block) if expected_block else ""
-    if not win or (win not in _STORAGE_WINDOWS and (not expected or win != expected)):
+    is_known_storage = win in _STORAGE_WINDOWS or win.endswith("_shulker_box")
+    if not win or (not is_known_storage and (not expected or win != expected)):
         return False
     target = view.get("target")
     if expected and isinstance(target, str) and bare(target) != expected:

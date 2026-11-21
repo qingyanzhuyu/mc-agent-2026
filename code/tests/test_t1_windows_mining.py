@@ -165,6 +165,11 @@ class WindowScriptsTests(unittest.TestCase):
                  "sections": {"container": [{"name": "diamond", "count": 3}]}}
         self.assertTrue(is_storage_window(before, "chest"))
         self.assertFalse(is_storage_window(before, "barrel"))
+        # 兼容本地联调网关与方块名 window 别名（如 window='chest' / 'barrel' / 'red_shulker_box'）
+        self.assertTrue(is_storage_window({"window": "chest", "target": "chest", "sections": {"container": []}}))
+        self.assertTrue(is_storage_window({"window": "barrel", "target": "barrel", "sections": {"container": []}}))
+        self.assertTrue(is_storage_window({"window": "red_shulker_box", "target": "red_shulker_box", "sections": {"container": []}}))
+        self.assertFalse(is_storage_window({"window": "furnace", "target": "furnace", "sections": {"input": []}}))
 
         def partial_take(world, **request):
             world.items["diamond"] = 64
