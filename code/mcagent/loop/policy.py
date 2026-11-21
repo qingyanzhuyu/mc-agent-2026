@@ -138,13 +138,28 @@ def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
     if st.get("on_fire") and not st.get("in_water"):
         return "douse", "on_fire"
     oxygen = st.get("oxygen")
-    if (st.get("in_water") or st.get("submerged")) and oxygen is not None:
-        try:
-            ox = float(oxygen)
-        except (TypeError, ValueError):
-            ox = float(OXYGEN_FULL)
-        if math.isfinite(ox) and ox <= 10.0:
-            return "surface", f"in_water oxygen={ox:g}"
+    if st.get("in_water") or st.get("submerged"):
+        if oxygen is not None:
+            try:
+                ox = float(oxygen)
+            except (TypeError, ValueError):
+                ox = float(OXYGEN_FULL)
+            if math.isfinite(ox) and ox <= 10.0:
+                return "surface", f"in_water oxygen={ox:g}"
+        if st.get("submerged"):
+            return "surface", "submerged"
+        if is_daytime(state) is False:
+            return "surface", "in_water_night"
+        if isinstance(hostile, Mapping) and hostile:
+            try:
+                hdist_w = float(hostile.get("dist", 99.0))
+            except (TypeError, ValueError):
+                hdist_w = 99.0
+            if math.isfinite(hdist_w) and hdist_w <= 18.0:
+                return "surface", f"in_water_hostile({hdist_w:g})"
+        get_hurt = getattr(state, "get_recent_hurt", None)
+        if callable(get_hurt) and get_hurt(max_age_s=6.0):
+            return "surface", "in_water_recent_hurt"
     return None
 
 

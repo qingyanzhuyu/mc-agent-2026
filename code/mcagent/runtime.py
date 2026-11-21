@@ -1078,8 +1078,8 @@ class Safety:
                 src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
                 att_ent = recent_hurt.get("likely_attacker") if isinstance(recent_hurt.get("likely_attacker"), dict) else {}
                 src_name = str(src_ent.get("name") or att_ent.get("name") or "").removeprefix("minecraft:").strip().lower()
-                is_arrow_or_ranged = hurt_src == "arrow" or src_name in (
-                    "skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast",
+                is_arrow_or_ranged = hurt_src in ("arrow", "trident") or src_name in (
+                    "skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast", "drowned",
                 )
                 is_mob_attack = hurt_src in ("mob_attack", "mob_projectile", "indirect_magic") or bool(src_name)
                 if (is_arrow_or_ranged or is_mob_attack) and (not has_equipped_armor(s) or hp < self.config.hp_risk):

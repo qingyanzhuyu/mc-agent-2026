@@ -1257,6 +1257,150 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         assert dec_safe.skill is not None
         self.assertEqual(dec_safe.skill.name, "eat_food")
 
+    def test_dry_land_flee_avoids_jumping_into_river(self) -> None:
+        # 复现 seg-12 t=147s（INC-001）：角色站在河岸干地 [-21.5, 63, -83.5] 遇到河对岸方向来的苦力怕时，
+        # 正背后是河道深水；_resolve_flee_vector(avoid_water=True) 必须沿干地河岸转向逃离，严禁盲目跳进河里
+        from mcagent.skills.voxel_cache import voxel_cache_for
+
+        class _RiverbankWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks={}, pos=[-21.5, 63.0, -83.5], items={})
+                self.st.update(
+                    dimension="overworld",
+                    ready=True,
+                    alive=True,
+                    health=18.3,
+                    food=17,
+                    in_water=False,
+                    on_ground=True,
+                    is_day=False,
+                    nearest_hostile={"id": 140071, "name": "creeper", "dist": 8.9, "pos": [-21.5, 63.0, -92.4]},
+                )
+
+            def get_block(self, pos, use_cache: bool = True):
+                x, y, z = int(pos[0]), int(pos[1]), int(pos[2])
+                # z >= -81 为深河（y<=62 为 water），z <= -82 为草地干岸（y<=62 为 grass_block）
+                if z >= -81:
+                    return {"name": "water"} if y <= 62 else {"name": "air"}
+                return {"name": "grass_block"} if y <= 62 else {"name": "air"}
+
+        w = _RiverbankWorld()
+        ex, state = w.session()
+        cache = voxel_cache_for(state)
+        ux, uz, _ = _resolve_flee_vector(
+            ex, -21.5, 63.0, -83.5, w.st["nearest_hostile"], cache, "overworld",
+            state=state, avoid_water=True, in_water=False,
+        )
+        # 正背敌方向为 +z（跳进河里）；修正后必须沿干岸（±x，且 uz <= 0.35）逃离而非冲入河道
+        self.assertLessEqual(uz, 0.35, f"flee vector ({ux:.2f}, {uz:.2f}) plunged directly into river (+z)")
+        self.assertGreaterEqual(abs(ux), 0.7, f"expected lateral riverbank escape, got ({ux:.2f}, {uz:.2f})")
+
+    def test_in_water_flee_uses_sprint_swim_not_5s_blocking_move_to(self) -> None:
+        # 复现 seg-12 t=172..182s（INC-001）：角色在河中被苦力怕+三叉戟溺尸追杀时，
+        # _flee_hostile 必须使用短步疾跑游泳 control(ms=800) 游离/上岸，严禁发起 5s 阻塞跨河 move_to 卡死原地吃三叉戟
+        from mcagent.skills.escape import _flee_hostile
+
+        class _RiverTridentWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks={}, pos=[-15.1, 62.3, -78.7], items={})
+                self.st.update(
+                    dimension="overworld",
+                    ready=True,
+                    alive=True,
+                    health=10.3,
+                    food=17,
+                    in_water=True,
+                    submerged=False,
+                    oxygen=20,
+                    is_day=False,
+                    nearest_hostile={"id": 140071, "name": "creeper", "dist": 8.1, "pos": [-23.2, 62.3, -78.7]},
+                )
+                self.controls: list[dict] = []
+                self.moves: list[dict] = []
+
+            def get_entities(self, radius: int = 16, types=None):
+                return {
+                    "entities": [
+                        dict(self.st["nearest_hostile"]),
+                        {"id": 140183, "name": "drowned", "dist": 9.5, "pos": [-19.0, 62.0, -84.0]},
+                    ]
+                }
+
+            def control(self, **kwargs):
+                self.controls.append(dict(kwargs))
+                yaw = float(kwargs.get("yaw", 0.0))
+                dx, dz = -math.sin(yaw) * 2.0, -math.cos(yaw) * 2.0
+                self.st["pos"] = [self.st["pos"][0] + dx, 62.4, self.st["pos"][2] + dz]
+                # 游 2 步后拉远至安全距离
+                new_dist = math.hypot(self.st["pos"][0] - (-23.2), self.st["pos"][2] - (-78.7))
+                self.st["nearest_hostile"] = {"id": 140071, "name": "creeper", "dist": round(new_dist, 1), "pos": [-23.2, 62.3, -78.7]}
+                return {"pos": list(self.st["pos"]), "moved": 2.0}
+
+            def move_to(self, *args, **kwargs):
+                self.moves.append(dict(kwargs))
+                return {"pos": list(self.st["pos"])}
+
+        w = _RiverTridentWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(w.controls), 1, "expected fast sprint-swim control bursts in water")
+        self.assertEqual(len(w.moves), 0, f"must not stall on 5s open-water move_to while fleeing in water: {w.moves}")
+
+    def test_in_water_night_triggers_proactive_surface_before_llm_idle_sink(self) -> None:
+        # 复现 seg-12 t=122..130s 与 t=152..160s：夜间刚结束 flee 仍浮在水中（oxy=20）时，
+        # _extract_escape_intent 必须立刻触发 surface 登岸，避免进 LLM 规划 7-8 秒下沉到河底氧量见底；
+        # 白天无怪且氧量充足时仍不误触发。
+        from mcagent.loop.policy import _extract_escape_intent
+
+        st_night = State()
+        st_night.set_status({
+            "ready": True, "alive": True, "health": 18.3, "food": 17, "oxygen": 20,
+            "in_water": True, "submerged": False, "is_day": False, "time_of_day": 15000,
+            "pos": [-15.7, 62.5, -72.2],
+        })
+        intent_night = _extract_escape_intent(st_night)
+        self.assertIsNotNone(intent_night)
+        assert intent_night is not None
+        self.assertEqual(intent_night[0], "surface")
+
+        st_day = State()
+        st_day.set_status({
+            "ready": True, "alive": True, "health": 20.0, "food": 20, "oxygen": 20,
+            "in_water": True, "submerged": False, "is_day": True, "time_of_day": 1000,
+            "pos": [-15.7, 62.5, -72.2],
+        })
+        self.assertIsNone(_extract_escape_intent(st_day))
+
+    def test_trident_hurt_from_drowned_triggers_safety_flee_hazard(self) -> None:
+        # 复现 seg-12 t=176.6s/180.5s：溺尸投掷三叉戟（source="trident"，单次 8 伤）命中无甲角色时，
+        # 即使最近敌怪超出近战距，Safety.hazards 必须立即发出 hurt_triggered flee（残血时 urgent）。
+        from mcagent.runtime import Safety
+
+        st = State()
+        st.set_status({
+            "ready": True, "alive": True, "health": 2.3, "food": 17, "armor_points": 0,
+            "in_water": True, "oxygen": 20, "pos": [-9.5, 62.2, -82.5],
+        })
+        st.set_inventory({"items": []})
+        st.last_hurt_at = time.monotonic()
+        st.last_hurt_info = {
+            "source": "trident",
+            "damage": 8,
+            "source_entity": {"id": 140183, "name": "drowned"},
+        }
+        hazards = Safety().hazards(st)
+        flee_h = [h for h in hazards if h.get("kind") == "flee"]
+        self.assertTrue(flee_h, f"expected hurt-triggered flee for trident hit, got {hazards}")
+        self.assertEqual(flee_h[0].get("severity"), "urgent")
+        self.assertTrue(flee_h[0].get("hurt_triggered"))
+
 
 if __name__ == "__main__":
     unittest.main()

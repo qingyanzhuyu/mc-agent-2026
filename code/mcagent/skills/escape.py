@@ -451,14 +451,16 @@ def _score_escape_dir(
     cz: float,
     threats: list[tuple[float, float, str, float, Optional[int]]],
     attacker_id: Optional[int],
+    *,
+    in_water: bool = False,
 ) -> float:
-    """对候选逃跑单位方向 (cx, cz) 评分：最大化对所有威胁的 4m/8m 净空，重罚朝向苦力怕/骷髅/刚偷袭者前进。"""
+    """对候选逃跑单位方向 (cx, cz) 评分：最大化对所有威胁的 4m/8m 净空，重罚朝向苦力怕/骷髅/水中溺尸/刚偷袭者前进。"""
     score = 0.0
     min_clear = float("inf")
     for hx, hz, name, d0, eid in threats:
         is_creeper = name == "creeper"
-        is_ranged = name in _RANGED_HOSTILES
         is_attacker = attacker_id is not None and eid == attacker_id
+        is_ranged = name in _RANGED_HOSTILES or (name == "drowned" and (in_water or is_attacker))
         weight = 2.5 if is_creeper else (1.8 if is_ranged else 1.0)
         if is_attacker:
             weight *= 1.6
@@ -479,6 +481,87 @@ def _score_escape_dir(
     return score + min_clear * 2.0
 
 
+def _path_enters_water(
+    ex: "Executor",
+    px: float,
+    py: float,
+    pz: float,
+    cx: float,
+    cz: float,
+    cache: Any,
+    dim: str,
+    *,
+    probes: tuple[int, ...] = (2, 4, 6),
+) -> bool:
+    """检测干地逃离方向前 probes 格是否会直接踏入河道/深水（防止干地遇怪反跳进溺尸河里）。"""
+    norm = math.hypot(cx, cz)
+    if norm <= 1e-6:
+        return False
+    ux, uz = cx / norm, cz / norm
+    _, fy, _ = block_cell([px, py, pz])
+    checked: set[tuple[int, int]] = set()
+    for dist in probes:
+        bx, bz = math.floor(px + ux * dist), math.floor(pz + uz * dist)
+        if (bx, bz) in checked:
+            continue
+        checked.add((bx, bz))
+        blk_body = _read_block(cache, ex.client, (bx, fy, bz), dim)
+        if _is_water_cell(blk_body):
+            return True
+        blk_floor = _read_block(cache, ex.client, (bx, fy - 1, bz), dim)
+        if _is_water_cell(blk_floor) and (blk_body is None or is_clear_space(blk_body)):
+            return True
+        if blk_floor is not None and is_clear_space(blk_floor) and (blk_body is None or is_clear_space(blk_body)):
+            blk_drop = _read_block(cache, ex.client, (bx, fy - 2, bz), dim)
+            if _is_water_cell(blk_drop):
+                return True
+    return False
+
+
+def _find_safe_dry_shore_away(
+    ex: "Executor",
+    st: dict,
+    cache: Any,
+    dim: str,
+    threats: list[tuple[float, float, str, float, Optional[int]]],
+    *,
+    tried_shores: set[Cell] = frozenset(),
+) -> Optional[Cell]:
+    """水中脱险时优先寻找 6 格内远离敌怪（不贴近苦力怕/近怪）的实心干岸格。"""
+    pos = _valid_vec3(st.get("pos"))
+    if pos is None:
+        return None
+    px, py, pz = pos
+    fx, fy, fz = block_cell([px, py, pz])
+    best: Optional[tuple[float, Cell]] = None
+    for dx, dz in _SHORE_OFFSETS:
+        sx, sz = fx + dx, fz + dz
+        for dy in (0, 1, 2, -1):
+            cand = (sx, fy + dy, sz)
+            if cand in tried_shores or not _is_dry_standable(cache, ex.client, cand, dim):
+                continue
+            cx, cz = cand[0] + 0.5, cand[2] + 0.5
+            d_self = math.hypot(cx - px, cz - pz)
+            safe = True
+            min_clearance = 18.0
+            for hx, hz, name, d0, _ in threats:
+                d_cand = math.hypot(cx - hx, cz - hz)
+                if name == "creeper" and d_cand < max(6.5, min(d0, 8.0)):
+                    safe = False
+                    break
+                if d0 < 9.0 and d_cand < max(4.5, d0 - 0.5):
+                    safe = False
+                    break
+                min_clearance = min(min_clearance, d_cand)
+            if not safe:
+                continue
+            score = min_clearance - 0.85 * d_self
+            if best is None or score > best[0]:
+                best = (score, cand)
+            break
+    return best[1] if best is not None else None
+
+
 def _resolve_flee_vector(
     ex: "Executor",
     px: float,
@@ -489,8 +572,10 @@ def _resolve_flee_vector(
     dim: str,
     *,
     state: Optional["State"] = None,
+    avoid_water: bool = False,
+    in_water: bool = False,
 ) -> tuple[float, float, Optional[list[float]]]:
-    """计算远离 18 格内全部敌对生物的单位逃离向量，避免避开近怪时直冲远程骷髅或苦力怕。"""
+    """计算远离 18 格内全部敌对生物的单位逃离向量，避免避开近怪时直冲远程骷髅/苦力怕或从干地跳入水中。"""
     ents = _collect_nearby_hostiles(ex, px, py, pz, hostile, radius=18)
     attacker_id: Optional[int] = None
     if state is not None:
@@ -516,30 +601,41 @@ def _resolve_flee_vector(
             nearest_pos = [ep[0], ep[1], ep[2]]
         threats.append((ep[0], ep[2], name, d, eid))
 
+    def _eval_dir(c: tuple[float, float]) -> float:
+        sc = _score_escape_dir(px, pz, c[0], c[1], threats, attacker_id, in_water=in_water)
+        if avoid_water and _path_enters_water(ex, px, py, pz, c[0], c[1], cache, dim):
+            sc -= 22.0
+        return sc
+
     if len(threats) == 1:
         hx, hz, _, d, _ = threats[0]
         if d >= 1e-6:
-            return (px - hx) / d, (pz - hz) / d, nearest_pos
+            ux0, uz0 = (px - hx) / d, (pz - hz) / d
+            if not (avoid_water and _path_enters_water(ex, px, py, pz, ux0, uz0, cache, dim)):
+                return ux0, uz0, nearest_pos
+            candidates: list[tuple[float, float]] = [(ux0, uz0)] + [
+                (math.cos(i * math.pi / 6.0), math.sin(i * math.pi / 6.0)) for i in range(12)
+            ]
+            best_dir = max(candidates, key=_eval_dir)
+            return best_dir[0], best_dir[1], nearest_pos
     elif len(threats) >= 2:
         rx, rz = 0.0, 0.0
         for hx, hz, name, d, eid in threats:
             if d < 1e-6:
                 continue
-            mult = 2.5 if name == "creeper" else (1.8 if name in _RANGED_HOSTILES else 1.0)
+            is_ranged_t = name in _RANGED_HOSTILES or (name == "drowned" and (in_water or (attacker_id is not None and eid == attacker_id)))
+            mult = 2.5 if name == "creeper" else (1.8 if is_ranged_t else 1.0)
             if attacker_id is not None and eid == attacker_id:
                 mult *= 1.6
             w = mult / max(0.5, d * d)
             rx += ((px - hx) / d) * w
             rz += ((pz - hz) / d) * w
-        candidates: list[tuple[float, float]] = [
+        candidates = [
             (math.cos(i * math.pi / 6.0), math.sin(i * math.pi / 6.0)) for i in range(12)
         ]
         if (rnorm := math.hypot(rx, rz)) >= 1e-6:
             candidates.insert(0, (rx / rnorm, rz / rnorm))
-        best_dir = max(
-            candidates,
-            key=lambda c: _score_escape_dir(px, pz, c[0], c[1], threats, attacker_id),
-        )
+        best_dir = max(candidates, key=_eval_dir)
         return best_dir[0], best_dir[1], nearest_pos
 
     fx, fy, fz = block_cell([px, py, pz])
@@ -953,7 +1049,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 return True
         return False
 
-    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, hostile, cache, dim, state=state)
+    in_water_init = bool(st.get("in_water") or st.get("submerged"))
+    ux, uz, h_pos = _resolve_flee_vector(
+        ex, px, py, pz, hostile, cache, dim, state=state,
+        avoid_water=not in_water_init, in_water=in_water_init,
+    )
 
     away_yaw = math.atan2(-ux, -uz)
     to_mob_yaw = math.atan2(ux, uz)
@@ -1269,7 +1369,122 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 return True
             return math.dist((px, py, pz), [float(pos[0]), float(pos[1]), float(pos[2])]) >= 3.0
 
+    # 水中逃敌严禁直接走 5s 阻塞 move_to 跨河寻路（Mineflayer 在水中极易卡死原地上下扑腾 4-5 秒被溺尸三叉戟点杀）：
+    # 改用短步疾跑游泳（800ms）优先游向远离敌怪的安全干岸，紧贴干岸 <=2.5 格时才允许 2.5s 短距 move_to 登岸。
+    st_cur = state.snapshot() or st
+    if st_cur.get("in_water") or st_cur.get("submerged"):
+        water_swim_supported = True
+        water_safe_dist = max(9.0 if is_creeper else 7.0, effective_hostile_flee_dist(state, h_name))
+        tried_shores_flee: set[Cell] = set()
+        for _ in range(3):
+            cur_hostile = st_cur.get("nearest_hostile") or hostile
+            cur_ents = _collect_nearby_hostiles(ex, px, py, pz, cur_hostile if isinstance(cur_hostile, dict) else {}, radius=18)
+            cur_threats: list[tuple[float, float, str, float, Optional[int]]] = []
+            for ent in cur_ents:
+                ep = _valid_vec3(ent.get("pos"))
+                if ep is None:
+                    continue
+                cur_threats.append((
+                    ep[0], ep[2],
+                    bare(ent.get("name")).strip().lower(),
+                    math.hypot(px - ep[0], pz - ep[2]),
+                    ent.get("id") if isinstance(ent.get("id"), int) and not isinstance(ent.get("id"), bool) else None,
+                ))
+            shore = _find_safe_dry_shore_away(ex, st_cur, cache, dim, cur_threats, tried_shores=tried_shores_flee)
+            if shore is not None and math.hypot((shore[0] + 0.5) - px, (shore[2] + 0.5) - pz) <= 2.5:
+                tried_shores_flee.add(shore)
+                moved_bank = yield from _move_to_bounded(
+                    ex, [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5], rng=1, timeout=2.5,
+                )
+                st_cur = _refresh_status(ex, state)
+                if st_cur.get("alive") is False:
+                    return False
+                cpos = st_cur.get("pos")
+                if isinstance(cpos, (list, tuple)) and len(cpos) >= 3:
+                    px, py, pz = float(cpos[0]), float(cpos[1]), float(cpos[2])
+                if not st_cur.get("in_water") and not st_cur.get("submerged"):
+                    nh_bank = st_cur.get("nearest_hostile") or {}
+                    if not isinstance(nh_bank, dict) or not nh_bank:
+                        return True
+                    bd = nh_bank.get("dist")
+                    if isinstance(bd, (int, float)) and not isinstance(bd, bool) and float(bd) >= water_safe_dist:
+                        return True
+                    ux, uz, h_pos = _resolve_flee_vector(
+                        ex, px, py, pz, nh_bank, cache, dim, state=state, avoid_water=True, in_water=False,
+                    )
+                    away_yaw = math.atan2(-ux, -uz)
+                    break
+                if moved_bank:
+                    continue
+            swim_yaw = away_yaw
+            if shore is not None:
+                sx_dx, sx_dz = (shore[0] + 0.5) - px, (shore[2] + 0.5) - pz
+                if math.hypot(sx_dx, sx_dz) > 1e-4:
+                    shore_yaw = math.atan2(-sx_dx, -sx_dz)
+                    if not any(_yaw_diff(shore_yaw, ty) < 0.65 for ty in tried_yaws):
+                        swim_yaw = shore_yaw
+            if swim_yaw == away_yaw and (burst_blocked or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim)):
+                swim_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
+            before_sw = (px, py, pz)
+            ok_sw, err_sw = yield from _control_step(
+                ex, forward=True, sprint=True, jump=True, yaw=swim_yaw, ms=800,
+            )
+            if not ok_sw and err_sw == "unsupported_api":
+                water_swim_supported = False
+                break
+            st_cur = _refresh_status(ex, state)
+            if st_cur.get("alive") is False:
+                return False
+            cpos = st_cur.get("pos")
+            moved_sw = 0.0
+            if isinstance(cpos, (list, tuple)) and len(cpos) >= 3:
+                px, py, pz = float(cpos[0]), float(cpos[1]), float(cpos[2])
+                moved_sw = math.dist(before_sw, (px, py, pz))
+            if not ok_sw or moved_sw < 0.5:
+                burst_blocked = True
+                tried_yaws.append(swim_yaw)
+            else:
+                burst_blocked = False
+            nh_sw = st_cur.get("nearest_hostile") or {}
+            if not st_cur.get("in_water") and not st_cur.get("submerged"):
+                if not isinstance(nh_sw, dict) or not nh_sw:
+                    return True
+                sd = nh_sw.get("dist")
+                if isinstance(sd, (int, float)) and not isinstance(sd, bool) and float(sd) >= water_safe_dist:
+                    return True
+                ux, uz, h_pos = _resolve_flee_vector(
+                    ex, px, py, pz, nh_sw, cache, dim, state=state, avoid_water=True, in_water=False,
+                )
+                away_yaw = math.atan2(-ux, -uz)
+                break
+            if not isinstance(nh_sw, dict) or not nh_sw:
+                return True
+            sd = nh_sw.get("dist")
+            if isinstance(sd, (int, float)) and not isinstance(sd, bool) and float(sd) >= water_safe_dist and not st_cur.get("submerged"):
+                return True
+            ux, uz, h_pos = _resolve_flee_vector(
+                ex, px, py, pz, nh_sw, cache, dim, state=state, avoid_water=False, in_water=True,
+            )
+            away_yaw = math.atan2(-ux, -uz)
+        if water_swim_supported and (st_cur.get("in_water") or st_cur.get("submerged")):
+            nh_end = st_cur.get("nearest_hostile") or {}
+            if not isinstance(nh_end, dict) or not nh_end:
+                return True
+            ed = nh_end.get("dist")
+            if isinstance(ed, (int, float)) and not isinstance(ed, bool) and float(ed) >= effective_hostile_flee_dist(state, h_name):
+                return True
+            return math.dist((px, py, pz), [float(pos[0]), float(pos[1]), float(pos[2])]) >= 2.5
+
     flee_stride = 16.0 if is_creeper else 12.0
+    if not (st_cur.get("in_water") or st_cur.get("submerged")):
+        # 干地逃离若远端落点伸入河道，收缩落点到入水前的干地岸段，防止 move_to 把角色带下水
+        if _path_enters_water(ex, px, py, pz, ux, uz, cache, dim, probes=(6, 8, 10, 12, int(flee_stride))):
+            for cand_stride in (10.0, 8.0, 6.0, 4.0):
+                if cand_stride < flee_stride and not _path_enters_water(
+                    ex, px, py, pz, ux, uz, cache, dim, probes=tuple(range(2, int(cand_stride) + 1, 2)),
+                ):
+                    flee_stride = cand_stride
+                    break
     moved = yield from _move_to_bounded(
         ex, [round(px + ux * flee_stride, 2), py, round(pz + uz * flee_stride, 2)], rng=2, timeout=5.0,
     )
