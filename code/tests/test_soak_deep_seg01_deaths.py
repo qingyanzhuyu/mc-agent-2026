@@ -1401,6 +1401,134 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(flee_h[0].get("severity"), "urgent")
         self.assertTrue(flee_h[0].get("hurt_triggered"))
 
+    def test_seg13_pillager_at_3_5m_after_first_burst_runs_followup_sprint_not_slow_move_to(self) -> None:
+        # 复现 seg-13 Death #2（t=3318..3323s）：首段 <2.5m 疾跑躲开僵尸后，掠夺者处于 dist=3.5m（此前 <3.5 严格不等漏判），
+        # 必须立即连补原生疾跑跳拉开安全距，严禁直接落入慢速 move_to 停滞 4.7s 被掠夺者+僵尸围杀
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks = {(x, 64, z): "grass_block" for x in range(-55, -25) for z in range(-55, -25)}
+
+        class _PillagerZombieWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-34.4, 65.0, -41.7], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=12.4, food=17, armor_points=0,
+                    nearest_hostile={"id": 150485, "name": "zombie", "dist": 1.6, "pos": [-33.0, 65.0, -42.5]},
+                )
+                self.controls = 0
+                self.moves = 0
+
+            def control(self, **kwargs):
+                self.controls += 1
+                if self.controls == 1:
+                    self.st["pos"] = [-38.7, 65.0, -39.3]
+                    # 恰好 dist=3.5m（此前 <3.5 漏判点）
+                    self.st["nearest_hostile"] = {"id": 150656, "name": "pillager", "dist": 3.5, "pos": [-35.2, 65.0, -39.3]}
+                    return {"pos": list(self.st["pos"]), "moved": 5.1}
+                self.st["pos"] = [-46.0, 65.0, -35.0]
+                self.st["nearest_hostile"] = {"id": 150656, "name": "pillager", "dist": 11.6, "pos": [-35.2, 65.0, -39.3]}
+                return {"pos": list(self.st["pos"]), "moved": 8.5}
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                return {"pos": list(self.st["pos"])}
+
+        w = _PillagerZombieWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(w.controls, 2, "expected follow-up sprint burst when pillager is at 3.5m")
+        self.assertEqual(w.moves, 0, "must escape via follow-up sprint burst without dropping into stalling move_to")
+
+    def test_seg13_cave_blocked_cover_rotates_yaw_and_caps_move_to_timeout(self) -> None:
+        # 复现 seg-13 Death #1（t=3220..3226s）：矿洞掩体后撤撞墙 moved=0 时，必须记录受阻角并换向带跳疾跑，
+        # 且即使回落至 move_to，其超时上限也必须收紧至 <=2.5s（杜绝 5.0s 站桩连吃两箭）
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        for x in range(-125, -108):
+            for z in range(18, 30):
+                blocks[(x, 44, z)] = "stone"
+        # 玩家在 (-117, 45, 23)，骷髅在 (-122, 45, 23)（距离 5.0m），中间 (-119, 45..46, 23) 为挡箭墙
+        blocks[(-119, 45, 23)] = "cobblestone"
+        blocks[(-119, 46, 23)] = "cobblestone"
+
+        class _CaveSkeletonWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-116.3, 45.0, 23.3], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=10.3, food=17, armor_points=0,
+                    nearest_hostile={"id": 150387, "name": "skeleton", "dist": 4.8, "pos": [-121.1, 45.0, 23.3]},
+                )
+                self.control_calls: list[dict] = []
+                self.move_timeouts: list[float] = []
+
+            def control(self, **kwargs):
+                self.control_calls.append(dict(kwargs))
+                if len(self.control_calls) == 1:
+                    # 第一次 cover 后撤撞墙原地 0 位移
+                    return {"pos": list(self.st["pos"]), "moved": 0.0}
+                # 第二次换向疾跑成功拉开距离
+                self.st["pos"] = [-116.3, 45.0, 29.0]
+                self.st["nearest_hostile"] = {"id": 150387, "name": "skeleton", "dist": 10.5, "pos": [-121.1, 45.0, 23.3]}
+                return {"pos": list(self.st["pos"]), "moved": 5.7}
+
+            def move_to(self, *args, **kwargs):
+                self.move_timeouts.append(float(kwargs.get("timeout", 99.0)))
+                return {"pos": list(self.st["pos"])}
+
+        w = _CaveSkeletonWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(w.control_calls), 2, "expected alternate-yaw sprint burst after cover stall")
+        self.assertTrue(w.control_calls[0].get("jump"), "cover retreat burst must include jump=True for 1-block steps")
+        self.assertEqual(len(w.move_timeouts), 0, "alternate-yaw sprint should escape without stalling in move_to")
+
+    def test_seg13_flee_fallback_move_to_timeout_is_capped_at_2_2s(self) -> None:
+        # 验证 _flee_hostile 兜底 move_to 超时上限压紧至 <=2.5s（2.2s），杜绝 5.0s 原地卡滞
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks = {(x, 64, z): "grass_block" for x in range(-20, 20) for z in range(-20, 20)}
+
+        class _MidDistZombieWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[0.5, 65.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=14.0, food=18, armor_points=0,
+                    nearest_hostile={"id": 999, "name": "zombie", "dist": 5.8, "pos": [-5.3, 65.0, 0.5]},
+                )
+                self.timeouts: list[float] = []
+
+            def move_to(self, *args, **kwargs):
+                self.timeouts.append(float(kwargs.get("timeout", 99.0)))
+                self.st["pos"] = [10.5, 65.0, 0.5]
+                self.st["nearest_hostile"] = {"id": 999, "name": "zombie", "dist": 15.8, "pos": [-5.3, 65.0, 0.5]}
+                return {"pos": list(self.st["pos"])}
+
+        w = _MidDistZombieWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(w.timeouts, "expected fallback move_to to run for mid-distance zombie")
+        self.assertLessEqual(max(w.timeouts), 2.5, f"flee move_to timeout must be <=2.5s, got {w.timeouts}")
+
 
 if __name__ == "__main__":
     unittest.main()

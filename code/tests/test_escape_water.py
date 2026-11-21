@@ -414,7 +414,7 @@ class TestEscapeWater(unittest.TestCase):
         self.assertEqual(ex1.acts, ["move_to"])
         self.assertLess(steps1[0]["pos"][2], 0.5)
         self.assertEqual(world1.move_requests[0]["rng"], 2)
-        self.assertEqual(world1.move_requests[0]["timeout"], 5.0)
+        self.assertEqual(world1.move_requests[0]["timeout"], 2.2)
 
         # Case 2: move_to 寻路失败 -> yield error rec 后转入 control(forward=True, sprint=True, jump=True, yaw=..., ms=800)
         world2 = EscapeWorld(
