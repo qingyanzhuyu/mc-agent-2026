@@ -9,7 +9,7 @@ import time
 from typing import TYPE_CHECKING, Collection, Iterator, Optional, Sequence
 from weakref import WeakKeyDictionary
 
-from ..runtime import EnvBlocked, Replan
+from ..runtime import EnvBlocked, Replan, has_equipped_armor
 from .base import Param, Skill, failure, rec
 from .field import move_local
 from .furnace import collect_furnace, inspect_furnace, load_furnace
@@ -354,6 +354,11 @@ class SmeltIron(Skill):
             return "铁锭异步熔炉租约冶炼中，尚未就绪"
         if not has_iron_input and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包无粗铁且缺石镐或更好的镐（木镐、金镐不能采铁）"
+        if not has_iron_input and dim == "overworld":
+            raw_hp = (state.st or {}).get("health", 20.0)
+            hp_val = float(raw_hp) if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp) else 20.0
+            if hp_val <= 8.0 and not has_equipped_armor(state) and state.count("shield") < 1:
+                return f"低血量无甲无盾(hp={hp_val:.1f}<=8.0)，暂缓下矿寻铁，优先回地表补粮回血"
         if not any(state.count(n) for n, _ in _fuels_for(state)) and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包缺煤、木板或原木燃料，且无可采煤的镐"
         return ""
@@ -459,6 +464,15 @@ class SmeltIron(Skill):
         vc = voxel_cache_for(state)
         vc.ingest_find_blocks(found, dimension=dim, client=ex.client)
         vc.clear_stance_blacklist_if_moved(cur)
+        raw_hp = status.get("health", 20.0)
+        hp_val = float(raw_hp) if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp) else 20.0
+        low_hp_fragile = (
+            not in_reach_only
+            and dim == "overworld"
+            and hp_val <= 10.0
+            and not has_equipped_armor(state)
+            and state.count("shield") < 1
+        )
         cands = [
             b["pos"] for b in blocks
             if isinstance(b.get("pos"), list) and len(b["pos"]) == 3
@@ -466,6 +480,12 @@ class SmeltIron(Skill):
             and not vc.is_unreachable("smelt_iron", b["pos"], dimension=dim, stance_cell=cur_cell)
             and (max_dy is None or abs(b["pos"][1] - cur[1]) <= max_dy)
             and not under_feet(cur, b["pos"])
+            and not (
+                low_hp_fragile
+                and b["pos"][1] < 58
+                and eye_to_block_dist(stance, b["pos"]) > MINING_REACH
+                and (b["pos"][1] < cur[1] - 3 or eye_to_block_dist(stance, b["pos"]) > 10.0)
+            )
             and (not in_reach_only or can_reach_block(ex, stance, b["pos"], reach=MINING_REACH))
         ]
         if not in_reach_only and len(cands) > 1:
@@ -802,15 +822,17 @@ class SmeltIron(Skill):
                 if route_skip:
                     _halt_residual_motion(ex, state)
                 if "void_risk" in str(err):
-                    # 趋近悬崖/深坑暴露矿时触发 void_risk 抢占：先将该矿点拉黑再向上抛出，防止下拍重复跳崖死循环
+                    # 趋近悬崖/深坑暴露矿时触发 void_risk 抢占：以非站位绑定全局拉黑（stance_cell=None, ttl=300s），
+                    # 防止脱险位移跨区块或 clear_stance_blacklist_if_moved 后下拍重复跳崖死循环
                     excluded.add(tuple(pos))
                     err_st = state.refresh_status(ex.client, max_age_s=0)
-                    err_cur = err_st.get("pos") or state.pos
+                    _session_excluded_for(ex.client, state, err_st).add(tuple(pos))
                     voxel_cache_for(state).mark_unreachable(
                         "smelt_iron",
                         pos,
                         dimension=str(err_st.get("dimension") or "overworld"),
-                        stance_cell=tuple(map(math.floor, err_cur)),
+                        stance_cell=None,
+                        ttl_s=300.0,
                     )
                     raise
                 if not dig_skip and (

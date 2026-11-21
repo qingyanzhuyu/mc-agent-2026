@@ -629,6 +629,194 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertTrue(any(c[0] == -1 for c in w.dug), f"expected safe -X climb cells: {w.dug}")
         self.assertLess(w.st["pos"][0], 0.0)
 
+    def test_smelt_iron_void_risk_blacklist_persists_across_chunks_and_escape_move(self) -> None:
+        # 复现 seg-05 INC-001：smelt_iron 趋近悬崖铁矿 [-40, 60, 92] 触发 void_risk，脱险位移跨区块后仍必须持续拉黑该矿
+        from mcagent.runtime import Replan
+        from mcagent.skills.iron import SmeltIron, reset_iron_memo
+
+        reset_iron_memo()
+        cliff_ore = [-40, 60, 92]
+
+        class _CrossChunkCliffWorld(GridWorld):
+            def find_blocks(self, types=None, radius=32, limit=64, **_):
+                if types and any("iron" in t for t in types):
+                    return {"blocks": [{"name": "iron_ore", "pos": list(cliff_ore)}]}
+                return {"blocks": []}
+
+            def move_to(self, *args, **kwargs):
+                self.st["pos"] = [-44.7, 62.0, 93.3]
+                raise Replan("动作被安全层抢占: void_risk: 脚下连续空气且正在下落：疑似坠落/深坑")
+
+        w = _CrossChunkCliffWorld(
+            blocks={(-17, 63, 51): "stone", tuple(cliff_ore): "iron_ore"},
+            pos=[-16.5, 64.0, 51.5],
+            items={"stone_pickaxe": 1, "coal": 4, "furnace": 1},
+        )
+        ex, state = w.session()
+        state.st.update(dimension="overworld", ready=True, alive=True, health=20.0)
+        with self.assertRaisesRegex(Replan, "void_risk"):
+            drive(SmeltIron(count=3), ex, state)
+
+        # 模拟脱险后移动到另一区块 [-52.7, 54.2, 83.7]（距离 >11 格，会触发 clear_stance_blacklist_if_moved）
+        w.st["pos"] = [-52.7, 54.2, 83.7]
+        state.refresh_status(ex.client, max_age_s=0)
+        cands = SmeltIron()._ore_candidates(ex, state, radius=32)
+        self.assertNotIn(cliff_ore, cands, "cliff ore must remain globally blacklisted across chunks after void_risk")
+
+    def test_smelt_iron_blocks_low_hp_unarmored_deep_cave_descent(self) -> None:
+        # 复现 seg-05 t=239s：hp=5 无甲无盾无粗铁时禁止再下矿寻铁；hp=9.5 时过滤深洞远矿 [-77, 43, 60]
+        from mcagent.skills.iron import SmeltIron, reset_iron_memo
+
+        reset_iron_memo()
+        st = State()
+        st.set_status({"dimension": "overworld", "ready": True, "alive": True, "health": 5.0, "armor_points": 0, "pos": [-52.5, 50.0, 76.7]})
+        st.set_inventory({"items": [{"name": "stone_pickaxe", "count": 1, "slot": 0}, {"name": "coal", "count": 4, "slot": 1}]})
+        self.assertIn("低血量", SmeltIron.blocked(st))
+
+        # 若背包已有粗铁，则允许继续熔炼以补齐铁盾
+        st.set_inventory({
+            "items": [
+                {"name": "stone_pickaxe", "count": 1, "slot": 0},
+                {"name": "coal", "count": 4, "slot": 1},
+                {"name": "raw_iron", "count": 3, "slot": 2},
+            ]
+        })
+        self.assertEqual(SmeltIron.blocked(st), "")
+
+        # hp=9.5 无甲无盾：跳过深洞远矿 [-77, 43, 60]，保留地表/浅层安全矿 [-50, 62, 76]
+        deep_ore = [-77, 43, 60]
+        shallow_ore = [-50, 62, 76]
+
+        class _MixedOreWorld(GridWorld):
+            def find_blocks(self, types=None, radius=32, limit=64, **_):
+                if types and any("iron" in t for t in types):
+                    return {
+                        "blocks": [
+                            {"name": "iron_ore", "pos": list(deep_ore)},
+                            {"name": "iron_ore", "pos": list(shallow_ore)},
+                        ]
+                    }
+                return {"blocks": []}
+
+        w = _MixedOreWorld(
+            blocks={(-53, 53, 76): "stone", tuple(deep_ore): "iron_ore", tuple(shallow_ore): "iron_ore"},
+            pos=[-52.5, 54.0, 76.7],
+            items={"stone_pickaxe": 1, "coal": 4},
+        )
+        w.st.update(dimension="overworld", ready=True, alive=True, health=9.5, armor_points=0)
+        ex, st2 = w.session()
+        cands = SmeltIron()._ore_candidates(ex, st2, radius=32)
+        self.assertNotIn(deep_ore, cands)
+        self.assertIn(shallow_ore, cands)
+
+    def test_void_risk_zero_hostile_flee_never_sprints_off_ravine_cliff(self) -> None:
+        # 复现 seg-05 t=212s/230s：无敌对生物的 void_risk 不得触发盲目 12 格 move_to 或滞空疾跑跳进峡谷
+        from mcagent.skills.escape import _flee_hostile, _is_sprint_yaw_safe
+
+        blocks = {
+            # 身后 (+Z) 是安全实心悬崖顶，前方 (-Z, yaw=0.0) 是 10 格深峡谷全空气
+            (0, 61, 1): "stone",
+            (0, 61, 2): "stone",
+            (1, 61, 1): "stone",
+            (-1, 61, 1): "stone",
+            # 脚下 (0, 61, 0) 为空气（刚滑出悬崖边缘）
+        }
+
+        class _CliffVoidWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 62.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=11.0,
+                    on_ground=False, nearest_hostile=None,
+                )
+                self.controls: list[dict] = []
+                self.moves: list[list[float]] = []
+
+            def move_to(self, x=None, z=None, y=None, pos=None, rng=1, timeout=None, **kwargs):
+                target = list(pos) if pos is not None else [x, y, z]
+                self.moves.append(target)
+                self.st["pos"] = list(target)
+                self.st["on_ground"] = True
+                return {"pos": list(target)}
+
+            def control(self, **kwargs):
+                self.controls.append(dict(kwargs))
+                return {"pos": list(self.st["pos"])}
+
+        w = _CliffVoidWorld()
+        ex, state = w.session()
+        cache = voxel_cache_for(state)
+        # 滞空在悬崖边缘时，朝 -Z 深坑 (yaw=0.0) 的 _is_sprint_yaw_safe 必须返回 False
+        self.assertFalse(_is_sprint_yaw_safe(ex, 0.5, 62.0, 0.5, 0.0, cache, "overworld"))
+
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertEqual(w.controls, [], "zero-hostile void_risk must never blind sprint-jump off cliff")
+        self.assertTrue(w.moves, "expected short move onto confirmed solid cliff ground")
+        self.assertGreaterEqual(w.moves[0][2], 1.0, f"should step back onto safe +Z ledge, got {w.moves[0]}")
+
+    def test_close_melee_burst_blocked_in_cave_immediately_sprints_alternate_corridor(self) -> None:
+        # 复现 seg-05 t=265s：洞穴内贴脸僵尸(dist=0.5)首段疾跑受阻(burst_blocked)时，立即改沿侧向通道二次疾跑，禁止直接回退慢速 move_to
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        # 地板全铺石块
+        for x in range(-6, 7):
+            for z in range(-6, 7):
+                blocks[(x, 41, z)] = "stone"
+        # 逃离方向 -Z 被 2 格高石墙挡住（位于 z=-2，让首段跑 0.7m 后撞墙，+X 为畅通洞穴通道）
+        for x in range(-2, 3):
+            blocks[(x, 42, -2)] = "stone"
+            blocks[(x, 43, -2)] = "stone"
+
+        class _TightCaveZombieWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 42.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=5.0,
+                    nearest_hostile={"id": 124816, "name": "zombie", "dist": 0.5, "pos": [0.5, 42.0, 1.0]},
+                )
+                self.controls: list[dict] = []
+                self.move_calls: int = 0
+
+            def control(self, **kwargs):
+                self.controls.append(dict(kwargs))
+                if len(self.controls) == 1:
+                    # 首段疾跑被岩壁/拐角卡住，仅移动 0.7 格
+                    self.st["pos"] = [0.5, 42.0, -0.2]
+                    self.st["nearest_hostile"] = {"id": 124816, "name": "zombie", "dist": 1.2, "pos": [0.5, 42.0, 1.0]}
+                else:
+                    # 侧向二次疾跑沿畅通通道脱离
+                    yaw = float(kwargs.get("yaw", 0.0))
+                    nx = self.st["pos"][0] + (-math.sin(yaw)) * 8.0
+                    nz = self.st["pos"][2] + (-math.cos(yaw)) * 8.0
+                    self.st["pos"] = [nx, 42.0, nz]
+                    self.st["nearest_hostile"] = {"id": 124816, "name": "zombie", "dist": 9.0, "pos": [0.5, 42.0, 1.0]}
+                return {"pos": list(self.st["pos"])}
+
+            def move_to(self, *args, **kwargs):
+                self.move_calls += 1
+                return {"pos": list(self.st["pos"])}
+
+        w = _TightCaveZombieWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(w.controls), 2, f"expected immediate alternate sprint after burst_blocked, got {w.controls}")
+        self.assertEqual(w.move_calls, 0, "should escape via alternate corridor sprint without stalling in move_to")
+
 
 if __name__ == "__main__":
     unittest.main()

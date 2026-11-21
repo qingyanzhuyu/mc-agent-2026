@@ -860,7 +860,7 @@ class TestHardModeSafetyAndEating(unittest.TestCase):
         state.set_active_escape(None)
 
     def test_flee_rotates_orthogonal_yaw_when_wall_blocks_primary_burst(self):
-        # 复现 INC-009：主方向贴脸疾跑撞墙 (moved < 1.5) 且 move_to path_not_found 后，旋转 ±90° 而非重撞同一堵墙
+        # 复现 INC-009 / seg-05：主方向贴脸疾跑撞墙 (moved < 1.5) 时，立即旋转 ±90° 二次疾跑脱险，不再先卡进慢速 move_to 挨打
         blocks = {(x, 63, z): "stone" for x in range(-4, 5) for z in range(-4, 5)}
         world = HardCombatWorld(pos=(0.5, 64.0, 0.5), blocks=blocks, entities=[_mob("zombie", identifier=7, pos=(1.5, 64.0, 0.5))])
         world.st["nearest_hostile"] = {"id": 7, "name": "zombie", "dist": 1.0}
@@ -879,7 +879,6 @@ class TestHardModeSafetyAndEating(unittest.TestCase):
             return {"moved": 6.0}
 
         world.queue("control", burst_hit_wall, retry_ortho)
-        world.queue("move_to", ApiError("path_not_found", "wall"))
         ex, state = world.session()
 
         ok, _ = _drive_ret(escape_hazard_step(ex, state, "flee"), ex)

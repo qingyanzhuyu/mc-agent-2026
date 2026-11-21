@@ -580,8 +580,22 @@ def _is_sprint_yaw_safe(
     """检查沿 yaw 疾跑前冲 1..lookahead 格是否存在 >3 格深坑/悬崖或岩浆（仅在脚下实心可观测时启用）。"""
     fx, fy, fz = block_cell([px, py, pz])
     under = _read_block(cache, ex.client, (fx, fy - 1, fz), dim)
-    if not (under and is_safe_solid_floor(under)):
+    if under is None or not bare(under.get("name")):
         return True
+    if not is_safe_solid_floor(under):
+        # 脚下悬空/边缘下落（如刚滑出峡谷崖壁）时，只要周邻存在可观测实心地形，仍必须做前方深坑/岩浆检查，
+        # 禁止跳过护栏导致滞空疾跑跳直接冲进深坑；纯空壳单测世界则保持兼容返回 True。
+        probe_cells = (
+            (fx + 1, fy - 1, fz), (fx - 1, fy - 1, fz),
+            (fx, fy - 1, fz + 1), (fx, fy - 1, fz - 1),
+            (fx, fy - 2, fz), (fx, fy, fz),
+        )
+        has_terrain = any(
+            (nb := _read_block(cache, ex.client, cell, dim)) is not None and is_safe_solid_floor(nb)
+            for cell in probe_cells
+        )
+        if not has_terrain:
+            return True
     dx, dz = -math.sin(yaw), -math.cos(yaw)
     checked: set[tuple[int, int]] = {(fx, fz)}
     for step in range(1, lookahead + 1):
@@ -901,6 +915,23 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     h_dist = float(h_dist_raw) if isinstance(h_dist_raw, (int, float)) and not isinstance(h_dist_raw, bool) else 99.0
     is_creeper = h_name == "creeper"
     is_ranged = h_name in _RANGED_HOSTILES
+
+    # 无敌对生物时的 void_risk 脱险：禁止执行盲目 12 格 move_to + 悬崖疾跑跳，仅就近踏上已确认实心干地
+    if not hostile and not _collect_nearby_hostiles(ex, px, py, pz, hostile, radius=18):
+        fx, fy, fz = block_cell([px, py, pz])
+        under = _read_block(cache, ex.client, (fx, fy - 1, fz), dim)
+        if st.get("on_ground") is True and under is not None and is_safe_solid_floor(under):
+            return True
+        safe_ground = _find_dry_shore(ex, st, cache, dim, set())
+        if safe_ground is not None:
+            moved_safe = yield from _move_to_bounded(
+                ex, [safe_ground[0] + 0.5, float(safe_ground[1]), safe_ground[2] + 0.5], rng=1, timeout=4.0,
+            )
+            st_safe = _refresh_status(ex, state)
+            if moved_safe or st_safe.get("on_ground") is True:
+                return True
+        return False
+
     ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, hostile, cache, dim, state=state)
 
     away_yaw = math.atan2(-ux, -uz)
@@ -1038,14 +1069,21 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             if mid_pos and len(mid_pos) >= 3:
                 px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
         if h_dist < 2.5:
-            # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用防跳崖检查的原生疾跑跳脱离近战命中圈再补 move_to
-            safe_burst_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, away_yaw, cache, dim)
+            # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先检测正前墙体并绕开，再用防跳崖检查的原生疾跑跳脱离近战命中圈
+            burst_pref_yaw = (
+                _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+                if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim)
+                else away_yaw
+            )
+            safe_burst_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, burst_pref_yaw, cache, dim)
             before_burst = (px, py, pz)
             ok_burst = False
             if safe_burst_yaw is not None:
                 ok_burst, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_burst_yaw, ms=900)
             if ok_burst:
                 st_mid = _refresh_status(ex, state)
+                if st_mid.get("alive") is False:
+                    return False
                 mid_hostile = st_mid.get("nearest_hostile") or {}
                 base_flee = float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)
                 safe_mid_clear = (
@@ -1062,6 +1100,36 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
                     if math.dist(before_burst, (px, py, pz)) < 1.5:
                         burst_blocked = True
+                # 窄洞首段疾跑被岩壁/拐角挡住且近怪仍贴脸（<4.5 格）：立即改沿侧向可通行通道二次疾跑，禁止直接回退慢速 move_to 站桩挨打
+                mid_dist_val = mid_hostile.get("dist") if isinstance(mid_hostile, dict) else None
+                if (
+                    burst_blocked
+                    and isinstance(mid_dist_val, (int, float))
+                    and not isinstance(mid_dist_val, bool)
+                    and float(mid_dist_val) < 4.5
+                ):
+                    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, mid_hostile, cache, dim, state=state)
+                    alt_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
+                    safe_alt_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, alt_yaw, cache, dim)
+                    if safe_alt_yaw is not None:
+                        ok_alt, _ = yield from _control_step(
+                            ex, forward=True, sprint=True, jump=True, yaw=safe_alt_yaw, ms=700,
+                        )
+                        if ok_alt:
+                            st_alt = _refresh_status(ex, state)
+                            if st_alt.get("alive") is False:
+                                return False
+                            alt_hostile = st_alt.get("nearest_hostile") or {}
+                            if not alt_hostile or (
+                                isinstance(alt_hostile.get("dist"), (int, float))
+                                and float(alt_hostile["dist"]) >= safe_mid_clear
+                            ):
+                                return True
+                            alt_pos = st_alt.get("pos")
+                            if isinstance(alt_pos, (list, tuple)) and len(alt_pos) >= 3:
+                                px, py, pz = float(alt_pos[0]), float(alt_pos[1]), float(alt_pos[2])
+                            ux, uz = -math.sin(safe_alt_yaw), -math.cos(safe_alt_yaw)
+                            away_yaw = safe_alt_yaw
 
     # 高速追击怪（蜘蛛/洞穴蜘蛛/小僵尸，移速高于 move_to 步行 4.3m/s）：禁止用 5s 慢速 move_to 站桩挨咬，直接连续防跳崖疾跑跳拉脱
     if h_name in _FAST_PURSUERS and h_dist < 8.5:
