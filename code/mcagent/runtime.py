@@ -848,6 +848,106 @@ def _has_edible_food(s: State) -> bool:
     return any(s.count(food) >= 1 for food in _EDIBLE_FOODS)
 
 
+_ARMOR_SLOTS: frozenset[str] = frozenset({
+    "head", "chest", "torso", "legs", "feet",
+    "helmet", "chestplate", "leggings", "boots",
+})
+
+
+def _is_equipped_armor_piece(piece: Any) -> bool:
+    """判断单个槽位条目是否为有效已穿戴护甲件。"""
+    if isinstance(piece, str):
+        name = piece.removeprefix("minecraft:").strip().lower()
+        return bool(name) and name not in ("air", "none")
+    if isinstance(piece, dict):
+        name = str(piece.get("name") or "").removeprefix("minecraft:").strip().lower()
+        if not name or name in ("air", "none"):
+            return False
+        raw_count = piece.get("count", 1)
+        if raw_count is None:
+            return True
+        if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float)) or not math.isfinite(raw_count):
+            return False
+        return float(raw_count) > 0
+    return False
+
+
+def _has_armor_in_container(container: Any, *, filter_slots: bool = False, allow_numeric: bool = False) -> bool:
+    if allow_numeric and isinstance(container, (int, float)) and not isinstance(container, bool):
+        return math.isfinite(container) and float(container) > 0
+    if isinstance(container, dict):
+        for slot, piece in container.items():
+            if filter_slots and str(slot).strip().lower() not in _ARMOR_SLOTS:
+                continue
+            if _is_equipped_armor_piece(piece):
+                return True
+        return False
+    if isinstance(container, (list, tuple)) and not filter_slots:
+        return any(_is_equipped_armor_piece(piece) for piece in container)
+    return False
+
+
+def has_equipped_armor(state: State) -> bool:
+    """判断角色当前是否穿戴了任意部位护甲（背包未穿戴不计入）。"""
+    st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
+    if not isinstance(st, dict):
+        st = {}
+    inv = getattr(state, "inventory", None) or {}
+    if not isinstance(inv, dict):
+        inv = {}
+
+    armor_points = st.get("armor_points")
+    if (
+        isinstance(armor_points, (int, float))
+        and not isinstance(armor_points, bool)
+        and math.isfinite(armor_points)
+        and armor_points > 0
+    ):
+        return True
+    if _has_armor_in_container(st.get("armor"), allow_numeric=True):
+        return True
+    if _has_armor_in_container(st.get("equipment"), filter_slots=True):
+        return True
+    if _has_armor_in_container(inv.get("armor"), allow_numeric=False):
+        return True
+    if _has_armor_in_container(inv.get("equipment"), filter_slots=True):
+        return True
+    return False
+
+
+def effective_hostile_flee_dist(state: State, hostile_name: str = "") -> float:
+    """无甲或低血量时扩大非苦力怕敌怪预警逃跑半径（骷髅 10m、其余 9m）。"""
+    cfg = getattr(state, "config", None)
+    raw_base = getattr(cfg, "hostile_flee_dist", 6.0)
+    base = (
+        float(raw_base)
+        if isinstance(raw_base, (int, float)) and not isinstance(raw_base, bool) and math.isfinite(raw_base) and raw_base > 0
+        else 6.0
+    )
+    raw_hp_risk = getattr(cfg, "hp_risk", 14.0)
+    hp_risk = (
+        float(raw_hp_risk)
+        if isinstance(raw_hp_risk, (int, float)) and not isinstance(raw_hp_risk, bool) and math.isfinite(raw_hp_risk) and raw_hp_risk > 0
+        else 14.0
+    )
+
+    st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
+    if not isinstance(st, dict):
+        st = {}
+    raw_hp = st.get("health", 20)
+    if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp):
+        hp = float(raw_hp)
+    else:
+        hp = 20.0
+
+    if (not has_equipped_armor(state)) or hp < hp_risk:
+        norm = str(hostile_name or "").removeprefix("minecraft:").strip().lower()
+        if norm == "skeleton":
+            return max(base, 10.0)
+        return max(base, 9.0)
+    return base
+
+
 class Safety:
     """纯判断：urgent 抢占，soft 留给执行层在动作边界切换技能。"""
 
@@ -878,13 +978,18 @@ class Safety:
             and support.get("status_pos") == st.get("pos")
         ):
             add("void_risk", support["risk"])
-        hostile = st.get("nearest_hostile") or {}
+        raw_hostile = st.get("nearest_hostile")
+        hostile = raw_hostile if isinstance(raw_hostile, dict) else {}
         hostile_name = (
             str(hostile.get("name", "")).removeprefix("minecraft:").strip().lower()
-            if isinstance(hostile, dict)
+            if hostile
             else ""
         )
-        hostile_dist = float(hostile.get("dist", 99)) if isinstance(hostile, dict) and hostile else 99.0
+        raw_dist = hostile.get("dist", 99.0) if hostile else 99.0
+        if isinstance(raw_dist, (int, float)) and not isinstance(raw_dist, bool) and math.isfinite(raw_dist):
+            hostile_dist = float(raw_dist)
+        else:
+            hostile_dist = 99.0
         creeper_urgent = hostile_name == "creeper" and hostile_dist < self.config.creeper_urgent_dist
         if creeper_urgent:
             add(
@@ -895,10 +1000,24 @@ class Safety:
                 dist=hostile.get("dist"),
                 creeper=True,
             )
+        close_hostile_threshold = max(6.0, float(self.config.hostile_flee_dist))
+        close_non_creeper = (not creeper_urgent) and bool(hostile) and hostile_dist < close_hostile_threshold
+        emitted_flee = bool(creeper_urgent)
         if s.in_safe_mode:
+            suppress_safe_mode_urgent = bool(s.get_active_escape()) or close_non_creeper
+            if close_non_creeper:
+                add(
+                    "flee",
+                    f"{hostile.get('name')} 距离 {hostile.get('dist')}",
+                    "soft",
+                    hostile=hostile.get("name"),
+                    dist=hostile.get("dist"),
+                )
+                emitted_flee = True
             add(
                 "safe_mode",
                 f"接近死亡循环，锁存避险剩 {s.safe_mode_remaining:.0f}s",
+                "soft" if suppress_safe_mode_urgent else "urgent",
                 remaining_s=round(s.safe_mode_remaining, 1),
             )
         hp = float(st.get("health", 20))
@@ -911,7 +1030,8 @@ class Safety:
                 can_eat = _has_edible_food(s)
                 sev = "urgent" if (food <= self.config.food_crit and can_eat) else "soft"
                 add("eat", f"低饱食度 {food:g}", sev, food=food, has_food=can_eat)
-        if not creeper_urgent and hostile and hostile_dist < self.config.hostile_flee_dist:
+        flee_threshold = effective_hostile_flee_dist(s, hostile_name)
+        if not emitted_flee and hostile and hostile_dist < flee_threshold:
             add(
                 "flee",
                 f"{hostile.get('name')} 距离 {hostile.get('dist')}",
@@ -1364,10 +1484,12 @@ def _accepts_use_cache(fn: Any) -> bool:
 
 def _same_escape_kind(active_escape: Optional[str], hazard_kind: str) -> bool:
     """避免后台 SafetyMonitor 重复 /stop 打断正在执行的同类紧急脱险（如 flee 被 flee 抢占）。"""
-    if not active_escape:
+    if not active_escape or not active_escape.strip():
         return False
     a = active_escape.strip().lower()
     h = hazard_kind.strip().lower()
+    if h == "safe_mode":
+        return True
     if a == h:
         return True
     douse_group = {"douse", "escape_lava"}
@@ -1378,6 +1500,11 @@ def _same_escape_kind(active_escape: Optional[str], hazard_kind: str) -> bool:
         or (a in surface_group and h in surface_group)
         or (a in flee_group and h in flee_group)
     )
+
+
+_VOID_NON_SOLID: frozenset[str] = frozenset({
+    "air", "cave_air", "void_air", "lava", "flowing_lava",
+})
 
 
 class SafetyMonitor:
@@ -1508,8 +1635,8 @@ class SafetyMonitor:
             block = self._get_block_uncached(under)
             evidence["block"] = block
             name = str(block.get("name", "")).removeprefix("minecraft:")
-            if name in ("air", "cave_air", "void_air"):
-                if guard:
+            if guard:
+                if name in ("air", "cave_air", "void_air"):
                     # 玩家水平碰撞箱 0.6×0.6（半宽 0.3，叠加上 /status 一位小数四舍五入容差 0.05 → ±0.35）：
                     # 非潜行走过单格桥/窄边且服务端物理判定 on_ground=True 时，中心点可能落在相邻空气格，
                     # 需核对碰撞箱四角是否存在实心承重块，避免把正常贴边行走误判为悬空并误发 /stop。
@@ -1525,7 +1652,7 @@ class SafetyMonitor:
                             cb = self._get_block_uncached(cpos)
                             cname = str(cb.get("name", "")).removeprefix("minecraft:")
                             aabb_checked.append({"pos": cpos, "name": cname})
-                            if cname and cname not in ("air", "cave_air", "void_air", "lava"):
+                            if cname and cname not in _VOID_NON_SOLID:
                                 has_aabb_support = True
                                 evidence["aabb_support"] = {"pos": cpos, "name": cname}
                                 break
@@ -1533,7 +1660,15 @@ class SafetyMonitor:
                             evidence["aabb_checked"] = aabb_checked
                     if not has_aabb_support:
                         evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
-                elif falling:
+                elif not name:
+                    evidence["risk"] = "高风险路径脚下方块未知"
+            else:
+                near_world_bottom = y <= -60.0
+                if name == "void_air":
+                    evidence["risk"] = "脚下虚空空气(void_air)：疑似坠入虚空"
+                elif near_world_bottom and name in ("air", "cave_air", "") and not ascending:
+                    evidence["risk"] = "接近世界底部(y<=-60)且脚下无实心支撑：疑似坠入虚空"
+                elif name in ("air", "cave_air") and falling:
                     # 普通地形下落时再往下探 3 格，区分正常下 1~3 格零摔伤台阶/山坡与真悬空/深坑（>=4 格）
                     has_near_ground = False
                     below_checked = []
@@ -1542,14 +1677,16 @@ class SafetyMonitor:
                         b = self._get_block_uncached(bpos)
                         bname = str(b.get("name", "")).removeprefix("minecraft:")
                         below_checked.append({"pos": bpos, "name": bname})
-                        if bname and bname not in ("air", "cave_air", "void_air", "lava"):
+                        if bname in ("lava", "flowing_lava"):
+                            break
+                        if bname and bname not in _VOID_NON_SOLID:
                             has_near_ground = True
                             break
                     evidence["below_checked"] = below_checked
                     if not has_near_ground:
                         evidence["risk"] = "脚下连续空气且正在下落：疑似坠落/深坑"
-            elif not name and guard:
-                evidence["risk"] = "高风险路径脚下方块未知"
+                elif not name and falling:
+                    evidence["risk"] = "脚下方块未知且正在下落：疑似虚空边缘"
         except ApiError as e:
             evidence["error"] = e.code
             if guard:

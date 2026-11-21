@@ -9,16 +9,17 @@ import math
 from typing import TYPE_CHECKING, Any, Callable, Generator, Optional
 
 from ..client import ApiError
-from ..runtime import Replan
+from ..runtime import Replan, effective_hostile_flee_dist, has_equipped_armor
 from .base import failure, rec
 from .items import AIR, NAV_FAIL_CODES, bare, is_clear_space, is_safe_solid_floor, pick_placeable, total_placeable
-from .sightline import DIG_EYE_REACH, block_cell, eye_to_block_dist
+from .sightline import DIG_EYE_REACH, block_cell, eye_to_block_dist, voxel_line_cells
 from .voxel_cache import voxel_cache_for
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
 
 Cell = tuple[int, int, int]
+PLACE_EYE_REACH: float = DIG_EYE_REACH
 _WATER_BLOCKS = frozenset({"water", "flowing_water", "bubble_column"})
 _FLUID_OR_FIRE = _WATER_BLOCKS | {"lava", "flowing_lava", "fire", "soul_fire"}
 _SOFT_OVERHANG = frozenset({
@@ -48,6 +49,24 @@ def _is_water_cell(blk: Optional[dict]) -> bool:
     if not isinstance(blk, dict):
         return False
     return bare(blk.get("name")) in _WATER_BLOCKS or (blk.get("properties") or {}).get("waterlogged") in (True, "true")
+
+
+def _valid_vec3(pos: Any) -> Optional[tuple[float, float, float]]:
+    if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+        return None
+    vals = pos[:3]
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in vals):
+        return None
+    return (float(vals[0]), float(vals[1]), float(vals[2]))
+
+
+def _is_solid_wall_block(blk: Optional[dict]) -> bool:
+    if not isinstance(blk, dict):
+        return False
+    name = bare(blk.get("name")).strip().lower()
+    if not name or name in AIR or name in _FLUID_OR_FIRE or is_clear_space(blk):
+        return False
+    return True
 
 
 def _refresh_status(ex: "Executor", state: "State") -> dict:
@@ -90,7 +109,9 @@ def _exec_step(
         return False
 
 
-def _move_to_bounded(ex: "Executor", target_pos: list[float], *, rng: float = 1, timeout: float = 15.0) -> Generator[dict, None, bool]:
+def _move_to_bounded(
+    ex: "Executor", target_pos: list[float], *, rng: float = 1, timeout: float = 15.0, **fields: Any,
+) -> Generator[dict, None, bool]:
     # 脱困移动必须使用 stop_on=("death",)：逃离怪群/岩浆/火焰时挨一下或受灼烧绝不能中途停步
     try:
         try:
@@ -100,14 +121,14 @@ def _move_to_bounded(ex: "Executor", target_pos: list[float], *, rng: float = 1,
                 res = ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0)
             except TypeError:
                 res = ex.move_to(pos=target_pos, rng=rng)
-        yield rec("move_to", res, pos=target_pos)
+        yield rec("move_to", res, pos=target_pos, **fields)
         return True
     except Replan as err:
         if _is_preemption(err):
             raise
         code, _ = failure(err)
         if code in NAV_FAIL_CODES or code == "timeout":
-            yield rec("move_to", pos=target_pos, error_code=code)
+            yield rec("move_to", pos=target_pos, error_code=code, **fields)
             return False
         raise
 
@@ -397,6 +418,122 @@ def _pick_alternate_escape_yaw(
     return math.atan2(uz, -ux)  # 右旋 90° 保底
 
 
+def _try_seal_underground_tunnel(
+    ex: "Executor", state: "State", st: dict, h_pos: Optional[list[float]], cache: Any, dim: str,
+) -> Generator[dict, None, bool]:
+    p = _valid_vec3(st.get("pos"))
+    hp = _valid_vec3(h_pos)
+    if p is None or hp is None:
+        return False
+    px, py, pz = p
+    fx, fy, fz = block_cell([px, py, pz])
+
+    underground = (
+        py < 58.0
+        or _is_solid_wall_block(_read_block(cache, ex.client, (fx, fy + 2, fz), dim))
+        or _is_solid_wall_block(_read_block(cache, ex.client, (fx, fy + 3, fz), dim))
+    )
+    if not underground:
+        return False
+
+    if getattr(state, "inventory_dirty", False):
+        try:
+            state.refresh_inventory(ex.client)
+        except AttributeError:
+            pass
+    if total_placeable(state) < 2:
+        return False
+
+    hx, hz = hp[0] - px, hp[2] - pz
+    d = math.hypot(hx, hz)
+    if not (1.5 <= d <= 10.0):
+        return False
+
+    dx, dz = ((1 if hx > 0 else -1), 0) if abs(hx) >= abs(hz) else (0, (1 if hz > 0 else -1))
+    foot_cell = (fx + dx, fy, fz + dz)
+    head_cell = (fx + dx, fy + 1, fz + dz)
+    foot_blk = _read_block(cache, ex.client, foot_cell, dim)
+    head_blk = _read_block(cache, ex.client, head_cell, dim)
+    if not (foot_blk and head_blk and is_clear_space(foot_blk) and is_clear_space(head_blk)):
+        return False
+
+    left_solid = (
+        _is_solid_wall_block(_read_block(cache, ex.client, (fx + dx - dz, fy, fz + dz + dx), dim))
+        or _is_solid_wall_block(_read_block(cache, ex.client, (fx + dx - dz, fy + 1, fz + dz + dx), dim))
+    )
+    right_solid = (
+        _is_solid_wall_block(_read_block(cache, ex.client, (fx + dx + dz, fy, fz + dz - dx), dim))
+        or _is_solid_wall_block(_read_block(cache, ex.client, (fx + dx + dz, fy + 1, fz + dz - dx), dim))
+    )
+    if not (left_solid and right_solid):
+        return False
+
+    placed = 0
+    for cell in (foot_cell, head_cell):
+        if eye_to_block_dist(st, cell) > PLACE_EYE_REACH or total_placeable(state) < 1:
+            break
+        block = pick_placeable(state)
+        cell_pos = list(cell)
+        ok = yield from _exec_step(
+            "place",
+            lambda b=block, p_pos=cell_pos: ex.place(b, pos=p_pos),
+            on_ok=lambda p_pos=cell_pos: cache.invalidate(p_pos, dimension=dim),
+            item=block,
+            pos=cell_pos,
+            tunnel_seal=True,
+        )
+        if not ok:
+            break
+        placed += 1
+        if getattr(state, "inventory_dirty", False):
+            try:
+                state.refresh_inventory(ex.client)
+            except AttributeError:
+                pass
+        st_next = _refresh_status(ex, state)
+        if st_next.get("pos"):
+            st = st_next
+    return placed >= 2
+
+
+def _find_skeleton_cover_cell(
+    ex: "Executor", px: float, py: float, pz: float, h_pos: Optional[list[float]], cache: Any, dim: str,
+) -> Optional[Cell]:
+    hp = _valid_vec3(h_pos)
+    if hp is None:
+        return None
+    fx, fy, fz = block_cell([px, py, pz])
+    hx, hy, hz = hp
+    skel_cell = block_cell([hx, hy, hz])
+    skel_eye = (hx, hy + 1.62, hz)
+
+    candidates: list[tuple[float, int, Cell]] = []
+    for dx, dz in _CARDINALS:
+        for dy in (0, 1, -1):
+            cand = (fx + dx, fy + dy, fz + dz)
+            if not _is_dry_standable(cache, ex.client, cand, dim):
+                continue
+            dist_h = math.hypot((cand[0] + 0.5) - hx, (cand[2] + 0.5) - hz)
+            if dist_h < 1.5:
+                continue
+            cand_eye = (cand[0] + 0.5, cand[1] + 1.62, cand[2] + 0.5)
+            skip = {
+                (cand[0], cand[1], cand[2]),
+                (cand[0], cand[1] + 1, cand[2]),
+                skel_cell,
+                (skel_cell[0], skel_cell[1] + 1, skel_cell[2]),
+            }
+            for cell in voxel_line_cells(cand_eye, skel_eye):
+                if cell in skip:
+                    continue
+                if _is_solid_wall_block(_read_block(cache, ex.client, cell, dim)):
+                    candidates.append((-dist_h, abs(dy), cand))
+                    break
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
 def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]:
     st = _refresh_status(ex, state)
     pos = st.get("pos")
@@ -445,23 +582,43 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             mid_pos = st_mid.get("pos")
             if mid_pos and len(mid_pos) >= 3:
                 px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
-    elif h_dist < 2.5:
-        # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用原生疾跑跳脱离近战命中圈再补 move_to
-        before_burst = (px, py, pz)
-        ok_burst, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=900)
-        if ok_burst:
-            st_mid = _refresh_status(ex, state)
-            mid_hostile = st_mid.get("nearest_hostile") or {}
-            safe_mid = 7.0 if is_creeper else float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)
-            if not mid_hostile or (
-                isinstance(mid_hostile.get("dist"), (int, float)) and float(mid_hostile["dist"]) >= safe_mid + 2.0
-            ):
-                return True
-            mid_pos = st_mid.get("pos")
-            if mid_pos and len(mid_pos) >= 3:
-                px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
-                if math.dist(before_burst, (px, py, pz)) < 1.5:
-                    burst_blocked = True
+    else:
+        sealed = yield from _try_seal_underground_tunnel(ex, state, st, h_pos, cache, dim)
+        if sealed:
+            return True
+        hp_raw = st.get("health", 20)
+        hp_val = float(hp_raw) if isinstance(hp_raw, (int, float)) and not isinstance(hp_raw, bool) else 20.0
+        hp_risk = float(getattr(getattr(state, "config", None), "hp_risk", 14.0) or 14.0)
+        if h_name == "skeleton" and h_dist < 10.0 and (not has_equipped_armor(state) or hp_val < hp_risk):
+            cover = _find_skeleton_cover_cell(ex, px, py, pz, h_pos, cache, dim)
+            if cover is not None:
+                moved_cover = yield from _move_to_bounded(
+                    ex, [cover[0] + 0.5, float(cover[1]), cover[2] + 0.5], rng=1, timeout=8.0, skeleton_cover=True,
+                )
+                if moved_cover:
+                    return True
+        if h_dist < 2.5:
+            # 贴脸挨打（<2.5 格）时跳过慢速 A* 寻路，先用原生疾跑跳脱离近战命中圈再补 move_to
+            before_burst = (px, py, pz)
+            ok_burst, _ = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=away_yaw, ms=900)
+            if ok_burst:
+                st_mid = _refresh_status(ex, state)
+                mid_hostile = st_mid.get("nearest_hostile") or {}
+                base_flee = float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)
+                safe_mid_clear = (
+                    max(9.0, effective_hostile_flee_dist(state, h_name))
+                    if is_creeper
+                    else max(base_flee + 2.0, effective_hostile_flee_dist(state, h_name))
+                )
+                if not mid_hostile or (
+                    isinstance(mid_hostile.get("dist"), (int, float)) and float(mid_hostile["dist"]) >= safe_mid_clear
+                ):
+                    return True
+                mid_pos = st_mid.get("pos")
+                if mid_pos and len(mid_pos) >= 3:
+                    px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+                    if math.dist(before_burst, (px, py, pz)) < 1.5:
+                        burst_blocked = True
 
     flee_stride = 16.0 if is_creeper else 18.0
     moved = yield from _move_to_bounded(
@@ -495,7 +652,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             after_hostile = st_after.get("nearest_hostile") or {}
     if not after_hostile:
         return True
-    flee_dist = float(getattr(getattr(state, "config", None), "hostile_flee_dist", 6.0) or 6.0)
+    flee_dist = effective_hostile_flee_dist(state, h_name)
     safe_dist = max(flee_dist, 7.0) if is_creeper else flee_dist
     if (after_dist := after_hostile.get("dist")) is not None and float(after_dist) >= safe_dist:
         return True

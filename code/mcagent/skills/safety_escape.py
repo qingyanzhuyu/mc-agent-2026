@@ -132,6 +132,8 @@ class EmergencyEscape(Skill):
     verified = "live"
 
     _start_pos: Optional[tuple[float, float, float]] = None
+    _sealed_corridor: bool = False
+    _cover_taken: bool = False
 
     @staticmethod
     def _has_active_hazard(state: Any) -> bool:
@@ -163,6 +165,8 @@ class EmergencyEscape(Skill):
 
     def run(self, ex, state):
         self._start_pos = _valid_pos(_state_dict(state).get("pos"))
+        self._sealed_corridor = False
+        self._cover_taken = False
         intent = self.args["intent"]
         setter = getattr(state, "set_active_escape", None)
         if callable(setter):
@@ -170,7 +174,29 @@ class EmergencyEscape(Skill):
         try:
             escape_step = _resolve_escape_hazard_step()
             if escape_step is not None:
-                ok = yield from escape_step(ex, state, intent)
+                gen = escape_step(ex, state, intent)
+                sealed_places = 0
+                cover_ok = False
+                ok = False
+                try:
+                    while True:
+                        try:
+                            step = next(gen)
+                        except StopIteration as stop:
+                            ok = stop.value
+                            break
+                        if isinstance(step, Mapping) and not step.get("error_code"):
+                            if step.get("tunnel_seal"):
+                                sealed_places += 1
+                            if step.get("skeleton_cover"):
+                                cover_ok = True
+                        yield step
+                finally:
+                    close = getattr(gen, "close", None)
+                    if callable(close):
+                        close()
+                self._sealed_corridor = bool(ok and sealed_places >= 2)
+                self._cover_taken = bool(ok and cover_ok)
                 return ok
             return (yield from _fallback_escape_step(ex, state, intent))
         finally:
@@ -199,6 +225,8 @@ class EmergencyEscape(Skill):
             return "灭火/脱岩浆未完成：仍处于着火或岩浆中"
 
         if intent == "flee":
+            if self._sealed_corridor or self._cover_taken:
+                return ""
             hostile = st.get("nearest_hostile")
             if not isinstance(hostile, Mapping) or not hostile:
                 return ""
