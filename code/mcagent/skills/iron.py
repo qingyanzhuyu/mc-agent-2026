@@ -580,6 +580,13 @@ class SmeltIron(Skill):
         try:
             while completed_steps < max_steps:
                 status = _halt_residual_motion(ex, state)
+                if status.get("in_water") or status.get("submerged") or status.get("in_lava"):
+                    raise EnvBlocked(
+                        "身处水域或岩浆中无法向下开挖探矿阶梯，请先上岸换干燥地形",
+                        missing_predicate="dry_ground",
+                        searched_volume="local",
+                        wake_on="chunk_moved",
+                    )
                 if (reach_mod is not None and hasattr(reach_mod, "settle_dry_landing")
                         and status.get("on_ground") is False
                         and not status.get("in_water")

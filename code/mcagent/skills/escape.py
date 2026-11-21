@@ -241,7 +241,7 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
 
     cache = voxel_cache_for(state)
     tried_shores, tried_digs, tried_places = set(), set(), set()
-    swim_idx, control_unsupported = 0, False
+    swim_idx, control_unsupported, shore_fails = 0, False, 0
 
     for _ in range(max(0, int(max_steps))):
         dim = str(st.get("dimension") or "overworld")
@@ -251,9 +251,10 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
             yield from _exec_step(
                 "dig", lambda: ex.dig(dig_pos), on_ok=lambda: cache.invalidate(dig_pos, dimension=dim), pos=dig_pos,
             )
-        elif (shore := _find_dry_shore(ex, st, cache, dim, tried_shores)) is not None:
+        elif shore_fails < 2 and (shore := _find_dry_shore(ex, st, cache, dim, tried_shores)) is not None:
             tried_shores.add(shore)
-            yield from _move_to_bounded(ex, [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5], rng=1, timeout=15.0)
+            moved_shore = yield from _move_to_bounded(ex, [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5], rng=1, timeout=15.0)
+            shore_fails = 0 if moved_shore else (shore_fails + 1)
         else:
             state.refresh_inventory(ex.client)
             step_cell = _find_step_cell(ex, st, cache, dim, tried_places) if total_placeable(state) >= 1 else None
