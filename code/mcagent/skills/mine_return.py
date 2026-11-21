@@ -151,7 +151,12 @@ def _climb_out_stairs(
             if not bn or bn in AIR:
                 continue
             if best_pickaxe(state) is not None:
-                yield from prepare_mining_pick(ex, state, allowed=_ANY_PICKAXE)
+                try:
+                    yield from prepare_mining_pick(ex, state, allowed=_ANY_PICKAXE)
+                except Replan as err:
+                    if _is_preemption(err):
+                        raise
+                    return False
             elif bn not in _SOFT_HAND_DIG and not bn.endswith("_leaves"):
                 return False
             try:
@@ -161,7 +166,7 @@ def _climb_out_stairs(
                     raise
                 yield rec("dig", pos=cell, error_code=failure(err)[0], reason="mine_return_climb")
                 return False
-            vc.invalidate(cell, dimension=dim)
+            vc.invalidate(cell, dimension=dim); state.refresh_inventory(ex.client)
             yield rec("dig", res, pos=cell, reason="mine_return_climb")
         up = [nx + 0.5, float(fy + 1), nz + 0.5]
         try:
@@ -189,11 +194,7 @@ def _try_move_wp(ex: Executor, state: State, wp: Sequence[float], *, reason: str
 
 
 def return_to_surface_from_mine(
-    ex: Executor,
-    state: State,
-    *,
-    target_y: Optional[float] = None,
-    max_climb_steps: int = 64,
+    ex: Executor, state: State, *, target_y: Optional[float] = None, max_climb_steps: int = 64,
 ) -> Generator[dict, None, bool]:
     """沿 `MINE_TRAILS` / `primary_mine_shaft` / 营地锚点安全返回地表，失败时尝试有界阶梯抬升。"""
     st, cur, dim = _cur_status(ex, state)
@@ -208,13 +209,14 @@ def return_to_surface_from_mine(
     if MINE_TRAILS and MINE_TRAILS[-1] and MINE_TRAILS[-1][0][1] > cur[1] + 2.0:
         trail = MINE_TRAILS[-1]
         if math.dist(cur, trail[-1]) <= 24.0:
-            indices = list(range(len(trail) - 1, -1, -8))
-            if indices[-1] != 0:
-                indices.append(0)
-            for idx in indices:
-                if idx == len(trail) - 1:
-                    continue
-                ok, cur = yield from _try_move_wp(ex, state, trail[idx], reason="return_mine_trail")
+            wps_t: list[Sequence[float]] = []
+            last_wp = list(cur)
+            for idx in range(len(trail) - 1, -1, -1):
+                pt = trail[idx]
+                if idx == 0 or (idx == len(trail) - 1 and math.dist(cur, pt) > 2.5) or math.dist(last_wp, pt) >= 8.0:
+                    wps_t.append(pt); last_wp = list(pt)
+            for wp in wps_t:
+                ok, cur = yield from _try_move_wp(ex, state, wp, reason="return_mine_trail")
                 if not ok:
                     break
                 if float(cur[1]) >= ref_y - 3.0:

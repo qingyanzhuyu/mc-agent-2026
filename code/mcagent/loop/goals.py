@@ -18,6 +18,7 @@ from typing import Any, Collection, Mapping, Optional, Sequence
 
 from ..runtime import State, has_equipped_armor
 from ..skills import REGISTRY, bind_args
+from ..skills.furnace_lease import lease_book_for
 from ..skills.items import STONE_OR_BETTER_PICKS, best_pickaxe
 from ..skills.survival_food import cooked_food_count, inventory_food_restore
 from ..skills.world_memo import memo_for
@@ -257,6 +258,7 @@ GOALS: tuple[GoalSpec, ...] = (
         prereq_goals=("upgrade_tools", "prep_stone_sword"),
         prereq_items=("@gear_ready:furnace>=1",),
         done_items=("furnace>=1",),
+        held_items=("@furnace_ready>=1",),
         must_hold_for_children=True,
         gather_fallbacks=(
             ("cobblestone|cobbled_deepslate>=8", "mine_stone", (("count", 8),)),
@@ -2026,6 +2028,24 @@ def eval_item_expr(state: State, expr: str) -> tuple[bool, int, int, str]:
         target = int(lhs.split(":", 1)[1])
         cur = int(state.count("stick") >= target or can_afford_gear(state, "stick"))
         label = f"已持 {target} 木棍或可继续制作"
+    elif lhs == "@furnace_ready":
+        ready = state.count("furnace") >= 1 or state.count("blast_furnace") >= 1
+        if not ready:
+            st_pos = state.st.get("pos") if isinstance(state.st, Mapping) else None
+            dim = str((state.st.get("dimension") if isinstance(state.st, Mapping) else None) or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+            if isinstance(st_pos, (list, tuple)) and len(st_pos) >= 3:
+                cur3 = (float(st_pos[0]), float(st_pos[1]), float(st_pos[2]))
+                leases = lease_book_for(state).active_leases(dimension=dim)
+                ready = any(math.dist(cur3, (l.pos[0] + 0.5, l.pos[1] + 0.5, l.pos[2] + 0.5)) <= 48.0 for l in leases)
+                if not ready:
+                    m = memo_for(state)
+                    stations = list(m.stations("furnace", dimension=dim)) + list(m.stations("blast_furnace", dimension=dim))
+                    ready = any(
+                        math.dist(cur3, (p[0] + 0.5, p[1] + 0.5, p[2] + 0.5)) <= 24.0
+                        for p in stations
+                    )
+        cur = 1 if ready else 0
+        label = "背包或附近可用熔炉"
     elif lhs.startswith("@gear_ready:"):
         gear_item = lhs.split(":", 1)[1].strip()
         cur = 1 if can_afford_gear(state, gear_item, assume_no_table=assume_no_tbl) else 0
