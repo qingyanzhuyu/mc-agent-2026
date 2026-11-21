@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from ..client import ApiError
 from ..runtime import Replan
@@ -46,8 +47,19 @@ def _standing(ex, cell: Cell) -> bool:
             and all(_dry_name(_block(ex, _above(cell, dy))) in AIR for dy in (0, 1)))
 
 
+_SETTLE_POLLS = 5
+_SETTLE_DELAY_S = 0.12
+
+
 def _safe_status(ex, state, dimension: str | None = None) -> dict:
     status = state.refresh_status(ex.client, max_age_s=0)
+    for _ in range(_SETTLE_POLLS):
+        if (status.get("on_ground") is True or status.get("ready") is not True
+                or status.get("alive") is not True
+                or any(status.get(flag) for flag in ("in_water", "submerged", "in_lava", "on_fire", "in_vehicle"))):
+            break
+        time.sleep(_SETTLE_DELAY_S)
+        status = state.refresh_status(ex.client, max_age_s=0)
     pos = status.get("pos")
     current_dimension = bare(status.get("dimension"))
     if (not pos or len(pos) != 3 or not current_dimension or status.get("ready") is not True

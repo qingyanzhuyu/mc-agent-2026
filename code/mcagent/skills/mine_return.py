@@ -119,7 +119,7 @@ def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> lis
 
 
 def _climb_out_stairs(
-    ex: Executor, state: State, *, target_y: float, max_steps: int = 8,
+    ex: Executor, state: State, *, target_y: float, max_steps: int = 64,
 ) -> Generator[dict, None, bool]:
     """当既有矿井路径不通时，在安全实心岩体中向上开凿有界 1×2 阶梯脱困（允许木镐，无镐仅挖软土）。"""
     vc = voxel_cache_for(state)
@@ -193,7 +193,7 @@ def return_to_surface_from_mine(
     state: State,
     *,
     target_y: Optional[float] = None,
-    max_climb_steps: int = 8,
+    max_climb_steps: int = 64,
 ) -> Generator[dict, None, bool]:
     """沿 `MINE_TRAILS` / `primary_mine_shaft` / 营地锚点安全返回地表，失败时尝试有界阶梯抬升。"""
     st, cur, dim = _cur_status(ex, state)
