@@ -368,8 +368,17 @@ def _douse_or_escape_lava(ex: "Executor", state: "State") -> Generator[dict, Non
                 control_ok = False
                 break
             st = _refresh_status(ex, state)
+            if st.get("alive") is False:
+                return False
             if not st.get("in_lava"):
                 break
+            # 仍在岩浆中则按最新坐标刷新干岸方向，避免重复撞墙
+            pos_now = _valid_vec3(st.get("pos"))
+            dry_now = _find_dry_shore(ex, st, cache, dim, set())
+            if pos_now is not None and dry_now is not None:
+                dx2, dz2 = (dry_now[0] + 0.5) - pos_now[0], (dry_now[2] + 0.5) - pos_now[2]
+                if math.hypot(dx2, dz2) > 1e-4:
+                    yaws[0] = math.atan2(-dx2, -dz2)
         if not st.get("on_fire") and not st.get("in_lava"):
             return True
         if st.get("in_lava") and not control_ok and dry is not None:

@@ -43,6 +43,8 @@ _UNSAFE_CLIMB: frozenset[str] = frozenset({
     "water", "lava", "flowing_water", "flowing_lava", "bedrock", "obsidian", "crying_obsidian", "crafting_table", "chest", "furnace",
 })
 _FALLING_ROOF: frozenset[str] = frozenset({"sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava"})
+_LAVA_FLUIDS: frozenset[str] = frozenset({"lava", "flowing_lava"})
+_FLUID_FACES: tuple[Cell, ...] = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
 _HAND_ESCAPE_ROCKS: frozenset[str] = frozenset({
     "stone", "cobblestone", "andesite", "diorite", "granite", "tuff", "deepslate",
     "cobbled_deepslate", "sandstone", "red_sandstone", "coal_ore", "copper_ore",
@@ -134,6 +136,20 @@ def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> lis
             for k in range(1, segs + 1)]
 
 
+def _step_touches_lava(ex: Executor, cells: Sequence[Cell]) -> bool:
+    """检查待挖阶梯方块的六邻面是否紧邻岩浆，避免向上开阶时挖破隐蔽岩浆池。"""
+    checked: set[Cell] = set()
+    for cx, cy, cz in cells:
+        for ox, oy, oz in _FLUID_FACES:
+            nb = (cx + ox, cy + oy, cz + oz)
+            if nb in checked:
+                continue
+            checked.add(nb)
+            if _probe_name(ex, nb) in _LAVA_FLUIDS:
+                return True
+    return False
+
+
 def _climb_out_stairs(
     ex: Executor,
     state: State,
@@ -188,6 +204,9 @@ def _climb_out_stairs(
                 s2_n = _probe_name(ex, (nx, fy + 2, nz))
                 roof_n = _probe_name(ex, (nx, fy + 3, nz))
                 if roof_n in _FALLING_ROOF or not _can_clear((head_n, s1_n, s2_n), hand_rock=hand_rock):
+                    continue
+                dig_cells = ((ix, fy + 2, iz), (nx, fy + 1, nz), (nx, fy + 2, nz))
+                if _step_touches_lava(ex, dig_cells):
                     continue
                 chosen = (nx, nz, need_place, hand_rock)
                 break

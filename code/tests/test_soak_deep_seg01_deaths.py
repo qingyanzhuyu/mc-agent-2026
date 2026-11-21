@@ -584,6 +584,51 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(dec.skill.name, "craft_iron_gear")
         self.assertEqual(dec.skill.args.get("item"), "shield")
 
+    def test_climb_out_stairs_avoids_direction_touching_hidden_lava(self) -> None:
+        # 复现 seg-04 t=89s 死亡：+X 方向待挖阶梯紧邻隐蔽岩浆 (2, 59, 0)，-X 方向为安全干石 -> 必须绕开 +X 改选 -X
+        from mcagent.skills.mine_return import _climb_out_stairs
+
+        blocks = {
+            (0, 57, 0): "stone",
+            (0, 60, 0): "stone",
+            # +X 方向（优先遍历）紧邻隐蔽岩浆
+            (1, 58, 0): "stone",
+            (1, 59, 0): "stone",
+            (1, 60, 0): "stone",
+            (1, 61, 0): "stone",
+            (2, 59, 0): "lava",
+            # -X 方向完全安全
+            (-1, 58, 0): "stone",
+            (-1, 59, 0): "stone",
+            (-1, 60, 0): "stone",
+            (-1, 61, 0): "stone",
+        }
+
+        class _HiddenLavaClimbWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 58.0, 0.5], items={"stone_pickaxe": 1})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20.0)
+                self.dug: list[tuple[int, int, int]] = []
+
+            def dig(self, pos, **kwargs):
+                cell = tuple(int(v) for v in pos)
+                self.blocks[cell] = "air"
+                self.dug.append(cell)
+                return {"dug": "stone"}
+
+        w = _HiddenLavaClimbWorld()
+        ex, state = w.session()
+        gen = _climb_out_stairs(ex, state, target_y=64.0, max_steps=1)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(w.dug, "expected climbing out via safe -X direction")
+        self.assertFalse(any(c[0] == 1 for c in w.dug), f"dug into lava-adjacent +X cells: {w.dug}")
+        self.assertTrue(any(c[0] == -1 for c in w.dug), f"expected safe -X climb cells: {w.dug}")
+        self.assertLess(w.st["pos"][0], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
