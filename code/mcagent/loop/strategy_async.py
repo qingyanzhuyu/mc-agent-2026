@@ -68,7 +68,7 @@ def dispatch_async_objective(
     ctx = orch.build_context(
         state, current_objective=prev_objective, current_objective_elapsed_s=prev_elapsed_s, now=now
     )
-    if not ctx.eligible_goals:
+    if len(ctx.eligible_goals) <= 1:
         return False
     rendered_ctx = ctx.render()
     state_snap = clone_state_for_worker(state)

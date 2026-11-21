@@ -355,11 +355,18 @@ class SmeltIron(Skill):
             return "铁锭异步熔炉租约冶炼中，尚未就绪"
         if not has_iron_input and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包无粗铁且缺石镐或更好的镐（木镐、金镐不能采铁）"
-        if not has_iron_input and dim == "overworld":
-            raw_hp = (state.st or {}).get("health", 20.0)
+        if dim == "overworld":
+            st_snap = state.st or {}
+            raw_hp = st_snap.get("health", 20.0)
             hp_val = float(raw_hp) if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp) else 20.0
-            if hp_val <= 8.0 and not has_equipped_armor(state) and state.count("shield") < 1:
+            unprotected = not has_equipped_armor(state) and state.count("shield") < 1
+            if not has_iron_input and hp_val <= 8.0 and unprotected:
                 return f"低血量无甲无盾(hp={hp_val:.1f}<=8.0)，暂缓下矿寻铁，优先回地表补粮回血"
+            pos_now = st_snap.get("pos")
+            in_cave_y = isinstance(pos_now, (list, tuple)) and len(pos_now) >= 2 and isinstance(pos_now[1], (int, float)) and float(pos_now[1]) < 58.0
+            raw_iron_total = state.count("raw_iron") + 9 * state.count("raw_iron_block")
+            if in_cave_y and raw_iron_total < 3 and hp_val <= 6.0 and unprotected:
+                return f"残血无甲无盾身处暗洞且粗铁不足(hp={hp_val:.1f}<=6.0, raw_iron={raw_iron_total}<3, Y={float(pos_now[1]):.0f})，暂缓寻矿，先脱险回血"
         if not any(state.count(n) for n, _ in _fuels_for(state)) and best_pickaxe(state) not in STONE_OR_BETTER_PICKS:
             return "背包缺煤、木板或原木燃料，且无可采煤的镐"
         return ""
@@ -771,6 +778,13 @@ class SmeltIron(Skill):
         excluded = _session_excluded_for(ex.client, state, status)
         if state.count("raw_iron") >= self.args["count"]:
             return
+        dim_col = bare((status or {}).get("dimension") or "overworld").strip().lower() or "overworld"
+        raw_hp_col = (status or {}).get("health", 20.0)
+        hp_col = float(raw_hp_col) if isinstance(raw_hp_col, (int, float)) and not isinstance(raw_hp_col, bool) and math.isfinite(raw_hp_col) else 20.0
+        if dim_col == "overworld" and hp_col <= 8.0 and not has_equipped_armor(state) and state.count("shield") < 1:
+            if state.count("raw_iron") >= 1:
+                return
+            raise Replan(f"低血量无甲无盾(hp={hp_col:.1f}<=8.0)，停止下洞继续采铁")
         if state.count("raw_iron"):
             # 已有部分粗铁：无石镐或紧邻 8 格内没有现成矿脉则立刻熔炼，有矿脉则先采完
             if (best_pickaxe(state) not in STONE_OR_BETTER_PICKS

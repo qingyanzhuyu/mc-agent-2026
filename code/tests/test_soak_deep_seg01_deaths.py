@@ -163,7 +163,9 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertTrue(flee_low)
         self.assertEqual(flee_low[0]["severity"], "urgent")
 
-        # 脱险完成后 clear_recent_hurt 不再复发
+        # 脱险拉远（>14m 残血远程预警圈）并 clear_recent_hurt 后不再复发
+        client._status["nearest_hostile"] = {"id": 115422, "name": "skeleton", "dist": 15.5}
+        state.set_status(client._status)
         state.clear_recent_hurt()
         hazards_after = Safety(state.config).hazards(state)
         self.assertFalse(any(h["kind"] == "flee" for h in hazards_after))
@@ -1638,6 +1640,34 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         # 确认无盾受箭时 flee_stride 已扩展为 18.0m（相对起点 -64.0 落点 ~ -46.0）
         self.assertTrue(w.move_targets)
         self.assertGreaterEqual(abs(w.move_targets[0][0] - (-64.0)), 17.5)
+
+    def test_seg16_crit_hp_unarmored_expands_ranged_flee_dist_to_14m_and_blocks_cave_smelt(self) -> None:
+        # 复现 seg-16 INC-003（t=1409.9s）：残血 hp=5.4 无甲无盾身处 Y=51 暗洞且骷髅距 10.3m（刚超旧 10.0m 阈值），
+        # 1) effective_hostile_flee_dist 对残血无甲远程射手必须扩展至 14.0m 立即触发逃跑；
+        # 2) SmeltIron.blocked 即使背包已有少量 raw_iron，在残血暗洞（hp<=6, Y<58）也必须阻断下洞熔炼/寻矿。
+        from mcagent.runtime import effective_hostile_flee_dist
+        from mcagent.skills.iron import SmeltIron
+
+        st = State()
+        st.set_status({
+            "ready": True, "alive": True, "health": 5.4, "food": 20, "armor_points": 0,
+            "dimension": "overworld", "pos": [-55.3, 51.0, -281.1],
+            "nearest_hostile": {"id": 161524, "name": "skeleton", "dist": 10.3, "pos": [-65.0, 51.0, -278.0]},
+        })
+        st.set_inventory({"items": [
+            {"name": "stone_pickaxe", "count": 1, "slot": 0},
+            {"name": "raw_iron", "count": 2, "slot": 1},
+            {"name": "coal", "count": 4, "slot": 2},
+        ]})
+        self.assertGreaterEqual(effective_hostile_flee_dist(st, "skeleton"), 14.0)
+        self.assertTrue(bool(SmeltIron.blocked(st)), "SmeltIron must stay blocked at crit hp=5.4 inside Y=51 cave")
+
+        # 回到地表安全高度（Y=68）且回血至 hp=12 后恢复放行
+        st.set_status({
+            "ready": True, "alive": True, "health": 12.0, "food": 20, "armor_points": 0,
+            "dimension": "overworld", "pos": [-55.3, 68.0, -281.1],
+        })
+        self.assertEqual(SmeltIron.blocked(st), "")
 
 
 if __name__ == "__main__":

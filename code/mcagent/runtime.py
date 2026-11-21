@@ -973,7 +973,11 @@ def effective_hostile_flee_dist(state: State, hostile_name: str = "") -> float:
 
     if (not has_equipped_armor(state)) or hp < hp_risk:
         norm = str(hostile_name or "").removeprefix("minecraft:").strip().lower()
-        if norm == "skeleton":
+        ranged_names = ("skeleton", "stray", "bogged", "pillager", "parched")
+        hp_crit = float(getattr(cfg, "hp_crit", 6.0) or 6.0)
+        if not has_equipped_armor(state) and hp <= hp_crit and norm in ranged_names:
+            return max(base, 14.0)
+        if norm in ranged_names:
             return max(base, 10.0)
         return max(base, 9.0)
     return base
@@ -1071,19 +1075,19 @@ class Safety:
                 dist=hostile.get("dist"),
             )
             emitted_flee = True
-        if not emitted_flee:
-            recent_hurt = s.get_recent_hurt(max_age_s=4.0) if hasattr(s, "get_recent_hurt") else None
-            if isinstance(recent_hurt, dict):
-                hurt_src = str(recent_hurt.get("source") or "").strip().lower()
-                src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
-                att_ent = recent_hurt.get("likely_attacker") if isinstance(recent_hurt.get("likely_attacker"), dict) else {}
-                src_name = str(src_ent.get("name") or att_ent.get("name") or "").removeprefix("minecraft:").strip().lower()
-                is_arrow_or_ranged = hurt_src in ("arrow", "trident") or src_name in (
-                    "skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast", "drowned",
-                )
-                is_mob_attack = hurt_src in ("mob_attack", "mob_projectile", "indirect_magic") or bool(src_name)
-                if (is_arrow_or_ranged or is_mob_attack) and (not has_equipped_armor(s) or hp < self.config.hp_risk):
-                    sev = "urgent" if (hp <= self.config.hp_crit and not s.get_active_escape()) else "soft"
+        recent_hurt = s.get_recent_hurt(max_age_s=4.0) if hasattr(s, "get_recent_hurt") else None
+        if isinstance(recent_hurt, dict):
+            hurt_src = str(recent_hurt.get("source") or "").strip().lower()
+            src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
+            att_ent = recent_hurt.get("likely_attacker") if isinstance(recent_hurt.get("likely_attacker"), dict) else {}
+            src_name = str(src_ent.get("name") or att_ent.get("name") or "").removeprefix("minecraft:").strip().lower()
+            is_arrow_or_ranged = hurt_src in ("arrow", "trident") or src_name in (
+                "skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast", "drowned",
+            )
+            is_mob_attack = hurt_src in ("mob_attack", "mob_projectile", "indirect_magic") or bool(src_name)
+            if (is_arrow_or_ranged or is_mob_attack) and (not has_equipped_armor(s) or hp < self.config.hp_risk):
+                sev = "urgent" if (hp <= self.config.hp_crit and not s.get_active_escape()) else "soft"
+                if not emitted_flee:
                     add(
                         "flee",
                         f"受击应急脱险 {src_name or hurt_src or 'hostile'}",
@@ -1092,6 +1096,13 @@ class Safety:
                         dist=hostile_dist if hostile else 16.0,
                         hurt_triggered=True,
                     )
+                    emitted_flee = True
+                elif sev == "urgent":
+                    for item in out:
+                        if item.get("kind") == "flee":
+                            item["severity"] = "urgent"
+                            item["hurt_triggered"] = True
+                            break
         if st.get("on_fire") and not st.get("in_water"):
             add("douse", "着火", "soft")
         return out
