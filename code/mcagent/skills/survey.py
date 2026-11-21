@@ -309,9 +309,17 @@ def _sample_site(ex: Any, state: Any, memo: Any, st: Mapping[str, Any], dim: str
     return bare(st.get("biome", "")).strip().lower(), set(tags) | _sweep_entities(ex, state, dim), ingested
 
 
+_ACTIVE_THREAT_INTENTS = frozenset({"flee", "douse", "escape_lava", "lava", "surface", "void_risk"})
+
+
 def _has_active_threat(state: Any, st: Mapping[str, Any]) -> bool:
-    """检查是否存在待响应安全意图或近身敌怪（防体检长扫方块 2~3s 期间被苦力怕近身引爆）。"""
-    if getattr(state, "safety_intent", None):
+    """检查是否存在紧急逃生类安全意图或近身敌怪（防体检长扫方块 2~3s 期间被苦力怕近身引爆；不因无怪残血 heal 误判振荡）。"""
+    intent_raw = getattr(state, "safety_intent", None)
+    if isinstance(intent_raw, Mapping):
+        kind = str(intent_raw.get("kind") or intent_raw.get("intent") or "").strip().lower()
+        if kind in _ACTIVE_THREAT_INTENTS:
+            return True
+    elif isinstance(intent_raw, str) and intent_raw.strip().lower() in _ACTIVE_THREAT_INTENTS:
         return True
     if st.get("in_lava") or st.get("on_fire") or st.get("submerged"):
         return True

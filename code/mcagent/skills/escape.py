@@ -1041,12 +1041,22 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             return True
         safe_ground = _find_dry_shore(ex, st, cache, dim, set())
         if safe_ground is not None:
+            # 必须使用 rng=0 真正踏上该实心安全格；rng=1 会在角色仍悬空于相邻 4 格坑口上方（距中心 1.0m）时 30ms 误报到达导致坠死
             moved_safe = yield from _move_to_bounded(
-                ex, [safe_ground[0] + 0.5, float(safe_ground[1]), safe_ground[2] + 0.5], rng=1, timeout=4.0,
+                ex, [safe_ground[0] + 0.5, float(safe_ground[1]), safe_ground[2] + 0.5], rng=0, timeout=4.0,
             )
             st_safe = _refresh_status(ex, state)
-            if moved_safe or st_safe.get("on_ground") is True:
+            if st_safe.get("alive") is False:
+                return False
+            if st_safe.get("on_ground") is True:
                 return True
+            if moved_safe:
+                spos = st_safe.get("pos")
+                if isinstance(spos, (list, tuple)) and len(spos) >= 3:
+                    sfx, sfy, sfz = block_cell(spos)
+                    s_under = _read_block(cache, ex.client, (sfx, sfy - 1, sfz), dim)
+                    if s_under is not None and is_safe_solid_floor(s_under):
+                        return True
         return False
 
     in_water_init = bool(st.get("in_water") or st.get("submerged"))

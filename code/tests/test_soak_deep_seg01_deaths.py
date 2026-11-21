@@ -1529,6 +1529,57 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertTrue(w.timeouts, "expected fallback move_to to run for mid-distance zombie")
         self.assertLessEqual(max(w.timeouts), 2.5, f"flee move_to timeout must be <=2.5s, got {w.timeouts}")
 
+    def test_seg14_void_risk_safe_ground_uses_rng_0_so_bot_steps_off_hole(self) -> None:
+        # 复现 seg-14 INC-002（t=391.3s）：hp=0.7 悬空在 4 格坑口 [-72.4, 67, -34.5] 时，
+        # 无敌怪 void_risk 脱险必须用 rng=0 真正踏上相邻实心格（-73, 67, -36），杜绝 rng=1 30ms 误报到达坠死
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks = {
+            (-73, 66, -36): "grass_block",
+            (-73, 62, -35): "grass_block",  # 4 格坑底
+        }
+
+        class _HoleEdgeWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-72.4, 67.0, -34.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=0.7, food=16,
+                    on_ground=False, nearest_hostile=None,
+                )
+                self.move_calls: list[dict] = []
+
+            def move_to(self, *args, **kwargs):
+                self.move_calls.append(dict(kwargs))
+                self.st["pos"] = [-72.5, 67.0, -35.5]
+                self.st["on_ground"] = True
+                return {"pos": list(self.st["pos"])}
+
+        w = _HoleEdgeWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertEqual(len(w.move_calls), 1)
+        self.assertEqual(w.move_calls[0].get("rng"), 0, "void_risk safe_ground recovery must use rng=0 to step onto solid block")
+
+    def test_seg14_survey_has_active_threat_ignores_passive_heal_without_hostiles(self) -> None:
+        # 复现 seg-14 INC-001（survey_island REPLAN_OSCILLATION）：残血无怪挂 soft heal 意图时，
+        # survey._has_active_threat 不应误判为近身敌怪威胁导致反复中断振荡；挂 flee 意图时仍必须立即让位
+        from mcagent.skills.survey import _has_active_threat
+
+        st_obj = State()
+        st_snap = {"health": 0.7, "in_lava": False, "on_fire": False, "submerged": False, "nearest_hostile": None}
+        st_obj.set_safety_intent({"kind": "heal", "severity": "soft", "why": "血量 0.7"})
+        self.assertFalse(_has_active_threat(st_obj, st_snap))
+
+        st_obj.set_safety_intent({"kind": "flee", "severity": "urgent", "why": "近身苦力怕"})
+        self.assertTrue(_has_active_threat(st_obj, st_snap))
+
 
 if __name__ == "__main__":
     unittest.main()
