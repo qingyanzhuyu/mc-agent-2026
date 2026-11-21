@@ -8,6 +8,7 @@ from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
 from .field import _drop_name, _standable_cell, collect_drops, place_block, scan_blocks, scan_entities
+from .food_forage import forage_surface_stride
 from .furnace import collect_furnace, load_furnace
 from .furnace_lease import (
     SMELTING_STATIONS, best_fuel_for, collect_leased, lease_book_for, smelt_output_for, smelt_seconds_per_item,
@@ -295,7 +296,7 @@ class GatherFood(Skill):
 
     def _hunt_animals(self, ex, state, target_restore: int):
         try:
-            entities = ex.client.get_entities(radius=32).get("entities") or []
+            entities = ex.client.get_entities(radius=48).get("entities") or []
         except ApiError as exc:
             if exc.code == "not_ready":
                 raise Replan("世界实体加载尚未就绪（not_ready），请稍后再试") from exc
@@ -316,7 +317,7 @@ class GatherFood(Skill):
         prey.sort(key=lambda e: (0 if need_wool and bare(e.get("name")) == "sheep" else 1, eye_to_point_dist(st, e["pos"])))
         hunted = 0
         for ent in prey:
-            if hunted >= 3 or inventory_food_restore(state) >= target_restore:
+            if hunted >= 4 or inventory_food_restore(state) >= target_restore:
                 break
             inv = _refresh_inv(ex, state)
             if (w := next((x for x in _WEAPONS if state.count(x) > 0), None)) and bare((inv.get("held") or {}).get("name")) != w:
@@ -339,7 +340,7 @@ class GatherFood(Skill):
         return hunted
 
     def _gather_hay_and_berries(self, ex, state, target_restore: int):
-        scan = scan_blocks(ex, state, ("hay_block", "sweet_berry_bush"), radius=24, limit=8, skill_name=self.name)
+        scan = scan_blocks(ex, state, ("hay_block", "sweet_berry_bush"), radius=32, limit=8, skill_name=self.name)
         if scan.get("ready") is False:
             raise Replan("世界区块加载尚未就绪（not_ready），暂无法扫描干草块或浆果丛")
         st = state.refresh_status(ex.client, max_age_s=0)
@@ -350,16 +351,13 @@ class GatherFood(Skill):
             if bname == "hay_block":
                 if not (yield from _reach_block(ex, state, pos, DIG_EYE_REACH)):
                     continue
-                yield rec("dig", ex.dig(list(pos), collect=True), pos=list(pos))
-                _refresh_inv(ex, state)
-                yield from _collect_visible_drops(ex, state, frozenset({"hay_block"}))
-                _refresh_inv(ex, state)
+                yield rec("dig", ex.dig(list(pos), collect=True), pos=list(pos)); _refresh_inv(ex, state)
+                yield from _collect_visible_drops(ex, state, frozenset({"hay_block"})); _refresh_inv(ex, state)
                 if state.count("hay_block") > 0:
                     if "wheat" in RECIPES:
                         yield from craft_recipe(ex, state, "wheat", goal_qty=state.count("wheat") + 9)
                     else:
-                        yield rec("craft", ex.craft("wheat", 1), item="wheat", count=1)
-                        _refresh_inv(ex, state)
+                        yield rec("craft", ex.craft("wheat", 1), item="wheat", count=1); _refresh_inv(ex, state)
                 if state.count("wheat") >= 3 and inventory_food_restore(state) < target_restore:
                     table_ok = "bread" in RECIPES
                     if not table_ok:
@@ -375,24 +373,26 @@ class GatherFood(Skill):
                             yield rec("craft", ex.craft("bread", 1), item="bread", count=1); _refresh_inv(ex, state)
             elif bname == "sweet_berry_bush" and (yield from _reach_block(ex, state, pos, STATION_EYE_REACH)):
                 yield rec("interact", ex.interact(pos=list(pos)), pos=list(pos))
-                yield from _collect_visible_drops(ex, state, frozenset({"sweet_berries"}))
-                _refresh_inv(ex, state)
+                yield from _collect_visible_drops(ex, state, frozenset({"sweet_berries"})); _refresh_inv(ex, state)
 
     def run(self, ex, state):
-        state.refresh_status(ex.client, max_age_s=0)
-        _refresh_inv(ex, state)
+        state.refresh_status(ex.client, max_age_s=0); _refresh_inv(ex, state)
         self._before_restore, self._before_cooked, self._loaded_furnace = inventory_food_restore(state), cooked_food_count(state), False
         yield from self._cook_raw_meat(ex, state)
         st, target_restore = state.refresh_status(ex.client, max_age_s=0), self.args["target_restore"]
         if not _is_night(st) and inventory_food_restore(state) < target_restore:
-            hunted = yield from self._hunt_animals(ex, state, target_restore)
-            if self.args["cook"] and raw_meat_count(state) > 0:
-                yield from self._cook_raw_meat(ex, state)
-            if inventory_food_restore(state) < target_restore and hunted == 0:
-                yield from self._gather_hay_and_berries(ex, state, target_restore)
-                if not self._made_progress(state):
-                    raise EnvBlocked("半径 32 内未找到被动动物、干草块或甜浆果丛", missing_predicate="food_source",
-                                     searched_volume="半径 32 格实体与半径 24 格方块", wake_on="chunk_moved")
+            for attempt in range(2):
+                hunted = yield from self._hunt_animals(ex, state, target_restore)
+                if self.args["cook"] and raw_meat_count(state) > 0:
+                    yield from self._cook_raw_meat(ex, state)
+                if inventory_food_restore(state) < target_restore and hunted == 0:
+                    yield from self._gather_hay_and_berries(ex, state, target_restore)
+                if self._made_progress(state) or inventory_food_restore(state) >= target_restore:
+                    break
+                if attempt == 0 and (yield from forage_surface_stride(ex, state)):
+                    continue
+                raise EnvBlocked("半径 48 内未找到被动动物、干草块或甜浆果丛", missing_predicate="food_source",
+                                 searched_volume="半径 48 格实体与半径 32 格方块", wake_on="chunk_moved")
 
     def verify_done(self, state, before_counts=None) -> str:
         return "" if (inventory_food_restore(state) >= self.args["target_restore"] or self._made_progress(state)) else "补粮结束后食物回复量与熟食均未增加且未装炉烤肉"

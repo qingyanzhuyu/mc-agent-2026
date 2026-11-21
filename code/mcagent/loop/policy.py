@@ -1111,13 +1111,13 @@ class RulePlanner:
                 return PlanDecision(ir_lease, "rule", "铁锭熔炉租约已就绪，回炉取回铁锭防遗弃")
         needs_food_now = food <= 17.0 or hp < 18.0
         proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
-        if restore < 10 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
+        if restore < 14 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
             gf = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf is not None:
-                return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<10)，白天补粮")
+                return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<14)，白天补粮")
         if (
-            raw_meat_count(state) >= 2
-            and cooked_food_count(state) < 4
+            raw_meat_count(state) >= 1
+            and cooked_food_count(state) < 6
             and best_fuel_for(state, 1, allow_lava_bucket=False) is not None
             and has_furnace_ready
             and safe_12
@@ -1610,12 +1610,51 @@ class CampaignPlanner:
             return PlanDecision(None, "idle", f"focus 技能参数 {self.focus_args} 当前不可启动")
         return PlanDecision(skill, "focus", f"定向验收 {skill}")
 
+    def _apply_pre_mine_food_gate(self, state: State, choice: PlanDecision) -> PlanDecision:
+        """白天身处地表且准备下矿（smelt_iron/mine_diamond）时，若食物底仓 <8，先补粮或有界外迁寻粮（<=3 次）再下矿。"""
+        if self.mode != "campaign" or self.target_goal or choice.skill is None:
+            return choice
+        if choice.skill.name not in ("smelt_iron", "mine_diamond"):
+            return choice
+        restore = inventory_food_restore(state)
+        now = time.monotonic()
+        if restore >= 8 or (now - getattr(self, "_pre_mine_food_scout_ts", 0.0)) >= 300.0:
+            self._pre_mine_food_scouts = 0
+            self._pre_mine_food_scout_ts = now
+        if restore >= 8 or is_daytime(state) is not True:
+            return choice
+        st = state.snapshot()
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        pos = st.get("pos")
+        if dim != "overworld" or not (isinstance(pos, (list, tuple)) and len(pos) >= 3 and float(pos[1]) >= 58.0):
+            return choice
+        hostile = st.get("nearest_hostile") or {}
+        if isinstance(hostile, Mapping) and hostile:
+            try:
+                if float(hostile.get("dist", 99.0)) < 12.0:
+                    return choice
+            except (TypeError, ValueError):
+                pass
+        if not any(state.count(s) >= 1 for s in _SURVIVAL_SWORDS):
+            return choice
+        gf = self.rules._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+        if gf is not None:
+            return PlanDecision(gf, "rule", f"下矿前食物底仓不足(restore={restore}<8)，白天先在地表储备熟食")
+        scouts_used = int(getattr(self, "_pre_mine_food_scouts", 0))
+        if scouts_used < 3 and self.rules.environment_block("survival:gather_food") is not None:
+            sc = self.rules._try_make("scout_island", {"radius": 36}, state)
+            if sc is not None:
+                self._pre_mine_food_scouts = scouts_used + 1
+                self._pre_mine_food_scout_ts = now
+                return PlanDecision(sc, "rule", f"下矿前食物底仓为空(restore={restore}<8)，白天先地表外迁寻粮({self._pre_mine_food_scouts}/3)")
+        return choice
+
     def select(self, state: State, recent_failures: list[str]) -> PlanDecision:
         bind_reservation_book(state, self.reservations)
         self.release_skill_materials()
         if not self.reservations.observe(state) and not state.inventory_dirty:
             self.reservations.reset(state)
-        choice = self._select_skill(state, recent_failures)
+        choice = self._apply_pre_mine_food_gate(state, self._select_skill(state, recent_failures))
         if choice.skill is None or not (plan := _material_plan(choice.skill, state)):
             return choice
         consumer = f"{self._last_selected_goal_id or 'skill'}:{choice.skill.goal}"
