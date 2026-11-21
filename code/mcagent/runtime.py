@@ -382,6 +382,7 @@ class State:
                     self.invalidate_inventory()
                     self.last_hurt_at = 0.0
                     self.last_hurt_info = {}
+                    self.safety_intent = None
                     if was_booted:
                         self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
                     elif ev_t_ms is not None and ref_t_ms is not None:
@@ -397,6 +398,7 @@ class State:
                 elif etype == "spawn":
                     self.last_hurt_at = 0.0
                     self.last_hurt_info = {}
+                    self.safety_intent = None
                 elif etype == "hurt" and was_booted:
                     self.last_hurt_at = now_mono
                     self.last_hurt_info = {

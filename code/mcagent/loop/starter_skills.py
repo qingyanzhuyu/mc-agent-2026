@@ -1406,6 +1406,21 @@ class MineStone(Skill):
         self._require_pickaxe(state)
 
     @staticmethod
+    def _touches_lava(ex: "Executor", pos, vc=None, dim: str = "overworld") -> bool:
+        """检查目标方块六邻面及正上方 2 格是否紧邻岩浆，严禁挖破岩浆池引火烧身。"""
+        bx, by, bz = int(pos[0]), int(pos[1]), int(pos[2])
+        neighbors = (
+            [bx + 1, by, bz], [bx - 1, by, bz],
+            [bx, by, bz + 1], [bx, by, bz - 1],
+            [bx, by + 1, bz], [bx, by - 1, bz],
+        )
+        for nb in neighbors:
+            name = bare(_get_block(ex, vc, nb, dim).get("name", ""))
+            if name in ("lava", "flowing_lava"):
+                return True
+        return False
+
+    @staticmethod
     def _safe_stair_column(ex: "Executor", x: int, y: int, z: int, vc=None, dim: str = "overworld") -> bool:
         floor = bare(_get_block(ex, vc, [x, y - 1, z], dim).get("name", ""))
         if not floor or floor in AIR or floor in ("lava", "water") or floor.endswith(("_leaves", "_log", "_wood")):
@@ -1590,6 +1605,10 @@ class MineStone(Skill):
                 raise Replan("附近未找到可安全挖掘的石头或非悬空表土")
 
             t_key = (int(target[0]), int(target[1]), int(target[2]))
+            if self._touches_lava(ex, target, vc=vc, dim=dim):
+                bad_positions.add(t_key)
+                vc and vc.mark_unreachable("mine_stone", t_key, dimension=dim, stance_cell=cur_cell)
+                continue
             if not can_reach_block(ex, st, target, reach=DIG_EYE_REACH):
                 if eye_to_block_dist(st, target) <= DIG_EYE_REACH:
                     yield from _clear_los(ex, state, st, target, max_clear=1, reach=DIG_EYE_REACH, vc=vc, dim=dim)

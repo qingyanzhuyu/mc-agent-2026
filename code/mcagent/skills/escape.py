@@ -348,14 +348,40 @@ def _douse_or_escape_lava(ex: "Executor", state: "State") -> Generator[dict, Non
                 return True
 
     dim = str(st.get("dimension") or "overworld")
-    dry = _find_dry_shore(ex, st, voxel_cache_for(state), dim, set())
-    moved = (
-        (yield from _move_to_bounded(ex, [dry[0] + 0.5, float(dry[1]), dry[2] + 0.5], rng=1, timeout=12.0))
-        if dry is not None
-        else False
-    )
-    if not moved:
-        yield from _control_step(ex, back=True, jump=True, ms=600)
+    cache = voxel_cache_for(state)
+    dry = _find_dry_shore(ex, st, cache, dim, set())
+
+    # 岩浆内每秒掉 8 血且 A* 寻路极易卡死不动：优先立即沿干岸方向原生疾跑跳出岩浆，避免 move_to 停滞烧死
+    if st.get("in_lava"):
+        pos = _valid_vec3(st.get("pos"))
+        yaws: list[float] = []
+        if pos is not None and dry is not None:
+            dx, dz = (dry[0] + 0.5) - pos[0], (dry[2] + 0.5) - pos[2]
+            if math.hypot(dx, dz) > 1e-4:
+                yaws.append(math.atan2(-dx, -dz))
+        yaws.extend(_SWIM_YAWS)
+        control_ok = True
+        for burst_idx in range(3):
+            yaw = yaws[burst_idx % len(yaws)]
+            ok_c, err_c = yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=yaw, ms=650)
+            if not ok_c and err_c == "unsupported_api":
+                control_ok = False
+                break
+            st = _refresh_status(ex, state)
+            if not st.get("in_lava"):
+                break
+        if not st.get("on_fire") and not st.get("in_lava"):
+            return True
+        if st.get("in_lava") and not control_ok and dry is not None:
+            yield from _move_to_bounded(ex, [dry[0] + 0.5, float(dry[1]), dry[2] + 0.5], rng=1, timeout=4.0)
+    else:
+        moved = (
+            (yield from _move_to_bounded(ex, [dry[0] + 0.5, float(dry[1]), dry[2] + 0.5], rng=1, timeout=6.0))
+            if dry is not None
+            else False
+        )
+        if not moved:
+            yield from _control_step(ex, back=True, jump=True, ms=600)
 
     st = _refresh_status(ex, state)
     return not st.get("on_fire") and not st.get("in_lava")

@@ -1178,9 +1178,15 @@ class RulePlanner:
         pos_val = st.get("pos")
         underground_risk = isinstance(pos_val, (list, tuple)) and len(pos_val) >= 2 and float(pos_val[1]) < 58.0
         early_shield_needed = (
-            1 <= iron_ingots <= 2
-            and state.count("raw_iron") < 3 - iron_ingots
-            and (day is False or hp < 16.0 or underground_risk)
+            iron_ingots >= 1
+            and (
+                hp < 12.0
+                or (
+                    1 <= iron_ingots <= 2
+                    and state.count("raw_iron") < 3 - iron_ingots
+                    and (day is False or hp < 16.0 or underground_risk)
+                )
+            )
         )
         if (
             state.count("shield") < 1

@@ -532,6 +532,58 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertTrue(ok, "expected counterattack_hostile to finish lone wounded spider at 7.5 HP")
         self.assertEqual(w.attack_rounds, 2)
 
+    def test_mine_stone_skips_stone_touching_lava(self) -> None:
+        from mcagent.loop.starter_skills import MineStone
+
+        blocks = {
+            (0, 63, 0): "stone",
+            (2, 64, 0): "stone",
+            (3, 64, 0): "lava",   # 紧邻 (2,64,0)，绝不可挖
+            (-2, 64, 0): "stone",  # 安全石头
+        }
+        w = GridWorld(blocks=blocks, pos=[0.5, 64.0, 0.5], items={"stone_pickaxe": 1})
+        ex, state = w.session()
+        self.assertTrue(MineStone._touches_lava(ex, [2, 64, 0], vc=voxel_cache_for(state), dim="overworld"))
+        self.assertFalse(MineStone._touches_lava(ex, [-2, 64, 0], vc=voxel_cache_for(state), dim="overworld"))
+
+    def test_death_clears_stale_safety_intent_and_low_hp_iron_crafts_shield_first(self) -> None:
+        # 1) death/spawn 事件必须清空过期 escape_lava 意图，禁止重生后发无意义脱险
+        st_payload = {"ready": True, "alive": True, "health": 20.0, "food": 20, "dimension": "overworld", "pos": [-63.5, 69.0, 16.5]}
+        client = _FakeMonitorClient(st_payload)
+        state = State()
+        state.drain(client)
+        state.set_safety_intent({"kind": "escape_lava", "why": "在岩浆里", "severity": "urgent"})
+        client._events.append({"seq": 343, "t": 1795284168317, "type": "death", "pos": [-2.5, 64, 61.5]})
+        state.drain(client)
+        self.assertIsNone(state.safety_intent)
+
+        # 2) 低血量（hp=6.8）持 3 铁锭与木板且无盾：优先快造盾牌而非先造桶去追美西螈
+        planner = RulePlanner(min_verified="offline")
+        st_low = State()
+        st_low.set_status({
+            "ready": True,
+            "alive": True,
+            "health": 6.8,
+            "food": 17,
+            "armor_points": 0,
+            "dimension": "overworld",
+            "is_day": True,
+            "pos": [-61.6, 66.0, 27.5],
+        })
+        st_low.set_inventory({
+            "items": [
+                {"name": "iron_ingot", "count": 3, "slot": 0},
+                {"name": "oak_planks", "count": 8, "slot": 1},
+                {"name": "stone_sword", "count": 1, "slot": 2},
+                {"name": "cooked_beef", "count": 4, "slot": 3},
+            ]
+        })
+        dec = planner.choose_proactive_survival(st_low)
+        self.assertIsNotNone(dec)
+        assert dec is not None and dec.skill is not None
+        self.assertEqual(dec.skill.name, "craft_iron_gear")
+        self.assertEqual(dec.skill.args.get("item"), "shield")
+
 
 if __name__ == "__main__":
     unittest.main()

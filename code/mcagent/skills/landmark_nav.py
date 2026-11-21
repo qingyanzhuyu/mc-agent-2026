@@ -81,7 +81,10 @@ def goto_known_landmark_or_biome(
     cx, cy, cz = block_center(best_cell)
     dest = [cx, float(best_cell[1]), cz]
     label = kinds if isinstance(kinds, str) else ",".join(str(k) for k in kinds)
-    receipt = ex.move_to(pos=dest, rng=max(1, int(rng)))
+    try:
+        receipt = ex.move_to(pos=dest, rng=max(1, int(rng)), timeout=30.0, retries=0)
+    except TypeError:
+        receipt = ex.move_to(pos=dest, rng=max(1, int(rng)))
     yield rec("move_to", receipt, pos=dest, landmark=label)
     state.refresh_status(ex.client, max_age_s=0)
     return True

@@ -364,7 +364,7 @@ class TestEscapeWater(unittest.TestCase):
         self.assertEqual(ex1.acts, ["move_to"])
         self.assertEqual(steps1[0]["pos"], [4.5, 64.0, 0.5])
 
-        # Case 2: 在岩浆中且无水桶 -> 找附近干地面移出；若无可走干地或 move_to 失败，则 control(back=True, jump=True)
+        # Case 2: 在岩浆中且无水桶 -> 立刻沿干岸方向原生疾跑跳出岩浆（禁止被慢速 move_to 卡死烧死）
         blocks_lava = {
             (0, 63, 0): "stone",
             (0, 64, 0): "lava",
@@ -373,16 +373,20 @@ class TestEscapeWater(unittest.TestCase):
             (1, 65, 0): "air",
         }
         world2 = EscapeWorld(pos=(0.5, 64.0, 0.5), blocks=blocks_lava, in_lava=True, on_fire=True)
-        world2.on_move = lambda _: world2.st.update({"in_lava": False, "on_fire": False})
+        world2.on_control = lambda _: world2.st.update({"in_lava": False, "on_fire": False})
         ex2, state2 = world2.session()
 
         ok2, _ = _drive_result(escape_hazard_step(ex2, state2, "escape_lava"), ex2)
 
         self.assertTrue(ok2)
-        self.assertEqual(ex2.acts, ["move_to"])
+        self.assertEqual(ex2.acts, ["control"])
+        self.assertTrue(world2.control_requests[0]["jump"])
+        self.assertTrue(world2.control_requests[0]["sprint"])
+        # 干岸在 +X，Mineflayer yaw = atan2(-1, 0) = -pi/2
+        self.assertAlmostEqual(world2.control_requests[0]["yaw"], -math.pi / 2, places=4)
 
-        # Case 3: 岩浆中 move_to 失败时退回 control(back=True, jump=True, ms=600)
-        world3 = EscapeWorld(pos=(0.5, 64.0, 0.5), blocks=blocks_lava, in_lava=True, on_fire=True)
+        # Case 3: 仅着火（不在岩浆中）且附近无水源时 move_to 失败，退回 control(back=True, jump=True, ms=600)
+        world3 = EscapeWorld(pos=(0.5, 64.0, 0.5), blocks=blocks_lava, in_lava=False, on_fire=True)
         world3.on_move = lambda _: (_ for _ in ()).throw(ApiError("path_not_found", "blocked"))
         world3.on_control = lambda _: world3.st.update({"in_lava": False, "on_fire": False})
         ex3, state3 = world3.session()
