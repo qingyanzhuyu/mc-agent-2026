@@ -1153,6 +1153,82 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(dec.source, "idle")
         self.assertIn("夜间空手无甲", dec.reason)
 
+    def test_smelt_iron_filters_deep_cave_ores_when_unarmored_at_10_3_hp_no_food(self) -> None:
+        # 复现 seg-10 t=62s：hp=10.3 无甲无盾无粮时，禁止再追 Y=48 远距深洞暴露矿，优先转安全矿井或地表浅矿
+        from mcagent.skills.iron import SmeltIron, reset_iron_memo
+
+        reset_iron_memo()
+        deep_cave_ore = [-77, 48, 36]
+        shallow_ore = [-60, 62, 26]
+
+        class _MidHpCaveWorld(GridWorld):
+            def find_blocks(self, types=None, radius=32, limit=64, **_):
+                if types and any("iron" in t for t in types):
+                    return {
+                        "blocks": [
+                            {"name": "iron_ore", "pos": list(deep_cave_ore)},
+                            {"name": "iron_ore", "pos": list(shallow_ore)},
+                        ]
+                    }
+                return {"blocks": []}
+
+        w = _MidHpCaveWorld(
+            blocks={(-64, 53, 26): "stone", tuple(deep_cave_ore): "iron_ore", tuple(shallow_ore): "iron_ore"},
+            pos=[-63.7, 54.0, 26.3],
+            items={"stone_pickaxe": 1, "coal": 4},
+        )
+        w.st.update(dimension="overworld", ready=True, alive=True, health=10.3, armor_points=0)
+        ex, state = w.session()
+        cands = SmeltIron()._ore_candidates(ex, state, radius=32)
+        self.assertNotIn(deep_cave_ore, cands)
+        self.assertIn(shallow_ore, cands)
+
+    def test_flee_runs_second_sprint_when_zombie_still_within_3_5m_after_first_burst(self) -> None:
+        # 复现 seg-10 t=149..152s：首段疾跑移出 2.3m（未撞墙），但僵尸紧追仍距 0.8m（<3.5m）时，
+        # 必须以最新坐标重算向量并补二次疾跑拉脱，严禁直接落入慢速 move_to 绕回僵尸嘴边被咬死
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks = {(x, 62, z): "stone" for x in range(-14, 15) for z in range(-14, 15)}
+
+        class _PersistentZombieWorld(GridWorld):
+            def __init__(self):
+                super().__init__(blocks=blocks, pos=[0.5, 63.0, 0.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=7.3,
+                    nearest_hostile={"id": 134975, "name": "zombie", "dist": 1.6, "pos": [0.5, 63.0, -1.1]},
+                )
+                self.controls = 0
+                self.moves = 0
+
+            def control(self, **kwargs):
+                self.controls += 1
+                if self.controls == 1:
+                    # 首段位移 2.3m（>=1.5m 未撞墙），但僵尸追至 0.8m
+                    self.st["pos"] = [0.5, 63.0, 2.8]
+                    self.st["nearest_hostile"] = {"id": 134975, "name": "zombie", "dist": 0.8, "pos": [0.5, 63.0, 2.0]}
+                else:
+                    # 二次疾跑拉脱至安全距离 10.0m
+                    self.st["pos"] = [0.5, 63.0, 12.0]
+                    self.st["nearest_hostile"] = {"id": 134975, "name": "zombie", "dist": 10.0, "pos": [0.5, 63.0, 2.0]}
+                return {"pos": list(self.st["pos"]), "moved": 2.3 if self.controls == 1 else 9.2}
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                return {"pos": list(self.st["pos"])}
+
+        w = _PersistentZombieWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(w.controls, 2, "expected second sprint burst while zombie is still <3.5m")
+        self.assertEqual(w.moves, 0, "should break melee range via second burst without slow move_to")
+
 
 if __name__ == "__main__":
     unittest.main()

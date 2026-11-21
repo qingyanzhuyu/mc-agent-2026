@@ -1167,16 +1167,22 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                         burst_blocked = True
                         if safe_burst_yaw is not None:
                             tried_yaws.append(safe_burst_yaw)
-                # 窄洞首段疾跑被岩壁/拐角挡住且近怪仍贴脸（<4.5 格）：立即改沿侧向可通行通道二次疾跑，禁止直接回退慢速 move_to 站桩挨打
+                # 首段疾跑后若近怪仍紧追贴脸（<3.5 格）或撞墙受阻（burst_blocked 且 <4.5 格）：
+                # 立即以最新坐标重算背敌向量并补二次原生疾跑跳，严禁带着旧向量/贴脸怪直接回退慢速 A* move_to 绕回怪嘴边
+                if isinstance(mid_hostile, dict) and mid_hostile:
+                    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, mid_hostile, cache, dim, state=state)
+                    away_yaw = math.atan2(-ux, -uz)
                 mid_dist_val = mid_hostile.get("dist") if isinstance(mid_hostile, dict) else None
                 if (
-                    burst_blocked
-                    and isinstance(mid_dist_val, (int, float))
+                    isinstance(mid_dist_val, (int, float))
                     and not isinstance(mid_dist_val, bool)
-                    and float(mid_dist_val) < 4.5
+                    and ((burst_blocked and float(mid_dist_val) < 4.5) or float(mid_dist_val) < 3.5)
                 ):
-                    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, mid_hostile, cache, dim, state=state)
-                    alt_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
+                    alt_yaw = (
+                        _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
+                        if (burst_blocked or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
+                        else away_yaw
+                    )
                     safe_alt_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, alt_yaw, cache, dim)
                     if safe_alt_yaw is not None:
                         before_alt = (px, py, pz)
@@ -1198,8 +1204,12 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                                 px, py, pz = float(alt_pos[0]), float(alt_pos[1]), float(alt_pos[2])
                                 if math.dist(before_alt, (px, py, pz)) < 1.5:
                                     tried_yaws.append(safe_alt_yaw)
-                            ux, uz = -math.sin(safe_alt_yaw), -math.cos(safe_alt_yaw)
-                            away_yaw = safe_alt_yaw
+                            if isinstance(alt_hostile, dict) and alt_hostile:
+                                ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, alt_hostile, cache, dim, state=state)
+                                away_yaw = math.atan2(-ux, -uz)
+                            else:
+                                ux, uz = -math.sin(safe_alt_yaw), -math.cos(safe_alt_yaw)
+                                away_yaw = safe_alt_yaw
 
     # 高速追击怪（蜘蛛/洞穴蜘蛛/小僵尸，移速高于 move_to 步行 4.3m/s）：禁止用 5s 慢速 move_to 站桩挨咬，直接连续防跳崖疾跑跳拉脱
     if h_name in _FAST_PURSUERS and h_dist < 8.5:

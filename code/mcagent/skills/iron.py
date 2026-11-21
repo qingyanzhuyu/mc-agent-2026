@@ -30,6 +30,7 @@ from .registry import register
 from .sightline import (
     API_DIG_EYE_REACH, DIG_EYE_REACH, STATION_EYE_REACH, can_reach_block, eye_to_block_dist,
 )
+from .survival_food import inventory_food_restore
 from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
 from .windows import window_amount, window_section, window_view
 from .world_memo import memo_for
@@ -469,9 +470,9 @@ class SmeltIron(Skill):
         low_hp_fragile = (
             not in_reach_only
             and dim == "overworld"
-            and hp_val <= 10.0
             and not has_equipped_armor(state)
             and state.count("shield") < 1
+            and (hp_val <= 12.0 or (hp_val < 16.0 and inventory_food_restore(state) < 4))
         )
         cands = [
             b["pos"] for b in blocks
