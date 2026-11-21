@@ -1265,6 +1265,12 @@ class Executor:
                         self.state.patch_action(result, action=name)
                     return result
                 except ApiError as e:
+                    if (
+                        name == "craft"
+                        and e.code == "bad_args"
+                        and any(tok in e.message.lower() for tok in ("updateslot", "did not fire within timeout"))
+                    ):
+                        e = ApiError("window_timeout", e.message, e.extra)
                     attempt_elapsed = time.monotonic() - attempt_started
                     self.n_errors += 1
                     self._record({
@@ -1302,7 +1308,7 @@ class Executor:
 
                     retryable = e.kind == RETRY and not (
                         e.code == "timeout" and attempt_elapsed >= _NO_RETRY_TIMEOUT_ELAPSED_S
-                    )
+                    ) and not (e.code == "window_timeout" and name in NON_IDEMPOTENT_ACTIONS)
                     if retryable and attempt <= retries:
                         try:
                             wait_s = self._recover_session_if_needed(e, backoff, attempt)

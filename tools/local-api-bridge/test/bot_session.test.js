@@ -204,3 +204,54 @@ test("windowView and windowAct classify mineflayer windowOpen timeout as retryab
     { code: "window_timeout" }
   );
 });
+
+test("craft classifies mineflayer updateSlot timeout as retryable window_timeout", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.registry = {
+    itemsByName: { oak_planks: { id: 5, name: "oak_planks" }, oak_log: { id: 17, name: "oak_log" } },
+    items: { 5: { id: 5, name: "oak_planks" }, 17: { id: 17, name: "oak_log" } },
+    blocksByName: {},
+    recipes: { 5: [{ inShape: [[17]], result: { id: 5, count: 4 } }] },
+  };
+  bot.recipesFor = () => [{ result: { id: 5, count: 4 }, delta: [{ id: 17, count: -1 }] }];
+  bot.craft = async () => {
+    throw new Error("Event updateSlot:0 did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.craft({ item: "oak_planks", count: 4 }),
+    { code: "window_timeout" }
+  );
+  assert.equal(session.busy, null);
+});
+
+test("craft aborts promptly on stop, closes open window, and releases busy lock", async () => {
+  const session = readySession();
+  const { bot } = session;
+  let closedWin = null;
+  bot.currentWindow = { id: 3, title: "Crafting" };
+  bot.closeWindow = (w) => {
+    closedWin = w;
+    bot.currentWindow = null;
+  };
+  bot.registry = {
+    itemsByName: { oak_planks: { id: 5, name: "oak_planks" }, oak_log: { id: 17, name: "oak_log" } },
+    items: { 5: { id: 5, name: "oak_planks" }, 17: { id: 17, name: "oak_log" } },
+    blocksByName: {},
+    recipes: { 5: [{ inShape: [[17]], result: { id: 5, count: 4 } }] },
+  };
+  bot.recipesFor = () => [{ result: { id: 5, count: 4 }, delta: [{ id: 17, count: -1 }] }];
+  // Simulate a hung Mineflayer bot.craft() that never resolves on its own
+  bot.craft = () => new Promise(() => {});
+
+  const craftPromise = session.craft({ item: "oak_planks", count: 4 });
+  const craftRejected = assert.rejects(craftPromise, { code: "interrupted" });
+  assert.equal(session.busy, "craft");
+
+  const stopped = await session.stop();
+  assert.equal(stopped.action, "craft");
+  assert.equal(stopped.released, true);
+  assert.equal(session.busy, null);
+  assert.ok(closedWin && closedWin.id === 3, "expected open crafting window to be closed on abort");
+  await craftRejected;
+});

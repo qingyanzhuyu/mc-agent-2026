@@ -1068,6 +1068,9 @@ class BotSession {
       try {
         if (this.bot && this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
         if (this.bot) this.bot.stopDigging();
+        if (this.bot && this.bot.currentWindow && typeof this.bot.closeWindow === "function") {
+          this.bot.closeWindow(this.bot.currentWindow);
+        }
       } catch (_) {}
     };
 
@@ -1188,6 +1191,9 @@ class BotSession {
         this.bot.stopDigging();
         this.bot.clearControlStates();
         this.bot.deactivateItem();
+        if (this.bot.currentWindow && typeof this.bot.closeWindow === "function") {
+          this.bot.closeWindow(this.bot.currentWindow);
+        }
       } catch (_) {}
     }
 
@@ -2023,7 +2029,31 @@ class BotSession {
         }
         return { times, needs };
       };
+      const closeCurrentWindow = () => {
+        try {
+          if (bot.currentWindow && typeof bot.closeWindow === "function") {
+            bot.closeWindow(bot.currentWindow);
+          }
+        } catch (_) {}
+      };
+      const craftCancellable = (rec, craftTimes, tableBlk) => {
+        signal.throwIfAborted();
+        const raw = Promise.resolve().then(() => bot.craft(rec, craftTimes, tableBlk));
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            closeCurrentWindow();
+            raw.catch(() => {});
+            reject(signal.reason);
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          raw.then(
+            (val) => { signal.removeEventListener("abort", onAbort); resolve(val); },
+            (err) => { signal.removeEventListener("abort", onAbort); reject(err); }
+          );
+        });
+      };
       const wrapCraftErr = (err, fallbackNeeds) => {
+        if (err instanceof ApiBizError) throw err;
         const msg = err && err.message ? err.message : String(err);
         if (msg.toLowerCase().includes("missing ingredient")) {
           const curInv = inventorySummaryMap(bot);
@@ -2031,6 +2061,10 @@ class BotSession {
             example_recipe_needs: fallbackNeeds,
             inventory: curInv,
           });
+        }
+        if (/updateSlot|windowOpen|did not fire within timeout/i.test(msg)) {
+          closeCurrentWindow();
+          throw new ApiBizError("window_timeout", msg);
         }
         throw err;
       };
@@ -2044,7 +2078,7 @@ class BotSession {
         try {
           for (let i = 0; i < times; i += 1) {
             signal.throwIfAborted();
-            await bot.craft(rec, 1, null);
+            await craftCancellable(rec, 1, null);
             if (i + 1 < times) await delay(60, undefined, { signal });
           }
         } catch (err) {
@@ -2080,7 +2114,7 @@ class BotSession {
           const { times, needs } = calcNeeds(rec, count);
           const beforeCount = inventorySummaryMap(bot)[itemName] || 0;
           try {
-            await bot.craft(rec, times, tableBlock);
+            await craftCancellable(rec, times, tableBlock);
           } catch (err) {
             wrapCraftErr(err, needs);
           }

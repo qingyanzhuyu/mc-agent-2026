@@ -15,7 +15,7 @@ import time
 from typing import TYPE_CHECKING, Generator, Iterator, Optional
 
 from ..client import ApiError
-from ..runtime import EnvBlocked, Replan
+from ..runtime import EnvBlocked, Replan, has_equipped_armor
 from ..skills import nav
 from ..skills.base import Param, Skill, failure, rec
 from ..skills.items import AIR, MINE_TRAILS, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, pick_placeable
@@ -475,7 +475,7 @@ def _craft_with_space(
         if code == "no_window":
             table = extra.get("table")
             _forget_stale_table(state, table if _is_valid_pos3(table) else table_pos)
-        if code == "bad_args" and ("updateslot" in str(e).lower() or "timeout" in str(e).lower()):
+        if code in ("bad_args", "window_timeout") and ("updateslot" in str(e).lower() or "timeout" in str(e).lower()):
             yield rec("craft", item=item, error_code=code)
             if _wait_craft_inventory_sync(ex, state, item, before) > before:
                 return
@@ -634,10 +634,17 @@ class ScoutIsland(Skill):
             if (vlen := math.hypot(vx, vz)) >= 4.0:
                 sux, suz = vx / vlen, vz / vlen
         recent_anchors = VISITED_ANCHORS[-24:]
+        naked_on_surface = (
+            float(cur[1]) >= 56.0
+            and not has_equipped_armor(state)
+            and not any(state.count(w) > 0 for w in ("wooden_sword", "stone_sword", "iron_sword", "diamond_sword", "netherite_sword"))
+        )
         cands, climb_cands = [], []
         for b in (land.get("blocks") or []):
             p = b.get("pos")
             if not (isinstance(p, list) and len(p) == 3) or _is_protected(p, radius=8.0):
+                continue
+            if naked_on_surface and float(p[1]) < 54.0:
                 continue
             if memo.is_near_void_edge(p, dimension=dim, margin=8.0):
                 continue
