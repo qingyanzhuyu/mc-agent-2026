@@ -466,6 +466,25 @@ def _pick_cliff_safe_yaw(
     return None
 
 
+def _is_yaw_wall_blocked(
+    ex: "Executor", px: float, py: float, pz: float, ux: float, uz: float, cache: Any, dim: str,
+) -> bool:
+    """检查逃离主方向紧邻前 1 格是否存在 2 格高实心墙体阻挡（避免疾跑撞墙空转）。"""
+    norm = math.hypot(ux, uz)
+    if norm <= 1e-6:
+        return False
+    sx, sz = int(round(ux / norm)), int(round(uz / norm))
+    if (sx, sz) == (0, 0):
+        return False
+    fx, fy, fz = block_cell([px, py, pz])
+    b_head = _read_block(cache, ex.client, (fx + sx, fy + 1, fz + sz), dim)
+    if not _is_solid_wall_block(b_head):
+        return False
+    b_foot = _read_block(cache, ex.client, (fx + sx, fy, fz + sz), dim)
+    b_top = _read_block(cache, ex.client, (fx + sx, fy + 2, fz + sz), dim)
+    return _is_solid_wall_block(b_foot) or _is_solid_wall_block(b_top)
+
+
 def _pick_alternate_escape_yaw(
     ex: "Executor", px: float, py: float, pz: float, ux: float, uz: float, cache: Any, dim: str,
 ) -> float:
@@ -881,7 +900,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             px, py, pz = float(rpos[0]), float(rpos[1]), float(rpos[2])
         retry_yaw = (
             _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
-            if burst_blocked
+            if (burst_blocked or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
             else away_yaw
         )
         safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim)

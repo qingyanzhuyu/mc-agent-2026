@@ -1119,7 +1119,7 @@ class RulePlanner:
                 return PlanDecision(ir_lease, "rule", "铁锭熔炉租约已就绪，回炉取回铁锭防遗弃")
         needs_food_now = food <= 17.0 or hp < 18.0
         proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
-        if restore < 14 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
+        if near_surface_for_camp and restore < 14 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
             gf = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf is not None:
                 return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<14)，白天补粮")
