@@ -1229,6 +1229,34 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertGreaterEqual(w.controls, 2, "expected second sprint burst while zombie is still <3.5m")
         self.assertEqual(w.moves, 0, "should break melee range via second burst without slow move_to")
 
+    def test_low_hp_pursuing_zombie_prioritizes_flee_above_stationary_eat_food(self) -> None:
+        # 复现 seg-11 t=637s（INC-003）：hp=0.9 无甲且僵尸距 5.5m 正在追击时，
+        # 必须优先 emergency_escape(flee) 拉开安全距，严禁原地站桩 1.6s 吃肉被追上秒杀
+        planner = RulePlanner(min_verified="offline")
+        st = State()
+        st.set_status({
+            "ready": True, "alive": True, "health": 0.9, "food": 16, "armor_points": 0,
+            "dimension": "overworld", "is_day": True, "pos": [-40.3, 61.0, -290.1],
+            "nearest_hostile": {"id": 139004, "name": "zombie", "dist": 5.5, "pos": [-45.8, 61.0, -290.1]},
+        })
+        st.set_inventory({"items": [{"name": "mutton", "count": 2, "slot": 0}]})
+        dec = planner.choose(st)
+        self.assertIsNotNone(dec.skill)
+        assert dec.skill is not None
+        self.assertEqual(dec.skill.name, "emergency_escape")
+        self.assertEqual(dec.skill.args.get("intent"), "flee")
+
+        # 拉开至 12m 安全距离后，才停步进食回血
+        st.set_status({
+            "ready": True, "alive": True, "health": 0.9, "food": 16, "armor_points": 0,
+            "dimension": "overworld", "is_day": True, "pos": [-28.3, 61.0, -290.1],
+            "nearest_hostile": {"id": 139004, "name": "zombie", "dist": 12.0, "pos": [-40.3, 61.0, -290.1]},
+        })
+        dec_safe = planner.choose(st)
+        self.assertIsNotNone(dec_safe.skill)
+        assert dec_safe.skill is not None
+        self.assertEqual(dec_safe.skill.name, "eat_food")
+
 
 if __name__ == "__main__":
     unittest.main()

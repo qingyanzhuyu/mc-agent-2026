@@ -172,9 +172,18 @@ def _is_urgent_escape_hazard(state: State) -> bool:
             hdist = 99.0
         if hname == "creeper" and math.isfinite(hdist) and hdist < creeper_dist:
             return True
-        # safe_mode 期间若真有敌怪守尸/贴近（<6 格），绝不可原地发呆吃第 3 死；常态下贴脸（<=2.5 格）亦先脱险再进食
+        # safe_mode 期间或敌怪处于 1.6s 站桩进食致死半径内（常态 <6 格；残血 <=8 或无甲 <12 时 <9~10 格）：
+        # 必须先脱险拉开安全距再进食，禁止残血原地啃肉 1.6s 被追上秒杀
+        raw_hp = st.get("health", 20.0)
+        hp_val = float(raw_hp) if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp) else 20.0
+        eff_flee = effective_hostile_flee_dist(state, hname)
+        eat_unsafe_dist = (
+            eff_flee
+            if (hp_val <= 8.0 or (hp_val < 12.0 and not has_equipped_armor(state)))
+            else flee_dist
+        )
         if math.isfinite(hdist) and (
-            (state.in_safe_mode and hdist < flee_dist) or hdist <= 2.5
+            (state.in_safe_mode and hdist < flee_dist) or hdist < eat_unsafe_dist
         ):
             return True
     raw = getattr(state, "safety_intent", None)
