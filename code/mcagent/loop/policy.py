@@ -14,7 +14,7 @@ from ..planner import skill_choice
 from ..planner.llm import LLMClient
 from ..planner.objective import Objective
 from ..planner.scheduler import DecisionScheduler
-from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint, effective_hostile_flee_dist
+from ..runtime import OXYGEN_FULL, EnvBlocked, State, _inv_fingerprint, effective_hostile_flee_dist, has_equipped_armor
 from ..skills import REGISTRY, Skill, bind_args, make
 from ..skills import base as skill_base
 from ..skills import camp_plan as _camp_plan
@@ -962,6 +962,25 @@ class RulePlanner:
         bunker = self._choose_nether_landing_bunker(state)
         if bunker is not None:
             return bunker
+        # 濒死低血量且饱食度支持自然回血（food>=18）且周边 16 格无敌怪时，先短暂原地回血避免残血直冲怪区
+        regen_hp_floor = 10.0 if not has_equipped_armor(state) else 8.0
+        if (
+            not self.target_goal
+            and food >= 18.0
+            and hp < regen_hp_floor
+            and not any(state.st.get(flag) for flag in ("in_water", "submerged", "in_lava", "on_fire"))
+        ):
+            hostile = state.st.get("nearest_hostile") or {}
+            hdist = 99.0
+            if isinstance(hostile, Mapping) and hostile:
+                try:
+                    raw_d = float(hostile.get("dist", 99.0))
+                    if math.isfinite(raw_d):
+                        hdist = raw_d
+                except (TypeError, ValueError):
+                    pass
+            if hdist >= 16.0:
+                return PlanDecision(None, "idle", f"低血量自然回血驻留 (hp={hp:.1f}, food={food:.0f})")
         return None
 
     def choose_proactive_survival(self, state: State) -> Optional[PlanDecision]:
