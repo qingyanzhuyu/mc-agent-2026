@@ -5,6 +5,8 @@ import math
 import unittest
 from copy import deepcopy
 
+from mcagent.client import ApiError
+from mcagent.loop.goals import GOAL_MAP, check_item_expr
 from mcagent.runtime import EnvBlocked, Replan, State
 from mcagent.skills.registry import REGISTRY, contract_errors
 from mcagent.skills.scripted_world import ScriptedWorld
@@ -21,6 +23,7 @@ from mcagent.skills.t3_biomes import (
 )
 from mcagent.skills.testing import GridWorld, drive
 from mcagent.skills.voxel_cache import reset_all_voxel_caches
+from mcagent.skills.world_memo import memo_for, reset_all_world_memos
 
 _SKILLS = (
     KillNearSculkCatalyst,
@@ -99,6 +102,7 @@ class BiomeWorld(ScriptedWorld):
         self.attack_kills = True
         self.kill_damage = 0.0
         self.spyglass_ok = True
+        self.wolf_armor_full = False
         self.next_eid = 900
 
     def inventory(self, timeout=10):
@@ -168,10 +172,50 @@ class BiomeWorld(ScriptedWorld):
             self.items[dug] = self.items.get(dug, 0) + 1
         return {"dug": dug}
 
+    def craft(self, item, count=1, *, stop_on=None):
+        self.calls.append(("craft", {"item": item, "count": count}))
+        if item.endswith("_planks"):
+            wood = item.removesuffix("_planks")
+            if wood == "bamboo":
+                src, out_qty = "bamboo_block", 2
+            else:
+                src, out_qty = f"{wood}_log", 4
+            if self.items.get(src, 0) < count:
+                raise ApiError("missing_item", f"合成 {item} 缺少 {src}")
+            self.items[src] -= count
+            self.items[item] = self.items.get(item, 0) + out_qty * count
+            return {"crafted": item, "count": out_qty * count}
+        if item.endswith("_boat") or item == "bamboo_raft":
+            planks = "bamboo_planks" if item == "bamboo_raft" else f"{item.removesuffix('_boat')}_planks"
+            if self.items.get(planks, 0) < 5 * count:
+                raise ApiError("missing_item", f"合成 {item} 缺少 {planks}")
+            self.items[planks] -= 5 * count
+            self.items[item] = self.items.get(item, 0) + count
+            return {"crafted": item, "count": count}
+        recipes = {
+            "shears": ((("iron_ingot", 2),), 1),
+            "wolf_armor": ((("armadillo_scute", 6),), 1),
+            "spyglass": ((("copper_ingot", 2), ("amethyst_shard", 1)), 1),
+        }
+        if item not in recipes:
+            raise ApiError("missing_recipe", f"未知测试配方 {item}")
+        ings, out_qty = recipes[item]
+        for ing, need in ings:
+            if self.items.get(ing, 0) < need * count:
+                raise ApiError("missing_item", f"合成 {item} 缺少 {ing}")
+        for ing, need in ings:
+            self.items[ing] -= need * count
+        self.items[item] = self.items.get(item, 0) + out_qty * count
+        return {"crafted": item, "count": out_qty * count}
+
     def interact(self, pos=None, entity_id=None, item=None, *, stop_on=None):
         self.calls.append(("interact", {"pos": pos, "entity_id": entity_id, "item": item}))
         if item is not None:
             self._need(item)
+        if pos is not None and item == "bucket" and self.blocks.get(tuple(int(v) for v in pos)) == "water":
+            self.items["bucket"] -= 1
+            self.items["water_bucket"] = self.items.get("water_bucket", 0) + 1
+            return {"changed": True}
         if pos is not None and item == "axolotl_bucket":
             self.items["axolotl_bucket"] -= 1
             self.items["water_bucket"] = self.items.get("water_bucket", 0) + 1
@@ -188,11 +232,17 @@ class BiomeWorld(ScriptedWorld):
         if ent is None:
             return {"changed": False}
         if ent["name"] == "wolf":
+            if item == "wolf_armor" and not ent.get("has_armor"):
+                self.items["wolf_armor"] -= 1
+                ent["has_armor"] = True
+                return {"changed": True}
             if item == "shears" and ent.get("has_armor"):
                 ent["has_armor"] = False
                 self.items["wolf_armor"] = self.items.get("wolf_armor", 0) + 1
                 return {"changed": True}
             if item == "armadillo_scute" and ent.get("has_armor"):
+                if self.wolf_armor_full or ent.get("armor_damaged") is False:
+                    return {"changed": False}
                 self.items["armadillo_scute"] -= 1
                 return {"changed": True}
             return {"changed": False}
@@ -433,6 +483,7 @@ class AssistAxolotlHuntTests(unittest.TestCase):
 class ManageWolfArmorTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_remove_and_repair_modes(self):
         w_rem = BiomeWorld(
@@ -457,6 +508,79 @@ class ManageWolfArmorTests(unittest.TestCase):
         drive(s_rep, ex2, st2)
         self.assertEqual(s_rep.verify_done(st2), "")
         self.assertEqual(st2.count("armadillo_scute"), 1)
+
+    def test_remove_auto_crafts_shears_and_equips_or_crafts_wolf_armor(self):
+        # 1) 无剪刀但有 2 铁锭 -> 自动合剪刀再卸铠
+        w_shears = BiomeWorld(
+            items={"iron_ingot": 2},
+            entities=[{"id": 44, "name": "wolf", "type": "animal", "tamed": True, "has_armor": True, "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex1, st1 = w_shears.session()
+        s1 = ManageWolfArmor(mode="remove")
+        self.assertTrue(s1.can_start(st1))
+        steps1 = drive(s1, ex1, st1)
+        self.assertTrue(any(s["op"] == "craft" and s.get("item") == "shears" for s in steps1))
+        self.assertEqual(st1.count("wolf_armor"), 1)
+        self.assertEqual(s1.verify_done(st1), "")
+
+        # 2) 狼未穿狼铠但背包有 wolf_armor -> 先穿再卸
+        w_equip = BiomeWorld(
+            items={"shears": 1, "wolf_armor": 1},
+            entities=[{"id": 45, "name": "wolf", "type": "animal", "tamed": True, "has_armor": False, "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex2, st2 = w_equip.session()
+        s2 = ManageWolfArmor(mode="remove")
+        steps2 = drive(s2, ex2, st2)
+        inter_items = [s.get("item") for s in steps2 if s["op"] == "interact"]
+        self.assertEqual(inter_items, ["wolf_armor", "shears"])
+        self.assertEqual(st2.count("wolf_armor"), 1)
+        self.assertEqual(s2.verify_done(st2), "")
+
+        # 3) 无剪刀无狼铠但有 2 铁锭 + 6 犰狳鳞甲 -> 自动合剪刀 + 合狼铠 + 穿戴 + 卸下
+        w_full = BiomeWorld(
+            blocks={(2, 64, 0): "crafting_table"},
+            items={"iron_ingot": 2, "armadillo_scute": 6},
+            entities=[{"id": 46, "name": "wolf", "type": "animal", "tamed": True, "has_armor": False, "pos": [2.5, 64.0, 1.5]}],
+        )
+        ex3, st3 = w_full.session()
+        s3 = ManageWolfArmor(mode="remove")
+        steps3 = drive(s3, ex3, st3)
+        crafted = [s.get("item") for s in steps3 if s["op"] == "craft"]
+        self.assertEqual(crafted, ["shears", "wolf_armor"])
+        self.assertEqual(st3.count("wolf_armor"), 1)
+        self.assertEqual(s3.verify_done(st3), "")
+
+    def test_repair_full_durability_or_unarmored_wolf_raises_env_blocked(self):
+        # 1) 元数据明确满耐久 -> 前置即抛 EnvBlocked，不浪费交互
+        w_meta_full = BiomeWorld(
+            items={"armadillo_scute": 2},
+            entities=[{"id": 47, "name": "wolf", "type": "animal", "tamed": True, "has_armor": True, "armor_durability": [64, 64], "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex1, st1 = w_meta_full.session()
+        with self.assertRaises(EnvBlocked) as ctx1:
+            drive(ManageWolfArmor(mode="repair"), ex1, st1)
+        self.assertEqual(ctx1.exception.missing_predicate, "wolf_armor:damaged")
+        self.assertEqual(ex1.acts, [])
+
+        # 2) 无耐久元数据但服务端因满耐久拒消费 -> 清晰转 EnvBlocked
+        w_srv_full = BiomeWorld(
+            items={"armadillo_scute": 2},
+            entities=[{"id": 48, "name": "wolf", "type": "animal", "tamed": True, "has_armor": True, "pos": [2.5, 64.0, 0.5]}],
+        )
+        w_srv_full.wolf_armor_full = True
+        ex2, st2 = w_srv_full.session()
+        with self.assertRaises(EnvBlocked) as ctx2:
+            drive(ManageWolfArmor(mode="repair"), ex2, st2)
+        self.assertEqual(ctx2.exception.missing_predicate, "wolf_armor:damaged")
+
+        # 3) 狼未穿戴狼铠执行 repair -> EnvBlocked
+        w_unarmored = BiomeWorld(
+            items={"armadillo_scute": 2},
+            entities=[{"id": 49, "name": "wolf", "type": "animal", "tamed": True, "has_armor": False, "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex3, st3 = w_unarmored.session()
+        with self.assertRaises(EnvBlocked):
+            drive(ManageWolfArmor(mode="repair"), ex3, st3)
 
     def test_unarmored_wolf_replan_and_missing_wolf_blocked(self):
         w1 = BiomeWorld(
@@ -508,6 +632,7 @@ class AllayDeliverItemTests(unittest.TestCase):
 class BoatWithGoatTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_place_lure_board_and_dismount_happy_path(self):
         world = BiomeWorld(
@@ -520,6 +645,36 @@ class BoatWithGoatTests(unittest.TestCase):
         self.assertEqual(skill.verify_done(state), "")
         self.assertIn("dismount", ex.acts)
         self.assertFalse(world.st["in_vehicle"])
+
+    def test_auto_crafts_boat_from_five_planks_and_from_two_logs(self):
+        # 1) 5 同色木板直合木船（1.21 无需木铲）
+        w_planks = BiomeWorld(
+            blocks={(2, 64, 0): "crafting_table"},
+            items={"spruce_planks": 5},
+            entities=[{"id": 64, "name": "goat", "type": "animal", "pos": [3.5, 64.0, 1.5]}],
+        )
+        ex1, st1 = w_planks.session()
+        self.assertEqual(BoatWithGoat.blocked(st1), "")
+        s1 = BoatWithGoat()
+        steps1 = drive(s1, ex1, st1)
+        self.assertTrue(any(s["op"] == "craft" and s.get("item") == "spruce_boat" for s in steps1))
+        self.assertEqual(s1.verify_done(st1), "")
+        self.assertFalse(w_planks.st["in_vehicle"])
+
+        # 2) 2 原木 + 背包工作台 -> 先合木板再放工作台合木船再同乘下船
+        w_logs = BiomeWorld(
+            items={"oak_log": 2, "crafting_table": 1},
+            entities=[{"id": 65, "name": "goat", "type": "animal", "pos": [3.5, 64.0, 1.5]}],
+        )
+        ex2, st2 = w_logs.session()
+        self.assertEqual(BoatWithGoat.blocked(st2), "")
+        s2 = BoatWithGoat()
+        steps2 = drive(s2, ex2, st2)
+        crafted = [s.get("item") for s in steps2 if s["op"] == "craft"]
+        self.assertEqual(crafted, ["oak_planks", "oak_planks", "oak_boat"])
+        self.assertIn("crafting_table", w_logs.blocks.values())
+        self.assertEqual(s2.verify_done(st2), "")
+        self.assertFalse(w_logs.st["in_vehicle"])
 
     def test_abort_while_mounted_dismounts_cleanly(self):
         world = BiomeWorld(
@@ -553,12 +708,21 @@ class BoatWithGoatTests(unittest.TestCase):
 class SilkTouchBeeNestTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_silk_touch_detection_formats(self):
         # 无精准采集被拦截
         w_no = BiomeWorld(items={"diamond_axe": 1}, item_meta={"diamond_axe": {"enchantments": [{"name": "fortune", "level": 3}]}})
         _, st_no = w_no.session()
         self.assertTrue(SilkTouchBeeNest.blocked(st_no))
+
+        # 附魔书（stored_enchantments 或 enchantments）不得被误判为精准采集工具
+        w_book = BiomeWorld(
+            items={"enchanted_book": 1},
+            item_meta={"enchanted_book": {"components": {"minecraft:stored_enchantments": {"levels": {"minecraft:silk_touch": 1}}}}},
+        )
+        _, st_book = w_book.session()
+        self.assertTrue(SilkTouchBeeNest.blocked(st_book))
 
         # enchantments 列表格式
         w_e = BiomeWorld(items={"diamond_axe": 1}, item_meta={"diamond_axe": {"enchantments": [{"name": "silk_touch", "level": 1}]}})
@@ -572,6 +736,29 @@ class SilkTouchBeeNestTests(unittest.TestCase):
         )
         _, st_c = w_c.session()
         self.assertEqual(SilkTouchBeeNest.blocked(st_c), "")
+
+    def test_remote_bee_nest_anchor_respects_daytime_and_nighttime_protection(self):
+        meta = {"diamond_axe": {"enchantments": [{"name": "silk_touch", "level": 1}]}}
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        blocks[(62, 65, 0)] = "bee_nest"
+        # 白天无雨无蜂：导航至 bee_nest 锚点后仍严格遵守归巢保护，不挖蜂巢
+        w_day = BiomeWorld(pos=(0.5, 64.0, 0.5), blocks=blocks, items={"diamond_axe": 1}, item_meta=meta, time_of_day=6000)
+        ex1, st1 = w_day.session()
+        memo_for(st1).record_landmark("bee_nest", [60, 64, 0], dimension="overworld")
+        with self.assertRaises(EnvBlocked) as ctx:
+            drive(SilkTouchBeeNest(radius=16), ex1, st1)
+        self.assertEqual(ctx.exception.wake_on, "night")
+        self.assertIn("move_to", ex1.acts)
+        self.assertNotIn("dig", ex1.acts)
+
+        # 夜间：导航至 bee_nest 锚点后安全精准采集成功
+        w_night = BiomeWorld(pos=(0.5, 64.0, 0.5), blocks=blocks, items={"diamond_axe": 1}, item_meta=meta, time_of_day=15000)
+        ex2, st2 = w_night.session()
+        memo_for(st2).record_landmark("bee_nest", [60, 64, 0], dimension="overworld")
+        s2 = SilkTouchBeeNest(radius=16)
+        drive(s2, ex2, st2)
+        self.assertEqual(s2.verify_done(st2), "")
+        self.assertEqual(st2.count("bee_nest"), 1)
 
     def test_night_harvest_with_campfire_and_daytime_conservative_block(self):
         meta = {"diamond_axe": {"enchantments": [{"name": "silk_touch", "level": 1}]}}
@@ -627,6 +814,7 @@ class SilkTouchBeeNestTests(unittest.TestCase):
 class CatchTadpoleTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_catch_tadpole_happy_path_and_errors(self):
         world = BiomeWorld(
@@ -653,10 +841,36 @@ class CatchTadpoleTests(unittest.TestCase):
         with self.assertRaises(Replan):
             drive(CatchTadpole(), ex2, st2)
 
+    def test_empty_bucket_fills_water_from_nearby_source_then_catches_tadpole(self):
+        world = BiomeWorld(
+            blocks={(2, 63, 0): "water"},
+            items={"bucket": 1},
+            entities=[{"id": 83, "name": "tadpole", "type": "animal", "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex, state = world.session()
+        self.assertEqual(CatchTadpole.blocked(state), "")
+        skill = CatchTadpole()
+        steps = drive(skill, ex, state)
+        inter_items = [s.get("item") for s in steps if s["op"] == "interact"]
+        self.assertEqual(inter_items, ["bucket", "water_bucket"])
+        self.assertEqual(state.count("tadpole_bucket"), 1)
+        self.assertEqual(skill.verify_done(state), "")
+
+        # 无水源时抛 EnvBlocked
+        w_dry = BiomeWorld(
+            items={"bucket": 1},
+            entities=[{"id": 84, "name": "tadpole", "type": "animal", "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex_dry, st_dry = w_dry.session()
+        with self.assertRaises(EnvBlocked) as ctx:
+            drive(CatchTadpole(), ex_dry, st_dry)
+        self.assertEqual(ctx.exception.missing_predicate, "visible_block:water")
+
 
 class SpyglassObserveTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_observe_parrot_and_ghast(self):
         for target in ("parrot", "ghast"):
@@ -672,6 +886,31 @@ class SpyglassObserveTests(unittest.TestCase):
                 ops = [s["op"] for s in steps if s]
                 self.assertEqual(ops, ["look", "use_item"])
                 self.assertEqual(skill.goal, f"t3:spyglass_{target}")
+
+    def test_auto_crafts_spyglass_from_copper_and_amethyst_then_observes_parrot(self):
+        world = BiomeWorld(
+            blocks={(2, 64, 0): "crafting_table"},
+            items={"copper_ingot": 2, "amethyst_shard": 1},
+            entities=[{"id": 93, "name": "parrot", "type": "animal", "pos": [6.5, 66.5, 0.5]}],
+        )
+        ex, state = world.session()
+        self.assertEqual(SpyglassObserve.blocked(state), "")
+        skill = SpyglassObserve(target="parrot")
+        steps = drive(skill, ex, state)
+        self.assertTrue(any(s["op"] == "craft" and s.get("item") == "spyglass" for s in steps))
+        self.assertEqual(state.count("spyglass"), 1)
+        self.assertEqual(skill.verify_done(state), "")
+
+        # 核查 goals.py 中 spyglass_at_parrot 的防徒劳解锁门控
+        spec = GOAL_MAP["spyglass_at_parrot"]
+        self.assertEqual(spec.requires_landmarks, ("jungle",))
+        self.assertTrue(spec.prereq_items)
+        empty = State()
+        empty.set_inventory({"items": []})
+        self.assertFalse(all(check_item_expr(empty, expr) for expr in spec.prereq_items))
+        has_shard = State()
+        has_shard.set_inventory({"items": [{"name": "amethyst_shard", "count": 1}]})
+        self.assertTrue(all(check_item_expr(has_shard, expr) for expr in spec.prereq_items))
 
     def test_missing_or_occluded_target_raises_env_blocked(self):
         w_none = BiomeWorld(items={"spyglass": 1}, entities=[])

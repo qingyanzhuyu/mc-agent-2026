@@ -1134,15 +1134,15 @@ class WaveDLedgerAndContractTests(_WaveDTestBase):
         # WIP=1 discipline preserved: smelt_iron is sole candidate
         self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
 
-        # Exact Stage 3 final totals: 104 goals / 89 scored / 2,730 pts (89 / 99, 80.6% of 3,385)
+        # Exact final totals (Stage 3 + biome/archaeology completion): 109 goals / 94 scored / 2,925 pts (94 / 99, 86.4% of 3,385)
         scored_all = [g for g in GOALS if g.score > 0]
         total_pts = sum(g.score for g in scored_all)
-        self.assertEqual(len(GOALS), 104)
-        self.assertEqual(len(scored_all), 89)
-        self.assertEqual(total_pts, 2730)
+        self.assertEqual(len(GOALS), 109)
+        self.assertEqual(len(scored_all), 94)
+        self.assertEqual(total_pts, 2925)
         self.assertEqual(len(ADVANCEMENT_SCORES_V2), 99)
         self.assertEqual(sum(ADVANCEMENT_SCORES_V2.values()), 3385)
-        self.assertEqual(round(total_pts / sum(ADVANCEMENT_SCORES_V2.values()) * 100, 1), 80.6)
+        self.assertEqual(round(total_pts / sum(ADVANCEMENT_SCORES_V2.values()) * 100, 1), 86.4)
 
         # Wave D goals: tier="T4", stage="draft", stop_loss=True, scores (30, 60, 60) = +150
         wave_d_goals = [GOAL_MAP[gid] for gid in WAVE_D_IDS]

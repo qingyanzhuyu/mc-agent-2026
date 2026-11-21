@@ -9,6 +9,7 @@ from .encounter import combat_melee, shoot_projectile, verify_shot_lane
 from .field import _cell, _drop_name, _observed_block, _standable_cell, collect_drops, equip_item, move_local, place_block, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
+from .landmark_nav import goto_known_landmark_or_biome
 from .mining import MineStepUnsafe, mine_step, reach_ore, sort_ore_candidates
 from .recipes import _table_position
 from .registry import register
@@ -89,8 +90,10 @@ def _find_place_cell(ex: Executor, st: dict) -> list[int] | None:
 def _hunt_mob_for_drop(
     ex: Executor, state: State, *, mob: str, drop: str, target_count: int, radius: int,
     max_kills: int, allow_ranged: bool, missing_msg: str, fail_msg: str,
+    landmark: str | Sequence[str] | None = None,
 ) -> Generator[dict, None, None]:
     _fresh_bag(ex, state)
+    navigated = False
     for _ in range(max_kills):
         if state.count(drop) >= target_count:
             return
@@ -100,7 +103,12 @@ def _hunt_mob_for_drop(
             yield from _collect_drop_if_seen(ex, state, drop, radius=min(16, radius))
             if state.count(drop) >= target_count:
                 return
-            raise EnvBlocked(missing_msg, missing_predicate=mob, searched_volume=f"半径 {radius} 格", wake_on="chunk_moved")
+            if landmark and not navigated and (yield from goto_known_landmark_or_biome(ex, state, landmark)):
+                navigated = True
+                st = _nether_status(ex, state, f"已离开下界，停止猎杀 {mob}", min_hp=10.0)
+                _, targets = _scan_named(ex, state, mob, radius)
+            if not targets:
+                raise EnvBlocked(missing_msg, missing_predicate=mob, searched_volume=f"半径 {radius} 格", wake_on="chunk_moved")
         target = min(targets, key=lambda e: math.dist(st["pos"], e["pos"]))
         retreat = _safe_retreat(ex, st)
         arrows = any(state.count(a) >= 1 for a in ("arrow", "spectral_arrow", "tipped_arrow"))
@@ -238,7 +246,7 @@ class HuntBlaze(Skill):
         return _nether_gate(state, min_hp=10.0)
     def run(self, ex: Executor, state: State):
         cnt = self.args["count"]
-        yield from _hunt_mob_for_drop(ex, state, mob="blaze", drop="blaze_rod", target_count=cnt, radius=self.args["radius"], max_kills=max(8, cnt * 6), allow_ranged=True, missing_msg="附近未发现烈焰人", fail_msg=f"烈焰棒收集未达到目标数量 {cnt}")
+        yield from _hunt_mob_for_drop(ex, state, mob="blaze", drop="blaze_rod", target_count=cnt, radius=self.args["radius"], max_kills=max(8, cnt * 6), allow_ranged=True, missing_msg="附近未发现烈焰人", fail_msg=f"烈焰棒收集未达到目标数量 {cnt}", landmark="nether_fortress")
     def verify_done(self, state: State, before_counts=None) -> str:
         need, have = self.args["count"], state.count("blaze_rod")
         return "" if have >= need else f"烈焰棒数量不足（现有 {have}，目标 {need}）"
@@ -263,7 +271,13 @@ class LootBastion(Skill):
         self._guard_brute(ex, state)
         blocks = _scan_blocks_ready(ex, state, ("chest", "trapped_chest"), radius=radius, limit=16, skill_name=self.name)
         dim, memo = bare(state.st.get("dimension")) or "the_nether", memo_for(state)
-        if not (chests := [c for c in blocks if not memo.is_blocked(c["pos"], dimension=dim)]):
+        chests = [c for c in blocks if not memo.is_blocked(c["pos"], dimension=dim)]
+        if not chests and (yield from goto_known_landmark_or_biome(ex, state, "bastion_remnant")):
+            _nether_status(ex, state, "当前不在下界，停止搜刮堡垒")
+            self._guard_brute(ex, state)
+            blocks = _scan_blocks_ready(ex, state, ("chest", "trapped_chest"), radius=radius, limit=16, skill_name=self.name)
+            chests = [c for c in blocks if not memo.is_blocked(c["pos"], dimension=dim)]
+        if not chests:
             raise EnvBlocked("附近未发现可搜刮的堡垒箱子", missing_predicate="bastion_chest", searched_volume=f"半径 {radius} 格", wake_on="chunk_moved")
         rank = lambda e: (0 if any(bare(_observed_block(ex, (_cell(e["pos"])[0] + dx, _cell(e["pos"])[1] + dy, _cell(e["pos"])[2] + dz)).get("name")) in _BASTION_BLOCKS for dx, dy, dz in _OFFSETS_6) else 1, math.dist(state.pos, e["pos"]))
         for chest in sorted(chests, key=rank):
@@ -374,6 +388,6 @@ class HuntWitherSkull(Skill):
         return _nether_gate(state, min_hp=10.0)
     def run(self, ex: Executor, state: State):
         k = self.args["max_kills"]
-        yield from _hunt_mob_for_drop(ex, state, mob="wither_skeleton", drop="wither_skeleton_skull", target_count=1, radius=self.args["radius"], max_kills=k, allow_ranged=False, missing_msg="附近未发现凋灵骷髅", fail_msg=f"已击杀 {k} 只凋灵骷髅仍未掉落头颅，止损退出")
+        yield from _hunt_mob_for_drop(ex, state, mob="wither_skeleton", drop="wither_skeleton_skull", target_count=1, radius=self.args["radius"], max_kills=k, allow_ranged=False, missing_msg="附近未发现凋灵骷髅", fail_msg=f"已击杀 {k} 只凋灵骷髅仍未掉落头颅，止损退出", landmark="nether_fortress")
     def verify_done(self, state: State, before_counts=None) -> str:
         return "" if state.count("wither_skeleton_skull") >= 1 else "未获取到凋灵骷髅头颅（wither_skeleton_skull）"

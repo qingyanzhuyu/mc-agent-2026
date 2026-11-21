@@ -29,7 +29,7 @@ from mcagent.loop.subgoals import (
 )
 from mcagent.runtime import EnvBlocked, Replan, State
 from mcagent.skills import REGISTRY, bind_args, contract_errors
-from mcagent.skills.t4_end_and_frogs import LeashFrogVariants, LootEndShipElytra
+from mcagent.skills.t4_end_and_frogs import CollectFroglights, LeashFrogVariants, LootEndShipElytra
 from mcagent.skills.t4_quick_exploits import (
     AllayCakeBirthday,
     CrafterChain,
@@ -663,6 +663,7 @@ class WaveASkillsContractTests(_WaveATestBase):
             "allay_cake_birthday": AllayCakeBirthday,
             "loot_end_ship_elytra": LootEndShipElytra,
             "leash_frog_variants": LeashFrogVariants,
+            "collect_froglights": CollectFroglights,
         }
         empty_ready = _state_with(items=[])
         for name, cls in expected_skills.items():
@@ -975,6 +976,28 @@ class DecoratedPotSherdsTests(_WaveATestBase):
         with self.assertRaises(EnvBlocked):
             drive(DecoratedPotSherds(), ex, state)
 
+    def test_navigates_to_known_trial_chambers_landmark_when_pots_out_of_range(self) -> None:
+        blocks = {**_flat(-4, 4, -4, 4, y=63), **_flat(76, 84, -4, 4, y=63)}
+        blocks[(82, 64, 0)] = "decorated_pot"
+        blocks[(82, 64, 1)] = "decorated_pot"
+        blocks[(78, 64, 0)] = "crafting_table"
+        world = WaveAWorld(pos=(0.5, 64.0, 0.5), blocks=blocks, items={"iron_pickaxe": 1})
+
+        def _on_dig(w: WaveAWorld, pos, collect):
+            dug = w.blocks.pop(tuple(pos), "air")
+            if dug == "decorated_pot" and collect:
+                w.items["flow_pottery_sherd"] = w.items.get("flow_pottery_sherd", 0) + 2
+            return {"dug": dug}
+
+        world.on_dig = _on_dig
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", (80, 64, 0), dimension="overworld")
+        skill = DecoratedPotSherds()
+        drive(skill, ex, state)
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertEqual(state.count("decorated_pot"), 1)
+        self.assertTrue(any(op == "move_to" and req["pos"] and req["pos"][0] >= 75.0 for op, req in world.calls))
+
 
 class JukeboxMeadowTests(_WaveATestBase):
     def test_blocked_missing_disc_or_jukebox_materials(self) -> None:
@@ -1050,6 +1073,55 @@ class JukeboxMeadowTests(_WaveATestBase):
         self.assertEqual(skill.verify_done(state), "")
         self.assertEqual(world.st["biome"], "meadow")
         self.assertTrue(any(op == "interact" and req["item"] == "music_disc_blocks" for op, req in world.calls))
+
+    def test_record_biome_meadow_navigation_and_music_disc_opportunity_gate(self) -> None:
+        # 1) record_biome("meadow", pos=...) works seamlessly via goto_known_landmark_or_biome
+        blocks = _flat(-4, 24, -4, 4, y=63)
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            biome="plains",
+            blocks=blocks,
+            items={"jukebox": 1, "music_disc_cat": 1},
+        )
+
+        def _on_move(w: WaveAWorld, pos, **kwargs):
+            if pos is not None:
+                w.st["pos"] = [float(v) for v in pos]
+                if w.st["pos"][0] >= 18.0:
+                    w.st["biome"] = "meadow"
+                return {"pos": list(w.st["pos"])}
+            return None
+
+        world.on_move_to = _on_move
+        ex, state = world.session()
+        memo_for(state).record_biome("meadow", pos=[20, 64, 0], dimension="overworld")
+        skill = JukeboxMeadow()
+        drive(skill, ex, state)
+        self.assertEqual(skill.verify_done(state), "")
+
+        # 2) Opportunity gating in goals.py: when prereqs are met, no music_disc_* -> skipped silently
+        active = resolve_active_goals(GOALS, target_goal=("play_jukebox_in_meadows",))
+        completed = {
+            "minecraft:story/mine_stone",
+            "minecraft:story/upgrade_tools",
+            "minecraft:story/smelt_iron",
+            "minecraft:story/iron_tools",
+            "minecraft:story/mine_diamond",
+            "minecraft:adventure/minecraft_trials_edition",
+        }
+        st_no_disc = _state_with(items=[{"name": "diamond", "count": 2}, {"name": "oak_planks", "count": 16}])
+        memo_for(st_no_disc).record_biome("meadow", pos=[20, 64, 0], dimension="overworld")
+        ranked_no_disc = rank_actionable_goals(st_no_disc, active, completed_advs=completed)
+        self.assertNotIn("play_jukebox_in_meadows", [s.step_goal.id for s in ranked_no_disc])
+
+        st_with_disc = _state_with(items=[
+            {"name": "diamond", "count": 2},
+            {"name": "oak_planks", "count": 16},
+            {"name": "music_disc_precipice", "count": 1},
+        ])
+        memo_for(st_with_disc).record_biome("meadow", pos=[20, 64, 0], dimension="overworld")
+        ranked_with_disc = rank_actionable_goals(st_with_disc, active, completed_advs=completed)
+        self.assertIn("play_jukebox_in_meadows", [s.step_goal.id for s in ranked_with_disc])
 
 
 class SweepOutpostCaptainTests(_WaveATestBase):
@@ -1616,6 +1688,338 @@ class LeashFrogVariantsTests(_WaveATestBase):
         with self.assertRaises(EnvBlocked):
             drive(LeashFrogVariants(), ex, state)
 
+    def test_multi_warm_biome_anchor_navigation_via_record_biome(self) -> None:
+        adv_id = "minecraft:husbandry/leash_all_frog_variants"
+        for warm_biome in ("savanna", "windswept_savanna", "badlands", "desert", "jungle", "nether_wastes"):
+            with self.subTest(warm_biome=warm_biome):
+                reset_all_world_memos()
+                reset_all_voxel_caches()
+                dim = "the_nether" if warm_biome == "nether_wastes" else "overworld"
+                start_biome = "plains"
+                blocks = {**_flat(-4, 4, -4, 4, y=63), **_flat(76, 84, -4, 4, y=63)}
+                world = WaveAWorld(
+                    pos=(0.5, 64.0, 0.5),
+                    dimension=dim,
+                    biome=start_biome if dim == "overworld" else "plains",
+                    blocks=blocks,
+                    items={"lead": 1},
+                    entities=[{"id": 910, "name": "frog", "type": "animal", "pos": [81.5, 64.0, 0.5]}],
+                    adv_snapshot={
+                        "advancements": [
+                            {"id": adv_id, "status": "in_progress", "completed_criteria": ["temperate", "cold"]},
+                        ]
+                    },
+                )
+                if dim == "the_nether":
+                    # Override dim to overworld so start is temperate, then test nether_wastes anchor in overworld/nether
+                    world.st["dimension"] = "overworld"
+                    dim = "overworld"
+
+                def _on_move(w: WaveAWorld, pos, **kwargs):
+                    if pos is not None:
+                        w.st["pos"] = [float(v) for v in pos]
+                        if w.st["pos"][0] >= 75.0:
+                            w.st["biome"] = warm_biome
+                        return {"pos": list(w.st["pos"])}
+                    return None
+
+                def _on_interact(w: WaveAWorld, pos, entity_id, item):
+                    if entity_id == 910 and item == "lead":
+                        w.adv_snapshot = {
+                            "advancements": [
+                                {"id": adv_id, "status": "completed", "completed_criteria": ["temperate", "cold", "warm"]},
+                            ]
+                        }
+                    return {"leashed": True}
+
+                world.on_move_to = _on_move
+                world.on_interact = _on_interact
+                ex, state = world.session()
+                memo_for(state).record_biome(warm_biome, pos=[80, 64, 0], dimension=dim)
+
+                skill = LeashFrogVariants()
+                drive(skill, ex, state)
+                self.assertEqual(skill.verify_done(state), "")
+                self.assertEqual(world.st["biome"], warm_biome)
+                self.assertTrue(any(op == "move_to" and req["pos"] and req["pos"][0] >= 75.0 for op, req in world.calls))
+                self.assertTrue(any(op == "interact" and req["entity_id"] == 910 and req["item"] == "lead" for op, req in world.calls))
+
+    def test_digs_1x1_pit_on_dry_ground_feeds_slime_ball_and_leashes_grown_frog(self) -> None:
+        adv_id = "minecraft:husbandry/leash_all_frog_variants"
+        blocks = {**_flat(-4, 4, -4, 4, y=62, block="stone"), **_flat(-4, 4, -4, 4, y=63, block="dirt")}
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="overworld",
+            biome="savanna",
+            blocks=blocks,
+            items={"lead": 1, "tadpole_bucket": 1, "slime_ball": 2},
+            adv_snapshot={
+                "advancements": [
+                    {"id": adv_id, "status": "in_progress", "completed_criteria": ["temperate", "cold"]},
+                ]
+            },
+        )
+
+        def _on_interact(w: WaveAWorld, pos, entity_id, item):
+            if item == "tadpole_bucket" and pos is not None:
+                w.items["tadpole_bucket"] -= 1
+                w.items["water_bucket"] = w.items.get("water_bucket", 0) + 1
+                w.blocks[tuple(pos)] = "water"
+                w.entities.append({"id": 920, "name": "tadpole", "type": "animal", "pos": [pos[0] + 0.5, float(pos[1]), pos[2] + 0.5]})
+                return {"released": True}
+            if item == "slime_ball" and entity_id == 920:
+                w.items["slime_ball"] -= 1
+                # Tadpole finishes growing into a warm frog inside the 1x1 pit
+                w.entities = [e for e in w.entities if e["id"] != 920]
+                w.entities.append({"id": 921, "name": "frog", "variant": "warm", "type": "animal", "pos": [1.5, 64.0, 0.5]})
+                return {"fed": True}
+            if item == "lead" and entity_id == 921:
+                w.adv_snapshot = {
+                    "advancements": [
+                        {"id": adv_id, "status": "completed", "completed_criteria": ["temperate", "cold", "warm"]},
+                    ]
+                }
+                return {"leashed": True}
+            return {"changed": True}
+
+        world.on_interact = _on_interact
+        ex, state = world.session()
+        skill = LeashFrogVariants()
+        drive(skill, ex, state)
+
+        self.assertEqual(skill.verify_done(state), "")
+        dig_calls = [req for op, req in world.calls if op == "dig"]
+        self.assertEqual(len(dig_calls), 1)
+        pit = dig_calls[0]["pos"]
+        self.assertEqual(pit[1], 63)
+        interacts = [req for op, req in world.calls if op == "interact"]
+        self.assertEqual(interacts[0]["item"], "tadpole_bucket")
+        self.assertEqual(interacts[0]["pos"], pit)
+        self.assertEqual(interacts[1]["item"], "slime_ball")
+        self.assertEqual(interacts[2]["item"], "lead")
+        self.assertEqual(interacts[2]["entity_id"], 921)
+
+    def test_safe_wait_stops_on_hostile_and_cleans_up_shield(self) -> None:
+        adv_id = "minecraft:husbandry/leash_all_frog_variants"
+        blocks = _flat(-4, 4, -4, 4, y=63, block="sand")
+        blocks[(2, 63, 0)] = "water"
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="overworld",
+            biome="desert",
+            blocks=blocks,
+            items={"lead": 1, "tadpole_bucket": 1, "shield": 1},
+            entities=[{"id": 930, "name": "zombie", "type": "hostile", "pos": [4.0, 64.0, 0.5]}],
+            adv_snapshot={
+                "advancements": [
+                    {"id": adv_id, "status": "in_progress", "completed_criteria": ["temperate", "cold"]},
+                ]
+            },
+        )
+        ex, state = world.session()
+        with self.assertRaises(Replan) as ctx:
+            drive(LeashFrogVariants(), ex, state)
+        self.assertIn("敌对生物", str(ctx.exception))
+        self.assertFalse(world.st["blocking"])
+        self.assertFalse(state.st.get("blocking", False))
+
+
+class CollectFroglightsTests(_WaveATestBase):
+    def test_blocked_conditions_and_already_complete_noop(self) -> None:
+        self.assertTrue(CollectFroglights.blocked(State()))
+        self.assertTrue(CollectFroglights.blocked(_state_with(dimension="overworld", items=[{"name": "iron_sword", "count": 1}])))
+        self.assertTrue(CollectFroglights.blocked(_state_with(dimension="the_nether", items=[{"name": "lead", "count": 1}])))
+        self.assertTrue(CollectFroglights.blocked(_state_with(dimension="the_nether", health=7.0, items=[{"name": "iron_sword", "count": 1}])))
+        self.assertEqual(CollectFroglights.blocked(_state_with(dimension="the_nether", health=16.0, items=[{"name": "iron_sword", "count": 1}])), "")
+
+        # Already holding all 3 froglights -> unblocked in any dimension and completes with zero actions
+        all_three = {
+            "ochre_froglight": 1,
+            "verdant_froglight": 1,
+            "pearlescent_froglight": 1,
+        }
+        world = WaveAWorld(pos=(0.5, 64.0, 0.5), dimension="overworld", biome="plains", items=all_three)
+        ex, state = world.session()
+        skill = CollectFroglights()
+        self.assertEqual(CollectFroglights.blocked(state), "")
+        steps = drive(skill, ex, state)
+        self.assertEqual(steps, [])
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_happy_path_split_large_magma_cube_lure_frog_and_collect_froglight(self) -> None:
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_nether",
+            biome="basalt_deltas",
+            blocks=_flat(-8, 12, -8, 8, y=63, block="basalt"),
+            items={
+                "diamond_sword": 1,
+                "shield": 1,
+                "lead": 1,
+                "ochre_froglight": 1,
+                "verdant_froglight": 1,
+            },
+            entities=[
+                {"id": 801, "name": "magma_cube", "type": "hostile", "size": 4, "health": 16, "pos": [6.5, 64.0, 0.5]},
+                {"id": 802, "name": "frog", "type": "animal", "variant": "warm", "pos": [1.5, 64.0, 0.5]},
+            ],
+        )
+        leashed_frog = {"ok": False}
+
+        def _on_attack(w: WaveAWorld, entity_id, max_hits):
+            if entity_id == 801:
+                # Splitting large magma cube produces a small magma cube (size=1)
+                w.entities = [e for e in w.entities if e["id"] != 801]
+                w.entities.append({"id": 803, "name": "magma_cube", "type": "hostile", "size": 1, "health": 1, "pos": [7.0, 64.0, 0.5]})
+            return {"entity_id": entity_id, "hits": max_hits or 1, "killed": True}
+
+        def _on_interact(w: WaveAWorld, pos, entity_id, item):
+            if entity_id == 802 and item == "lead":
+                leashed_frog["ok"] = True
+                for e in w.entities:
+                    if e["id"] == 802:
+                        e["leashed"] = True
+            return {"leashed": True}
+
+        def _on_move(w: WaveAWorld, pos, entity_id=None, **kwargs):
+            if pos is not None:
+                w.st["pos"] = [float(v) for v in pos]
+                if leashed_frog["ok"]:
+                    for e in w.entities:
+                        if e["id"] == 802:
+                            e["pos"] = [w.st["pos"][0] - 0.5, w.st["pos"][1], w.st["pos"][2]]
+                    # Frog within 4 blocks of small magma cube eats it -> drops pearlescent_froglight!
+                    small = next((e for e in w.entities if e["id"] == 803), None)
+                    frog = next((e for e in w.entities if e["id"] == 802), None)
+                    if small is not None and frog is not None and math.dist(frog["pos"], small["pos"]) <= 4.0:
+                        if math.dist(w.st["pos"], small["pos"]) <= 2.5:
+                            w.entities = [e for e in w.entities if e["id"] != 803]
+                            w.items["pearlescent_froglight"] = w.items.get("pearlescent_froglight", 0) + 1
+                return {"pos": list(w.st["pos"])}
+            return None
+
+        world.on_attack = _on_attack
+        world.on_interact = _on_interact
+        world.on_move_to = _on_move
+        ex, state = world.session()
+        skill = CollectFroglights()
+        drive(skill, ex, state)
+
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertEqual(state.count("pearlescent_froglight"), 1)
+        attack_calls = [req for op, req in world.calls if op == "attack"]
+        self.assertEqual([r["entity_id"] for r in attack_calls], [801])  # only attacked large cube, never small cube 803!
+        self.assertTrue(any(op == "interact" and req["entity_id"] == 802 and req["item"] == "lead" for op, req in world.calls))
+        self.assertFalse(world.st["blocking"])
+        self.assertFalse(state.st.get("blocking", False))
+
+    def test_ranged_split_and_memo_anchor_navigation_to_basalt_deltas(self) -> None:
+        blocks = {**_flat(-4, 4, -4, 4, y=63, block="netherrack"), **_flat(56, 68, -4, 4, y=63, block="basalt")}
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_nether",
+            biome="nether_wastes",
+            blocks=blocks,
+            items={
+                "bow": 1,
+                "arrow": 8,
+                "ochre_froglight": 1,
+                "pearlescent_froglight": 1,
+            },
+            entities=[
+                {"id": 811, "name": "magma_cube", "type": "hostile", "size": 2, "health": 4, "pos": [62.5, 64.0, 0.5]},
+                {"id": 812, "name": "frog", "type": "animal", "variant": "cold", "pos": [61.5, 64.0, 0.5]},
+            ],
+        )
+
+        def _on_shoot(w: WaveAWorld, entity_id, pos, weapon):
+            if entity_id == 811:
+                w.entities = [e for e in w.entities if e["id"] != 811]
+                w.entities.append({"id": 813, "name": "magma_cube", "type": "hostile", "size": 1, "health": 1, "pos": [62.5, 64.0, 0.5]})
+            return {"hit": True, "entity_id": entity_id, "weapon": weapon}
+
+        def _on_move(w: WaveAWorld, pos, **kwargs):
+            if pos is not None:
+                w.st["pos"] = [float(v) for v in pos]
+                if w.st["pos"][0] >= 58.0:
+                    w.st["biome"] = "basalt_deltas"
+                small = next((e for e in w.entities if e["id"] == 813), None)
+                if small is not None and math.dist(w.st["pos"], small["pos"]) <= 2.0:
+                    w.entities = [e for e in w.entities if e["id"] != 813]
+                    w.items["verdant_froglight"] = w.items.get("verdant_froglight", 0) + 1
+                return {"pos": list(w.st["pos"])}
+            return None
+
+        world.on_shoot = _on_shoot
+        world.on_move_to = _on_move
+        ex, state = world.session()
+        memo_for(state).record_biome("basalt_deltas", pos=[60, 64, 0], dimension="the_nether")
+
+        skill = CollectFroglights()
+        drive(skill, ex, state)
+        self.assertEqual(skill.verify_done(state), "")
+        self.assertEqual(state.count("verdant_froglight"), 1)
+        self.assertTrue(any(op == "move_to" and req["pos"] and req["pos"][0] >= 55.0 for op, req in world.calls))
+        self.assertTrue(any(op == "shoot" and req["entity_id"] == 811 and req["weapon"] == "bow" for op, req in world.calls))
+
+    def test_env_blocked_when_missing_magma_cube_or_missing_frog_variant(self) -> None:
+        # 1) Missing magma_cube -> EnvBlocked(missing_predicate="magma_cube", wake_on="chunk_moved")
+        w1 = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_nether",
+            biome="basalt_deltas",
+            blocks=_flat(-4, 4, -4, 4, y=63, block="basalt"),
+            items={"iron_sword": 1},
+            entities=[{"id": 820, "name": "frog", "type": "animal", "variant": "cold", "pos": [2.0, 64.0, 0.5]}],
+        )
+        ex1, st1 = w1.session()
+        with self.assertRaises(EnvBlocked) as ctx1:
+            drive(CollectFroglights(), ex1, st1)
+        self.assertEqual(ctx1.exception.missing_predicate, "magma_cube")
+        self.assertEqual(ctx1.exception.wake_on, "chunk_moved")
+
+        # 2) Has magma_cube, but only temperate frog when ochre is already collected & cold is missing
+        w2 = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_nether",
+            biome="basalt_deltas",
+            blocks=_flat(-4, 4, -4, 4, y=63, block="basalt"),
+            items={"iron_sword": 1, "ochre_froglight": 1},
+            entities=[
+                {"id": 821, "name": "magma_cube", "type": "hostile", "size": 1, "pos": [3.0, 64.0, 0.5]},
+                {"id": 822, "name": "frog", "type": "animal", "variant": "temperate", "pos": [2.0, 64.0, 0.5]},
+            ],
+        )
+        ex2, st2 = w2.session()
+        with self.assertRaises(EnvBlocked) as ctx2:
+            drive(CollectFroglights(), ex2, st2)
+        self.assertEqual(ctx2.exception.missing_predicate, "frog_variant:cold")
+        self.assertEqual(ctx2.exception.wake_on, "chunk_moved")
+
+    def test_abort_mid_run_cleans_up_shield_in_finally(self) -> None:
+        world = WaveAWorld(
+            pos=(0.5, 64.0, 0.5),
+            dimension="the_nether",
+            biome="basalt_deltas",
+            blocks=_flat(-4, 8, -4, 4, y=63, block="basalt"),
+            items={"iron_sword": 1, "shield": 1},
+            entities=[
+                {"id": 831, "name": "magma_cube", "type": "hostile", "size": 4, "pos": [6.5, 64.0, 0.5]},
+                {"id": 832, "name": "frog", "type": "animal", "variant": "temperate", "pos": [2.0, 64.0, 0.5]},
+            ],
+        )
+        ex, state = world.session()
+        skill = CollectFroglights()
+
+        # Step 1 raises shield and yields equip(iron_sword)
+        self.assertFalse(skill.step(ex, state))
+        self.assertTrue(world.st["blocking"])
+
+        skill.abort()
+        self.assertFalse(world.st["blocking"])
+        self.assertFalse(state.st.get("blocking", False))
+        self.assertFalse(world.st["sneaking"])
+
 
 # ============================================================================
 # 3. Wave A Ledger & Shared-Subgraph ROI Contract
@@ -1752,6 +2156,40 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
         self.assertEqual(solo_ranked[0].marginal_roi, solo_ranked[0].roi)
         self.assertGreater(shared_ranked[0].marginal_roi, shared_ranked[0].roi)
         self.assertGreater(shared_ranked[0].marginal_roi, solo_ranked[0].marginal_roi)
+
+    def test_froglights_and_frog_landmark_gating_contract(self) -> None:
+        self.assertEqual(validate_ledger(GOALS), [])
+        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
+
+        # leash_all_frog_variants gates only swamp|mangrove_swamp so End/Nether hatching routes stay legal
+        leash_goal = GOAL_MAP["leash_all_frog_variants"]
+        self.assertEqual(leash_goal.requires_landmarks, ("swamp|mangrove_swamp",))
+        st_swamp = _state_with()
+        memo_for(st_swamp).record_biome("swamp", pos=[40, 64, 0], dimension="overworld")
+        from mcagent.loop.goals import goal_landmarks_satisfied
+        self.assertTrue(goal_landmarks_satisfied(leash_goal, memo_for(st_swamp)))
+        self.assertFalse(goal_landmarks_satisfied(leash_goal, WorldResourceMemo()))
+
+        # froglights 60-point T4 goal registered cleanly
+        fl = GOAL_MAP["froglights"]
+        self.assertEqual(fl.score, 60)
+        self.assertEqual(fl.tier, "T4")
+        self.assertEqual(fl.stage, "draft")
+        self.assertEqual(fl.skill, "collect_froglights")
+        self.assertEqual(fl.prereq_goals, ("leash_all_frog_variants", "enter_the_nether"))
+        self.assertEqual(fl.done_advancements, ("minecraft:husbandry/froglights",))
+        self.assertEqual(fl.done_items, ("ochre_froglight>=1", "verdant_froglight>=1", "pearlescent_froglight>=1"))
+        self.assertEqual(fl.score, ADVANCEMENT_SCORES_V2["minecraft:husbandry/froglights"])
+        self.assertTrue(fl.stop_loss)
+        self.assertIn("collect_froglights", REGISTRY)
+        self.assertEqual(REGISTRY["collect_froglights"].verified, "offline")
+        self.assertEqual(contract_errors(REGISTRY["collect_froglights"]), [])
+        _, arg_errs = bind_args(REGISTRY["collect_froglights"], fl.args_dict)
+        self.assertEqual(arg_errs, [])
+
+        # play_jukebox_in_meadows has @music_disc>=1 opportunity gate
+        juke = GOAL_MAP["play_jukebox_in_meadows"]
+        self.assertEqual(juke.prereq_items, ("@music_disc>=1",))
 
 
 if __name__ == "__main__":

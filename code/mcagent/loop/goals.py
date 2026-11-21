@@ -143,6 +143,10 @@ _T4_STRIDER_TRIDENT_EDITABLE: tuple[str, ...] = (
     "code/mcagent/skills/t4_strider_and_trident.py",
     "code/tests/test_stage3_wave_d.py",
 )
+_ARCHAEOLOGY_SNIFFER_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/archaeology_sniffer.py",
+    "code/tests/test_archaeology_sniffer.py",
+)
 _FISHING_STOCK = ("string>=2", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2)))
 _ARROW_STOCK = ("arrow|spectral_arrow|tipped_arrow>=1", "hunt_mob",
                 (("target", "skeleton"), ("drop", "arrow"), ("count", 1)))
@@ -979,7 +983,12 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="catch_aquatic_mob",
         skill_args=(("target", "axolotl"),),
         prereq_goals=("smelt_iron",),
+        prereq_items=("bucket|water_bucket>=1",),
         done_advancements=("minecraft:husbandry/axolotl_in_a_bucket",),
+        gather_fallbacks=(
+            ("bucket|water_bucket|iron_ingot>=3", "smelt_iron", (("count", 3), ("async_lease", True))),
+            ("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
+        ),
         budget_s=300.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1027,6 +1036,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="harvest_honey_wax",
         skill_args=(("mode", "honey"),),
         prereq_goals=("prep_wood",),
+        prereq_items=("glass_bottle|glass>=1", "campfire|soul_campfire|coal|charcoal>=1"),
         done_advancements=("minecraft:husbandry/safely_harvest_honey",),
         budget_s=240.0,
         max_fails_per_ep=3,
@@ -1044,7 +1054,12 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="harvest_honey_wax",
         skill_args=(("mode", "wax_on"),),
         prereq_goals=("prep_wood",),
+        prereq_items=("honeycomb|shears>=1",),
         done_advancements=("minecraft:husbandry/wax_on",),
+        gather_fallbacks=(
+            ("honeycomb|shears|iron_ingot>=2", "smelt_iron", (("count", 2), ("async_lease", True))),
+            ("honeycomb|shears>=1", "craft_iron_gear", (("item", "shears"),)),
+        ),
         budget_s=240.0,
         max_fails_per_ep=3,
         stop_loss=True,
@@ -1061,7 +1076,21 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="harvest_honey_wax",
         skill_args=(("mode", "wax_off"),),
         prereq_goals=("wax_on",),
+        prereq_items=(
+            "wooden_axe|stone_axe|copper_axe|iron_axe|golden_axe|diamond_axe|netherite_axe|"
+            "oak_log|birch_log|spruce_log|jungle_log|acacia_log|dark_oak_log|cherry_log|mangrove_log|pale_oak_log|"
+            "oak_planks|birch_planks|spruce_planks|jungle_planks|acacia_planks|dark_oak_planks|cherry_planks|mangrove_planks|pale_oak_planks>=1",
+        ),
         done_advancements=("minecraft:husbandry/wax_off",),
+        gather_fallbacks=(
+            (
+                "wooden_axe|stone_axe|copper_axe|iron_axe|golden_axe|diamond_axe|netherite_axe|"
+                "oak_log|birch_log|spruce_log|jungle_log|acacia_log|dark_oak_log|cherry_log|mangrove_log|pale_oak_log|"
+                "oak_planks|birch_planks|spruce_planks|jungle_planks|acacia_planks|dark_oak_planks|cherry_planks|mangrove_planks|pale_oak_planks>=1",
+                "gather_wood",
+                (("count", 2),),
+            ),
+        ),
         budget_s=180.0,
         max_fails_per_ep=3,
         stop_loss=True,
@@ -1093,6 +1122,7 @@ GOALS: tuple[GoalSpec, ...] = (
         score=15,
         skill="biome_quick_action",
         skill_args=(("action", "brush_armadillo"),),
+        prereq_items=("brush|feather>=1", "brush|copper_ingot>=1"),
         done_advancements=("minecraft:adventure/brush_armadillo",),
         budget_s=240.0,
         max_fails_per_ep=3,
@@ -1109,6 +1139,7 @@ GOALS: tuple[GoalSpec, ...] = (
         score=15,
         skill="biome_quick_action",
         skill_args=(("action", "powder_snow"),),
+        prereq_items=("leather_boots|leather>=1",),
         done_advancements=("minecraft:adventure/walk_on_powder_snow_with_leather_boots",),
         budget_s=240.0,
         max_fails_per_ep=3,
@@ -1143,7 +1174,13 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="biome_quick_action",
         skill_args=(("action", "crossbow_pillager"),),
         prereq_goals=("ol_betsy",),
+        prereq_items=("crossbow|string>=1", "crossbow|iron_ingot>=1", "arrow|spectral_arrow|tipped_arrow>=2"),
         done_advancements=("minecraft:adventure/whos_the_pillager_now",),
+        gather_fallbacks=(
+            ("arrow|spectral_arrow|tipped_arrow>=2", "hunt_mob", (("target", "skeleton"), ("drop", "arrow"), ("count", 2))),
+            ("crossbow|string>=1", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2))),
+            ("crossbow|iron_ingot>=1", "smelt_iron", (("count", 2), ("async_lease", True))),
+        ),
         budget_s=240.0,
         max_fails_per_ep=3,
         stop_loss=True,
@@ -1223,6 +1260,7 @@ GOALS: tuple[GoalSpec, ...] = (
         score=30,
         skill="unlock_trial_vault",
         prereq_goals=("minecraft_trials_edition",),
+        prereq_items=("trial_key|ominous_trial_key|netherite_sword|diamond_sword|iron_sword|stone_sword|netherite_axe|diamond_axe|iron_axe|stone_axe|mace>=1",),
         done_advancements=("minecraft:adventure/under_lock_and_key",),
         budget_s=360.0,
         max_fails_per_ep=2,
@@ -1239,6 +1277,7 @@ GOALS: tuple[GoalSpec, ...] = (
         score=30,
         skill="wind_charge_bounce",
         prereq_goals=("minecraft_trials_edition",),
+        prereq_items=("wind_charge|breeze_rod|netherite_sword|diamond_sword|iron_sword|stone_sword|netherite_axe|diamond_axe|iron_axe|stone_axe|mace>=1",),
         done_advancements=("minecraft:adventure/who_needs_rockets",),
         budget_s=300.0,
         max_fails_per_ep=3,
@@ -1255,6 +1294,7 @@ GOALS: tuple[GoalSpec, ...] = (
         score=15,
         skill="scrape_lit_copper_bulb",
         prereq_goals=("minecraft_trials_edition",),
+        prereq_items=("netherite_axe|diamond_axe|iron_axe|copper_axe|stone_axe|golden_axe|wooden_axe>=1",),
         done_advancements=("minecraft:adventure/lighten_up",),
         budget_s=240.0,
         max_fails_per_ep=3,
@@ -1336,8 +1376,10 @@ GOALS: tuple[GoalSpec, ...] = (
         score=30,
         skill="manage_wolf_armor",
         skill_args=(("mode", "remove"),),
-        prereq_goals=("tame_an_animal",),
+        prereq_goals=("tame_an_animal", "brush_armadillo"),
         done_advancements=("minecraft:husbandry/remove_wolf_armor",),
+        gather_when_blocked=True,
+        gather_fallbacks=(("shears>=1", "craft_iron_gear", (("item", "shears"),)),),
         budget_s=360.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1354,6 +1396,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="manage_wolf_armor",
         skill_args=(("mode", "repair"),),
         prereq_goals=("tame_an_animal", "brush_armadillo"),
+        prereq_items=("armadillo_scute>=1",),
         done_advancements=("minecraft:husbandry/repair_wolf_armor",),
         budget_s=360.0,
         max_fails_per_ep=2,
@@ -1387,6 +1430,8 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="boat_with_goat",
         prereq_goals=("prep_wood",),
         done_advancements=("minecraft:husbandry/ride_a_boat_with_a_goat",),
+        gather_when_blocked=True,
+        gather_fallbacks=(("@wood_equiv>=5", "gather_wood", (("count", 2),)),),
         budget_s=360.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1401,7 +1446,7 @@ GOALS: tuple[GoalSpec, ...] = (
         tier="T3",
         score=30,
         skill="silk_touch_bee_nest",
-        prereq_goals=("enchant_item",),
+        prereq_goals=("enchant_item",),  # enchant_item 不保证附魔出 silk_touch，由 SilkTouchBeeNest.blocked() 强拦截
         done_advancements=("minecraft:husbandry/silk_touch_nest",),
         budget_s=420.0,
         max_fails_per_ep=2,
@@ -1419,6 +1464,8 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="catch_tadpole",
         prereq_goals=("smelt_iron",),
         done_advancements=("minecraft:husbandry/tadpole_in_a_bucket",),
+        gather_when_blocked=True,
+        gather_fallbacks=(("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),),
         budget_s=360.0,
         max_fails_per_ep=2,
         stop_loss=True,
@@ -1451,6 +1498,7 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="spyglass_observe",
         skill_args=(("target", "parrot"),),
         prereq_goals=("prep_wood",),
+        prereq_items=("spyglass|amethyst_shard>=1",),
         done_advancements=("minecraft:adventure/spyglass_at_parrot",),
         budget_s=300.0,
         max_fails_per_ep=3,
@@ -1535,6 +1583,9 @@ GOALS: tuple[GoalSpec, ...] = (
         score=30,
         skill="jukebox_meadow",
         prereq_goals=("minecraft_trials_edition", "mine_diamond"),
+        # 机会门控：音乐唱片无确定性合成路径（依赖试炼宝库/箱子/骷髅射杀苦力怕掉落），
+        # 前置达成后若仍无任意 music_disc_*，由 prereq_items 机会门控静默跳过，避免反复触发 blocked() 空转。
+        prereq_items=("@music_disc>=1",),
         done_advancements=("minecraft:adventure/play_jukebox_in_meadows",),
         budget_s=360.0,
         max_fails_per_ep=2,
@@ -1606,6 +1657,26 @@ GOALS: tuple[GoalSpec, ...] = (
         est_cost_s=300.0,
         stage="draft",
         editable_files=_T4_END_FROGS_EDITABLE,
+        # 仅门控产蝌蚪所需的 swamp|mangrove_swamp；冷群系可由主世界冷群系或 enter_the_end 末地兜底，
+        # 暖群系可由主世界暖群系或 enter_the_nether 下界兜底，不硬门控主世界冷/暖群系以免屏蔽跨维孵化路线。
+        requires_landmarks=("swamp|mangrove_swamp",),
+    ),
+    GoalSpec(
+        id="froglights",
+        title="聚光灯下（集齐三种蛙明灯入包）",
+        tier="T4",
+        score=60,
+        skill="collect_froglights",
+        prereq_goals=("leash_all_frog_variants", "enter_the_nether"),
+        done_advancements=("minecraft:husbandry/froglights",),
+        done_items=("ochre_froglight>=1", "verdant_froglight>=1", "pearlescent_froglight>=1"),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=300.0,
+        stage="draft",
+        editable_files=_T4_END_FROGS_EDITABLE,
+        requires_landmarks=("basalt_deltas|bastion_remnant",),
     ),
 
     # ---- Stage 3 (Wave B, T4_PREP + T4)：高空贸易、劲弩手与下界终局（7 项准备 + 5 项计分，全部 stage="draft"） ----
@@ -1926,6 +1997,75 @@ GOALS: tuple[GoalSpec, ...] = (
         stage="draft",
         editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
     ),
+
+    # ---- 生态与考古线（4 项计分，+135 分，全部 stage="draft"） ----
+    GoalSpec(
+        id="salvage_sherd",
+        title="探古寻源（考古结构刷可疑沙/沙砾出陶片）",
+        tier="T2",
+        score=15,
+        skill="brush_archaeology",
+        skill_args=(("target", "sherd"),),
+        done_advancements=("minecraft:adventure/salvage_sherd",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=110.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("archaeology|warm_ocean_ruins",),
+    ),
+    GoalSpec(
+        id="obtain_sniffer_egg",
+        title="嗅探之谜（暖水海底废墟刷可疑沙子获得嗅探兽蛋）",
+        tier="T3",
+        score=30,
+        skill="brush_archaeology",
+        skill_args=(("target", "sniffer_egg"),),
+        done_advancements=("minecraft:husbandry/obtain_sniffer_egg",),
+        done_items=("sniffer_egg>=1",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("warm_ocean_ruins|warm_ocean|archaeology",),
+    ),
+    GoalSpec(
+        id="plant_any_sniffer_seed",
+        title="昔日重现（种植火把花种子或瓶子草荚果）",
+        tier="T3",
+        score=30,
+        skill="hatch_and_raise_sniffer",
+        skill_args=(("mode", "plant_seed"),),
+        prereq_goals=("obtain_sniffer_egg",),
+        done_advancements=("minecraft:husbandry/plant_any_sniffer_seed",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("warm_ocean_ruins|warm_ocean|archaeology",),
+    ),
+    GoalSpec(
+        id="feed_snifflet",
+        title="小小嗅探兽（用火把花种子喂食幼年嗅探兽）",
+        tier="T4",
+        score=60,
+        skill="hatch_and_raise_sniffer",
+        skill_args=(("mode", "feed_snifflet"),),
+        prereq_goals=("obtain_sniffer_egg",),
+        done_advancements=("minecraft:husbandry/feed_snifflet",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("warm_ocean_ruins|warm_ocean|archaeology",),
+    ),
 )
 
 _NETHER_END_ADV_PREFIXES: tuple[str, ...] = (
@@ -1948,6 +2088,7 @@ _NETHER_END_EXTRA_IDS: frozenset[str] = frozenset({
     "prep_netherite_upgrade_set",
     "netherite_armor",
     "obtain_netherite_hoe",
+    "froglights",
 })
 
 
@@ -2050,6 +2191,22 @@ def eval_item_expr(state: State, expr: str) -> tuple[bool, int, int, str]:
         gear_item = lhs.split(":", 1)[1].strip()
         cur = 1 if can_afford_gear(state, gear_item, assume_no_table=assume_no_tbl) else 0
         label = f"合成 {gear_item} 所需材料与工作台条件"
+    elif lhs == "@music_disc":
+        inv = state.inventory or {}
+        disc_names = {
+            str(it.get("name") or "").removeprefix("minecraft:").strip().lower()
+            for it in (*(inv.get("items") or ()), inv.get("held"), inv.get("offhand"))
+            if isinstance(it, Mapping)
+        }
+        held_row = inv.get("held") if isinstance(inv.get("held"), Mapping) else None
+        held_name = str(held_row.get("name") or "").removeprefix("minecraft:").strip().lower() if held_row else ""
+        held_cnt = int(held_row.get("count", 0)) if held_row else 0
+        cur = sum(
+            max(state.count(n), held_cnt if n == held_name else 0)
+            for n in disc_names
+            if n.startswith("music_disc_")
+        )
+        label = "任意音乐唱片"
     else:
         names = [x.strip() for x in lhs.split("|") if x.strip()]
         cur = sum(state.count(n) for n in names)
@@ -2477,6 +2634,15 @@ def compute_goal_marginal_rois(
         chain = _unmet_chain(g)
         if not chain:
             continue
+        if (
+            g.id not in target_ids
+            and len(chain) == 1
+            and chain[0].id == g.id
+            and g.prereq_items
+            and not g.gather_fallbacks
+            and not all(check_item_expr(state, expr) for expr in g.prereq_items)
+        ):
+            continue
         if g.id not in target_ids and not chain_landmarks_satisfied(chain, resolved_memo):
             continue
         chains.append((g, chain))
@@ -2767,6 +2933,15 @@ def rank_actionable_goals(
             continue
         chain = _unmet_chain(g)
         if not chain:
+            continue
+        if (
+            g.id not in target_ids
+            and len(chain) == 1
+            and chain[0].id == g.id
+            and g.prereq_items
+            and not g.gather_fallbacks
+            and not all(check_item_expr(state, expr) for expr in g.prereq_items)
+        ):
             continue
         if g.id not in target_ids and not chain_landmarks_satisfied(chain, resolved_memo):
             continue

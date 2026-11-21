@@ -70,12 +70,17 @@ class WorkstationWorld(ScriptedWorld):
         if "craft" in self._replies:
             return self._reply("craft", dict(item=item, count=count, stop_on=stop_on))
         self.calls.append(("craft", {"item": item, "count": count}))
-        if item != "diamond_hoe":
-            raise ApiError("unknown_recipe", f"unsupported craft {item}")
-        self._take_item("diamond", 2 * count)
-        self._take_item("stick", 2 * count)
-        self.items["diamond_hoe"] = self.items.get("diamond_hoe", 0) + count
-        return {"crafted": item, "gained": count}
+        if item == "diamond_hoe":
+            self._take_item("diamond", 2 * count)
+            self._take_item("stick", 2 * count)
+            self.items["diamond_hoe"] = self.items.get("diamond_hoe", 0) + count
+            return {"crafted": item, "gained": count}
+        if item == "golden_apple":
+            self._take_item("gold_ingot", 8 * count)
+            self._take_item("apple", count)
+            self.items["golden_apple"] = self.items.get("golden_apple", 0) + count
+            return {"crafted": item, "gained": count}
+        raise ApiError("unknown_recipe", f"unsupported craft {item}")
 
     def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None):
         req = dict(item=item, target=target, ms=ms, timeout_ms=timeout_ms, source=source, stop_on=stop_on)
@@ -328,3 +333,80 @@ class Stage2WorkstationsTests(unittest.TestCase):
             with self.subTest(items=items):
                 with self.assertRaises(Replan):
                     drive(CureZombieVillager(), *WorkstationWorld(items=items, item_meta={"splash_potion": {"potion": "weakness"}}).session())
+
+    def test_brew_potion_weakness_splash_and_village_anchor_fallback(self):
+        # 1) weakness_splash refuses to start / raises Replan without gunpowder
+        w_no_gp = WorkstationWorld(blocks={(2, 64, 0): "brewing_stand"}, items={"blaze_powder": 1, "potion": 1, "fermented_spider_eye": 1}, item_meta={"potion": {"potion": "water"}})
+        ex0, st0 = w_no_gp.session()
+        s0 = BrewPotion(recipe="weakness_splash")
+        self.assertFalse(s0.can_start(st0))
+        with self.assertRaises(Replan):
+            drive(s0, ex0, st0)
+
+        # 2) Full 2-stage weakness_splash brewing at a remote village anchor (80, 64, 0)
+        remote_blocks = {(x, 63, z): "stone" for x in range(76, 85) for z in range(-4, 5)}
+        remote_blocks[(81, 64, 0)] = "brewing_stand"
+        w_remote = WorkstationWorld(
+            blocks=remote_blocks,
+            items={"blaze_powder": 1, "potion": 1, "fermented_spider_eye": 1, "gunpowder": 1},
+            item_meta={"potion": {"potion": "water"}},
+        )
+        ex1, st1 = w_remote.session()
+        memo_for(st1).record_landmark("village", (80, 64, 0), dimension="overworld")
+        before1, s1 = dict(w_remote.items), BrewPotion(recipe="weakness_splash", radius=24)
+        s1._sleep_fn = lambda _: None
+        self.assertTrue(s1.can_start(st1))
+        drive(s1, ex1, st1)
+        self.assertEqual(st1.count("splash_potion"), 1)
+        self.assertEqual(s1.verify_done(st1, before1), "")
+        self.assertTrue(any(m == "move_to" and c["pos"] and c["pos"][0] >= 78.0 for m, c in w_remote.calls))
+
+        # 3) Already holding weakness potion + gunpowder -> skips fermented_spider_eye and converts to splash directly
+        w_stage2 = WorkstationWorld(
+            blocks={(2, 64, 0): "brewing_stand"},
+            items={"blaze_powder": 1, "potion": 1, "gunpowder": 1},
+            item_meta={"potion": {"potion": "weakness"}},
+        )
+        ex2, st2 = w_stage2.session()
+        before2, s2 = dict(w_stage2.items), BrewPotion(recipe="weakness_splash")
+        s2._sleep_fn = lambda _: None
+        self.assertEqual(BrewPotion.blocked(st2), "")
+        self.assertTrue(s2.can_start(st2))
+        drive(s2, ex2, st2)
+        self.assertEqual(st2.count("splash_potion"), 1)
+        self.assertEqual(s2.verify_done(st2, before2), "")
+
+    def test_trade_and_cure_zombie_villager_craft_golden_apple_and_village_anchor_fallback(self):
+        remote_blocks = {(x, 63, z): "stone" for x in range(76, 86) for z in range(-4, 5)}
+
+        # 1) TradeVillager navigates to known village anchor when none nearby
+        w_tr = WorkstationWorld(
+            blocks=remote_blocks,
+            items={"emerald": 5},
+            entities=[{"id": 301, "name": "villager", "type": "villager", "pos": [82.5, 64.0, 0.5]}],
+            merchant_options=_merchant_opts(),
+        )
+        ex_tr, st_tr = w_tr.session()
+        memo_for(st_tr).record_landmark("village", (80, 64, 0), dimension="overworld")
+        before_tr, sk_tr = dict(w_tr.items), TradeVillager(radius=32)
+        drive(sk_tr, ex_tr, st_tr)
+        self.assertEqual(sk_tr.verify_done(st_tr, before_tr), "")
+        self.assertTrue(any(m == "move_to" and c["pos"] and c["pos"][0] >= 78.0 for m, c in w_tr.calls))
+
+        # 2) CureZombieVillager crafts golden_apple (8 gold_ingot + 1 apple) & navigates to village anchor
+        cure_blocks = {**remote_blocks, (81, 64, 0): "crafting_table"}
+        w_cure = WorkstationWorld(
+            blocks=cure_blocks,
+            items={"splash_potion": 1, "gold_ingot": 8, "apple": 1},
+            item_meta={"splash_potion": {"potion": "weakness"}},
+            entities=[{"id": 302, "name": "zombie_villager", "type": "zombie_villager", "pos": [82.5, 64.0, 0.5]}],
+        )
+        ex_c, st_c = w_cure.session()
+        memo_for(st_c).record_landmark("village", (80, 64, 0), dimension="overworld")
+        self.assertEqual(CureZombieVillager.blocked(st_c), "")
+        before_c, sk_c = dict(w_cure.items), CureZombieVillager(radius=32)
+        drive(sk_c, ex_c, st_c)
+        self.assertIn("craft", ex_c.acts)
+        self.assertEqual((st_c.count("gold_ingot"), st_c.count("apple"), st_c.count("golden_apple")), (0, 0, 0))
+        self.assertEqual(sk_c.verify_done(st_c, before_c), "")
+        self.assertTrue(any(m == "move_to" and c["pos"] and c["pos"][0] >= 78.0 for m, c in w_cure.calls))

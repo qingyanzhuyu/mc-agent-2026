@@ -18,6 +18,9 @@ from .world_memo import SPIRAL_RING_RADII, STRUCTURE_FINGERPRINTS, entity_landma
 
 NETHER_BIOMES: frozenset[str] = frozenset({"nether_wastes", "soul_sand_valley", "crimson_forest", "warped_forest", "basalt_deltas"})
 _HAZARD_BLOCKS: frozenset[str] = AIR | {"water", "lava", "flowing_water", "flowing_lava", "bubble_column", "fire", "soul_fire", "powder_snow", "magma_block", "cactus", "campfire", "soul_campfire", "sweet_berry_bush"}
+_NETHER_ADJ_HAZARDS: frozenset[str] = frozenset({"lava", "flowing_lava", "fire", "soul_fire", "magma_block"})
+_NETHER_OVERHEAD_HAZARDS: frozenset[str] = frozenset({"lava", "flowing_lava", "fire", "soul_fire"})
+_CARDINALS: tuple[tuple[int, int], ...] = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _PASSABLE: frozenset[str] = AIR | PASSABLE_COVER
 _REQUIRED_DIM: dict[str, str] = {"nether_fortress": "the_nether", "bastion_remnant": "the_nether", "nether_biomes": "the_nether", "stronghold": "overworld", "trial_chambers": "overworld"}
 _ENTITY_LANDMARKS: dict[str, str] = {"villager": "village", "iron_golem": "village", "pillager": "pillager_outpost", "allay": "pillager_outpost", "breeze": "trial_chambers", "blaze": "nether_fortress", "wither_skeleton": "nether_fortress", "piglin_brute": "bastion_remnant", "sheep": "sheep_flock"}
@@ -183,12 +186,79 @@ def _is_standable_dry(ex: Any, cache: Any, wx: int, wy: int, wz: int, dim: str) 
         return False
     return _block_name_at(ex, cache, (wx, wy, wz), dim) in _PASSABLE and _block_name_at(ex, cache, (wx, wy + 1, wz), dim) in _PASSABLE
 
+def _is_nether_safe_waypoint(ex: Any, cache: Any, wx: int, wy: int, wz: int, dim: str) -> bool:
+    if not _is_standable_dry(ex, cache, wx, wy, wz, dim):
+        return False
+    if dim != "the_nether":
+        return True
+    if _block_name_at(ex, cache, (wx, wy + 2, wz), dim) in _NETHER_OVERHEAD_HAZARDS:
+        return False
+    supported_neighbors = 0
+    for dx, dz in _CARDINALS:
+        nx, nz = wx + dx, wz + dz
+        nb_body = _block_name_at(ex, cache, (nx, wy, nz), dim)
+        nb_floor = _block_name_at(ex, cache, (nx, wy - 1, nz), dim)
+        if nb_body in _NETHER_ADJ_HAZARDS or nb_floor in _NETHER_ADJ_HAZARDS:
+            return False
+        if (nb_floor and nb_floor not in _HAZARD_BLOCKS and nb_floor not in PASSABLE_COVER) or (
+            (nb_low := _block_name_at(ex, cache, (nx, wy - 2, nz), dim)) and nb_low not in _HAZARD_BLOCKS and nb_low not in PASSABLE_COVER
+        ):
+            supported_neighbors += 1
+    return supported_neighbors >= 2
+
+def _pick_ray_waypoint(
+    ex: Any, state: Any, origin: tuple[float, float, float], dim: str,
+    ux: float, uz: float, dists: Sequence[int],
+    *, angle_offsets_deg: Sequence[float] = (0.0,),
+) -> Optional[list[float]]:
+    ox, oy, oz = origin
+    base_y, cache, memo = math.floor(oy), voxel_cache_for(state), memo_for(state)
+    for deg in angle_offsets_deg:
+        rad = math.radians(deg)
+        c, s = math.cos(rad), math.sin(rad)
+        rx, rz = ux * c - uz * s, ux * s + uz * c
+        for dist in dists:
+            wx, wz = math.floor(ox + dist * rx), math.floor(oz + dist * rz)
+            if memo.is_near_void_edge((wx, wz), dimension=dim):
+                continue
+            for dy in (0, 1, -1, 2, -2):
+                if _is_nether_safe_waypoint(ex, cache, wx, base_y + dy, wz, dim):
+                    return [wx + 0.5, float(base_y + dy), wz + 0.5]
+    return None
+
+def _extract_eye_bearing(origin: tuple[float, float, float], receipt: Any) -> Optional[float]:
+    """从 /use_item("ender_eye") 回执中提取 MC yaw 约定方位角（0=+Z, 90=-X；规范 §4.5）。"""
+    if not isinstance(receipt, Mapping):
+        return None
+    raw_deg = receipt.get("bearing_deg")
+    if isinstance(raw_deg, (int, float)) and not isinstance(raw_deg, bool) and math.isfinite(float(raw_deg)):
+        return float(raw_deg)
+    vec = receipt.get("eye_vector")
+    if isinstance(vec, Sequence) and not isinstance(vec, (str, bytes)) and len(vec) in (2, 3):
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)) for v in vec):
+            dx, dz = float(vec[0]), float(vec[-1])
+            if math.hypot(dx, dz) >= 1e-4:
+                return math.degrees(math.atan2(-dx, dz))
+    landed = receipt.get("landed_at")
+    if isinstance(landed, Sequence) and not isinstance(landed, (str, bytes)) and len(landed) == 3:
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)) for v in landed):
+            dx, dz = float(landed[0]) - origin[0], float(landed[2]) - origin[2]
+            if math.hypot(dx, dz) >= 1e-4:
+                return math.degrees(math.atan2(-dx, dz))
+    return None
+
+def _spiral_anchor(memo: Any, st: Mapping[str, Any], dim: str) -> tuple[float, float, float]:
+    spawn = memo.get_spawn(dimension=dim)
+    if spawn is None:
+        spawn = memo.set_spawn(feet_pos(st), dimension=dim)
+    return (float(spawn[0]), float(spawn[1]), float(spawn[2]))
+
 def _pick_sector_waypoint(
     ex: Any, state: Any, origin: tuple[float, float, float], dim: str,
     sector_idx: int, total_sectors: int, radius: int,
     *, ring_radius: Optional[int] = None, anchor: Optional[tuple[float, float, float]] = None,
 ) -> Optional[list[float]]:
-    """沿扇区或环形目标射线探测经方块验证的干燥安全落脚路点，并避开虚空边缘。"""
+    """沿扇区或环形目标射线探测经方块验证的干燥安全落脚路点，并避开虚空/熔岩海与悬崖边缘。"""
     theta = 2.0 * math.pi * (sector_idx % total_sectors) / total_sectors
     ux, uz = math.cos(theta), math.sin(theta)
     ox, oy, oz = origin
@@ -207,12 +277,17 @@ def _pick_sector_waypoint(
         if memo.is_near_void_edge((wx, wz), dimension=dim):
             continue
         for dy in (0, 1, -1, 2, -2):
-            if _is_standable_dry(ex, cache, wx, base_y + dy, wz, dim):
+            if _is_nether_safe_waypoint(ex, cache, wx, base_y + dy, wz, dim):
                 return [wx + 0.5, float(base_y + dy), wz + 0.5]
         if has_origin_floor:
-            col = [_block_name_at(ex, cache, (wx, base_y + dy, wz), dim) for dy in range(-4, 3)]
-            if all(col) and all(b in AIR for b in col):
-                memo.record_void_edge((wx, wz), dimension=dim)
+            if dim == "the_nether":
+                down_col = [_block_name_at(ex, cache, (wx, base_y - k, wz), dim) for k in range(1, 5)]
+                if all(down_col) and (all(b in AIR for b in down_col) or any(b in ("lava", "flowing_lava") for b in down_col)):
+                    memo.record_void_edge((wx, wz), dimension=dim)
+            else:
+                col = [_block_name_at(ex, cache, (wx, base_y + dy, wz), dim) for dy in range(-4, 3)]
+                if all(col) and all(b in AIR for b in col):
+                    memo.record_void_edge((wx, wz), dimension=dim)
     return None
 
 def _pick_approach_dest(ex: Any, state: Any, target_cell: tuple[int, int, int], dim: str) -> list[float]:
@@ -338,25 +413,101 @@ class DiscoverStructure(Skill):
                 except Replan: continue
         return list(cells)
 
+    def _triangulate_stronghold(self, ex: Any, state: Any, dim: str, radius: int) -> Generator[dict, None, list[tuple[int, int, int]]]:
+        """持 >=2 颗末影之眼且尚无要塞坐标时：双点投掷测向 -> resolve_eye_bearings -> 沿交点推进扫描。"""
+        memo = memo_for(state)
+        state.refresh_inventory(ex.client)
+        if state.count("ender_eye") < 2 or not callable(getattr(ex, "use_item", None)):
+            return []
+        st1 = state.refresh_status(ex.client, max_age_s=0)
+        o1 = feet_pos(st1)
+        rcpt1 = ex.use_item("ender_eye")
+        yield rec("use_item", rcpt1, item="ender_eye", throw=1, structure="stronghold")
+        if cands := self._collect_targets(ex, state, "stronghold", dim, radius):
+            return cands
+        yaw1 = _extract_eye_bearing(o1, rcpt1)
+        if yaw1 is None:
+            return []
+        dx1, dz1 = -math.sin(math.radians(yaw1)), math.cos(math.radians(yaw1))
+        wp_lat = (
+            _pick_ray_waypoint(ex, state, o1, dim, -dz1, dx1, (32, 28, 24, 20, 16), angle_offsets_deg=(0.0, 15.0, -15.0))
+            or _pick_ray_waypoint(ex, state, o1, dim, dz1, -dx1, (32, 28, 24, 20, 16), angle_offsets_deg=(0.0, 15.0, -15.0))
+        )
+        if wp_lat is None or not (yield from _move_step(ex, wp_lat, purpose="ender_eye_baseline", structure="stronghold")):
+            return []
+        st2 = state.refresh_status(ex.client, max_age_s=0)
+        o2 = feet_pos(st2)
+        if cands := self._collect_targets(ex, state, "stronghold", dim, radius):
+            return cands
+        if math.hypot(o2[0] - o1[0], o2[2] - o1[2]) < 8.0:
+            return []
+        state.refresh_inventory(ex.client)
+        if state.count("ender_eye") < 1:
+            return []
+        rcpt2 = ex.use_item("ender_eye")
+        yield rec("use_item", rcpt2, item="ender_eye", throw=2, structure="stronghold")
+        yaw2 = _extract_eye_bearing(o2, rcpt2)
+        if yaw2 is None:
+            return []
+        hit = resolve_eye_bearings((o1[0], o1[2], yaw1), (o2[0], o2[2], yaw2))
+        if hit is None:
+            return []
+        ix, iz = hit
+        for _ in range(8):
+            st_cur = state.refresh_status(ex.client, max_age_s=0)
+            cur = feet_pos(st_cur)
+            memo.mark_grid_visited(cur, dimension=dim)
+            memo.record_biome(st_cur.get("biome", ""), pos=cur, dimension=dim)
+            if cands := self._collect_targets(ex, state, "stronghold", dim, radius):
+                return cands
+            rem = math.hypot(ix - cur[0], iz - cur[2])
+            if rem <= 4.0:
+                break
+            ux, uz = (ix - cur[0]) / rem, (iz - cur[2]) / rem
+            step_max = min(int(math.ceil(rem)), min(radius, 48))
+            dists = list(dict.fromkeys(d for d in (step_max, min(step_max, 40), 32, 24, 16, 8, 4) if 1 <= d <= step_max)) or [max(1, step_max)]
+            wp = _pick_ray_waypoint(ex, state, cur, dim, ux, uz, dists, angle_offsets_deg=(0.0, 20.0, -20.0, 40.0, -40.0))
+            if wp is None or not (yield from _move_step(ex, wp, purpose="ender_eye_approach", structure="stronghold")):
+                break
+        return self._collect_targets(ex, state, "stronghold", dim, radius)
+
     def run(self, ex, state):
         structure, radius = self.args["structure"], self.args["radius"]
         st, cur_dim = _require_ready_dim(ex, state, _REQUIRED_DIM[structure])
         memo = memo_for(state)
+        anchor = _spiral_anchor(memo, st, cur_dim)
         if structure == "nether_biomes":
             memo.record_biome(st.get("biome", ""), pos=st.get("pos"), dimension=cur_dim)
             self._before_biomes = memo.biomes(dimension=cur_dim) & NETHER_BIOMES
             if self._before_biomes >= NETHER_BIOMES:
                 self._done = True; return
-            for s in range(4):
-                yield from survey_sector(ex, state, sector_idx=s, total_sectors=4, radius=radius)
-                cur = memo.biomes(dimension=cur_dim) & NETHER_BIOMES
-                if (cur - self._before_biomes) or cur >= NETHER_BIOMES:
-                    self._done = True; return
-            raise EnvBlocked("扫描周边扇区未发现新下界群系", missing_predicate="nether_biomes:new", searched_volume=f"4 扇区半径 {radius} 格", wake_on="chunk_moved")
+            for _ in range(4):
+                cur_cursor = memo.get_spiral_cursor(dimension=cur_dim)
+                sec, ring_r = cur_cursor["sector"], cur_cursor["radius"]
+                theta = 2.0 * math.pi * (sec % 8) / 8
+                tx, tz = anchor[0] + ring_r * math.cos(theta), anchor[2] + ring_r * math.sin(theta)
+                max_hops = 1 if ring_r <= radius else min(3, math.ceil(ring_r / max(1, radius)))
+                for _hop in range(max_hops):
+                    res = yield from survey_sector(ex, state, sector_idx=sec, total_sectors=8, radius=radius, ring_radius=ring_r, anchor=anchor)
+                    cur_biomes = memo.biomes(dimension=cur_dim) & NETHER_BIOMES
+                    if (cur_biomes - self._before_biomes) or cur_biomes >= NETHER_BIOMES:
+                        memo.advance_spiral_cursor(dimension=cur_dim, sectors_per_ring=8)
+                        self._done = True; return
+                    if not res.get("moved"):
+                        break
+                    pos_now = feet_pos(state.st or st)
+                    if math.hypot(tx - pos_now[0], tz - pos_now[2]) <= max(16.0, radius * 0.6):
+                        break
+                memo.advance_spiral_cursor(dimension=cur_dim, sectors_per_ring=8)
+            raise EnvBlocked("扫描周边螺旋扇区未发现新下界群系", missing_predicate="nether_biomes:new", searched_volume=f"4 螺旋扇区半径 {radius} 格", wake_on="chunk_moved")
         candidates = self._collect_targets(ex, state, structure, cur_dim, radius)
-        for s in range(4):
+        if structure == "stronghold" and not candidates and not memo.has_landmark("stronghold", dimension=cur_dim):
+            candidates = yield from self._triangulate_stronghold(ex, state, cur_dim, radius)
+        for _ in range(4):
             if candidates: break
-            yield from survey_sector(ex, state, sector_idx=s, total_sectors=4, radius=radius)
+            cur_cursor = memo.get_spiral_cursor(dimension=cur_dim)
+            yield from survey_sector(ex, state, sector_idx=cur_cursor["sector"], total_sectors=8, radius=radius, ring_radius=cur_cursor["radius"], anchor=anchor)
+            memo.advance_spiral_cursor(dimension=cur_dim, sectors_per_ring=8)
             candidates = self._collect_targets(ex, state, structure, cur_dim, radius)
         if not candidates: raise EnvBlocked(f"周边扇区未发现 {structure} 结构指纹", missing_predicate=f"structure:{structure}", searched_volume=f"4 扇区半径 {radius} 格", wake_on="chunk_moved")
         st = state.refresh_status(ex.client, max_age_s=0)

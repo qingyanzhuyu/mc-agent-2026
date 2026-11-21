@@ -21,7 +21,8 @@ from .voxel_cache import voxel_cache_for
 _CARDINALS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _MELEE = ("netherite_sword", "diamond_sword", "iron_sword", "stone_sword", "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "mace", "wooden_sword")
 _AQUATIC_PREY = ("drowned", "guardian", "elder_guardian", "squid", "glow_squid", "cod", "salmon", "pufferfish", "tropical_fish", "tadpole")
-_BOATS = ("oak_boat", "spruce_boat", "birch_boat", "jungle_boat", "acacia_boat", "dark_oak_boat", "mangrove_boat", "cherry_boat", "pale_oak_boat", "bamboo_raft")
+_BOAT_WOODS = ("oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak")
+_BOATS = tuple(f"{w}_boat" for w in _BOAT_WOODS) + ("bamboo_raft",)
 _ALLAY_PREF = ("cobblestone", "dirt", "oak_planks", "stick", "apple", "cookie")
 _NON_KILLABLE = frozenset({"player", "item", "experience_orb", "boat", "chest_boat", "minecart", "armor_stand", "allay", "villager", "iron_golem", "wolf", "cat", "axolotl"})
 
@@ -68,6 +69,41 @@ def _has_bow(state: State) -> bool: return state.count("bow") >= 1 and any(state
 def _pick_boat(state: State) -> str | None:
     return next((b for b in _BOATS if state.count(b) >= 1), None) or next(
         (n for r in _inv_entries(state) if (n := bare(r.get("name"))) and state.count(n) >= 1 and n.endswith(("_boat", "_raft")) and "chest" not in n), None)
+def _wood_log_count(state: State, wood: str) -> int:
+    return sum(state.count(n) for n in (f"{wood}_log", f"{wood}_wood", f"stripped_{wood}_log", f"stripped_{wood}_wood"))
+def _boat_craft_plan(state: State) -> tuple[str, str] | None:
+    for wood in _BOAT_WOODS:
+        if state.count(f"{wood}_planks") >= 5:
+            return (f"{wood}_boat", f"{wood}_planks")
+    if state.count("bamboo_planks") >= 5:
+        return ("bamboo_raft", "bamboo_planks")
+    for wood in _BOAT_WOODS:
+        if state.count(f"{wood}_planks") + _wood_log_count(state, wood) * 4 >= 5:
+            return (f"{wood}_boat", f"{wood}_planks")
+    if state.count("bamboo_planks") + (state.count("bamboo_block") + state.count("stripped_bamboo_block")) * 2 >= 5:
+        return ("bamboo_raft", "bamboo_planks")
+    return None
+def _can_craft_shears(state: State) -> bool: return state.count("iron_ingot") >= 2
+def _can_craft_wolf_armor(state: State) -> bool: return state.count("armadillo_scute") >= 6
+def _can_craft_spyglass(state: State) -> bool: return state.count("copper_ingot") >= 2 and state.count("amethyst_shard") >= 1
+def _wolf_has_armor(wolf: Mapping) -> bool: return bool(wolf.get("has_armor") or wolf.get("armor") or wolf.get("wolf_armor"))
+def _wolf_armor_full_durability(wolf: Mapping) -> bool:
+    if wolf.get("armor_damaged") is False: return True
+    if "armor_damage" in wolf and wolf.get("armor_damage") == 0: return True
+    dur = wolf.get("armor_durability")
+    if isinstance(dur, Sequence) and not isinstance(dur, (str, bytes)) and len(dur) >= 2 and isinstance(dur[0], (int, float)) and isinstance(dur[1], (int, float)):
+        return dur[0] >= dur[1]
+    if isinstance(dur, Mapping):
+        cur, mx = dur.get("current", dur.get("cur")), dur.get("max")
+        if isinstance(cur, (int, float)) and isinstance(mx, (int, float)): return cur >= mx
+    wa = wolf.get("wolf_armor") if isinstance(wolf.get("wolf_armor"), Mapping) else (wolf.get("armor") if isinstance(wolf.get("armor"), Mapping) else None)
+    if isinstance(wa, Mapping):
+        if wa.get("damaged") is False: return True
+        if "damage" in wa and wa.get("damage") == 0: return True
+        wdur = wa.get("durability")
+        if isinstance(wdur, Sequence) and not isinstance(wdur, (str, bytes)) and len(wdur) >= 2 and isinstance(wdur[0], (int, float)) and isinstance(wdur[1], (int, float)):
+            return wdur[0] >= wdur[1]
+    return False
 def _pick_allay_item(state: State) -> str | None:
     return next((i for i in _ALLAY_PREF if state.count(i) >= 2), None) or next(
         (n for r in (state.inventory or {}).get("items") or () if isinstance(r, dict) and (n := bare(r.get("name"))) and state.count(n) >= 2), None)
@@ -78,11 +114,34 @@ def _has_silk_val(obj: object) -> bool:
             lvl = obj.get("level", obj.get("lvl", 1))
             return isinstance(lvl, int) and not isinstance(lvl, bool) and lvl > 0
         return any((bare(k) == "silk_touch" and ((isinstance(v, int) and not isinstance(v, bool) and v > 0) or v is True))
-                   or (bare(k) in ("enchantments", "levels", "stored_enchantments") and _has_silk_val(v)) for k, v in obj.items())
+                   or (bare(k) in ("enchantments", "levels") and _has_silk_val(v)) for k, v in obj.items())
     return isinstance(obj, Sequence) and not isinstance(obj, (bytes, bytearray)) and any(_has_silk_val(el) for el in obj)
 def _find_silk_tool(state: State) -> str | None:
-    return next((n for r in _inv_entries(state) if (n := bare(r.get("name"))) and state.count(n) >= 1
-                 and (_has_silk_val(r.get("enchantments")) or _has_silk_val(r.get("components")))), None)
+    return next((n for r in _inv_entries(state) if (n := bare(r.get("name"))) and n not in ("book", "enchanted_book")
+                 and state.count(n) >= 1 and (_has_silk_val(r.get("enchantments")) or _has_silk_val(r.get("components")))), None)
+def _find_place_cell(ex: Executor, st: dict, radius: int = 3) -> tuple[int, int, int] | None:
+    ox, oy, oz = block_cell(st["pos"])
+    cands = [(ox + dx, oy + dy, oz + dz) for dy in (0, -1, 1) for dx in range(-radius, radius + 1) for dz in range(-radius, radius + 1)
+             if not _overlaps((ox + dx, oy + dy, oz + dz), st["pos"])
+             and _is_air(ex, (ox + dx, oy + dy, oz + dz)) and _has_floor(ex, (ox + dx, oy + dy, oz + dz))
+             and can_reach_block(ex, st, (ox + dx, oy + dy, oz + dz), reach=DIG_EYE_REACH)]
+    return min(cands, key=lambda c: eye_to_block_dist(st, c)) if cands else None
+def _craft_item(ex: Executor, state: State, item: str, *, need_table: bool = True, err_msg: str | None = None) -> Generator[dict, None, None]:
+    if need_table:
+        st = state.refresh_status(ex.client, max_age_s=0)
+        tables = _ready(scan_blocks(ex, state, "crafting_table", radius=16, limit=5))["blocks"]
+        if tables:
+            tcell = block_cell(min(tables, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+            if not can_reach_block(ex, st, tcell, reach=STATION_EYE_REACH):
+                yield from _approach_block(ex, state, tcell, reach=STATION_EYE_REACH)
+        elif state.count("crafting_table") >= 1:
+            if (pcell := _find_place_cell(ex, st)) is not None:
+                yield from place_block(ex, state, "crafting_table", pcell)
+    before = state.count(item)
+    yield rec("craft", ex.craft(item, 1), item=item, count=1)
+    refresh_inventory(ex, state)
+    if state.count(item) <= before:
+        raise Replan(err_msg or f"合成 {item} 后背包数量未增加")
 def _standable_near(ex: Executor, target: Sequence[float], origin: Sequence[float], radius: int = 3, *, blk: tuple[int, int, int] | None = None, reach: float = STATION_EYE_REACH) -> tuple[int, int, int] | None:
     tx, ty, tz = blk if blk is not None else block_cell(target)
     cands = [(tx + dx, ty + dy, tz + dz) for dy in (0, -1, 1, -2, 2) for dx in range(-radius, radius + 1) for dz in range(-radius, radius + 1)
@@ -122,7 +181,7 @@ def lure_entity(ex: Executor, state: State, entity_types: str | Sequence[str], b
     st = state.refresh_status(ex.client, max_age_s=0)
     ent = min(_req_ents(ex, state, entity_types, radius, f"半径 {radius} 格内未发现可引诱实体", f"visible_entity:{entity_types}"), key=lambda e: eye_to_point_dist(st, e["pos"]))
     if math.dist(ent["pos"], tpos) <= 4.5: return ent
-    if math.dist(st["pos"], ent["pos"]) > 6.0:
+    if eye_to_point_dist(st, ent["pos"]) > 6.0:
         yield from _approach_ent(ex, state, ent, reach=5.5)
         ent = next((e for e in _ready(scan_entities(ex, state, entity_types, radius=max(radius, 24)))["entities"] if e["id"] == ent["id"]), None)
         if ent is None: raise Replan("接近后引诱目标实体丢失")
@@ -203,12 +262,19 @@ class AssistAxolotlHunt(_BiomeSkill):
         if not axos and (yield from goto_known_landmark_or_biome(ex, state, "lush_caves")):
             st = state.refresh_status(ex.client, max_age_s=0)
             axos = _ready(scan_entities(ex, state, "axolotl", radius=radius))["entities"]
+            if not axos and state.count("axolotl_bucket") >= 1:
+                if waters := _ready(scan_blocks(ex, state, "water", radius=min(radius, 16), limit=6, skill_name=self.name))["blocks"]:
+                    wpos = block_cell(min(waters, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+                    yield from _approach_block(ex, state, wpos, reach=STATION_EYE_REACH)
+                    yield from use_item_on(ex, state, wpos, "axolotl_bucket")
+                    axos = _ready(scan_entities(ex, state, "axolotl", radius=radius))["entities"]
         if not axos: raise _env_blocked(f"半径 {radius} 格内未发现美西螈", "visible_entity:axolotl", f"半径 {radius} 格实体")
         axo = min(axos, key=lambda e: eye_to_point_dist(st, e["pos"]))
         preys = [e for e in _ready(scan_entities(ex, state, _AQUATIC_PREY, radius=radius))["entities"] if math.dist(e["pos"], axo["pos"]) <= 16.0]
         if not preys: raise _env_blocked("美西螈 16 格内未发现水生猎物", "visible_entity:aquatic_prey", "美西螈 16 格内")
         prey = min(preys, key=lambda e: math.dist(e["pos"], axo["pos"]))
-        yield from equip_item(ex, state, _pick_melee(state, allow_trident=True), "hand")
+        if (weapon := _pick_melee(state, allow_trident=True)) is None: raise Replan("背包缺少近战武器")
+        yield from equip_item(ex, state, weapon, "hand")
         st = yield from _approach_ent(ex, state, prey, reach=ENTITY_EYE_REACH); _check_hp(st)
         if (retreat := _find_retreat(ex, st, prey["pos"])) is not None and _grounded(ex, st):
             yield from combat_melee(ex, state, prey, retreat_pos=retreat, radius=min(16, radius))
@@ -220,23 +286,53 @@ class AssistAxolotlHunt(_BiomeSkill):
 
 @register
 class ManageWolfArmor(_BiomeSkill):
-    name, goal, description = "manage_wolf_armor", "t3:wolf_armor_{mode}", "用剪刀脱下狼铠或用犰狳鳞甲修复狼铠"
+    name, goal, description = "manage_wolf_armor", "t3:wolf_armor_{mode}", "备齐剪刀或狼铠后脱下狼铠或用犰狳鳞甲修复狼铠"
     params = {"mode": Param(str, "操作模式", default="repair", choices=("remove", "repair")), "radius": Param(int, "搜索驯服狼半径", default=24, min=8, max=64)}
     _done_msg = "未确认脱下或修复狼铠"
     @classmethod
-    def blocked(cls, state: State) -> str: return _gate(state, state.count("shears") >= 1 or state.count("armadillo_scute") >= 1, "背包缺少剪刀或犰狳鳞甲")
-    def can_start(self, state: State) -> bool: return not self.blocked(state) and state.count("shears" if self.args["mode"] == "remove" else "armadillo_scute") >= 1
+    def blocked(cls, state: State) -> str:
+        ok = state.count("shears") >= 1 or _can_craft_shears(state) or state.count("armadillo_scute") >= 1
+        return _gate(state, ok, "背包缺少剪刀（或 2 个铁锭合成剪刀）或犰狳鳞甲")
+    def can_start(self, state: State) -> bool:
+        if self.blocked(state): return False
+        return (state.count("shears") >= 1 or _can_craft_shears(state)) if self.args["mode"] == "remove" else state.count("armadillo_scute") >= 1
     def _delta_done(self, state: State, before: dict) -> bool:
         return state.count("wolf_armor") > before.get("wolf_armor", 0) if self.args["mode"] == "remove" else state.count("armadillo_scute") < before.get("armadillo_scute", 0)
     def _run(self, ex: Executor, state: State):
         st, mode, radius = self._begin(ex, state), self.args["mode"], self.args["radius"]
-        wolves = _req_ents(ex, state, "wolf", radius, f"半径 {radius} 格内未发现狼", "visible_entity:wolf")
-        wolf = min(wolves, key=lambda e: (0 if e.get("tamed") else 1, 0 if e.get("has_armor") or e.get("armor") or e.get("wolf_armor") else 1, eye_to_point_dist(st, e["pos"])))
-        yield from _approach_ent(ex, state, wolf, reach=ENTITY_EYE_REACH)
-        before_wa, before_sc = state.count("wolf_armor"), state.count("armadillo_scute")
-        ev = yield from use_item_on(ex, state, wolf["id"], "shears" if mode == "remove" else "armadillo_scute")
-        if not ((state.count("wolf_armor") > before_wa) if mode == "remove" else (state.count("armadillo_scute") < before_sc or ev["receipt"].get("changed") is True)):
-            raise Replan(f"狼铠操作 {mode} 未确认生效")
+        wolves = yield from _req_ents_or_landmark(ex, state, "wolf", radius, f"半径 {radius} 格内未发现狼", "visible_entity:wolf", "savanna|badlands")
+        st = state.refresh_status(ex.client, max_age_s=0)
+        wolf = min(wolves, key=lambda e: (0 if e.get("tamed") else 1, 0 if _wolf_has_armor(e) else 1, eye_to_point_dist(st, e["pos"])))
+        if mode == "remove":
+            if state.count("shears") < 1:
+                if not _can_craft_shears(state): raise Replan("背包缺少剪刀且铁锭不足 2 个，无法合成剪刀")
+                yield from _craft_item(ex, state, "shears", need_table=False, err_msg="用铁锭合成剪刀后背包未确认增加 shears")
+            if not _wolf_has_armor(wolf):
+                if state.count("wolf_armor") < 1 and _can_craft_wolf_armor(state):
+                    yield from _craft_item(ex, state, "wolf_armor", need_table=True, err_msg="用犰狳鳞甲合成狼铠后背包未确认增加 wolf_armor")
+                if state.count("wolf_armor") >= 1:
+                    yield from _approach_ent(ex, state, wolf, reach=ENTITY_EYE_REACH)
+                    before_put = state.count("wolf_armor")
+                    ev_put = yield from use_item_on(ex, state, wolf["id"], "wolf_armor")
+                    if state.count("wolf_armor") >= before_put and ev_put["receipt"].get("changed") is not True:
+                        raise Replan("给驯服狼穿戴狼铠后未确认生效")
+                elif "has_armor" in wolf and wolf.get("has_armor") is False:
+                    raise Replan("驯服狼尚未穿戴狼铠，且背包缺少 wolf_armor 或 6 个 armadillo_scute 合成狼铠")
+            yield from _approach_ent(ex, state, wolf, reach=ENTITY_EYE_REACH)
+            before_wa = state.count("wolf_armor")
+            yield from use_item_on(ex, state, wolf["id"], "shears")
+            if state.count("wolf_armor") <= before_wa:
+                raise Replan("狼铠操作 remove 未确认生效")
+        else:
+            if "has_armor" in wolf and not _wolf_has_armor(wolf):
+                raise _env_blocked("驯服狼尚未穿戴狼铠，无法执行狼铠修复", "wolf_armor:damaged", f"半径 {radius} 格实体", wake_on="chunk_moved")
+            if _wolf_armor_full_durability(wolf):
+                raise _env_blocked("驯服狼所穿狼铠当前满耐久，无法消耗犰狳鳞甲修复", "wolf_armor:damaged", f"半径 {radius} 格实体", wake_on="chunk_moved")
+            yield from _approach_ent(ex, state, wolf, reach=ENTITY_EYE_REACH)
+            before_sc = state.count("armadillo_scute")
+            ev = yield from use_item_on(ex, state, wolf["id"], "armadillo_scute")
+            if state.count("armadillo_scute") >= before_sc and ev["receipt"].get("changed") is not True:
+                raise _env_blocked("使用犰狳鳞甲修复狼铠未消耗（狼铠可能满耐久或未穿戴受损狼铠），挂起等待受损后重试", "wolf_armor:damaged", f"半径 {radius} 格实体", wake_on="chunk_moved")
         self._done = True
 
 @register
@@ -266,11 +362,23 @@ class AllayDeliverItem(_BiomeSkill):
 
 @register
 class BoatWithGoat(_BiomeSkill):
-    name, goal, description = "boat_with_goat", "t3:boat_goat", "在山羊旁放船引诱上船并同乘后安全下船"
+    name, goal, description = "boat_with_goat", "t3:boat_goat", "备齐或合成木船并在山羊旁放船引诱上船同乘后下船"
     params = {"radius": Param(int, "搜索山羊半径", default=24, min=8, max=64)}
     _done_msg = "未确认与山羊同乘船并安全下船"
     @classmethod
-    def blocked(cls, state: State) -> str: return _gate(state, _pick_boat(state) is not None, "背包缺少船或竹筏（*_boat / *_raft）")
+    def blocked(cls, state: State) -> str:
+        return _gate(state, _pick_boat(state) is not None or _boat_craft_plan(state) is not None,
+                     "背包缺少船/竹筏，且无足够同种木板（>=5）或原木（>=2）合成木船")
+    def _ensure_boat(self, ex: Executor, state: State) -> Generator[dict, None, str]:
+        if (boat := _pick_boat(state)) is not None: return boat
+        if (plan := _boat_craft_plan(state)) is None:
+            raise Replan("背包缺少船且同种木板/原木不足以合成木船")
+        boat_item, planks_item = plan
+        while state.count(planks_item) < 5:
+            yield from _craft_item(ex, state, planks_item, need_table=False, err_msg=f"合成木板 {planks_item} 后背包数量未增加")
+        yield from _craft_item(ex, state, boat_item, need_table=True, err_msg=f"合成木船 {boat_item} 后背包数量未增加")
+        if (boat := _pick_boat(state)) is None: raise Replan(f"合成 {boat_item} 后背包仍未找到可用木船")
+        return boat
     def _find_boat_cell(self, ex: Executor, gpos: Sequence[float], ppos: Sequence[float]) -> tuple[int, int, int] | None:
         gx, gy, gz = block_cell(gpos)
         cands = [(gx + dx, gy + dy, gz + dz) for dy in (0, -1, 1) for dx in range(-2, 3) for dz in range(-2, 3)
@@ -279,6 +387,7 @@ class BoatWithGoat(_BiomeSkill):
         return min(cands, key=lambda c: math.dist(_pt(c), gpos)) if cands else None
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
+        boat_item = yield from self._ensure_boat(ex, state)
         goats = yield from _req_ents_or_landmark(ex, state, "goat", radius, f"半径 {radius} 格内未发现山羊", "visible_entity:goat", "jagged_peaks|frozen_peaks|snowy_slopes|meadow")
         st = state.refresh_status(ex.client, max_age_s=0)
         goat = min(goats, key=lambda e: eye_to_point_dist(st, e["pos"]))
@@ -286,7 +395,7 @@ class BoatWithGoat(_BiomeSkill):
         if (bcell := self._find_boat_cell(ex, goat["pos"], st["pos"])) is None: raise _env_blocked("山羊附近缺少放置船的平坦空位", "clear_site:boat", "山羊周边 2 格")
         floor_cell, boat_pos = (bcell[0], bcell[1] - 1, bcell[2]), _pt(bcell)
         yield from _approach_block(ex, state, floor_cell, reach=STATION_EYE_REACH)
-        yield from use_item_on(ex, state, floor_cell, _pick_boat(state))
+        yield from use_item_on(ex, state, floor_cell, boat_item)
         if state.count("wheat") >= 1: yield from lure_entity(ex, state, ("goat",), "wheat", boat_pos, radius=radius)
         boats = [e for e in _ready(scan_entities(ex, state, None, radius=min(32, radius)))["entities"]
                  if (n := bare(e.get("name"))) in ("boat", "chest_boat", "raft") or n.endswith(("_boat", "_raft"))]
@@ -318,13 +427,14 @@ class SilkTouchBeeNest(_BiomeSkill):
     def _is_night_or_rain(self, st: dict) -> bool:
         rain = bool(st.get("is_raining") or st.get("raining") or str(st.get("weather") or "").lower() in ("rain", "thunder"))
         tod = st.get("time_of_day", st.get("time"))
-        return rain or (isinstance(tod, (int, float)) and not isinstance(tod, bool) and (12500 <= int(tod) % 24000 <= 23500))
+        night = (isinstance(tod, (int, float)) and not isinstance(tod, bool) and (12500 <= int(tod) % 24000 <= 23500)) or (tod is None and st.get("is_day") is False)
+        return rain or night
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
         nests = yield from _req_blks_or_landmark(ex, state, "bee_nest", radius, f"半径 {radius} 格内未发现自然蜂巢", "visible_block:bee_nest", "bee_nest", self.name)
         st = state.refresh_status(ex.client, max_age_s=0)
         npos = block_cell(min(nests, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
-        # API /get_block 不暴露蜂巢内部蜜蜂数：保守校验夜间/雨天归巢，或巢旁可见蜜蜂（黄昏前活跃蜂巢）
+        # API /get_block 不暴露蜂巢内部蜜蜂数：导航到锚点后仍严格复核夜间/雨天归巢，或巢旁可见蜜蜂（黄昏前活跃蜂巢）
         if not self._is_night_or_rain(st):
             if not any(math.dist(e["pos"], block_center(npos)) <= 16.0 for e in _ready(scan_entities(ex, state, "bee", radius=radius))["entities"]):
                 raise _env_blocked("非夜间/雨天且蜂巢旁未见蜜蜂，保守等待入夜归巢再挖", "bee_nest_occupied:night_or_rain", f"半径 {radius} 格", wake_on="night")
@@ -343,15 +453,30 @@ class SilkTouchBeeNest(_BiomeSkill):
 
 @register
 class CatchTadpole(_BiomeSkill):
-    name, goal, description = "catch_tadpole", "t3:tadpole_bucket", "靠近蝌蚪并用水桶将其装入蝌蚪桶"
+    name, goal, description = "catch_tadpole", "t3:tadpole_bucket", "必要时先装水再靠近蝌蚪用水桶将其装入蝌蚪桶"
     params = {"radius": Param(int, "搜索蝌蚪半径", default=24, min=8, max=64)}
     _done_msg = "未确认捕获蝌蚪装桶"
     @classmethod
-    def blocked(cls, state: State) -> str: return _gate(state, state.count("water_bucket") >= 1, "背包缺少水桶（water_bucket）")
+    def blocked(cls, state: State) -> str:
+        return _gate(state, state.count("water_bucket") >= 1 or state.count("bucket") >= 1, "背包缺少水桶（water_bucket）或空桶（bucket）")
     def _delta_done(self, state: State, before: dict) -> bool: return state.count("tadpole_bucket") > before.get("tadpole_bucket", 0)
+    def _ensure_water_bucket(self, ex: Executor, state: State, radius: int) -> Generator[dict, None, None]:
+        if state.count("water_bucket") >= 1: return
+        st = state.refresh_status(ex.client, max_age_s=0)
+        waters = _ready(scan_blocks(ex, state, "water", radius=min(radius, 24), limit=8, skill_name=self.name))["blocks"]
+        if not waters:
+            raise _env_blocked("背包仅有空桶且附近未发现水源，无法装水捕捞蝌蚪", "visible_block:water", f"半径 {min(radius, 24)} 格")
+        wblk = min(waters, key=lambda b: (0 if (b.get("properties") or {}).get("level") in (None, 0, "0") else 1, eye_to_block_dist(st, b["pos"])))
+        wpos = block_cell(wblk["pos"])
+        yield from _approach_block(ex, state, wpos, reach=STATION_EYE_REACH)
+        before_wb = state.count("water_bucket")
+        yield from use_item_on(ex, state, wpos, "bucket")
+        if state.count("water_bucket") <= before_wb:
+            raise Replan("向水源使用空桶后未确认获得水桶（water_bucket）")
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
         tads = yield from _req_ents_or_landmark(ex, state, "tadpole", radius, f"半径 {radius} 格内未发现蝌蚪", "visible_entity:tadpole", "swamp|mangrove_swamp")
+        yield from self._ensure_water_bucket(ex, state, radius)
         st = state.refresh_status(ex.client, max_age_s=0)
         tad = min(tads, key=lambda e: eye_to_point_dist(st, e["pos"]))
         yield from _approach_ent(ex, state, tad, reach=ENTITY_EYE_REACH)
@@ -363,13 +488,20 @@ class CatchTadpole(_BiomeSkill):
 
 @register
 class SpyglassObserve(_BiomeSkill):
-    name, goal, description = "spyglass_observe", "t3:spyglass_{target}", "使用望远镜瞄准并观察恶魂或鹦鹉"
+    name, goal, description = "spyglass_observe", "t3:spyglass_{target}", "备齐或合成望远镜后瞄准并观察恶魂或鹦鹉"
     params = {"target": Param(str, "观察目标", default="parrot", choices=("ghast", "parrot")), "radius": Param(int, "搜索目标半径", default=48, min=8, max=64)}
     _done_msg = "未确认望远镜观察目标生物"
     @classmethod
-    def blocked(cls, state: State) -> str: return _gate(state, state.count("spyglass") >= 1, "背包缺少望远镜（spyglass）")
+    def blocked(cls, state: State) -> str:
+        return _gate(state, state.count("spyglass") >= 1 or _can_craft_spyglass(state),
+                     "背包缺少望远镜（spyglass）及合成材料（2 铜锭 + 1 紫水晶碎片）")
     def _run(self, ex: Executor, state: State):
         st, target, radius = self._begin(ex, state), self.args["target"], self.args["radius"]
+        if state.count("spyglass") < 1:
+            if not _can_craft_spyglass(state):
+                raise Replan("背包缺少望远镜及合成材料（2 铜锭 + 1 紫水晶碎片）")
+            yield from _craft_item(ex, state, "spyglass", need_table=True, err_msg="合成望远镜后背包未确认增加 spyglass")
+            st = state.refresh_status(ex.client, max_age_s=0)
         if target == "parrot":
             ents = yield from _req_ents_or_landmark(ex, state, target, radius, f"半径 {radius} 格内未发现 {target}", f"visible_entity:{target}", "jungle")
             st = state.refresh_status(ex.client, max_age_s=0)
@@ -377,7 +509,7 @@ class SpyglassObserve(_BiomeSkill):
             ents = _req_ents(ex, state, target, radius, f"半径 {radius} 格内未发现 {target}", f"visible_entity:{target}")
         visible = [e for e in ents if can_see_block(ex, st, e["pos"])]
         if not visible: raise _env_blocked(f"半径 {radius} 格内 {target} 视线均被遮挡", f"visible_los:{target}", f"半径 {radius} 格视线")
-        ent = min(visible, key=lambda e: eye_to_block_dist(st, e["pos"]))
+        ent = min(visible, key=lambda e: eye_to_point_dist(st, e["pos"]))
         yield rec("look", ex.look(entity_id=ent["id"]), entity_id=ent["id"])
         receipt = ex.use_item("spyglass", target={"entity_id": ent["id"]}, ms=600)
         yield rec("use_item", receipt, item="spyglass", target={"entity_id": ent["id"]}, ms=600)

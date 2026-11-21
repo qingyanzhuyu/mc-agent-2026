@@ -10,6 +10,7 @@ from .base import Param, Skill, rec
 from .field import _cell, _observed_block, _standable_cell, move_local, place_block, scan_blocks, scan_entities
 from .interaction import use_item, use_item_on
 from .items import bare
+from .landmark_nav import goto_known_landmark_or_biome
 from .observations import refresh_inventory
 from .recipes import RECIPES, craft_recipe
 from .registry import register
@@ -20,7 +21,7 @@ from .world_memo import memo_for
 _ADJACENT = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _TRIM_MATERIALS = ("iron_ingot", "copper_ingot", "gold_ingot", "lapis_lazuli", "emerald", "diamond", "redstone", "quartz", "amethyst_shard", "netherite_ingot")
 _ARMOR_SUFFIXES = ("_helmet", "_chestplate", "_leggings", "_boots")
-_BREW_INGREDIENTS = {"mundane": "redstone", "weakness": "fermented_spider_eye"}
+_BREW_INGREDIENTS = {"mundane": "redstone", "weakness": "fermented_spider_eye", "weakness_splash": "fermented_spider_eye"}
 
 
 def _find_adjacent_stand(ex, pos, *, origin=None, max_dist: Optional[float] = None):
@@ -33,7 +34,7 @@ def _find_adjacent_stand(ex, pos, *, origin=None, max_dist: Optional[float] = No
     return None
 
 
-def _ensure_station(ex, state, station: str, radius: int, *, skill_name: str = ""):
+def _find_station_nearby(ex, state, station: str, radius: int, *, skill_name: str = ""):
     status = state.refresh_status(ex.client, max_age_s=0)
     if status.get("ready") is False:
         raise Replan("世界区块和实体加载尚未就绪（not_ready），请等 ready=true 后再试")
@@ -56,15 +57,26 @@ def _ensure_station(ex, state, station: str, radius: int, *, skill_name: str = "
         if bare(_observed_block(ex, pos).get("name")) == station and (can_reach_block(ex, status, pos, reach=STATION_EYE_REACH) or eye_to_block_dist(status, pos) <= STATION_EYE_REACH + 1.0):
             memo_for(state).record_station(station, pos, dimension=dim)
             return list(pos)
+    return None
+
+
+def _ensure_station(ex, state, station: str, radius: int, *, skill_name: str = "", landmark: Optional[str] = None):
+    if (found := (yield from _find_station_nearby(ex, state, station, radius, skill_name=skill_name))) is not None:
+        return found
     refresh_inventory(ex, state)
+    status = state.refresh_status(ex.client, max_age_s=0)
+    dim = str(status.get("dimension") or "overworld")
     if state.count(station) >= 1:
-        px, py, pz = _cell(state.refresh_status(ex.client, max_age_s=0).get("pos"))
+        px, py, pz = _cell(status.get("pos"))
         for dx, dz in _ADJACENT:
             cand = (px + dx, py, pz + dz)
             if _standable_cell(ex, cand):
                 yield from place_block(ex, state, station, cand)
                 memo_for(state).record_station(station, cand, dimension=dim)
                 return list(cand)
+    if landmark and (yield from goto_known_landmark_or_biome(ex, state, landmark)):
+        if (found := (yield from _find_station_nearby(ex, state, station, radius, skill_name=skill_name))) is not None:
+            return found
     raise EnvBlocked(f"{radius} 格内未找到可达的 {station}，且缺少可放置工作站或安全落点", missing_predicate=f"station_ready:{station}", searched_volume=f"半径 {radius} 格 {station}", wake_on="chunk_moved")
 
 
@@ -95,6 +107,15 @@ def _scan_sorted_entities(ex, state, types: tuple[str, ...], radius: int, *, lab
         raise EnvBlocked(f"{radius} 格内未发现{label}", missing_predicate=pred, searched_volume=f"半径 {radius} 格{label}", wake_on=wake_on)
     status = state.refresh_status(ex.client, max_age_s=0)
     return sorted(entities, key=lambda e: eye_to_point_dist(status, e["pos"]))
+
+
+def _scan_sorted_entities_or_landmark(ex, state, types: tuple[str, ...], radius: int, *, label: str, pred: str, wake_on: str, landmark: Optional[str] = None):
+    try:
+        return _scan_sorted_entities(ex, state, types, radius, label=label, pred=pred, wake_on=wake_on)
+    except EnvBlocked:
+        if not landmark or not (yield from goto_known_landmark_or_biome(ex, state, landmark)):
+            raise
+        return _scan_sorted_entities(ex, state, types, radius, label=label, pred=pred, wake_on=wake_on)
 
 
 def _got_items(got) -> dict[str, int]:
@@ -128,6 +149,18 @@ def _has_weakness_splash(inventory) -> bool:
     )
 
 
+def _has_weakness_potion(inventory) -> bool:
+    return any(
+        isinstance(r, dict) and int(r.get("count", 0)) >= 1 and bare(r.get("name")) == "potion"
+        and bool(r.get("potion")) and "weakness" in bare(r["potion"]).lower()
+        for r in (inventory or {}).get("items") or ()
+    )
+
+
+def _can_craft_golden_apple(state) -> bool:
+    return state.count("gold_ingot") >= 8 and state.count("apple") >= 1
+
+
 @register
 class TradeVillager(Skill):
     name, goal, verified = "trade_villager", "trade:villager", "offline"
@@ -142,7 +175,7 @@ class TradeVillager(Skill):
 
     def run(self, ex, state):
         self._trade_result, radius = None, self.args["radius"]
-        ordered = _scan_sorted_entities(ex, state, ("villager", "wandering_trader"), radius, label="村民或流浪商人", pred="villager", wake_on="chunk_moved")
+        ordered = yield from _scan_sorted_entities_or_landmark(ex, state, ("villager", "wandering_trader"), radius, label="村民或流浪商人", pred="villager", wake_on="chunk_moved", landmark="village")
         last_exc: Optional[Replan] = None
         for ent in ordered:
             try:
@@ -255,8 +288,8 @@ class SmithNetheriteHoe(Skill):
 @register
 class BrewPotion(Skill):
     name, goal, verified = "brew_potion", "brew:{recipe}", "offline"
-    description = "在酿造台放入药水与原料酿造平凡药水或虚弱药水"
-    params = {"recipe": Param(str, "酿造配方", default="mundane", choices=("mundane", "weakness")), "radius": Param(int, "找酿造台半径", default=24, min=8, max=64)}
+    description = "在酿造台放入药水与原料酿造平凡药水、虚弱药水或虚弱喷溅药水"
+    params = {"recipe": Param(str, "酿造配方", default="mundane", choices=("mundane", "weakness", "weakness_splash")), "radius": Param(int, "找酿造台半径", default=24, min=8, max=64)}
     _max_polls, _poll_sleep_s, _sleep_fn = 48, 0.5, staticmethod(time.sleep)
     _brew_result: Optional[dict] = None
     _primary_ingredient: Optional[str] = None
@@ -265,20 +298,44 @@ class BrewPotion(Skill):
     def blocked(cls, state) -> str:
         if state.count("potion") < 1:
             return "背包缺少水瓶或基础药水"
-        return "" if (state.count("redstone") >= 1 or state.count("fermented_spider_eye") >= 1) else "背包缺少红石粉或发酵蛛眼"
+        if state.count("redstone") >= 1 or state.count("fermented_spider_eye") >= 1 or (_has_weakness_potion(state.inventory) and state.count("gunpowder") >= 1):
+            return ""
+        return "背包缺少红石粉、发酵蛛眼或可喷溅化火药"
 
     def can_start(self, state) -> bool:
-        return state.count("potion") >= 1 and state.count(_BREW_INGREDIENTS[self.args["recipe"]]) >= 1
+        recipe = self.args["recipe"]
+        if state.count("potion") < 1:
+            return False
+        if recipe == "weakness_splash":
+            return state.count("gunpowder") >= 1 and (state.count("fermented_spider_eye") >= 1 or _has_weakness_potion(state.inventory))
+        return state.count(_BREW_INGREDIENTS[recipe]) >= 1
 
     def run(self, ex, state):
         self._brew_result = self._primary_ingredient = None
         recipe, radius = self.args["recipe"], self.args["radius"]
         ing = _BREW_INGREDIENTS[recipe]
         refresh_inventory(ex, state)
+        kw = dict(max_polls=self._max_polls, poll_sleep_s=self._poll_sleep_s, sleep_fn=self._sleep_fn)
+        if recipe == "weakness_splash":
+            already_weak = _has_weakness_potion(state.inventory)
+            if state.count("potion") < 1 or state.count("gunpowder") < 1 or (not already_weak and state.count("fermented_spider_eye") < 1):
+                raise Replan("缺少酿造 weakness_splash 所需的 potion、fermented_spider_eye 或 gunpowder")
+            pos = yield from _ensure_station(ex, state, "brewing_stand", radius, skill_name=self.name, landmark="village")
+            if not already_weak:
+                yield from brew_batch(ex, state, pos, bottle_item="potion", ingredient="fermented_spider_eye", **kw)
+                refresh_inventory(ex, state)
+            if state.count("gunpowder") < 1 or state.count("potion") < 1:
+                raise Replan("酿造虚弱喷溅药水缺少火药或虚弱药水")
+            res = yield from brew_batch(ex, state, pos, bottle_item="potion", ingredient="gunpowder", **kw)
+            refresh_inventory(ex, state)
+            if bare(res.get("output")) != "splash_potion" and not _has_weakness_splash(state.inventory):
+                raise Replan("酿造虚弱喷溅药水后未确认产出 splash_potion")
+            self._brew_result, self._primary_ingredient = res, ("gunpowder" if already_weak else "fermented_spider_eye")
+            yield rec("brew_potion_evidence", res, recipe=recipe, output=res["output"], potion=res.get("potion"))
+            return
         if state.count("potion") < 1 or state.count(ing) < 1:
             raise Replan(f"缺少酿造 {recipe} 所需的 potion 或 {ing}")
-        pos = yield from _ensure_station(ex, state, "brewing_stand", radius, skill_name=self.name)
-        kw = dict(max_polls=self._max_polls, poll_sleep_s=self._poll_sleep_s, sleep_fn=self._sleep_fn)
+        pos = yield from _ensure_station(ex, state, "brewing_stand", radius, skill_name=self.name, landmark="village")
         res = yield from brew_batch(ex, state, pos, bottle_item="potion", ingredient=ing, **kw)
         if recipe == "weakness":
             refresh_inventory(ex, state)
@@ -294,6 +351,8 @@ class BrewPotion(Skill):
         out = bare(res["output"])
         if state.count(out) < 1:
             return f"酿造后背包未确认产出 {out}"
+        if self.args["recipe"] == "weakness_splash" and not _has_weakness_splash(state.inventory):
+            return "酿造后背包未确认虚弱喷溅药水（splash_potion）"
         ing = self._primary_ingredient
         if before_counts is not None and ing and ing in before_counts and state.count(ing) >= before_counts[ing]:
             return f"酿造后原料 {ing} 未确认消耗"
@@ -306,30 +365,42 @@ class CureZombieVillager(Skill):
     description = "向附近僵尸村民投掷虚弱喷溅药水并喂食金苹果进行治疗"
     params = {"radius": Param(int, "找僵尸村民半径", default=32, min=8, max=64)}
     _cured: bool = False
+    _crafted_golden_apple: bool = False
 
     @classmethod
     def blocked(cls, state) -> str:
         if not _has_weakness_splash(state.inventory):
-            return "背包缺少虚弱喷溅药水"
-        return "" if state.count("golden_apple") >= 1 else "背包缺少金苹果"
+            return "背包缺少虚弱喷溅药水（需先 brew_potion(recipe='weakness_splash')）"
+        return "" if (state.count("golden_apple") >= 1 or _can_craft_golden_apple(state)) else "背包缺少金苹果（或 8 个金锭与 1 个苹果）"
 
     def run(self, ex, state):
-        self._cured, radius = False, self.args["radius"]
+        self._cured, self._crafted_golden_apple, radius = False, False, self.args["radius"]
         refresh_inventory(ex, state)
         if reason := self.blocked(state):
             raise Replan(reason)
-        zv = _scan_sorted_entities(ex, state, ("zombie_villager",), radius, label="僵尸村民", pred="zombie_villager", wake_on="night")[0]
+        if state.count("golden_apple") < 1:
+            yield from _ensure_station(ex, state, "crafting_table", radius, skill_name=self.name, landmark="village")
+            before_ga = state.count("golden_apple")
+            yield rec("craft", ex.craft("golden_apple", 1), item="golden_apple", count=1)
+            refresh_inventory(ex, state)
+            if state.count("golden_apple") <= before_ga:
+                raise Replan("合成 golden_apple 后背包未确认产出")
+            self._crafted_golden_apple = True
+        zv = (yield from _scan_sorted_entities_or_landmark(ex, state, ("zombie_villager",), radius, label="僵尸村民", pred="zombie_villager", wake_on="night", landmark="village"))[0]
         yield from _approach_entity(ex, state, zv, reach=ENTITY_EYE_REACH, max_distance=radius)
         splash_before = state.count("splash_potion")
         yield from use_item(ex, state, "splash_potion", target={"entity_id": zv["id"]}, verify=lambda _ev: state.count("splash_potion") < splash_before)
         apple_before = state.count("golden_apple")
         yield from use_item_on(ex, state, {"entity_id": zv["id"]}, "golden_apple", verify=lambda _ev: state.count("golden_apple") < apple_before)
         self._cured = True
-        yield rec("cure_zombie_villager_evidence", None, entity_id=zv["id"], golden_apple_consumed=True)
+        yield rec("cure_zombie_villager_evidence", None, entity_id=zv["id"], golden_apple_consumed=True, crafted_golden_apple=self._crafted_golden_apple)
 
     def verify_done(self, state, before_counts=None) -> str:
         if not self._cured:
             return "尚未完成僵尸村民治疗交互"
-        if before_counts is not None and "golden_apple" in before_counts and state.count("golden_apple") >= before_counts["golden_apple"]:
-            return "治疗后金苹果未确认消耗"
+        if before_counts is not None:
+            if not self._crafted_golden_apple and before_counts.get("golden_apple", 0) > 0 and state.count("golden_apple") >= before_counts["golden_apple"]:
+                return "治疗后金苹果未确认消耗"
+            if self._crafted_golden_apple and before_counts.get("gold_ingot", 0) >= 8 and state.count("gold_ingot") >= before_counts["gold_ingot"]:
+                return "合成并治疗后金锭未确认消耗"
         return ""

@@ -80,6 +80,7 @@ STAGE2_EXPECTED_IDS: tuple[str, ...] = (
     + BATCH_2D_IDS
     + BATCH_2E_IDS
     + BATCH_2F_IDS
+    + ("salvage_sherd", "obtain_sniffer_egg", "plant_any_sniffer_seed")
 )
 
 
@@ -95,12 +96,12 @@ class Stage2LedgerContractTests(unittest.TestCase):
         t0_t1 = [g for g in stage12 if g.tier in {"T0_PREP", "T1"}]
         t0_t1_scored = [g for g in t0_t1 if g.score > 0]
         stage2 = [g for g in stage12 if g.tier in {"T2", "T3"}]
-        self.assertEqual(len(stage12), 76)
+        self.assertEqual(len(stage12), 79)
         self.assertEqual(len(t0_t1), 26)
         self.assertEqual((len(t0_t1_scored), sum(g.score for g in t0_t1_scored)), (21, 290))
-        self.assertEqual(len(stage2), 50)
-        self.assertEqual(sum(g.score for g in stage2), 1435)
-        self.assertEqual(sum(g.score for g in stage12), 1725)
+        self.assertEqual(len(stage2), 53)
+        self.assertEqual(sum(g.score for g in stage2), 1510)
+        self.assertEqual(sum(g.score for g in stage12), 1800)
         self.assertEqual(tuple(g.id for g in stage2), STAGE2_EXPECTED_IDS)
 
         expected_batches = (
@@ -120,7 +121,7 @@ class Stage2LedgerContractTests(unittest.TestCase):
 
     def test_stage2_goals_preserve_draft_and_wip1_discipline(self):
         stage2 = [g for g in GOALS if g.tier in {"T2", "T3"}]
-        self.assertEqual(len(stage2), 50)
+        self.assertEqual(len(stage2), 53)
         for goal in stage2:
             with self.subTest(goal=goal.id):
                 self.assertEqual(goal.stage, "draft")
@@ -134,8 +135,8 @@ class Stage2LedgerContractTests(unittest.TestCase):
 
     def test_stage2_advancements_and_scores_match_draft_scores_v2(self):
         stage12_scored = [g for g in GOALS if g.tier in STAGE12_TIERS and g.score > 0]
-        self.assertEqual(len(stage12_scored), 71)
-        self.assertEqual(sum(g.score for g in stage12_scored), 1725)
+        self.assertEqual(len(stage12_scored), 74)
+        self.assertEqual(sum(g.score for g in stage12_scored), 1800)
 
         scored = [g for g in GOALS if g.score > 0]
         for goal in scored:

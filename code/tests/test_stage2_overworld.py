@@ -1,11 +1,14 @@
 """Stage 2 Batch 2C Overworld T2 Quick Wins 离线单测。"""
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import unittest
 
 from mcagent.client import ApiError
-from mcagent.runtime import EnvBlocked, Replan
+from mcagent.loop.goals import GOAL_MAP, rank_actionable_goals
+from mcagent.loop.policy import RulePlanner
+from mcagent.runtime import EnvBlocked, Replan, State
 from mcagent.skills import REGISTRY, contract_errors
 import mcagent.skills.t2_overworld as t2
 from mcagent.skills.t2_overworld import (
@@ -13,6 +16,7 @@ from mcagent.skills.t2_overworld import (
     SniperDuel, SummonIronGolem, TameAnimal,
 )
 from mcagent.skills.testing import GridWorld, drive
+from mcagent.skills.world_memo import memo_for, reset_all_world_memos
 
 
 def _flat_floor(x0=-5, x1=5, z0=-5, z1=5, y=63, block="stone"):
@@ -20,9 +24,9 @@ def _flat_floor(x0=-5, x1=5, z0=-5, z1=5, y=63, block="stone"):
 
 
 class OverworldTestWorld(GridWorld):
-    def __init__(self, pos=(0.5, 64.0, 0.5), blocks=None, items=None, entities=None):
+    def __init__(self, pos=(0.5, 64.0, 0.5), blocks=None, items=None, entities=None, dimension="overworld"):
         super().__init__(pos=pos, blocks=blocks, items=items)
-        self.st["dimension"] = "overworld"
+        self.st["dimension"] = dimension
         self.entities: list[dict] = list(entities or [])
         self.armor: dict[str, dict] = {}
         self.held: dict | None = None
@@ -31,6 +35,7 @@ class OverworldTestWorld(GridWorld):
         self.instant_golem: bool = False
         self.tame_after_feeds: int = 1
         self._feeds: dict[int, int] = {}
+        self._furnaces: dict[tuple[int, int, int], dict[str, list[dict]]] = {}
 
     def inventory(self, timeout=10):
         inv = super().inventory(timeout)
@@ -82,21 +87,132 @@ class OverworldTestWorld(GridWorld):
     def advancements(self, status="completed", include_recipes=False):
         return {"ready": True, "advancements": [{"id": a, "status": "completed"} for a in sorted(self.adv_completed)]}
 
+    def dig(self, pos, collect=True, *, stop_on=None):
+        self.calls.append(("dig", {"pos": list(pos)}))
+        dug = self.blocks.pop(tuple(pos), "air")
+        if dug in ("copper_ore", "deepslate_copper_ore") and collect:
+            self.items["raw_copper"] = self.items.get("raw_copper", 0) + 3
+        elif dug != "air" and collect:
+            self.items[dug] = self.items.get(dug, 0) + 1
+        return {"dug": dug}
+
     def craft(self, item, count=1, *, stop_on=None):
         self.calls.append(("craft", {"item": item, "count": count}))
+
+        def _take_any(names, qty):
+            if sum(self.items.get(n, 0) for n in names) < qty:
+                raise ApiError("missing_item", f"缺少 {names[0]}")
+            rem = qty
+            for n in names:
+                got = min(self.items.get(n, 0), rem)
+                if got:
+                    self.items[n] -= got
+                    rem -= got
+                if not rem:
+                    break
+
+        logs = ("oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "cherry_log", "mangrove_log", "pale_oak_log")
+        planks = ("oak_planks", "birch_planks", "spruce_planks", "jungle_planks", "acacia_planks", "dark_oak_planks", "cherry_planks", "mangrove_planks", "pale_oak_planks")
         if item == "iron_block":
-            need = 9 * count
-            if self.items.get("iron_ingot", 0) < need:
-                raise ApiError("missing_item", "缺少铁锭")
-            self.items["iron_ingot"] -= need
+            _take_any(("iron_ingot",), 9 * count)
             self.items["iron_block"] = self.items.get("iron_block", 0) + count
+        elif item == "copper_block":
+            _take_any(("copper_ingot",), 9 * count)
+            self.items["copper_block"] = self.items.get("copper_block", 0) + count
         elif item == "oak_sign":
-            if self.items.get("oak_planks", 0) < 6 * count or self.items.get("stick", 0) < count:
-                raise ApiError("missing_item", "缺少木板或木棍")
-            self.items["oak_planks"] -= 6 * count
-            self.items["stick"] -= count
+            _take_any(("oak_planks",), 6 * count)
+            _take_any(("stick",), count)
             self.items["oak_sign"] = self.items.get("oak_sign", 0) + 3 * count
+        elif item.endswith("_planks"):
+            log = item.removesuffix("_planks") + "_log"
+            _take_any((log,), count)
+            self.items[item] = self.items.get(item, 0) + 4 * count
+        elif item == "stick":
+            _take_any(planks, 2 * count)
+            self.items["stick"] = self.items.get("stick", 0) + 4 * count
+        elif item == "crafting_table":
+            _take_any(planks, 4 * count)
+            self.items["crafting_table"] = self.items.get("crafting_table", 0) + count
+        elif item == "campfire":
+            _take_any(logs, 3 * count)
+            _take_any(("stick",), 3 * count)
+            _take_any(("coal", "charcoal"), count)
+            self.items["campfire"] = self.items.get("campfire", 0) + count
+        elif item == "glass_bottle":
+            _take_any(("glass",), 3 * count)
+            self.items["glass_bottle"] = self.items.get("glass_bottle", 0) + 3 * count
+        elif item == "wooden_axe":
+            _take_any(planks, 3 * count)
+            _take_any(("stick",), 2 * count)
+            self.items["wooden_axe"] = self.items.get("wooden_axe", 0) + count
+        elif item == "brush":
+            _take_any(("copper_ingot",), count)
+            _take_any(("feather",), count)
+            _take_any(("stick",), count)
+            self.items["brush"] = self.items.get("brush", 0) + count
+        elif item == "leather_boots":
+            _take_any(("leather",), 4 * count)
+            self.items["leather_boots"] = self.items.get("leather_boots", 0) + count
+        elif item == "dried_ghast":
+            _take_any(("soul_sand",), count)
+            _take_any(("ghast_tear",), 8 * count)
+            self.items["dried_ghast"] = self.items.get("dried_ghast", 0) + count
+        elif item == "tripwire_hook":
+            _take_any(("iron_ingot",), count)
+            _take_any(("stick",), count)
+            _take_any(planks, count)
+            self.items["tripwire_hook"] = self.items.get("tripwire_hook", 0) + 2 * count
+        elif item == "crossbow":
+            _take_any(("stick",), 3 * count)
+            _take_any(("iron_ingot",), count)
+            _take_any(("string",), 2 * count)
+            _take_any(("tripwire_hook",), count)
+            self.items["crossbow"] = self.items.get("crossbow", 0) + count
         return {"crafted": item, "count": count}
+
+    def _furnace_at(self, pos):
+        key = tuple(pos)
+        return self._furnaces.setdefault(key, {"input": [], "fuel": [], "output": []})
+
+    def window_view(self, target, *, stop_on=None):
+        pos = tuple(target["pos"])
+        self.calls.append(("window_view", {"pos": list(pos)}))
+        kind = self.blocks.get(pos, "furnace")
+        sec = self._furnace_at(pos)
+        return {
+            "window": kind,
+            "target": kind,
+            "sections": {k: [dict(x) for x in v] for k, v in sec.items()},
+        }
+
+    def window_act(self, target, ops, *, stop_on=None):
+        pos = tuple(target["pos"])
+        self.calls.append(("window_act", {"pos": list(pos), "ops": ops}))
+        sec = self._furnace_at(pos)
+        done = []
+        for op in ops:
+            if op["op"] == "put":
+                item, cnt, to = op["item"], int(op["count"]), op["to"]
+                if self.items.get(item, 0) < cnt:
+                    raise ApiError("missing_item", f"缺少 {item}")
+                self.items[item] -= cnt
+                sec[to].append({"name": item, "count": cnt, "slot": 0})
+                done.append({"op": "put", "item": item, "count": cnt, "to": to})
+            elif op["op"] == "take":
+                frm = op["from"]
+                took = {}
+                for entry in list(sec[frm]):
+                    name, cnt = entry["name"], int(entry["count"])
+                    self.items[name] = self.items.get(name, 0) + cnt
+                    took[name] = took.get(name, 0) + cnt
+                sec[frm].clear()
+                done.append({"op": "take", "from": frm, "took": took})
+        if sec["input"] and sec["fuel"]:
+            for entry in list(sec["input"]):
+                if entry["name"] == "raw_copper":
+                    sec["output"].append({"name": "copper_ingot", "count": entry["count"], "slot": 2})
+            sec["input"].clear()
+        return {"ok": True, "done": done}
 
     def place(self, item, pos=None, *, stop_on=None):
         res = super().place(item, pos=pos, stop_on=stop_on)
@@ -132,6 +248,20 @@ class OverworldTestWorld(GridWorld):
                 if self._feeds[entity_id] >= self.tame_after_feeds:
                     ent["tamed"] = True
                 return {"changed": True, "tamed": bool(ent.get("tamed"))}
+        if item == "bucket" and pos is not None:
+            if self.blocks.get(tuple(pos)) == "water":
+                self.items["bucket"] -= 1
+                self.items["water_bucket"] = self.items.get("water_bucket", 0) + 1
+                return {"changed": True}
+        if item == "water_bucket" and pos is not None:
+            self.items["water_bucket"] -= 1
+            self.items["bucket"] = self.items.get("bucket", 0) + 1
+            self.blocks[(pos[0], pos[1] + 1, pos[2])] = "water"
+            return {"changed": True}
+        if item == "shears" and pos is not None:
+            if self.blocks.get(tuple(pos)) in ("bee_nest", "beehive"):
+                self.items["honeycomb"] = self.items.get("honeycomb", 0) + 3
+                return {"changed": True}
         if item == "glass_bottle" and pos is not None:
             self.items["glass_bottle"] -= 1
             self.items["honey_bottle"] = self.items.get("honey_bottle", 0) + 1
@@ -497,6 +627,266 @@ class BiomeQuickActionTests(unittest.TestCase):
         with self.assertRaises(EnvBlocked):
             ex2, st2 = OverworldTestWorld(blocks=_flat_floor(), items={"crossbow": 1, "arrow": 4}).session()
             drive(BiomeQuickAction(action="crossbow_pillager"), ex2, st2)
+
+
+class BiomePrepAndLandmarkTests(unittest.TestCase):
+    def setUp(self):
+        reset_all_world_memos()
+
+    def tearDown(self):
+        reset_all_world_memos()
+
+    def test_catch_axolotl_fills_empty_bucket_from_water_and_navigates_lush_caves(self):
+        blocks = _flat_floor(-4, 46, -4, 4)
+        blocks[(42, 63, 0)] = "water"
+        w = OverworldTestWorld(
+            blocks=blocks,
+            items={"bucket": 1},
+            entities=[{"id": 51, "name": "axolotl", "type": "animal", "pos": [41.5, 64.0, 0.5]}],
+        )
+        ex, st = w.session()
+        memo_for(st).record_biome("lush_caves", pos=[40, 64, 0], dimension="overworld")
+        skill = CatchAquaticMob(target="axolotl", radius=24)
+        drive(skill, ex, st)
+        interacts = [c[1] for c in w.calls if c[0] == "interact"]
+        self.assertEqual([it["item"] for it in interacts], ["bucket", "water_bucket"])
+        self.assertEqual(st.count("axolotl_bucket"), 1)
+        self.assertEqual(skill.verify_done(st, {"axolotl_bucket": 0}), "")
+
+        no_water = OverworldTestWorld(
+            blocks=_flat_floor(),
+            items={"bucket": 1},
+            entities=[{"id": 52, "name": "axolotl", "type": "animal", "pos": [2.5, 64.0, 0.5]}],
+        )
+        ex2, st2 = no_water.session()
+        with self.assertRaises(EnvBlocked):
+            drive(CatchAquaticMob(target="axolotl"), ex2, st2)
+
+    def test_honey_crafts_campfire_and_glass_bottle_via_bee_nest_landmark(self):
+        blocks = _flat_floor(-4, 46, -4, 4)
+        blocks[(2, 64, 0)] = "crafting_table"
+        blocks[(41, 64, 1)] = "crafting_table"
+        blocks[(42, 66, 0)] = "bee_nest"
+        w = OverworldTestWorld(blocks=blocks, items={"oak_log": 4, "coal": 1, "glass": 3})
+        ex, st = w.session()
+        memo_for(st).record_landmark("bee_nest", [40, 64, 0], dimension="overworld")
+        skill = HarvestHoneyAndWax(mode="honey", radius=24)
+        drive(skill, ex, st)
+        crafted = [c[1]["item"] for c in w.calls if c[0] == "craft"]
+        self.assertIn("glass_bottle", crafted)
+        self.assertIn("campfire", crafted)
+        ops = [(c[0], c[1].get("item"), c[1].get("pos")) for c in w.calls if c[0] in ("place", "interact")]
+        self.assertEqual(ops[0], ("place", "campfire", [42, 64, 0]))
+        self.assertEqual(ops[1], ("interact", "glass_bottle", [42, 66, 0]))
+        self.assertEqual(st.count("honey_bottle"), 1)
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_wax_on_shears_honeycomb_with_campfire_via_landmark_and_records_waxed_copper(self):
+        blocks = _flat_floor(-4, 46, -4, 4)
+        blocks[(42, 66, 0)] = "bee_nest"
+        w = OverworldTestWorld(blocks=blocks, items={"shears": 1, "campfire": 1, "copper_block": 1})
+        ex, st = w.session()
+        memo_for(st).record_landmark("bee_nest", [40, 64, 0], dimension="overworld")
+        skill = HarvestHoneyAndWax(mode="wax_on", radius=24)
+        drive(skill, ex, st)
+        ops = [(c[0], c[1].get("item")) for c in w.calls if c[0] in ("place", "interact")]
+        self.assertEqual(ops, [
+            ("place", "campfire"),
+            ("interact", "shears"),
+            ("place", "copper_block"),
+            ("interact", "honeycomb"),
+        ])
+        self.assertTrue(memo_for(st).has_landmark("waxed_copper", dimension="overworld"))
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_wax_on_mines_smelts_copper_ore_and_crafts_copper_block(self):
+        blocks = _flat_floor()
+        blocks[(2, 64, 0)] = "furnace"
+        blocks[(2, 64, 1)] = "crafting_table"
+        blocks[(3, 64, 0)] = "copper_ore"
+        blocks[(3, 64, 1)] = "copper_ore"
+        blocks[(3, 64, 2)] = "copper_ore"
+        w = OverworldTestWorld(blocks=blocks, items={"honeycomb": 1, "stone_pickaxe": 1, "coal": 2})
+        ex, st = w.session()
+        skill = HarvestHoneyAndWax(mode="wax_on")
+        drive(skill, ex, st)
+        self.assertEqual(sum(1 for c in w.calls if c[0] == "dig"), 3)
+        self.assertTrue(any(c[0] == "window_act" for c in w.calls))
+        self.assertTrue(any(c[0] == "craft" and c[1]["item"] == "copper_block" for c in w.calls))
+        self.assertTrue(any(v == "waxed_copper_block" for v in w.blocks.values()))
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_wax_off_crafts_wooden_axe_and_navigates_to_waxed_copper_landmark(self):
+        blocks = _flat_floor(-4, 46, -4, 4)
+        blocks[(2, 64, 0)] = "crafting_table"
+        blocks[(42, 64, 0)] = "waxed_copper_block"
+        w = OverworldTestWorld(blocks=blocks, items={"oak_log": 2})
+        ex, st = w.session()
+        memo_for(st).record_landmark("waxed_copper", [40, 64, 0], dimension="overworld")
+        skill = HarvestHoneyAndWax(mode="wax_off", radius=24)
+        drive(skill, ex, st)
+        self.assertTrue(any(c[0] == "craft" and c[1]["item"] == "wooden_axe" for c in w.calls))
+        self.assertEqual(w.blocks[(42, 64, 0)], "copper_block")
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_brush_armadillo_crafts_brush_from_copper_feather_stick(self):
+        blocks = _flat_floor()
+        blocks[(2, 64, 0)] = "crafting_table"
+        w = OverworldTestWorld(
+            blocks=blocks,
+            items={"copper_ingot": 1, "feather": 1, "stick": 1},
+            entities=[{"id": 61, "name": "armadillo", "type": "animal", "pos": [2.5, 64.0, 1.5]}],
+        )
+        ex, st = w.session()
+        skill = BiomeQuickAction(action="brush_armadillo")
+        drive(skill, ex, st)
+        self.assertTrue(any(c[0] == "craft" and c[1]["item"] == "brush" for c in w.calls))
+        self.assertEqual(st.count("armadillo_scute"), 1)
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_powder_snow_crafts_leather_boots_from_four_leather_and_equips(self):
+        blocks = _flat_floor()
+        blocks[(2, 64, 1)] = "crafting_table"
+        blocks[(2, 63, 0)] = "powder_snow"
+        w = OverworldTestWorld(blocks=blocks, items={"leather": 4})
+        ex, st = w.session()
+        skill = BiomeQuickAction(action="powder_snow")
+        drive(skill, ex, st)
+        ops = [c[0] for c in w.calls if c[0] in ("craft", "equip", "move_to")]
+        self.assertEqual(ops[0], "craft")
+        self.assertEqual(ops[1], "equip")
+        self.assertEqual(ops[-1], "move_to")
+        self.assertEqual(w.armor.get("feet", {}).get("name"), "leather_boots")
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_dried_ghast_nether_harvest_and_dimension_guard(self):
+        blocks = _flat_floor(-4, 46, -4, 4, block="soul_sand")
+        blocks[(42, 64, 0)] = "dried_ghast"
+        w_nether = OverworldTestWorld(blocks=blocks, items={}, dimension="the_nether")
+        ex, st = w_nether.session()
+        memo_for(st).record_biome("soul_sand_valley", pos=[40, 64, 0], dimension="the_nether")
+        skill = BiomeQuickAction(action="dried_ghast", radius=24)
+        self.assertEqual(BiomeQuickAction.blocked(st), "")
+        self.assertTrue(skill.can_start(st))
+        drive(skill, ex, st)
+        self.assertEqual(st.count("dried_ghast"), 1)
+        self.assertTrue(any(c[0] == "dig" and c[1]["pos"] == [42, 64, 0] for c in w_nether.calls))
+        self.assertEqual(skill.verify_done(st, {"dried_ghast": 0}), "")
+
+        # Already holding dried_ghast in Nether -> EnvBlocked until Overworld
+        with self.assertRaises(EnvBlocked) as ctx:
+            drive(BiomeQuickAction(action="dried_ghast", radius=24), ex, st)
+        self.assertEqual(ctx.exception.missing_predicate, "dimension:overworld")
+
+    def test_dried_ghast_overworld_crafts_recipe_and_places_directly_into_water(self):
+        blocks = _flat_floor()
+        blocks[(2, 64, 0)] = "crafting_table"
+        blocks[(2, 63, 1)] = "water"
+        w = OverworldTestWorld(blocks=blocks, items={"soul_sand": 1, "ghast_tear": 8}, dimension="overworld")
+        ex, st = w.session()
+        skill = BiomeQuickAction(action="dried_ghast")
+        drive(skill, ex, st)
+        self.assertTrue(any(c[0] == "craft" and c[1]["item"] == "dried_ghast" for c in w.calls))
+        places = [c[1] for c in w.calls if c[0] == "place" and c[1]["item"] == "dried_ghast"]
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["pos"], [2, 63, 1])
+        self.assertEqual(skill.verify_done(st), "")
+
+        # Overworld without item or recipe -> cannot start
+        empty_ow = OverworldTestWorld(blocks=_flat_floor(), items={}, dimension="overworld")
+        _, st_empty = empty_ow.session()
+        self.assertFalse(BiomeQuickAction(action="dried_ghast").can_start(st_empty))
+
+    def test_crossbow_pillager_crafts_crossbow_when_materials_present(self):
+        blocks = _flat_floor(-4, 20, -4, 4)
+        blocks[(2, 64, 1)] = "crafting_table"
+        pillager = {"id": 71, "name": "pillager", "type": "hostile", "pos": [15.5, 64.0, 0.5]}
+        w = OverworldTestWorld(
+            blocks=blocks,
+            items={"iron_ingot": 2, "string": 2, "stick": 4, "oak_planks": 1, "arrow": 4},
+            entities=[pillager],
+        )
+        ex, st = w.session()
+        skill = BiomeQuickAction(action="crossbow_pillager")
+        drive(skill, ex, st)
+        crafted = [c[1]["item"] for c in w.calls if c[0] == "craft"]
+        self.assertEqual(crafted, ["tripwire_hook", "crossbow"])
+        self.assertEqual(len([c for c in w.calls if c[0] == "shoot"]), 1)
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_sightline_repositions_around_wall_blocking_copper_block(self):
+        blocks = _flat_floor()
+        # Solid wall across x=1 blocks LOS from (0.5, 64, 0.5) to (2, 64, 0)
+        for z in (-1, 0, 1):
+            for y in (64, 65, 66):
+                blocks[(1, y, z)] = "stone"
+        blocks[(2, 64, 0)] = "copper_block"
+        w = OverworldTestWorld(blocks=blocks, items={"honeycomb": 1})
+        ex, st = w.session()
+        skill = HarvestHoneyAndWax(mode="wax_on")
+        drive(skill, ex, st)
+        self.assertTrue(any(c[0] == "move_to" for c in w.calls))
+        self.assertEqual(w.blocks[(2, 64, 0)], "waxed_copper_block")
+        self.assertEqual(skill.verify_done(st), "")
+
+    def test_nine_biome_goals_prereqs_fallbacks_and_planner_expansion(self):
+        nine_ids = (
+            "axolotl_in_a_bucket",
+            "safely_harvest_honey",
+            "wax_on",
+            "wax_off",
+            "avoid_vibration",
+            "brush_armadillo",
+            "walk_on_powder_snow_with_leather_boots",
+            "place_dried_ghast_in_water",
+            "whos_the_pillager_now",
+        )
+        for gid in nine_ids:
+            self.assertEqual(GOAL_MAP[gid].stage, "draft", gid)
+            self.assertTrue(GOAL_MAP[gid].requires_landmarks, gid)
+
+        # axolotl_in_a_bucket: with iron_ingot=3 (no bucket) -> expands to craft_iron_gear(bucket)
+        st_axo = State()
+        st_axo.set_status({"ready": True, "alive": True, "health": 20, "food": 20, "dimension": "overworld", "pos": [0.5, 64.0, 0.5]})
+        st_axo.set_inventory({"items": [{"name": "iron_ingot", "count": 3, "slot": 0}]})
+        memo_for(st_axo).record_biome("lush_caves", pos=[30, 64, 0], dimension="overworld")
+        rp_axo = RulePlanner(REGISTRY, ledger=(replace(GOAL_MAP["axolotl_in_a_bucket"], stage="graduated"),), include_stages=("graduated",), min_verified="offline")
+        rp_axo.completed_advancements.add("minecraft:story/smelt_iron")
+        sk_axo, _ = rp_axo.expand_objective_skill(st_axo)
+        self.assertIsNotNone(sk_axo)
+        self.assertEqual(sk_axo.name, "craft_iron_gear")
+        self.assertEqual(sk_axo.args["item"], "bucket")
+
+        # wax_on: with iron_ingot=2 (no honeycomb/shears) -> expands to craft_iron_gear(shears)
+        st_wax = State()
+        st_wax.set_status({"ready": True, "alive": True, "health": 20, "food": 20, "dimension": "overworld", "pos": [0.5, 64.0, 0.5]})
+        st_wax.set_inventory({"items": [{"name": "iron_ingot", "count": 2, "slot": 0}, {"name": "oak_log", "count": 3, "slot": 1}]})
+        memo_for(st_wax).record_landmark("bee_nest", [30, 66, 0], dimension="overworld")
+        rp_wax = RulePlanner(REGISTRY, ledger=(replace(GOAL_MAP["wax_on"], stage="graduated"),), include_stages=("graduated",), min_verified="offline")
+        sk_wax, _ = rp_wax.expand_objective_skill(st_wax)
+        self.assertIsNotNone(sk_wax)
+        self.assertEqual(sk_wax.name, "craft_iron_gear")
+        self.assertEqual(sk_wax.args["item"], "shears")
+
+        # brush_armadillo & powder_snow: filtered out when lacking items, actionable once materials present
+        st_empty = State()
+        st_empty.set_status({"ready": True, "alive": True, "health": 20, "food": 20, "dimension": "overworld", "pos": [0.5, 64.0, 0.5]})
+        st_empty.set_inventory({"items": []})
+        memo_for(st_empty).record_biome("savanna", pos=[20, 64, 0], dimension="overworld")
+        memo_for(st_empty).record_landmark("powder_snow", [20, 64, 0], dimension="overworld")
+        g_pair = (
+            replace(GOAL_MAP["brush_armadillo"], stage="graduated"),
+            replace(GOAL_MAP["walk_on_powder_snow_with_leather_boots"], stage="graduated"),
+        )
+        self.assertEqual(rank_actionable_goals(st_empty, g_pair), [])
+
+        st_empty.set_inventory({"items": [
+            {"name": "copper_ingot", "count": 1, "slot": 0},
+            {"name": "feather", "count": 1, "slot": 1},
+            {"name": "stick", "count": 1, "slot": 2},
+            {"name": "leather", "count": 4, "slot": 3},
+        ]})
+        self.assertEqual(len(rank_actionable_goals(st_empty, g_pair)), 2)
 
 
 if __name__ == "__main__":

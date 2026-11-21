@@ -89,9 +89,9 @@ class DraftPoolAndContextTests(unittest.TestCase):
 
     def test_ledger_wip1_discipline_and_totals_preserved(self) -> None:
         # 不改 goals.py 既有 stage 标记，严格保持 WIP=1（唯一 candidate 为 smelt_iron）
-        self.assertEqual(len(GOALS), 104)
-        self.assertEqual(sum(1 for g in GOALS if g.score > 0), 89)
-        self.assertEqual(sum(g.score for g in GOALS), 2730)
+        self.assertEqual(len(GOALS), 109)
+        self.assertEqual(sum(1 for g in GOALS if g.score > 0), 94)
+        self.assertEqual(sum(g.score for g in GOALS), 2925)
         self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
 
     def test_cli_include_draft_and_goal_stages_parsing(self) -> None:
@@ -104,10 +104,10 @@ class DraftPoolAndContextTests(unittest.TestCase):
         self.assertIsNone(loop_main.resolve_cli_include_stages(args_default))
         self.assertEqual(len(RulePlanner(min_verified="offline").active_goals), 7)
 
-        # --include-draft -> 全 4 阶段 GOAL_STAGES（104 项）
+        # --include-draft -> 全 4 阶段 GOAL_STAGES（109 项）
         args_draft = parser.parse_args(["--include-draft"])
         self.assertEqual(loop_main.resolve_cli_include_stages(args_draft), GOAL_STAGES)
-        self.assertEqual(len(RulePlanner(min_verified="offline", include_stages=GOAL_STAGES).active_goals), 104)
+        self.assertEqual(len(RulePlanner(min_verified="offline", include_stages=GOAL_STAGES).active_goals), 109)
 
         # --goal-stages 合法逗号枚举 + 去重；与 --include-draft 合并
         args_custom = parser.parse_args(["--goal-stages", "candidate, graduated, candidate"])
@@ -134,7 +134,7 @@ class DraftPoolAndContextTests(unittest.TestCase):
             rc_draft = loop_main.main(["--dry", "--strategy", "llm", "--min-verified", "offline", "--include-draft"])
         self.assertEqual(rc_draft, 0)
         txt = out_draft.getvalue()
-        self.assertIn("共 104 项（已激活 104 项）", txt)
+        self.assertIn("共 109 项（已激活 109 项）", txt)
         self.assertIn("strategy=llm", txt)
 
         # 构造带真实坐标的满台账上下文，验证严格 <= 2000 字、零裸坐标、按边际 ROI 截断 Top-K 且保留挂起区

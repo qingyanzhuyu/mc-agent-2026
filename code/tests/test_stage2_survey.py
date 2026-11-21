@@ -722,6 +722,134 @@ class DiscoverStructureSkillTests(unittest.TestCase):
             drive(DiscoverStructure(structure="nether_fortress", radius=32), ex_ne, st_ne)
         self.assertEqual(caught_ne.exception.wake_on, "chunk_moved")
 
+    def test_discover_stronghold_ender_eye_triangulation_end_to_end_and_fallback(self) -> None:
+        target_x, target_z = 110.5, 80.5
+
+        class _EnderEyeWorld(_SurveyGridWorld):
+            def __init__(self, *, parallel: bool = False, **kw: Any) -> None:
+                super().__init__(**kw)
+                self.parallel = parallel
+                self.eye_throws: list[tuple[float, float, float]] = []
+
+            def get_block(self, pos) -> dict:
+                cell = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
+                if cell in self.blocks:
+                    return {"name": self.blocks[cell]}
+                return {"name": "grass_block" if cell[1] == 63 else "air"}
+
+            def use_item(self, item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None) -> dict:
+                self.calls.append(("use_item", {"item": item, "target": target}))
+                self._need(item)
+                self.items[item] -= 1
+                px, _, pz = self.st["pos"]
+                yaw = 0.0 if self.parallel else math.degrees(math.atan2(-(target_x - px), target_z - pz))
+                self.eye_throws.append((px, pz, yaw))
+                return {"used": item, "thrown": True, "bearing_deg": yaw}
+
+        # Case 1: >=2 ender_eye + distant stronghold (outside 48-block radius) -> triangulates & finds stronghold
+        stronghold_blocks = {
+            (110, 63, 80): "end_portal_frame",
+            (111, 63, 80): "stone_bricks",
+        }
+        w_ok = _EnderEyeWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=stronghold_blocks,
+            items={"ender_eye": 3, "stone_pickaxe": 1},
+            dimension="overworld",
+            biome="plains",
+        )
+        ex_ok, st_ok = w_ok.session()
+        skill_ok = DiscoverStructure(structure="stronghold", radius=48)
+        drive(skill_ok, ex_ok, st_ok)
+
+        self.assertEqual(len(w_ok.eye_throws), 2)
+        baseline = math.hypot(
+            w_ok.eye_throws[1][0] - w_ok.eye_throws[0][0],
+            w_ok.eye_throws[1][1] - w_ok.eye_throws[0][1],
+        )
+        self.assertGreaterEqual(baseline, 16.0)
+        self.assertTrue(memo_for(st_ok).has_landmark("stronghold", dimension="overworld"))
+        self.assertLessEqual(math.hypot(w_ok.st["pos"][0] - target_x, w_ok.st["pos"][2] - target_z), 10.0)
+        self.assertEqual(skill_ok.verify_done(st_ok), "")
+
+        # Case 2: parallel bearings -> resolve_eye_bearings returns None -> gracefully falls back to sector scan
+        w_par = _EnderEyeWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={},
+            items={"ender_eye": 2, "stone_pickaxe": 1},
+            dimension="overworld",
+            biome="plains",
+            parallel=True,
+        )
+        ex_par, st_par = w_par.session()
+        with self.assertRaises(EnvBlocked) as caught:
+            drive(DiscoverStructure(structure="stronghold", radius=32), ex_par, st_par)
+        self.assertEqual(caught.exception.missing_predicate, "structure:stronghold")
+        self.assertEqual(len(w_par.eye_throws), 2)
+        self.assertGreaterEqual(len(w_par.move_calls), 2)
+
+    def test_discover_nether_biomes_multi_round_spiral_no_repeat_and_avoids_hazards(self) -> None:
+        # Procedural Nether terrain: lava sea at +X dist=48 (x in [44,54]), magma patch at +Z dist=48,
+        # sheer cliff at -X dist=48, and warped_forest far out in ring 1 (r >= 85) so Round 1 & 2 must advance spiral cursor!
+        lava_zone = {(x, 63, z) for x in range(44, 55) for z in range(-6, 7)}
+        magma_zone = {(x, 63, z) for x in range(-6, 7) for z in range(44, 55)}
+        cliff_zone = {(x, 63, z) for x in range(-54, -43) for z in range(-6, 7)}
+
+        class _LargeNetherWorld(_SurveyGridWorld):
+            def get_block(self, pos) -> dict:
+                cell = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
+                if cell in self.blocks:
+                    return {"name": self.blocks[cell]}
+                if (cell[0], 63, cell[2]) in lava_zone:
+                    return {"name": "lava" if cell[1] == 63 else "air"}
+                if (cell[0], 63, cell[2]) in magma_zone:
+                    return {"name": "magma_block" if cell[1] == 63 else "air"}
+                if (cell[0], 63, cell[2]) in cliff_zone:
+                    return {"name": "air"}
+                return {"name": "netherrack" if cell[1] == 63 else "air"}
+
+        def biome_by_pos(pos: list[float]) -> str:
+            return "warped_forest" if math.hypot(pos[0], pos[2]) >= 85.0 else "nether_wastes"
+
+        world = _LargeNetherWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={},
+            dimension="the_nether",
+            biome_fn=biome_by_pos,
+        )
+        ex, state = world.session()
+        memo = memo_for(state)
+        memo.record_biome("nether_wastes", pos=world.st["pos"], dimension="the_nether")
+
+        # Round 1: sweeps ring 0 sectors 0..3 -> raises EnvBlocked, advances cursor to sector 4
+        with self.assertRaises(EnvBlocked):
+            drive(DiscoverStructure(structure="nether_biomes", radius=48), ex, state)
+        cur_after_r1 = memo.get_spiral_cursor(dimension="the_nether")
+        self.assertEqual((cur_after_r1["ring"], cur_after_r1["sector"]), (0, 4))
+        self.assertTrue(memo.void_edges(dimension="the_nether"))
+
+        # Round 2: sweeps ring 0 sectors 4..7 (does NOT repeat 0..3) -> advances cursor to ring 1 (radius=96)
+        moves_before_r2 = len(world.move_calls)
+        with self.assertRaises(EnvBlocked):
+            drive(DiscoverStructure(structure="nether_biomes", radius=48), ex, state)
+        cur_after_r2 = memo.get_spiral_cursor(dimension="the_nether")
+        self.assertEqual((cur_after_r2["ring"], cur_after_r2["sector"]), (1, 0))
+        self.assertGreater(len(world.move_calls), moves_before_r2)
+
+        # Round 3: ring 1 (radius=96) reaches >= 85 blocks and discovers warped_forest!
+        skill_r3 = DiscoverStructure(structure="nether_biomes", radius=48)
+        drive(skill_r3, ex, state)
+        self.assertIn("warped_forest", memo.biomes(dimension="the_nether"))
+        self.assertEqual(skill_r3.verify_done(state), "")
+
+        # Verify no waypoint ever landed on or directly adjacent to lava / magma / cliff
+        for dest in world.move_calls:
+            wx, wy, wz = math.floor(dest[0]), math.floor(dest[1]), math.floor(dest[2])
+            self.assertEqual(world.get_block([wx, wy - 1, wz])["name"], "netherrack")
+            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nb = world.get_block([wx + dx, wy - 1, wz + dz])["name"]
+                self.assertNotIn(nb, ("lava", "flowing_lava", "magma_block"))
+
 
 if __name__ == "__main__":
     unittest.main()

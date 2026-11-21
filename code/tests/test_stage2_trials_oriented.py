@@ -6,6 +6,7 @@ import unittest
 from copy import deepcopy
 
 from mcagent.client import ApiError
+from mcagent.loop.goals import GOAL_MAP, check_item_expr
 from mcagent.runtime import EnvBlocked, Replan, State
 from mcagent.skills.registry import REGISTRY, contract_errors
 from mcagent.skills.scripted_world import ScriptedWorld
@@ -21,6 +22,7 @@ from mcagent.skills.t2_trials_oriented import (
 )
 from mcagent.skills.testing import GridWorld, drive
 from mcagent.skills.voxel_cache import reset_all_voxel_caches
+from mcagent.skills.world_memo import memo_for, reset_all_world_memos
 
 _SKILLS = (
     UnlockTrialVault,
@@ -62,7 +64,7 @@ def _run_gen(gen, ex, state=None):
 class TrialsWorld(ScriptedWorld):
     """支持方块属性、朝向模拟、红石通电、铜灯刮氧化、试炼怪与风弹弹跳的离线夹具。"""
 
-    def __init__(self, pos=(0.5, 64.0, 0.5), *, blocks=None, items=None, entities=None, block_props=None, hp=20.0):
+    def __init__(self, pos=(0.5, 64.0, 0.5), *, blocks=None, items=None, item_meta=None, entities=None, block_props=None, hp=20.0):
         floor = _flat_floor()
         if blocks:
             floor.update({tuple(k): v for k, v in blocks.items()})
@@ -70,10 +72,14 @@ class TrialsWorld(ScriptedWorld):
         self.st.update(dimension="overworld", health=hp)
         self.entities: list[dict] = [deepcopy(e) for e in (entities or ())]
         self.block_props: dict[tuple[int, int, int], dict] = {tuple(k): dict(v) for k, v in (block_props or {}).items()}
+        self.item_meta: dict[str, dict] = {k: deepcopy(v) for k, v in (item_meta or {}).items()}
         self.held: dict | None = None
         self.place_props_fn = None
         self.status_y_seq: list[float] = []
         self.kill_damage: float = 0.0
+        self.on_attack_fn = None
+        self.resin_per_dig: int = 3
+        self.silk_required_for_heart: bool = False
 
     def status(self, timeout=10):
         if self.status_y_seq:
@@ -81,9 +87,16 @@ class TrialsWorld(ScriptedWorld):
         return super().status(timeout=timeout)
 
     def inventory(self, timeout=10):
-        inv = super().inventory(timeout=timeout)
+        rows = []
+        for i, (n, c) in enumerate(self.items.items()):
+            if c > 0:
+                row = {"name": n, "count": c, "slot": i}
+                if n in self.item_meta:
+                    row.update(deepcopy(self.item_meta[n]))
+                rows.append(row)
+        inv: dict = {"items": rows}
         if self.held:
-            inv["held"] = dict(self.held)
+            inv["held"] = deepcopy(self.held)
         return inv
 
     def get_block(self, pos):
@@ -126,7 +139,7 @@ class TrialsWorld(ScriptedWorld):
     def equip(self, item, slot="hand", *, stop_on=None):
         res = GridWorld.equip(self, item, slot=slot, stop_on=stop_on)
         if slot == "hand":
-            self.held = {"name": item, "count": self.items[item]}
+            self.held = {"name": item, "count": self.items[item], **deepcopy(self.item_meta.get(item, {}))}
         return res
 
     def _default_place_props(self, item: str, cell: tuple[int, int, int]) -> dict:
@@ -150,10 +163,49 @@ class TrialsWorld(ScriptedWorld):
             self.block_props[cell] = dict(props)
         return res
 
+    def _held_has_silk(self) -> bool:
+        if not self.held or self.held.get("name") in ("book", "enchanted_book"):
+            return False
+        enchs = self.held.get("enchantments") or ()
+        return any(isinstance(e, dict) and e.get("name") == "silk_touch" and int(e.get("level", 0)) > 0 for e in enchs)
+
     def dig(self, pos, collect=True, *, stop_on=None):
+        self.calls.append(("dig", {"pos": list(pos)}))
         cell = tuple(int(v) for v in pos)
         self.block_props.pop(cell, None)
-        return GridWorld.dig(self, pos, collect=collect, stop_on=stop_on)
+        dug = self.blocks.pop(cell, "air")
+        if dug != "air" and collect:
+            if dug == "creaking_heart":
+                if not self.silk_required_for_heart or self._held_has_silk():
+                    self.items["creaking_heart"] = self.items.get("creaking_heart", 0) + 1
+                else:
+                    self.items["resin_clump"] = self.items.get("resin_clump", 0) + self.resin_per_dig
+            elif dug == "resin_clump":
+                self.items["resin_clump"] = self.items.get("resin_clump", 0) + self.resin_per_dig
+            else:
+                self.items[dug] = self.items.get(dug, 0) + 1
+        return {"dug": dug}
+
+    def craft(self, item, count=1, *, stop_on=None):
+        self.calls.append(("craft", {"item": item, "count": count}))
+        recipes = {
+            "wind_charge": ((("breeze_rod", 1),), 4),
+            "resin_block": ((("resin_clump", 9),), 1),
+            "creaking_heart": ((("resin_block", 1), ("pale_oak_log", 2)), 1),
+            "lever": ((("stick", 1), ("cobblestone", 1)), 1),
+            "stone_button": ((("stone", 1),), 1),
+            "oak_button": ((("oak_planks", 1),), 1),
+        }
+        if item not in recipes:
+            raise ApiError("missing_recipe", f"未知测试配方 {item}")
+        ings, out_qty = recipes[item]
+        for ing, need in ings:
+            if self.items.get(ing, 0) < need * count:
+                raise ApiError("missing_item", f"合成 {item} 缺少 {ing}")
+        for ing, need in ings:
+            self.items[ing] -= need * count
+        self.items[item] = self.items.get(item, 0) + out_qty * count
+        return {"crafted": item, "count": out_qty * count}
 
     def interact(self, pos=None, entity_id=None, item=None, *, stop_on=None):
         self.calls.append(("interact", {"pos": pos, "entity_id": entity_id, "item": item}))
@@ -199,9 +251,12 @@ class TrialsWorld(ScriptedWorld):
 
     def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None):
         self.calls.append(("attack", {"entity_id": entity_id}))
+        victim = next((e for e in self.entities if e["id"] == entity_id), None)
         self.entities = [e for e in self.entities if e["id"] != entity_id]
         if self.kill_damage:
             self.st["health"] = max(0.0, float(self.st["health"]) - self.kill_damage)
+        if self.on_attack_fn and victim is not None:
+            self.on_attack_fn(self, victim)
         return {"killed": True, "entity_id": entity_id}
 
 
@@ -383,15 +438,73 @@ class UnlockTrialVaultTests(unittest.TestCase):
         self.assertEqual(skill.verify_done(state), "")
 
     def test_missing_vault_raises_env_blocked(self):
+        reset_all_world_memos()
         world = TrialsWorld(items={"trial_key": 1})
         ex, state = world.session()
         with self.assertRaises(EnvBlocked):
             drive(UnlockTrialVault(radius=16), ex, state)
 
+    def test_navigates_to_remote_trial_chambers_anchor_and_unlocks_vault(self):
+        reset_all_world_memos()
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        blocks[(62, 64, 0)] = "vault"
+        world = TrialsWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            block_props={(62, 64, 0): {"vault_state": "active", "ominous": "false"}},
+            items={"trial_key": 1},
+        )
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", [60, 64, 0], dimension="overworld")
+        skill = UnlockTrialVault(radius=16, clear_wave=True)
+        steps = drive(skill, ex, state)
+        self.assertTrue(any(s["op"] == "move_to" and s.get("landmark") == "trial_chambers" for s in steps))
+        self.assertEqual(world.items["trial_key"], 0)
+        self.assertEqual(world.block_props[(62, 64, 0)]["vault_state"], "unlocking")
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_farms_trial_spawner_key_when_no_key_in_bag(self):
+        reset_all_world_memos()
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        blocks[(61, 64, 0)] = "trial_spawner"
+        blocks[(63, 64, 0)] = "vault"
+        world = TrialsWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            block_props={(63, 64, 0): {"vault_state": "active", "ominous": "false"}},
+            items={"iron_sword": 1},
+            entities=[{"id": 15, "type": "hostile", "name": "bogged", "pos": [61.5, 64.0, 1.5], "health": 16}],
+        )
+        world.on_attack_fn = lambda w, v: w.items.__setitem__("trial_key", w.items.get("trial_key", 0) + 1)
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", [60, 64, 0], dimension="overworld")
+        self.assertEqual(UnlockTrialVault.blocked(state), "")
+        skill = UnlockTrialVault(radius=16, clear_wave=True)
+        steps = drive(skill, ex, state)
+        self.assertTrue(any(s["op"] == "attack" for s in steps))
+        self.assertTrue(any(s["op"] == "interact" and s.get("item") == "trial_key" for s in steps))
+        self.assertEqual(world.block_props[(63, 64, 0)]["vault_state"], "unlocking")
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_farm_trial_spawner_without_key_drop_raises_env_blocked(self):
+        reset_all_world_memos()
+        world = TrialsWorld(
+            blocks={(2, 64, 0): "trial_spawner", (4, 64, 0): "vault"},
+            items={"iron_sword": 1},
+            entities=[{"id": 16, "type": "hostile", "name": "bogged", "pos": [2.5, 64.0, 1.5], "health": 16}],
+        )
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", [2, 64, 0], dimension="overworld")
+        with self.assertRaises(EnvBlocked) as ctx:
+            drive(UnlockTrialVault(radius=16), ex, state)
+        self.assertEqual(ctx.exception.missing_predicate, "item:trial_key")
+        self.assertFalse(check_item_expr(State(), GOAL_MAP["under_lock_and_key"].prereq_items[0]))
+
 
 class WindChargeBounceTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_bounce_reaches_target_dy(self):
         world = TrialsWorld(pos=(0.5, 64.0, 0.5), items={"wind_charge": 2}, hp=20.0)
@@ -401,6 +514,72 @@ class WindChargeBounceTests(unittest.TestCase):
         steps = drive(skill, ex, state)
         self.assertEqual([s["op"] for s in steps], ["use_item"])
         self.assertEqual(steps[0]["target"], {"pos": [0.5, 63.5, 0.5]})
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_crafts_wind_charge_from_breeze_rod_then_bounces(self):
+        world = TrialsWorld(pos=(0.5, 64.0, 0.5), items={"breeze_rod": 1}, hp=20.0)
+        ex, state = world.session()
+        self.assertEqual(WindChargeBounce.blocked(state), "")
+        orig_use_item = world.use_item
+
+        def use_and_bounce(item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None):
+            res = orig_use_item(item, target=target, ms=ms, timeout_ms=timeout_ms, source=source, stop_on=stop_on)
+            world.status_y_seq = [68.0, 72.0]
+            return res
+
+        world.use_item = use_and_bounce
+        skill = WindChargeBounce(target_dy=7)
+        steps = drive(skill, ex, state)
+        self.assertEqual([s["op"] for s in steps], ["craft", "use_item"])
+        self.assertEqual(world.items["breeze_rod"], 0)
+        self.assertEqual(world.items["wind_charge"], 3)
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_hunts_breeze_at_trial_chambers_crafts_wind_charge_and_bounces(self):
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        world = TrialsWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"iron_sword": 1},
+            entities=[{"id": 25, "type": "hostile", "name": "breeze", "pos": [61.5, 64.0, 0.5], "health": 30}],
+        )
+        world.on_attack_fn = lambda w, v: w.items.__setitem__("breeze_rod", w.items.get("breeze_rod", 0) + 1)
+        orig_use_item = world.use_item
+
+        def use_and_bounce(item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None):
+            res = orig_use_item(item, target=target, ms=ms, timeout_ms=timeout_ms, source=source, stop_on=stop_on)
+            world.status_y_seq = [68.5, 72.5]
+            return res
+
+        world.use_item = use_and_bounce
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", [60, 64, 0], dimension="overworld")
+        skill = WindChargeBounce(target_dy=7)
+        steps = drive(skill, ex, state)
+        ops = [s["op"] for s in steps]
+        self.assertIn("move_to", ops)
+        self.assertIn("attack", ops)
+        self.assertIn("craft", ops)
+        self.assertIn("use_item", ops)
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_low_ceiling_navigates_to_trial_chambers_anchor_with_clear_headroom(self):
+        blocks = _flat_floor(x0=46, x1=56, z0=-5, z1=5)
+        blocks[(0, 68, 0)] = "stone"
+        world = TrialsWorld(pos=(0.5, 64.0, 0.5), blocks=blocks, items={"wind_charge": 1}, hp=20.0)
+        orig_use_item = world.use_item
+
+        def use_and_bounce(item, target=None, ms=None, timeout_ms=None, source=None, *, stop_on=None):
+            res = orig_use_item(item, target=target, ms=ms, timeout_ms=timeout_ms, source=source, stop_on=stop_on)
+            world.status_y_seq = [69.0, 72.0]
+            return res
+
+        world.use_item = use_and_bounce
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", [50, 64, 0], dimension="overworld")
+        skill = WindChargeBounce(target_dy=7)
+        steps = drive(skill, ex, state)
+        self.assertEqual([s["op"] for s in steps], ["move_to", "use_item"])
         self.assertEqual(skill.verify_done(state), "")
 
     def test_bounce_insufficient_height_raises_replan(self):
@@ -421,6 +600,7 @@ class WindChargeBounceTests(unittest.TestCase):
 class ScrapeLitCopperBulbTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_powers_unlit_bulb_then_scrapes(self):
         world = TrialsWorld(
@@ -434,6 +614,27 @@ class ScrapeLitCopperBulbTests(unittest.TestCase):
         self.assertIn("place", [s["op"] for s in steps])
         self.assertEqual(world.blocks[(2, 64, 0)], "weathered_copper_bulb")
         self.assertEqual(world.block_props[(2, 64, 0)]["lit"], "true")
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_navigates_to_remote_trial_chambers_anchor_and_auto_crafts_lever(self):
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        blocks[(62, 64, 0)] = "oxidized_copper_bulb"
+        world = TrialsWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            block_props={(62, 64, 0): {"lit": "false"}},
+            items={"iron_axe": 1, "stick": 1, "cobblestone": 1},
+        )
+        ex, state = world.session()
+        memo_for(state).record_landmark("trial_chambers", [60, 64, 0], dimension="overworld")
+        skill = ScrapeLitCopperBulb(radius=16)
+        steps = drive(skill, ex, state)
+        ops = [s["op"] for s in steps]
+        self.assertIn("move_to", ops)
+        self.assertIn("craft", ops)
+        self.assertIn("place", ops)
+        self.assertEqual(world.blocks[(62, 64, 0)], "weathered_copper_bulb")
+        self.assertEqual(world.block_props[(62, 64, 0)]["lit"], "true")
         self.assertEqual(skill.verify_done(state), "")
 
     def test_already_lit_bulb_skips_powering(self):
@@ -504,6 +705,7 @@ class ReadChiseledBookshelfTests(unittest.TestCase):
 class TransplantCreakingHeartTests(unittest.TestCase):
     def setUp(self):
         reset_all_voxel_caches()
+        reset_all_world_memos()
 
     def test_places_vertical_pale_oak_and_creaking_heart_axis_y(self):
         world = TrialsWorld(items={"pale_oak_log": 2, "creaking_heart": 1})
@@ -516,6 +718,66 @@ class TransplantCreakingHeartTests(unittest.TestCase):
         self.assertEqual(world.blocks[top], "pale_oak_log")
         for cell in (bot, mid, top):
             self.assertEqual(world.block_props[cell]["axis"], "y")
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_pale_garden_anchor_silk_touch_harvests_heart_and_logs_then_places(self):
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        blocks[(62, 64, 0)] = "creaking_heart"
+        blocks[(63, 64, 0)] = "pale_oak_log"
+        blocks[(63, 65, 0)] = "pale_oak_log"
+        world = TrialsWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"diamond_axe": 1},
+            item_meta={"diamond_axe": {"enchantments": [{"name": "silk_touch", "level": 1}]}},
+        )
+        world.silk_required_for_heart = True
+        ex, state = world.session()
+        memo_for(state).record_biome("pale_garden", pos=[60, 64, 0], dimension="overworld")
+        self.assertEqual(TransplantCreakingHeart.blocked(state), "")
+        skill = TransplantCreakingHeart(radius=16)
+        steps = drive(skill, ex, state)
+        self.assertTrue(any(s["op"] == "move_to" and s.get("landmark") == "pale_garden" for s in steps))
+        self.assertGreaterEqual(ex.acts.count("dig"), 3)
+        mid = next(p for p, name in world.blocks.items() if name == "creaking_heart")
+        self.assertEqual(world.blocks[(mid[0], mid[1] - 1, mid[2])], "pale_oak_log")
+        self.assertEqual(world.blocks[(mid[0], mid[1] + 1, mid[2])], "pale_oak_log")
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_pale_garden_anchor_resin_craft_route_builds_heart_and_places(self):
+        blocks = _flat_floor(x0=54, x1=68, z0=-5, z1=5)
+        blocks[(62, 64, 1)] = "resin_clump"
+        blocks[(62, 64, 2)] = "resin_clump"
+        blocks[(62, 64, -1)] = "resin_clump"
+        for i in range(4):
+            blocks[(64, 64 + (i % 2), i // 2)] = "pale_oak_log"
+        world = TrialsWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"iron_axe": 1, "crafting_table": 1},
+        )
+        ex, state = world.session()
+        memo_for(state).record_biome("pale_garden", pos=[60, 64, 0], dimension="overworld")
+        skill = TransplantCreakingHeart(radius=16)
+        steps = drive(skill, ex, state)
+        crafted = [s.get("item") for s in steps if s["op"] == "craft"]
+        self.assertEqual(crafted, ["resin_block", "creaking_heart"])
+        self.assertIn("crafting_table", world.blocks.values())
+        mid = next(p for p, name in world.blocks.items() if name == "creaking_heart")
+        self.assertEqual(world.blocks[(mid[0], mid[1] - 1, mid[2])], "pale_oak_log")
+        self.assertEqual(world.blocks[(mid[0], mid[1] + 1, mid[2])], "pale_oak_log")
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_bag_resin_block_and_four_logs_crafts_and_places_without_landmark(self):
+        world = TrialsWorld(
+            blocks={(2, 64, 0): "crafting_table"},
+            items={"resin_block": 1, "pale_oak_log": 4},
+        )
+        ex, state = world.session()
+        self.assertEqual(TransplantCreakingHeart.blocked(state), "")
+        skill = TransplantCreakingHeart(radius=16)
+        steps = drive(skill, ex, state)
+        self.assertTrue(any(s["op"] == "craft" and s.get("item") == "creaking_heart" for s in steps))
         self.assertEqual(skill.verify_done(state), "")
 
     def test_retries_when_creaking_heart_axis_initially_wrong(self):

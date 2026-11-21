@@ -968,6 +968,61 @@ class UnlockOminousVaultTests(_WaveCTestBase):
         self.assertTrue(any(p.get("shield") is True for p in postures))
         self.assertIs(postures[-1].get("shield"), False)
 
+    def test_landmark_nav_to_trial_chambers_and_low_hp_retreat_with_posture_cleanup(self) -> None:
+        # Subcase A: ominous vault outside radius 48 -> navigates via trial_chambers landmark and unlocks
+        blocks = {**_flat(-4, 4, -4, 4, y=63), **_flat(86, 94, -4, 4, y=63), (91, 64, 0): "vault"}
+        w_nav = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            block_props={(91, 64, 0): {"ominous": True, "vault_state": "active"}},
+            items={"ominous_trial_key": 1},
+        )
+        w_nav.on_interact = lambda w, pos=None, entity_id=None, item=None: (
+            w._consume_item("ominous_trial_key", 1),
+            w.block_props[(91, 64, 0)].__setitem__("vault_state", "ejecting"),
+            {"changed": True},
+        )[2]
+        ex1, st1 = w_nav.session()
+        memo_for(st1).record_landmark("trial_chambers", (90, 64, 0), dimension="overworld")
+        sk1 = UnlockOminousVault()
+        drive(sk1, ex1, st1, max_steps=40)
+        self.assertEqual(sk1.verify_done(st1), "")
+        self.assertTrue(any(op == "move_to" and req["pos"] and req["pos"][0] >= 88.0 for op, req in w_nav.calls))
+
+        # Subcase B: low HP before drinking ominous_bottle -> retreats safely without wasting bottle
+        w_pre = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={**_flat(-5, 5, -5, 5, y=63), (3, 64, 0): "vault", (4, 64, 0): "trial_spawner"},
+            block_props={(3, 64, 0): {"ominous": True}, (4, 64, 0): {"mob": "zombie"}},
+            items={"iron_sword": 1, "ominous_bottle": 1},
+            hp=7.0,
+        )
+        ex2, st2 = w_pre.session()
+        with self.assertRaises(Replan):
+            drive(UnlockOminousVault(), ex2, st2)
+        self.assertFalse(any(op == "use_item" for op, _ in w_pre.calls))
+        self.assertLess(w_pre.st["pos"][0], 0.5)
+
+        # Subcase C: low HP mid-wave -> retreats away from spawner and clears shield posture
+        w_mid = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks={**_flat(-5, 5, -5, 5, y=63), (3, 64, 0): "vault", (4, 64, 0): "trial_spawner"},
+            block_props={(3, 64, 0): {"ominous": True}, (4, 64, 0): {"mob": "zombie"}},
+            items={"iron_sword": 1, "shield": 1},
+            effects=["trial_omen"],
+            hp=7.0,
+            entities=[{"id": 650, "name": "zombie", "type": "hostile", "pos": [2.5, 64.0, 0.5], "health": 20}],
+        )
+        ex3, st3 = w_mid.session()
+        with self.assertRaises(Replan):
+            drive(UnlockOminousVault(), ex3, st3)
+        self.assertLess(w_mid.st["pos"][0], 0.5)
+        self.assertFalse(w_mid.st.get("blocking"))
+        self.assertFalse(st3.st.get("blocking"))
+        postures = [req for op, req in w_mid.calls if op == "posture"]
+        self.assertTrue(any(p.get("shield") is True for p in postures))
+        self.assertIs(postures[-1].get("shield"), False)
+
 
 # ============================================================================
 # 3. win_micro_village_raid (adventure/hero_of_the_village + prep_micro_village_bunker)
@@ -1334,6 +1389,39 @@ class WinMicroVillageRaidTests(_WaveCTestBase):
         postures = [req for op, req in world_lowhp.calls if op == "posture"]
         self.assertTrue(any(p.get("shield") is True for p in postures))
         self.assertIs(postures[-1].get("shield"), False)
+        # Retreated away from pillager at x=2.0 before raising Replan
+        self.assertLess(world_lowhp.st["pos"][0], 0.5)
+
+    def test_raid_landmark_nav_to_village_and_bunker_and_low_hp_bottle_guard(self) -> None:
+        # Subcase A: prep_only navigates to village landmark when villager is outside radius 32
+        blocks = {**_flat(-4, 4, -4, 4, y=63), **_flat(84, 96, -4, 4, y=63)}
+        w_prep = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"cobblestone": 24, "red_bed": 1, "bell": 1},
+            entities=[{"id": 880, "name": "villager", "type": "other", "pos": [91.5, 64.0, 0.5]}],
+        )
+        ex1, st1 = w_prep.session()
+        memo_for(st1).record_landmark("village", (90, 64, 0), dimension="overworld")
+        sk1 = WinMicroVillageRaid(prep_only=True)
+        drive(sk1, ex1, st1, max_steps=80)
+        self.assertEqual(sk1.verify_done(st1), "")
+        self.assertTrue(any(op == "move_to" and req["pos"] and req["pos"][0] >= 88.0 for op, req in w_prep.calls))
+
+        # Subcase B: full raid returns to remote micro_village_bunker before drinking ominous_bottle,
+        # and refuses to drink when HP < 10.0
+        w_ret = WaveCWorld(
+            pos=(0.5, 64.0, 0.5),
+            blocks=blocks,
+            items={"iron_sword": 1, "ominous_bottle": 1},
+            hp=7.5,
+        )
+        ex2, st2 = w_ret.session()
+        memo_for(st2).record_landmark("micro_village_bunker", (90, 64, 0), dimension="overworld")
+        with self.assertRaises(Replan):
+            drive(WinMicroVillageRaid(prep_only=False), ex2, st2)
+        self.assertTrue(any(op == "move_to" and req["pos"] and req["pos"][0] >= 88.0 for op, req in w_ret.calls))
+        self.assertFalse(any(op == "use_item" for op, _ in w_ret.calls))
 
 
 # ============================================================================

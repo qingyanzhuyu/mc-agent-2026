@@ -2,18 +2,28 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 
 from ..runtime import EnvBlocked, Executor, Replan, State
 from .base import Param, Skill, rec
 from .encounter import _retreat_clear, combat_melee
-from .field import equip_item, scan_blocks, scan_entities
+from .field import collect_drops, equip_item, place_block, scan_blocks, scan_entities
 from .interaction import _clear_posture, use_item_on
 from .items import AIR, bare, is_clear_space, is_safe_solid_floor
+from .landmark_nav import goto_known_landmark_or_biome
 from .observations import observe_block, refresh_inventory
 from .registry import register
-from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
+from .sightline import (
+    DIG_EYE_REACH,
+    ENTITY_EYE_REACH,
+    STATION_EYE_REACH,
+    block_cell,
+    can_reach_block,
+    eye_to_block_dist,
+    eye_to_point_dist,
+)
 from .voxel_cache import voxel_cache_for
+from .world_memo import memo_for
 
 _CARDINALS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _OFFSETS_6 = ((1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0))
@@ -21,7 +31,7 @@ _FACING_DELTA = {"north": (0, 0, -1), "south": (0, 0, 1), "east": (1, 0, 0), "we
 _DELTA_FACING = {v: k for k, v in _FACING_DELTA.items()}
 _TRIAL_HOSTILES = ("breeze", "bogged", "skeleton", "stray", "zombie", "husk", "spider", "cave_spider", "slime", "silverfish")
 _MELEE_WEAPONS = ("netherite_sword", "diamond_sword", "iron_sword", "stone_sword", "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "mace", "wooden_sword")
-_AXES = ("netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "golden_axe", "wooden_axe")
+_AXES = ("netherite_axe", "diamond_axe", "iron_axe", "copper_axe", "stone_axe", "golden_axe", "wooden_axe")
 _BOOKS = ("book", "enchanted_book", "writable_book", "written_book")
 _UNWAXED_OX_BULBS = ("exposed_copper_bulb", "weathered_copper_bulb", "oxidized_copper_bulb")
 _ALL_OX_BULBS = _UNWAXED_OX_BULBS + tuple(f"waxed_{b}" for b in _UNWAXED_OX_BULBS)
@@ -32,13 +42,103 @@ def _pt(c: tuple[int, int, int]) -> tuple[float, float, float]: return (c[0] + 0
 def _is_air(ex: Executor, pos: Sequence[int]) -> bool: return bare(observe_block(ex, list(pos)).get("name")) in AIR
 def _has_floor(ex: Executor, c: tuple[int, int, int]) -> bool: return is_safe_solid_floor(observe_block(ex, [c[0], c[1] - 1, c[2]]))
 def _is_lit(blk: dict) -> bool: return (blk.get("properties") or {}).get("lit") in (True, "true")
+def _inv_entries(state: State) -> list[dict]:
+    inv = state.inventory or {}
+    return [r for r in (inv.get("items") or ()) if isinstance(r, dict)] + [inv[k] for k in ("held", "offhand") if isinstance(inv.get(k), dict)]
 def _pick_axe(state: State) -> str | None: return next((a for a in _AXES if state.count(a) >= 1), None)
+def _pick_melee(state: State) -> str | None:
+    return next((w for w in _MELEE_WEAPONS if state.count(w) >= 1), None) or next(
+        (n for r in _inv_entries(state) if (n := bare(r.get("name"))) and state.count(n) >= 1 and (n.endswith(("_sword", "_axe")) or n == "mace")), None)
+def _has_silk_val(obj: object) -> bool:
+    if isinstance(obj, str): return bare(obj) == "silk_touch"
+    if isinstance(obj, Mapping):
+        if bare(obj.get("name") or obj.get("id")) == "silk_touch":
+            lvl = obj.get("level", obj.get("lvl", 1))
+            return isinstance(lvl, int) and not isinstance(lvl, bool) and lvl > 0
+        return any((bare(k) == "silk_touch" and ((isinstance(v, int) and not isinstance(v, bool) and v > 0) or v is True))
+                   or (bare(k) in ("enchantments", "levels") and _has_silk_val(v)) for k, v in obj.items())
+    return isinstance(obj, Sequence) and not isinstance(obj, (bytes, bytearray)) and any(_has_silk_val(el) for el in obj)
+def _find_silk_tool(state: State) -> str | None:
+    return next((n for r in _inv_entries(state) if (n := bare(r.get("name"))) and n not in ("book", "enchanted_book")
+                 and state.count(n) >= 1 and (_has_silk_val(r.get("enchantments")) or _has_silk_val(r.get("components")))), None)
+def _has_landmark_context(state: State, kind: str) -> bool:
+    cur_biome = bare((state.st or {}).get("biome")).strip().lower()
+    alts = [a.strip().lower() for a in kind.split("|") if a.strip()]
+    if cur_biome and any(cur_biome == a or cur_biome.startswith(f"{a}_") or cur_biome.endswith(f"_{a}") for a in alts):
+        return True
+    memo = memo_for(state)
+    dim = _dim(state)
+    pos_fn = getattr(memo, "biome_or_landmark_positions", None)
+    if callable(pos_fn) and pos_fn(kind, dimension=dim):
+        return True
+    return any(memo.has_landmark(a, dimension=dim) for a in alts)
 def _gate(state: State, ok: bool, msg: str) -> str: return "世界尚未就绪（ready=false）" if not state.ready else ("" if ok else msg)
 def _env_blocked(msg: str, pred: str, vol: str) -> EnvBlocked: return EnvBlocked(msg, missing_predicate=pred, searched_volume=vol, wake_on="chunk_moved")
 
 def _ready_scan(scan: dict) -> dict:
     if scan.get("ready") is False: raise Replan("世界加载尚未就绪（ready=false）")
     return scan
+
+def _req_blks_or_landmark(ex: Executor, state: State, types, radius: int, msg: str, pred: str, landmark: str, *, skill_name: str = "") -> Generator[dict, None, list[dict]]:
+    blocks = _ready_scan(scan_blocks(ex, state, types, radius=radius, limit=12, skill_name=skill_name))["blocks"]
+    if blocks: return blocks
+    if (yield from goto_known_landmark_or_biome(ex, state, landmark)):
+        blocks = _ready_scan(scan_blocks(ex, state, types, radius=radius, limit=12, skill_name=skill_name))["blocks"]
+        if blocks: return blocks
+    raise _env_blocked(msg, pred, f"半径 {radius} 格")
+
+def _req_ents_or_landmark(ex: Executor, state: State, types, radius: int, msg: str, pred: str, landmark: str) -> Generator[dict, None, list[dict]]:
+    ents = _ready_scan(scan_entities(ex, state, types, radius=radius))["entities"]
+    if ents: return ents
+    if (yield from goto_known_landmark_or_biome(ex, state, landmark)):
+        ents = _ready_scan(scan_entities(ex, state, types, radius=radius))["entities"]
+        if ents: return ents
+    raise _env_blocked(msg, pred, f"半径 {radius} 格实体")
+
+def _pick_switch_craft(state: State) -> str | None:
+    if state.count("stick") >= 1 and state.count("cobblestone") >= 1: return "lever"
+    if state.count("stone") >= 1: return "stone_button"
+    for r in _inv_entries(state):
+        if (n := bare(r.get("name"))).endswith("_planks") and state.count(n) >= 1:
+            return f"{n.removesuffix('_planks')}_button"
+    return None
+
+def _find_place_cell(ex: Executor, st: dict, radius: int = 3) -> tuple[int, int, int] | None:
+    ox, oy, oz = block_cell(st["pos"])
+    cands = [(ox + dx, oy + dy, oz + dz) for dy in (0, -1, 1) for dx in range(-radius, radius + 1) for dz in range(-radius, radius + 1)
+             if not _overlaps_player((ox + dx, oy + dy, oz + dz), st["pos"])
+             and _is_air(ex, (ox + dx, oy + dy, oz + dz)) and _has_floor(ex, (ox + dx, oy + dy, oz + dz))
+             and can_reach_block(ex, st, (ox + dx, oy + dy, oz + dz), reach=DIG_EYE_REACH)]
+    return min(cands, key=lambda c: eye_to_block_dist(st, c)) if cands else None
+
+def _craft_item(ex: Executor, state: State, item: str, *, need_table: bool = True, err_msg: str | None = None) -> Generator[dict, None, None]:
+    if need_table:
+        st = state.refresh_status(ex.client, max_age_s=0)
+        tables = _ready_scan(scan_blocks(ex, state, "crafting_table", radius=16, limit=5))["blocks"]
+        if tables:
+            tcell = block_cell(min(tables, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+            if not can_reach_block(ex, st, tcell, reach=STATION_EYE_REACH):
+                yield from _approach_block(ex, state, tcell, reach=STATION_EYE_REACH)
+        elif state.count("crafting_table") >= 1:
+            if (pcell := _find_place_cell(ex, st)) is not None:
+                yield from place_block(ex, state, "crafting_table", pcell)
+    before = state.count(item)
+    yield rec("craft", ex.craft(item, 1), item=item, count=1)
+    refresh_inventory(ex, state)
+    if state.count(item) <= before:
+        raise Replan(err_msg or f"合成 {item} 后背包数量未增加")
+
+def _dig_block_cell(ex: Executor, state: State, cell: tuple[int, int, int], *, tool: str | None = None) -> Generator[dict, None, None]:
+    yield from _approach_block(ex, state, cell, reach=DIG_EYE_REACH)
+    if tool is not None:
+        yield from equip_item(ex, state, tool, "hand")
+        st = state.refresh_status(ex.client, max_age_s=0)
+        if not can_reach_block(ex, st, cell, reach=DIG_EYE_REACH):
+            yield from _approach_block(ex, state, cell, reach=DIG_EYE_REACH)
+    receipt = ex.dig(list(cell), collect=True)
+    voxel_cache_for(state).invalidate(cell, dimension=_dim(state))
+    yield rec("dig", receipt, pos=list(cell))
+    refresh_inventory(ex, state)
 
 def _is_standable(ex: Executor, cell: tuple[int, int, int]) -> bool:
     x, y, z = cell
@@ -162,11 +262,11 @@ def clear_trial_wave(ex: Executor, state: State, radius: int = 24, max_kills: in
             raise Replan(f"血量低于止损线 {min_hp:.1f}，中止清怪")
         hostiles = [e for e in (_ready_scan(scan_entities(ex, state, _TRIAL_HOSTILES, radius=radius)).get("entities") or ()) if bare(e.get("name")) in _TRIAL_HOSTILES]
         if not hostiles: return cleared
-        target = min(hostiles, key=lambda e: math.dist(st["pos"], e["pos"]))
+        target = min(hostiles, key=lambda e: eye_to_point_dist(st, e["pos"]))
         refresh_inventory(ex, state)
-        if (weapon := next((w for w in _MELEE_WEAPONS if state.count(w) >= 1), None)) is not None:
+        if (weapon := _pick_melee(state)) is not None:
             yield from equip_item(ex, state, weapon, "hand")
-        if math.dist(st["pos"], target["pos"]) > 4.5:
+        if eye_to_point_dist(st, target["pos"]) > 4.5:
             dest = [float(target["pos"][0]), float(target["pos"][1]), float(target["pos"][2])]
             yield rec("move_to", ex.move_to(pos=dest, rng=2), pos=dest)
             st = state.refresh_status(ex.client, max_age_s=0)
@@ -199,16 +299,38 @@ class _TrialSkill(Skill):
 
 @register
 class UnlockTrialVault(_TrialSkill):
-    name, goal, description = "unlock_trial_vault", "t2:under_lock_and_key", "清理试炼怪并用试炼钥匙开启试炼宝库"
+    name, goal, description = "unlock_trial_vault", "t2:under_lock_and_key", "前往试炼密室清怪/刷钥匙并用试炼钥匙开启宝库"
     params = {"radius": Param(int, "搜索宝库半径", default=32, min=8, max=64), "clear_wave": Param(bool, "解锁前清试炼怪", default=True)}
     _done_msg, _delta_keys = "未确认试炼宝库解锁", ("trial_key", "ominous_trial_key")
     @classmethod
     def blocked(cls, state: State) -> str:
-        return _gate(state, state.count("trial_key") >= 1 or state.count("ominous_trial_key") >= 1, "背包缺少试炼钥匙（trial_key / ominous_trial_key）")
+        has_key = state.count("trial_key") >= 1 or state.count("ominous_trial_key") >= 1
+        can_farm = state.hp >= 10 and _pick_melee(state) is not None and _has_landmark_context(state, "trial_chambers")
+        return _gate(state, has_key or can_farm, "背包缺少试炼钥匙（trial_key / ominous_trial_key），且未具备试炼密室清笼条件")
+    def _farm_trial_key(self, ex: Executor, state: State, radius: int) -> Generator[dict, None, None]:
+        st = state.refresh_status(ex.client, max_age_s=0)
+        if not st.get("alive", True) or float(st.get("health", 20)) < 10.0 or _pick_melee(state) is None:
+            raise Replan("背包缺少试炼钥匙，且血量或近战武器不足以安全刷取试炼刷怪笼")
+        spawners = yield from _req_blks_or_landmark(ex, state, "trial_spawner", radius, f"半径 {radius} 格内未发现试炼刷怪笼，无法刷取试炼钥匙", "visible_block:trial_spawner", "trial_chambers", skill_name=self.name)
+        st = state.refresh_status(ex.client, max_age_s=0)
+        spos = block_cell(min(spawners, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+        yield from _approach_block(ex, state, spos, reach=DIG_EYE_REACH)
+        yield from clear_trial_wave(ex, state, radius=min(radius, 24), max_kills=8, min_hp=10.0)
+        refresh_inventory(ex, state)
+        if state.count("trial_key") < 1 and state.count("ominous_trial_key") < 1:
+            try:
+                yield from collect_drops(ex, state, "trial_key", count=1, radius=12)
+            except (EnvBlocked, Replan):
+                pass
+            refresh_inventory(ex, state)
+        if state.count("trial_key") < 1 and state.count("ominous_trial_key") < 1:
+            raise _env_blocked("清理试炼刷怪笼波次后未获得试炼钥匙（trial_key）", "item:trial_key", f"半径 {radius} 格")
     def _run(self, ex: Executor, state: State):
         st, radius, clear_wave = self._begin(ex, state), self.args["radius"], self.args["clear_wave"]
-        blocks = _ready_scan(scan_blocks(ex, state, "vault", radius=radius, limit=8, skill_name=self.name))["blocks"]
-        if not blocks: raise _env_blocked(f"半径 {radius} 格内未发现试炼宝库", "visible_block:vault", f"半径 {radius} 格")
+        if state.count("trial_key") < 1 and state.count("ominous_trial_key") < 1:
+            yield from self._farm_trial_key(ex, state, radius)
+        blocks = yield from _req_blks_or_landmark(ex, state, "vault", radius, f"半径 {radius} 格内未发现试炼宝库", "visible_block:vault", "trial_chambers", skill_name=self.name)
+        st = state.refresh_status(ex.client, max_age_s=0)
         vault = min(blocks, key=lambda b: (1 if (b.get("properties") or {}).get("vault_state") == "inactive" else 0, eye_to_block_dist(st, b["pos"])))
         vpos = block_cell(vault["pos"])
         if clear_wave and any(bare(e.get("name")) in _TRIAL_HOSTILES for e in (scan_entities(ex, state, _TRIAL_HOSTILES, radius=min(16, radius)).get("entities") or ())):
@@ -226,17 +348,57 @@ class UnlockTrialVault(_TrialSkill):
 
 @register
 class WindChargeBounce(_TrialSkill):
-    name, goal, description = "wind_charge_bounce", "t2:who_needs_rockets", "向脚下发射风弹并确认垂直弹跳达到目标高度"
+    name, goal, description = "wind_charge_bounce", "t2:who_needs_rockets", "备齐或合成风弹后向脚下发射确认垂直弹跳达标"
     params = {"target_dy": Param(int, "目标弹跳高度", default=7, min=7, max=16)}
     _done_msg, _delta_keys = "未确认风弹弹跳达到目标高度", ("wind_charge",)
     @classmethod
     def blocked(cls, state: State) -> str:
-        return _gate(state, state.count("wind_charge") >= 1, "背包缺少风弹（wind_charge）") or ("" if state.hp >= 10 else f"生命值过低（{state.hp:.1f} < 10）")
+        if not state.ready: return "世界尚未就绪（ready=false）"
+        if state.hp < 10: return f"生命值过低（{state.hp:.1f} < 10）"
+        ready = (state.count("wind_charge") >= 1 or state.count("breeze_rod") >= 1
+                 or (_pick_melee(state) is not None and _has_landmark_context(state, "trial_chambers")))
+        return "" if ready else "背包缺少风弹（wind_charge）或旋风棒（breeze_rod），且未具备试炼密室击杀旋风人条件"
+    def _ensure_wind_charge(self, ex: Executor, state: State) -> Generator[dict, None, None]:
+        if state.count("wind_charge") >= 1: return
+        if state.count("breeze_rod") < 1:
+            weapon = _pick_melee(state)
+            if weapon is None: raise Replan("背包缺少风弹/旋风棒且无近战武器击杀旋风人")
+            breezes = yield from _req_ents_or_landmark(ex, state, "breeze", 32, "半径 32 格内未发现旋风人（breeze），无法获取旋风棒", "visible_entity:breeze", "trial_chambers")
+            st = state.refresh_status(ex.client, max_age_s=0)
+            breeze = min(breezes, key=lambda e: eye_to_point_dist(st, e["pos"]))
+            yield from equip_item(ex, state, weapon, "hand")
+            if eye_to_point_dist(st, breeze["pos"]) > ENTITY_EYE_REACH:
+                dest = [float(breeze["pos"][0]), float(breeze["pos"][1]), float(breeze["pos"][2])]
+                yield rec("move_to", ex.move_to(pos=dest, rng=2), pos=dest)
+                st = state.refresh_status(ex.client, max_age_s=0)
+            if not st.get("alive", True) or float(st.get("health", 20)) < 10.0:
+                raise Replan("接近旋风人后血量低于 10.0，中止战斗")
+            if (retreat := _find_retreat(ex, st, breeze["pos"])) is None:
+                raise Replan("击杀旋风人缺少同高安全退路格")
+            yield from combat_melee(ex, state, breeze, retreat_pos=retreat, radius=16)
+            refresh_inventory(ex, state)
+            if state.count("breeze_rod") < 1 and state.count("wind_charge") < 1:
+                try:
+                    yield from collect_drops(ex, state, "breeze_rod", count=1, radius=12)
+                except (EnvBlocked, Replan):
+                    pass
+                refresh_inventory(ex, state)
+            if state.count("breeze_rod") < 1 and state.count("wind_charge") < 1:
+                raise _env_blocked("击杀旋风人后未获得旋风棒（breeze_rod）", "item:breeze_rod", "半径 12 格掉落物")
+        if state.count("wind_charge") < 1 and state.count("breeze_rod") >= 1:
+            yield from _craft_item(ex, state, "wind_charge", need_table=False, err_msg="用旋风棒合成风弹后背包未确认增加 wind_charge")
     def _run(self, ex: Executor, state: State):
         st, target_dy = self._begin(ex, state), self.args["target_dy"]
+        if state.count("wind_charge") < 1:
+            yield from self._ensure_wind_charge(ex, state)
+            st = state.refresh_status(ex.client, max_age_s=0)
         cx, cy, cz = block_cell(st["pos"])
         if not all(_is_air(ex, (cx, cy + dy, cz)) for dy in range(1, target_dy + 3)):
-            raise Replan(f"头顶净空不足 {target_dy + 2} 格，无法安全风弹弹跳")
+            if (yield from goto_known_landmark_or_biome(ex, state, "trial_chambers")):
+                st = state.refresh_status(ex.client, max_age_s=0)
+                cx, cy, cz = block_cell(st["pos"])
+            if not all(_is_air(ex, (cx, cy + dy, cz)) for dy in range(1, target_dy + 3)):
+                raise Replan(f"头顶净空不足 {target_dy + 2} 格，无法安全风弹弹跳")
         x, start_y, z = float(st["pos"][0]), float(st["pos"][1]), float(st["pos"][2])
         aim = [x, start_y - 0.5, z]
         yield rec("use_item", ex.use_item("wind_charge", target={"pos": aim}), item="wind_charge", target={"pos": aim})
@@ -250,20 +412,23 @@ class WindChargeBounce(_TrialSkill):
 
 @register
 class ScrapeLitCopperBulb(_TrialSkill):
-    name, goal, description = "scrape_lit_copper_bulb", "t2:lighten_up", "点亮氧化铜灯并用斧刮除氧化层"
+    name, goal, description = "scrape_lit_copper_bulb", "t2:lighten_up", "前往试炼密室点亮氧化铜灯并用斧刮除氧化层"
     params = {"radius": Param(int, "搜索铜灯半径", default=32, min=8, max=64)}
     _done_msg = "未确认点亮并刮除氧化铜灯"
     @classmethod
     def blocked(cls, state: State) -> str: return _gate(state, _pick_axe(state) is not None, "背包缺少斧头")
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
-        blocks = _ready_scan(scan_blocks(ex, state, _ALL_OX_BULBS, radius=radius, limit=12, skill_name=self.name))["blocks"]
-        if not blocks: raise _env_blocked(f"半径 {radius} 格内未发现氧化铜灯", "visible_block:oxidized_copper_bulb", f"半径 {radius} 格")
+        blocks = yield from _req_blks_or_landmark(ex, state, _ALL_OX_BULBS, radius, f"半径 {radius} 格内未发现氧化铜灯", "visible_block:oxidized_copper_bulb", "trial_chambers", skill_name=self.name)
+        st = state.refresh_status(ex.client, max_age_s=0)
         target = min(blocks, key=lambda b: (1 if bare(b["name"]).startswith("waxed_") else 0, 0 if _is_lit(b) else 1, eye_to_block_dist(st, b["pos"])))
         pos = block_cell(target["pos"])
         yield from _approach_block(ex, state, pos, reach=STATION_EYE_REACH)
         blk = ex.client.get_block(list(pos))
         if not _is_lit(blk):
+            refresh_inventory(ex, state)
+            if _pick_switch(state) is None and (sw_craft := _pick_switch_craft(state)) is not None:
+                yield from _craft_item(ex, state, sw_craft, need_table=False, err_msg=f"合成通电开关 {sw_craft} 失败")
             yield from power_block_once(ex, state, pos)
             blk = ex.client.get_block(list(pos))
             if not _is_lit(blk): raise Replan(f"给铜灯 {list(pos)} 通电后仍未点亮")
@@ -323,12 +488,54 @@ class ReadChiseledBookshelf(_TrialSkill):
 
 @register
 class TransplantCreakingHeart(_TrialSkill):
-    name, goal, description = "transplant_creaking_heart", "t2:heart_transplanter", "垂直摆放苍白橡木原木夹心嘎枝之心"
-    params = {"radius": Param(int, "放置搜索半径", default=24, min=6, max=48)}
+    name, goal, description = "transplant_creaking_heart", "t2:heart_transplanter", "在苍白之园采集或合成嘎枝之心并垂直夹心摆放"
+    params = {"radius": Param(int, "采集与放置搜索半径", default=24, min=6, max=48)}
     _done_msg, _delta_keys = "未确认嘎枝之心垂直夹心摆放完成", ("creaking_heart",)
     @classmethod
     def blocked(cls, state: State) -> str:
-        return _gate(state, state.count("creaking_heart") >= 1 and state.count("pale_oak_log") >= 2, "背包缺少嘎枝之心或 2 个苍白橡木原木")
+        ready_bag = state.count("creaking_heart") >= 1 and state.count("pale_oak_log") >= 2
+        craft_bag = (state.count("resin_block") >= 1 or state.count("resin_clump") >= 9) and state.count("pale_oak_log") >= 4
+        return _gate(state, ready_bag or craft_bag or _has_landmark_context(state, "pale_garden"),
+                     "背包缺少嘎枝之心与 2 个苍白橡木原木，且尚未探明苍白之园（pale_garden）")
+    def _harvest_pale_oak_logs(self, ex: Executor, state: State, target_count: int, radius: int) -> Generator[dict, None, None]:
+        while state.count("pale_oak_log") < target_count:
+            need = target_count - state.count("pale_oak_log")
+            logs = yield from _req_blks_or_landmark(ex, state, "pale_oak_log", radius, f"半径 {radius} 格内未发现苍白橡木原木（还需 {need} 块）", "visible_block:pale_oak_log", "pale_garden", skill_name=self.name)
+            st = state.refresh_status(ex.client, max_age_s=0)
+            target = block_cell(min(logs, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+            before = state.count("pale_oak_log")
+            yield from _dig_block_cell(ex, state, target, tool=_pick_axe(state))
+            if state.count("pale_oak_log") <= before:
+                raise Replan("砍伐苍白橡木原木后背包未确认增加 pale_oak_log")
+    def _ensure_creaking_heart(self, ex: Executor, state: State, radius: int) -> Generator[dict, None, None]:
+        if state.count("creaking_heart") >= 1: return
+        # 路径 ①：若背包尚无现成树脂块/足够树脂团且有精准采集工具，优先直接挖取自然嘎枝之心
+        if state.count("resin_block") < 1 and state.count("resin_clump") < 9 and (silk := _find_silk_tool(state)) is not None:
+            hearts: list[dict] = []
+            try:
+                hearts = yield from _req_blks_or_landmark(ex, state, "creaking_heart", radius, f"半径 {radius} 格内未发现自然嘎枝之心", "visible_block:creaking_heart", "pale_garden", skill_name=self.name)
+            except EnvBlocked:
+                hearts = []
+            if hearts:
+                st = state.refresh_status(ex.client, max_age_s=0)
+                hpos = block_cell(min(hearts, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+                before_h = state.count("creaking_heart")
+                yield from _dig_block_cell(ex, state, hpos, tool=silk)
+                if state.count("creaking_heart") > before_h: return
+        # 路径 ②：1.21.4+ 树脂合成路线（9 resin_clump -> 1 resin_block；1 resin_block + 2 pale_oak_log -> 1 creaking_heart）
+        if state.count("resin_block") < 1:
+            while state.count("resin_clump") < 9:
+                sources = yield from _req_blks_or_landmark(ex, state, ("resin_clump", "creaking_heart"), radius, f"半径 {radius} 格内未发现树脂团或自然嘎枝之心", "visible_block:resin_clump", "pale_garden", skill_name=self.name)
+                st = state.refresh_status(ex.client, max_age_s=0)
+                blk = min(sources, key=lambda b: (0 if bare(b.get("name")) == "resin_clump" else 1, eye_to_block_dist(st, b["pos"])))
+                before_r = state.count("resin_clump")
+                tool = _pick_axe(state) if bare(blk.get("name")) == "creaking_heart" else None
+                yield from _dig_block_cell(ex, state, block_cell(blk["pos"]), tool=tool)
+                if state.count("resin_clump") <= before_r:
+                    raise Replan("采集苍白之园树脂团后背包未确认增加 resin_clump")
+            yield from _craft_item(ex, state, "resin_block", need_table=True, err_msg="合成树脂块（resin_block）后背包未确认增加")
+        yield from self._harvest_pale_oak_logs(ex, state, 2, radius)
+        yield from _craft_item(ex, state, "creaking_heart", need_table=True, err_msg="合成嘎枝之心（creaking_heart）后背包未确认增加")
     def _find_column(self, ex: Executor, st: dict, radius: int) -> tuple[int, int, int] | None:
         ox, oy, oz = block_cell(st["pos"])
         lim = min(radius, 4)
@@ -341,9 +548,12 @@ class TransplantCreakingHeart(_TrialSkill):
                         return base
         return None
     def _run(self, ex: Executor, state: State):
-        st = self._begin(ex, state)
-        if (base := self._find_column(ex, st, self.args["radius"])) is None:
-            raise _env_blocked("附近缺少 3 格垂直空位摆放嘎枝之心", "clear_column_3:creaking_heart", f"半径 {self.args['radius']} 格")
+        st, radius = self._begin(ex, state), self.args["radius"]
+        yield from self._ensure_creaking_heart(ex, state, radius)
+        yield from self._harvest_pale_oak_logs(ex, state, 2, radius)
+        st = state.refresh_status(ex.client, max_age_s=0)
+        if (base := self._find_column(ex, st, radius)) is None:
+            raise _env_blocked("附近缺少 3 格垂直空位摆放嘎枝之心", "clear_column_3:creaking_heart", f"半径 {radius} 格")
         bot, mid, top = base, (base[0], base[1] + 1, base[2]), (base[0], base[1] + 2, base[2])
         yield from place_oriented(ex, state, bot, "pale_oak_log", want_axis="y")
         yield from place_oriented(ex, state, mid, "creaking_heart", want_axis="y")

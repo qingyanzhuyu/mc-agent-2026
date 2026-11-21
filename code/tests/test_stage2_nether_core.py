@@ -21,7 +21,7 @@ from mcagent.skills.nether_core import (
 from mcagent.skills.registry import REGISTRY, contract_errors
 from mcagent.skills.testing import GridWorld, drive
 from mcagent.skills.voxel_cache import reset_all_voxel_caches, voxel_cache_for
-from mcagent.skills.world_memo import reset_all_world_memos
+from mcagent.skills.world_memo import memo_for, reset_all_world_memos
 
 
 class NetherWorld(GridWorld):
@@ -375,3 +375,47 @@ class NetherCoreTests(unittest.TestCase):
         self.assertEqual((got1, got2, st.count("iron_ingot"), st.count("bucket")), (2, 0, 2, 1))
         self.assertIsNone(lease_book_for(st).get_lease((1, 64, 0), dimension="the_nether"))
         self.assertIsNotNone(lease_book_for(st).get_lease((2, 64, 0), dimension="the_nether"))
+
+    def test_landmark_nav_fallback_for_hunt_blaze_wither_skull_and_loot_bastion(self):
+        remote_floor = {(x, 63, z): "netherrack" for x in range(86, 95) for z in range(-4, 5)}
+
+        # 1) HuntBlaze: blaze at remote nether_fortress anchor (90, 64, 0)
+        w1 = NetherWorld(
+            blocks=remote_floor,
+            items={"diamond_sword": 1},
+            entities=[{"id": 61, "type": "hostile", "name": "blaze", "pos": [91.5, 64.0, 0.5], "health": 20}],
+        )
+        ex1, st1 = w1.session()
+        memo_for(st1).record_landmark("nether_fortress", (90, 64, 0), dimension="the_nether")
+        sk1 = HuntBlaze(count=1, radius=32)
+        drive(sk1, ex1, st1)
+        self.assertEqual(sk1.verify_done(st1), "")
+        self.assertTrue(any(c[0] == "move_to" and c[1]["pos"] and c[1]["pos"][0] >= 88.0 for c in w1.calls))
+
+        # 2) HuntWitherSkull: wither_skeleton at remote nether_fortress anchor (90, 64, 0)
+        w2 = NetherWorld(
+            blocks=remote_floor,
+            items={"diamond_sword": 1},
+            entities=[{"id": 62, "type": "hostile", "name": "wither_skeleton", "pos": [91.5, 64.0, 0.5], "health": 20}],
+        )
+        ex2, st2 = w2.session()
+        memo_for(st2).record_landmark("nether_fortress", (90, 64, 0), dimension="the_nether")
+        sk2 = HuntWitherSkull(radius=32, max_kills=3)
+        drive(sk2, ex2, st2)
+        self.assertEqual(sk2.verify_done(st2), "")
+        self.assertTrue(any(c[0] == "move_to" and c[1]["pos"] and c[1]["pos"][0] >= 88.0 for c in w2.calls))
+
+        # 3) LootBastion: chest at remote bastion_remnant anchor (90, 64, 0)
+        bastion_blocks = {**remote_floor, (91, 64, 0): "chest", (91, 64, 1): "gilded_blackstone"}
+        w3 = NetherWorld(
+            blocks=bastion_blocks,
+            items={"golden_helmet": 1},
+            chests={(91, 64, 0): [{"name": "netherite_upgrade_smithing_template", "count": 1}]},
+        )
+        ex3, st3 = w3.session()
+        memo_for(st3).record_landmark("bastion_remnant", (90, 64, 0), dimension="the_nether")
+        sk3 = LootBastion(radius=32)
+        drive(sk3, ex3, st3)
+        self.assertEqual(sk3.verify_done(st3), "")
+        self.assertEqual(st3.count("netherite_upgrade_smithing_template"), 1)
+        self.assertTrue(any(c[0] == "move_to" and c[1]["pos"] and c[1]["pos"][0] >= 88.0 for c in w3.calls))
