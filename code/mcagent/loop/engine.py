@@ -1182,9 +1182,11 @@ class MainLoop:
                     if moved_away or finished_name not in ("scout_island", "emergency_escape"):
                         self._reset_failure_tier(end_pos)
                     skills_ok += 1
+                    goal_specs = list(self._resolve_target_goal_specs())
+                    active_rules_goals = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()
                     force_tick = any(
                         g.skill == finished_name and g.done_advancements
-                        for g in self._resolve_target_goal_specs()
+                        for g in (*goal_specs, *active_rules_goals, *GOAL_MAP.values())
                     )
                     if self.observer is not None:
                         self.observer.on_skill_end(
