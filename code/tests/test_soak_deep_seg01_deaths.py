@@ -1980,6 +1980,87 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         first_diff = abs(math.atan2(math.sin(w.yaws[0] - 0.0), math.cos(w.yaws[0] - 0.0)))
         self.assertGreaterEqual(first_diff, 0.65, f"must not re-ram remembered blocked yaw=0.0, got {w.yaws}")
 
+    def test_seg20_escape_water_digs_soft_bank_instead_of_15s_move_to_on_two_block_pit(self) -> None:
+        # 复现 seg-20 t=282.9..328.9s（[-101.1, 62.5, 20.7]）：无怪时陷在 2 格高松软泥土/草水坑且无垫脚方块，
+        # escape_water_to_shore 必须直接破拆 1 格紧邻松软土岸开台阶，绝不可干等 3×15s 长 move_to 超时招来僵尸偷袭
+        from mcagent.skills.escape import escape_water_to_shore
+
+        blocks: dict[tuple[int, int, int], str] = {
+            (-102, 61, 20): "dirt",
+            (-102, 62, 20): "water",
+            (-102, 63, 20): "air",
+            (-102, 64, 20): "air",
+        }
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            blocks[(-102 + dx, 62, 20 + dz)] = "dirt"
+            blocks[(-102 + dx, 63, 20 + dz)] = "grass_block"
+            blocks[(-102 + dx, 64, 20 + dz)] = "air"
+
+        class _TwoBlockPitWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-101.5, 62.3, 20.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=20.0, food=20,
+                    in_water=True, submerged=False, on_ground=False, nearest_hostile=None,
+                )
+                self.dug: list[list[int]] = []
+                self.move_timeouts: list[float] = []
+
+            def dig(self, pos, **kwargs):
+                self.dug.append([int(pos[0]), int(pos[1]), int(pos[2])])
+                self.blocks[(int(pos[0]), int(pos[1]), int(pos[2]))] = "air"
+                return {"dug": "grass_block", "pos": list(pos)}
+
+            def move_to(self, x=None, z=None, *, y=None, entity_id=None, rng=1, pos=None, timeout=None, **kwargs):
+                if timeout is not None:
+                    self.move_timeouts.append(float(timeout))
+                target = pos if pos is not None else [x, y if y is not None else self.st["pos"][1], z]
+                self.st["pos"] = [float(target[0]), float(target[1]), float(target[2])]
+                self.st["in_water"] = False
+                self.st["on_ground"] = True
+                return {"pos": list(self.st["pos"])}
+
+        w = _TwoBlockPitWorld()
+        ex, state = w.session()
+        gen = escape_water_to_shore(ex, state, max_steps=4)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(w.dug, "expected escape_water_to_shore to dig soft bank block on 2-block-high water pit")
+        self.assertTrue(all(t <= 5.0 for t in w.move_timeouts), f"expected bounded shore timeout <=5.0s, got {w.move_timeouts}")
+
+    def test_seg20_pick_cliff_safe_yaw_avoids_sprinting_180_into_close_zombie(self) -> None:
+        # 复现 seg-20 Death #1（t=16.43s）：背敌方向（+z）遇深崖时，_pick_cliff_safe_yaw 必须改选侧向（±x），
+        # 绝不可在侧向安全时选 180°（-z）直冲 4m 处的僵尸正脸
+        from mcagent.skills.escape import _pick_cliff_safe_yaw
+        from mcagent.skills.voxel_cache import voxel_cache_for
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        for x in range(-42, -28):
+            for z in range(44, 60):
+                for y in range(56, 65):
+                    blocks[(x, y, z)] = "air"
+                if z >= 54:
+                    # +z 方向是深崖（无地面）
+                    continue
+                blocks[(x, 60, z)] = "stone"
+
+        w = GridWorld(blocks=blocks, pos=[-34.5, 61.0, 52.3])
+        w.st.update(dimension="overworld", on_ground=True)
+        ex, state = w.session()
+        cache = voxel_cache_for(state)
+        # 僵尸在 -z 方向 (0, -1)，首选逃跑角朝 +z（yaw=pi）受深崖阻挡
+        safe_yaw = _pick_cliff_safe_yaw(
+            ex, -34.5, 61.0, 52.3, math.pi, cache, "overworld",
+            avoid_water=True, hostile_dir=(0.0, -1.0),
+        )
+        self.assertIsNotNone(safe_yaw)
+        assert safe_yaw is not None
+        # 不能直冲 -z（-cos(yaw) < -0.70 表示直冲僵尸）
+        self.assertGreater(-math.cos(safe_yaw), -0.70, f"must not pick 180° straight into zombie, got yaw={safe_yaw}")
+
 
 if __name__ == "__main__":
     unittest.main()

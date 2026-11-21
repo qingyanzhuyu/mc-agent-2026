@@ -223,7 +223,7 @@ class TestEscapeWater(unittest.TestCase):
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0]["op"], "move_to")
         self.assertEqual(world.move_requests[0]["pos"], [2.5, 64.0, 0.5])
-        self.assertEqual(world.move_requests[0]["timeout"], 15.0)
+        self.assertEqual(world.move_requests[0]["timeout"], 5.0)
         self.assertEqual(world.move_requests[0]["rng"], 1)
 
     def test_trapped_basin_places_step_block_with_cobblestone_then_climbs(self) -> None:

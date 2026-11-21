@@ -112,9 +112,11 @@ def _exec_step(
         return False
 
 
-def _call_move_once(ex: "Executor", target_pos: list[float], *, rng: float, timeout: float) -> dict:
+def _call_move_once(
+    ex: "Executor", target_pos: list[float], *, rng: float, timeout: float, stop_on: tuple[str, ...] = ("death",),
+) -> dict:
     try:
-        return ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0, stop_on=("death",))
+        return ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0, stop_on=stop_on)
     except TypeError:
         try:
             return ex.move_to(pos=target_pos, rng=rng, timeout=timeout, retries=0)
@@ -123,12 +125,19 @@ def _call_move_once(ex: "Executor", target_pos: list[float], *, rng: float, time
 
 
 def _move_to_bounded(
-    ex: "Executor", target_pos: list[float], *, rng: float = 1, timeout: float = 15.0, **fields: Any,
+    ex: "Executor",
+    target_pos: list[float],
+    *,
+    rng: float = 1,
+    timeout: float = 15.0,
+    stop_on: tuple[str, ...] = ("death",),
+    **fields: Any,
 ) -> Generator[dict, None, bool]:
-    # 脱困移动必须使用 stop_on=("death",)：逃离怪群/岩浆/火焰时挨一下或受灼烧绝不能中途停步
+    # 默认使用 stop_on=("death",)：逃离怪群/岩浆/火焰时挨一下或受灼烧绝不能中途停步；
+    # 无怪上岸寻路可传 stop_on=("hurt", "death")，一旦中途遭偷袭立即打断并移交敌怪逃离。
     for attempt in range(2):
         try:
-            res = _call_move_once(ex, target_pos, rng=rng, timeout=timeout)
+            res = _call_move_once(ex, target_pos, rng=rng, timeout=timeout, stop_on=stop_on)
             yield rec("move_to", res, pos=target_pos, **fields)
             return True
         except Replan as err:
@@ -141,7 +150,7 @@ def _move_to_bounded(
                 if callable(stop_fn):
                     stop_fn(raise_on_error=False)
                 continue
-            if code in NAV_FAIL_CODES or code == "timeout":
+            if code in NAV_FAIL_CODES or code == "timeout" or ("hurt" in stop_on and code == "interrupted"):
                 yield rec("move_to", pos=target_pos, error_code=code, **fields)
                 return False
             raise
@@ -264,31 +273,36 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
                 "dig", lambda: ex.dig(dig_pos), on_ok=lambda: cache.invalidate(dig_pos, dimension=dim), pos=dig_pos,
             )
         else:
+            p_cur = _valid_vec3(st.get("pos"))
+            cur_fy = block_cell(p_cur)[1] if p_cur is not None else None
             shore = None
             if shore_fails < 2:
-                if under_hostile_fire:
-                    p_cur = _valid_vec3(st.get("pos"))
-                    if p_cur is not None:
-                        ents = _collect_nearby_hostiles(ex, p_cur[0], p_cur[1], p_cur[2], nh_cur or {}, radius=18)
-                        threats: list[tuple[float, float, str, float, Optional[int]]] = []
-                        for ent in ents:
-                            ep = _valid_vec3(ent.get("pos"))
-                            if ep is None:
-                                continue
-                            threats.append((
-                                ep[0], ep[2],
-                                bare(ent.get("name")).strip().lower(),
-                                math.hypot(p_cur[0] - ep[0], p_cur[2] - ep[2]),
-                                ent.get("id") if isinstance(ent.get("id"), int) and not isinstance(ent.get("id"), bool) else None,
-                            ))
-                        shore = _find_safe_dry_shore_away(ex, st, cache, dim, threats, tried_shores=tried_shores)
+                if under_hostile_fire and p_cur is not None:
+                    ents = _collect_nearby_hostiles(ex, p_cur[0], p_cur[1], p_cur[2], nh_cur or {}, radius=18)
+                    threats: list[tuple[float, float, str, float, Optional[int]]] = []
+                    for ent in ents:
+                        ep = _valid_vec3(ent.get("pos"))
+                        if ep is None:
+                            continue
+                        threats.append((
+                            ep[0], ep[2],
+                            bare(ent.get("name")).strip().lower(),
+                            math.hypot(p_cur[0] - ep[0], p_cur[2] - ep[2]),
+                            ent.get("id") if isinstance(ent.get("id"), int) and not isinstance(ent.get("id"), bool) else None,
+                        ))
+                    shore = _find_safe_dry_shore_away(ex, st, cache, dim, threats, tried_shores=tried_shores)
                 if shore is None:
                     shore = _find_dry_shore(ex, st, cache, dim, tried_shores)
-            if shore is not None:
+            shore_climbable = shore is not None and (cur_fy is None or shore[1] <= cur_fy + 1)
+            if shore_climbable and shore is not None:
                 tried_shores.add(shore)
-                shore_timeout = 2.2 if under_hostile_fire else 15.0
+                shore_timeout = 2.2 if under_hostile_fire else 5.0
                 moved_shore = yield from _move_to_bounded(
-                    ex, [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5], rng=1, timeout=shore_timeout,
+                    ex,
+                    [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5],
+                    rng=1,
+                    timeout=shore_timeout,
+                    stop_on=("hurt", "death"),
                 )
                 shore_fails = 0 if moved_shore else (shore_fails + 1)
             else:
@@ -305,6 +319,27 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
                         item=block,
                         pos=step_pos,
                     )
+                elif (soft_dig := _find_soft_bank_dig_cell(ex, st, cache, dim, tried_digs)) is not None:
+                    # 2 格高泥土/草水坑且无垫脚方块时，先快挖 1 格紧邻松软土岸开出 1 格登岸台阶，严禁干等 15s 寻路超时
+                    tried_digs.add(soft_dig)
+                    dig_pos = list(soft_dig)
+                    yield from _exec_step(
+                        "dig",
+                        lambda dp=dig_pos: ex.dig(dp),
+                        on_ok=lambda dp=dig_pos: cache.invalidate(dp, dimension=dim),
+                        pos=dig_pos,
+                    )
+                elif shore is not None:
+                    tried_shores.add(shore)
+                    shore_timeout = 2.2 if under_hostile_fire else 4.0
+                    moved_hi = yield from _move_to_bounded(
+                        ex,
+                        [shore[0] + 0.5, float(shore[1]), shore[2] + 0.5],
+                        rng=1,
+                        timeout=shore_timeout,
+                        stop_on=("hurt", "death"),
+                    )
+                    shore_fails = 0 if moved_hi else (shore_fails + 1)
                 elif control_unsupported:
                     break
                 else:
@@ -774,18 +809,42 @@ def _pick_cliff_safe_yaw(
     dim: str,
     *,
     avoid_water: bool = False,
+    hostile_dir: Optional[tuple[float, float]] = None,
 ) -> Optional[float]:
-    """若首选逃离方向前方有深坑/悬崖/岩浆（干地时兼避水面），依次改选侧向 ±90°/±45°/±135°/180° 安全方向。"""
+    """若首选逃离方向前方有深坑/悬崖/岩浆（干地时兼避水面），依次改选侧向 ±90°/±45°/±135°/180° 安全方向；尽量拒绝直冲敌怪正脸。"""
     offsets = (0.0, math.pi / 2, -math.pi / 2, math.pi / 4, -math.pi / 4, 3 * math.pi / 4, -3 * math.pi / 4, math.pi)
+    h_unit: Optional[tuple[float, float]] = None
+    if hostile_dir is not None:
+        hnorm = math.hypot(hostile_dir[0], hostile_dir[1])
+        if hnorm > 1e-6:
+            h_unit = (hostile_dir[0] / hnorm, hostile_dir[1] / hnorm)
+
+    def _toward_hostile(yaw: float) -> bool:
+        if h_unit is None:
+            return False
+        dx, dz = -math.sin(yaw), -math.cos(yaw)
+        return (dx * h_unit[0] + dz * h_unit[1]) > 0.70
+
     if avoid_water:
         for offset in offsets:
             cand = preferred_yaw + offset
+            if _toward_hostile(cand):
+                continue
             if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=True):
                 return cand
     for offset in offsets:
         cand = preferred_yaw + offset
+        if _toward_hostile(cand):
+            continue
         if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=False):
             return cand
+    if h_unit is not None:
+        # 仅当所有非直冲方向全部为深崖/岩浆时才允许回退兜底
+        for aw in ((True, False) if avoid_water else (False,)):
+            for offset in offsets:
+                cand = preferred_yaw + offset
+                if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=aw):
+                    return cand
     return None
 
 
@@ -1849,6 +1908,46 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 if not zero_stall:
                     break
 
+    # 若近战敌怪此刻仍贴脸 <=2.5 格（如前序 2 段疾跑遇拐角脱墙后僵尸仍在 1.4m），
+    # 严禁落入慢速步行 move_to(2.2s) 站桩挨两刀致死：直接沿避敌防跳崖方向补一段 800ms 疾跑拉开身位。
+    cur_nh_mv = st_cur.get("nearest_hostile") if isinstance(st_cur.get("nearest_hostile"), dict) else None
+    cur_d_mv = cur_nh_mv.get("dist") if cur_nh_mv else None
+    if (
+        not (st_cur.get("in_water") or st_cur.get("submerged"))
+        and isinstance(cur_d_mv, (int, float))
+        and not isinstance(cur_d_mv, bool)
+        and float(cur_d_mv) <= 2.5
+    ):
+        pb_yaw = (
+            _pick_alternate_escape_yaw(
+                ex, px, py, pz, ux, uz, cache, dim,
+                tried_yaws=tried_yaws, prefer_opposite=zero_stall,
+            )
+            if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
+            else away_yaw
+        )
+        safe_pb = _pick_cliff_safe_yaw(
+            ex, px, py, pz, pb_yaw, cache, dim, avoid_water=True, hostile_dir=(-ux, -uz),
+        )
+        if safe_pb is not None:
+            ok_pb, _ = yield from _control_step(
+                ex, forward=True, sprint=True, jump=not zero_stall, yaw=safe_pb, ms=800,
+            )
+            if ok_pb:
+                st_pb = _refresh_status(ex, state)
+                if st_pb.get("alive") is False:
+                    return False
+                nh_pb = st_pb.get("nearest_hostile") or {}
+                if not isinstance(nh_pb, dict) or not nh_pb:
+                    return True
+                d_pb = nh_pb.get("dist")
+                if isinstance(d_pb, (int, float)) and not isinstance(d_pb, bool) and float(d_pb) >= effective_hostile_flee_dist(state, h_name):
+                    return True
+                p_pb = st_pb.get("pos")
+                if isinstance(p_pb, (list, tuple)) and len(p_pb) >= 3 and math.hypot(float(p_pb[0]) - px, float(p_pb[2]) - pz) >= 1.5:
+                    return True
+                return False
+
     flee_stride = 18.0 if (is_ranged and not has_shield) else (16.0 if is_creeper else 12.0)
     if not (st_cur.get("in_water") or st_cur.get("submerged")):
         # 干地逃离若远端落点伸入河道，收缩落点到入水前的干地岸段，防止 move_to 把角色带下水
@@ -1886,7 +1985,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
             else away_yaw
         )
-        safe_retry_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, retry_yaw, cache, dim, avoid_water=not in_w_retry)
+        safe_retry_yaw = _pick_cliff_safe_yaw(
+            ex, px, py, pz, retry_yaw, cache, dim,
+            avoid_water=not in_w_retry,
+            hostile_dir=(-ux, -uz) if h_pos is not None else None,
+        )
         if safe_retry_yaw is not None:
             before_retry = (px, py, pz)
             ok_rt, _ = yield from _control_step(
