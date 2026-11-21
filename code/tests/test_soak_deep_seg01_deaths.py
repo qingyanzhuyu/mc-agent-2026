@@ -1669,6 +1669,105 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         })
         self.assertEqual(SmeltIron.blocked(st), "")
 
+    def test_seg17_in_water_bobbing_uses_horizontal_xz_displacement_and_rotates_to_open_water(self) -> None:
+        # 复现 seg-17 Death #1 与 17 连卡死（[-87.7, 62.4, 13.3]）：水中撞岸壁上下扑腾 Δy=0.7 但水平 Δxz=0.0 时，
+        # 必须按水平位移 Δxz<0.5 判停滞并记录 tried_yaws，转向开放水道游离，杜绝 17 轮重复同角撞墙
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        # 玩家在 (-88, 62, 13) 水中；西侧 (-89, 62..64, 13) 是 3 格高石壁；南/北 (-88, 62, 12/14) 是开放水道
+        blocks[(-88, 62, 13)] = "water"
+        blocks[(-88, 63, 13)] = "air"
+        for z in (12, 14):
+            blocks[(-88, 62, z)] = "water"
+            blocks[(-88, 63, z)] = "air"
+        for y in (61, 62, 63, 64):
+            blocks[(-89, y, 13)] = "stone"
+            blocks[(-87, y, 13)] = "stone"
+
+        class _RiverCliffWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-87.7, 62.2, 13.3], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=18.0, food=20, armor_points=0,
+                    in_water=True, submerged=False, on_ground=False,
+                    nearest_hostile={"id": 163469, "name": "skeleton", "dist": 4.2, "pos": [-83.5, 62.2, 13.3]},
+                )
+                self.yaws: list[float] = []
+
+            def control(self, **kwargs):
+                yaw = float(kwargs.get("yaw", 0.0))
+                self.yaws.append(yaw)
+                if len(self.yaws) == 1:
+                    # 首轮撞墙上下扑腾：Δy=+0.7m 但 Δxz=0.0m
+                    self.st["pos"] = [-87.7, 62.9, 13.3]
+                    return {"pos": list(self.st["pos"]), "moved": 0.7}
+                # 换向沿开放水道游离成功
+                self.st["pos"] = [-87.7, 62.3, 21.0]
+                self.st["nearest_hostile"] = {"id": 163469, "name": "skeleton", "dist": 12.0, "pos": [-83.5, 62.2, 13.3]}
+                return {"pos": list(self.st["pos"]), "moved": 7.7}
+
+        w = _RiverCliffWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(w.yaws), 2)
+        diff = abs(math.atan2(math.sin(w.yaws[1] - w.yaws[0]), math.cos(w.yaws[1] - w.yaws[0])))
+        self.assertGreaterEqual(diff, 0.65, f"must rotate yaw away from bobbing cliff wall, got yaws={w.yaws}")
+
+    def test_seg17_water_pit_trap_digs_soft_bank_after_two_horizontal_stalls(self) -> None:
+        # 复现 seg-17 Death #2（[-101.5, 61.3, 20.3]）：角色陷在四周 2 格高泥土壁水坑且背包无垫脚块时，
+        # 连续 2 次水中水平受阻（Δxz<0.5）后必须破拆 1 格紧邻松软土岸开出登岸台阶，严禁原地扑腾至死
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {
+            (-102, 60, 20): "dirt",
+            (-102, 61, 20): "water",
+            (-102, 62, 20): "air",
+            (-102, 63, 20): "air",
+        }
+        # 四周 2 格高（y=61, 62）全是草/土坑壁，上方 y=63 为空气
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            blocks[(-102 + dx, 61, 20 + dz)] = "dirt"
+            blocks[(-102 + dx, 62, 20 + dz)] = "grass_block"
+            blocks[(-102 + dx, 63, 20 + dz)] = "air"
+
+        class _DirtWaterPitWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-101.5, 61.3, 20.5], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=17.0, food=20, armor_points=0,
+                    in_water=True, submerged=False, on_ground=False,
+                    nearest_hostile={"id": 164834, "name": "zombie", "dist": 3.5, "pos": [-98.0, 63.0, 20.5]},
+                )
+                self.dug: list[list[int]] = []
+
+            def control(self, **kwargs):
+                # 坑内四周无水平位移，仅垂直扑腾
+                self.st["pos"] = [-101.5, 61.9, 20.5]
+                return {"pos": list(self.st["pos"]), "moved": 0.6}
+
+            def dig(self, pos, **kwargs):
+                self.dug.append([int(pos[0]), int(pos[1]), int(pos[2])])
+                self.blocks[(int(pos[0]), int(pos[1]), int(pos[2]))] = "air"
+                return {"dug": "grass_block", "pos": list(pos)}
+
+        w = _DirtWaterPitWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(w.dug, "expected _flee_hostile to dig a soft bank block after 2 water-pit horizontal stalls")
+
 
 if __name__ == "__main__":
     unittest.main()
