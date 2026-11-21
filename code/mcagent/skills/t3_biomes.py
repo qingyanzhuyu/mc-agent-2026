@@ -11,6 +11,7 @@ from .encounter import _ARROWS, _retreat_clear, combat_melee, shoot_projectile
 from .field import _grounded, equip_item, place_block, scan_blocks, scan_entities
 from .interaction import _clear_posture, use_item_on
 from .items import AIR, bare, is_clear_space, is_safe_solid_floor
+from .landmark_nav import goto_known_landmark_or_biome
 from .observations import observe_block, refresh_inventory
 from .registry import register
 from .sightline import (DIG_EYE_REACH, ENTITY_EYE_REACH, STATION_EYE_REACH, block_cell,
@@ -42,6 +43,16 @@ def _req_blks(ex: Executor, state: State, types, radius: int, msg: str, pred: st
     blks = _ready(scan_blocks(ex, state, types, radius=radius, limit=8, skill_name=skill))["blocks"]
     if not blks: raise _env_blocked(msg, pred, f"半径 {radius} 格")
     return blks
+def _req_ents_or_landmark(ex: Executor, state: State, types, radius: int, msg: str, pred: str, landmark: str) -> Generator[dict, None, list[dict]]:
+    try: return _req_ents(ex, state, types, radius, msg, pred)
+    except EnvBlocked:
+        if not (yield from goto_known_landmark_or_biome(ex, state, landmark)): raise
+        return _req_ents(ex, state, types, radius, msg, pred)
+def _req_blks_or_landmark(ex: Executor, state: State, types, radius: int, msg: str, pred: str, landmark: str, skill: str = "") -> Generator[dict, None, list[dict]]:
+    try: return _req_blks(ex, state, types, radius, msg, pred, skill=skill)
+    except EnvBlocked:
+        if not (yield from goto_known_landmark_or_biome(ex, state, landmark)): raise
+        return _req_blks(ex, state, types, radius, msg, pred, skill=skill)
 def _is_standable(ex: Executor, c: tuple[int, int, int]) -> bool:
     return _has_floor(ex, c) and is_clear_space(observe_block(ex, [c[0], c[1], c[2]])) and is_clear_space(observe_block(ex, [c[0], c[1] + 1, c[2]]))
 def _overlaps(c: tuple[int, int, int], p: Sequence[float]) -> bool:
@@ -154,7 +165,8 @@ class KillNearSculkCatalyst(_BiomeSkill):
     def blocked(cls, state: State) -> str: return _gate(state, state.hp >= 10 and (_pick_melee(state) is not None or _has_bow(state)), "生命值不足 10 或缺少近战武器/弓箭")
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
-        cats = _req_blks(ex, state, "sculk_catalyst", radius, f"半径 {radius} 格内未发现幽匿催发体", "visible_block:sculk_catalyst", self.name)
+        cats = yield from _req_blks_or_landmark(ex, state, "sculk_catalyst", radius, f"半径 {radius} 格内未发现幽匿催发体", "visible_block:sculk_catalyst", "deep_dark", self.name)
+        st = state.refresh_status(ex.client, max_age_s=0)
         ccenter = block_center(min(cats, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
         mobs = [e for e in _ready(scan_entities(ex, state, None, radius=radius))["entities"]
                 if e.get("type") in ("hostile", "animal", "other") and bare(e.get("name")) not in _NON_KILLABLE and math.dist(e["pos"], ccenter) <= 8.0]
@@ -188,6 +200,9 @@ class AssistAxolotlHunt(_BiomeSkill):
                 yield from _approach_block(ex, state, wpos, reach=STATION_EYE_REACH)
                 yield from use_item_on(ex, state, wpos, "axolotl_bucket")
                 axos = _ready(scan_entities(ex, state, "axolotl", radius=radius))["entities"]
+        if not axos and (yield from goto_known_landmark_or_biome(ex, state, "lush_caves")):
+            st = state.refresh_status(ex.client, max_age_s=0)
+            axos = _ready(scan_entities(ex, state, "axolotl", radius=radius))["entities"]
         if not axos: raise _env_blocked(f"半径 {radius} 格内未发现美西螈", "visible_entity:axolotl", f"半径 {radius} 格实体")
         axo = min(axos, key=lambda e: eye_to_point_dist(st, e["pos"]))
         preys = [e for e in _ready(scan_entities(ex, state, _AQUATIC_PREY, radius=radius))["entities"] if math.dist(e["pos"], axo["pos"]) <= 16.0]
@@ -233,7 +248,9 @@ class AllayDeliverItem(_BiomeSkill):
     def blocked(cls, state: State) -> str: return _gate(state, _pick_allay_item(state) is not None, "背包缺少数量 >= 2 的可丢弃同类物品")
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
-        allay = min(_req_ents(ex, state, "allay", radius, f"半径 {radius} 格内未发现悦灵", "visible_entity:allay"), key=lambda e: eye_to_point_dist(st, e["pos"]))
+        allays = yield from _req_ents_or_landmark(ex, state, "allay", radius, f"半径 {radius} 格内未发现悦灵", "visible_entity:allay", "pillager_outpost")
+        st = state.refresh_status(ex.client, max_age_s=0)
+        allay = min(allays, key=lambda e: eye_to_point_dist(st, e["pos"]))
         if (item := _pick_allay_item(state)) is None: raise Replan("背包缺少数量 >= 2 的可交付物品")
         yield from _approach_ent(ex, state, allay, reach=ENTITY_EYE_REACH)
         before_hand = state.count(item)
@@ -262,7 +279,9 @@ class BoatWithGoat(_BiomeSkill):
         return min(cands, key=lambda c: math.dist(_pt(c), gpos)) if cands else None
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
-        goat = min(_req_ents(ex, state, "goat", radius, f"半径 {radius} 格内未发现山羊", "visible_entity:goat"), key=lambda e: eye_to_point_dist(st, e["pos"]))
+        goats = yield from _req_ents_or_landmark(ex, state, "goat", radius, f"半径 {radius} 格内未发现山羊", "visible_entity:goat", "jagged_peaks|frozen_peaks|snowy_slopes|meadow")
+        st = state.refresh_status(ex.client, max_age_s=0)
+        goat = min(goats, key=lambda e: eye_to_point_dist(st, e["pos"]))
         st = yield from _approach_ent(ex, state, goat, reach=5.0)
         if (bcell := self._find_boat_cell(ex, goat["pos"], st["pos"])) is None: raise _env_blocked("山羊附近缺少放置船的平坦空位", "clear_site:boat", "山羊周边 2 格")
         floor_cell, boat_pos = (bcell[0], bcell[1] - 1, bcell[2]), _pt(bcell)
@@ -302,7 +321,8 @@ class SilkTouchBeeNest(_BiomeSkill):
         return rain or (isinstance(tod, (int, float)) and not isinstance(tod, bool) and (12500 <= int(tod) % 24000 <= 23500))
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
-        nests = _req_blks(ex, state, "bee_nest", radius, f"半径 {radius} 格内未发现自然蜂巢", "visible_block:bee_nest", self.name)
+        nests = yield from _req_blks_or_landmark(ex, state, "bee_nest", radius, f"半径 {radius} 格内未发现自然蜂巢", "visible_block:bee_nest", "bee_nest", self.name)
+        st = state.refresh_status(ex.client, max_age_s=0)
         npos = block_cell(min(nests, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
         # API /get_block 不暴露蜂巢内部蜜蜂数：保守校验夜间/雨天归巢，或巢旁可见蜜蜂（黄昏前活跃蜂巢）
         if not self._is_night_or_rain(st):
@@ -331,7 +351,9 @@ class CatchTadpole(_BiomeSkill):
     def _delta_done(self, state: State, before: dict) -> bool: return state.count("tadpole_bucket") > before.get("tadpole_bucket", 0)
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
-        tad = min(_req_ents(ex, state, "tadpole", radius, f"半径 {radius} 格内未发现蝌蚪", "visible_entity:tadpole"), key=lambda e: eye_to_point_dist(st, e["pos"]))
+        tads = yield from _req_ents_or_landmark(ex, state, "tadpole", radius, f"半径 {radius} 格内未发现蝌蚪", "visible_entity:tadpole", "swamp|mangrove_swamp")
+        st = state.refresh_status(ex.client, max_age_s=0)
+        tad = min(tads, key=lambda e: eye_to_point_dist(st, e["pos"]))
         yield from _approach_ent(ex, state, tad, reach=ENTITY_EYE_REACH)
         before_tb, before_wb = state.count("tadpole_bucket"), state.count("water_bucket")
         ev = yield from use_item_on(ex, state, tad["id"], "water_bucket")
@@ -348,7 +370,11 @@ class SpyglassObserve(_BiomeSkill):
     def blocked(cls, state: State) -> str: return _gate(state, state.count("spyglass") >= 1, "背包缺少望远镜（spyglass）")
     def _run(self, ex: Executor, state: State):
         st, target, radius = self._begin(ex, state), self.args["target"], self.args["radius"]
-        ents = _req_ents(ex, state, target, radius, f"半径 {radius} 格内未发现 {target}", f"visible_entity:{target}")
+        if target == "parrot":
+            ents = yield from _req_ents_or_landmark(ex, state, target, radius, f"半径 {radius} 格内未发现 {target}", f"visible_entity:{target}", "jungle")
+            st = state.refresh_status(ex.client, max_age_s=0)
+        else:
+            ents = _req_ents(ex, state, target, radius, f"半径 {radius} 格内未发现 {target}", f"visible_entity:{target}")
         visible = [e for e in ents if can_see_block(ex, st, e["pos"])]
         if not visible: raise _env_blocked(f"半径 {radius} 格内 {target} 视线均被遮挡", f"visible_los:{target}", f"半径 {radius} 格视线")
         ent = min(visible, key=lambda e: eye_to_block_dist(st, e["pos"]))

@@ -14,7 +14,7 @@ from .observations import observe_block
 from .registry import register
 from .sightline import block_cell, eye_to_block_dist, feet_pos
 from .voxel_cache import has_batch_get_blocks, voxel_cache_for
-from .world_memo import SPIRAL_RING_RADII, STRUCTURE_FINGERPRINTS, memo_for, structure_tags_for
+from .world_memo import SPIRAL_RING_RADII, STRUCTURE_FINGERPRINTS, entity_landmark_tags, memo_for, structure_tags_for
 
 NETHER_BIOMES: frozenset[str] = frozenset({"nether_wastes", "soul_sand_valley", "crimson_forest", "warped_forest", "basalt_deltas"})
 _HAZARD_BLOCKS: frozenset[str] = AIR | {"water", "lava", "flowing_water", "flowing_lava", "bubble_column", "fire", "soul_fire", "powder_snow", "magma_block", "cactus", "campfire", "soul_campfire", "sweet_berry_bush"}
@@ -145,7 +145,11 @@ def _sweep_entities(ex: Any, state: Any, dim: str) -> set[str]:
     ents = (res.get("entities") or ()) if isinstance(res, Mapping) else (res if isinstance(res, list) else ())
     memo, found = memo_for(state), set()
     for ent in ents:
-        if isinstance(ent, Mapping) and ent.get("pos") is not None and (tag := _ENTITY_LANDMARKS.get(ename := bare(ent.get("name")).strip().lower())):
+        if not isinstance(ent, Mapping) or ent.get("pos") is None:
+            continue
+        ename = bare(ent.get("name")).strip().lower()
+        tags = entity_landmark_tags(ename) or ((t,) if (t := _ENTITY_LANDMARKS.get(ename)) else ())
+        for tag in tags:
             try:
                 if memo.record_landmark(tag, ent["pos"], dimension=dim, meta={"entity": ename}):
                     found.add(tag)
@@ -225,7 +229,7 @@ def _pick_approach_dest(ex: Any, state: Any, target_cell: tuple[int, int, int], 
 def _sample_site(ex: Any, state: Any, memo: Any, st: Mapping[str, Any], dim: str, sector_idx: int, scan_r: int) -> tuple[str, set[str], int]:
     if st.get("pos"):
         memo.mark_grid_visited(st["pos"], dimension=dim)
-    memo.record_biome(st.get("biome", ""), dimension=dim)
+    memo.record_biome(st.get("biome", ""), pos=st.get("pos"), dimension=dim)
     _, tags, ingested = _sweep_blocks(ex, state, radius=scan_r, limit=64, landmark_meta={"sector": sector_idx})
     return bare(st.get("biome", "")).strip().lower(), set(tags) | _sweep_entities(ex, state, dim), ingested
 
@@ -276,6 +280,8 @@ class SurveyIsland(Skill):
         dim = _norm_dim(self.args["dimension"])
         if _norm_dim((state.st or {}).get("dimension")) != dim: return False
         memo = memo_for(state)
+        if memo.is_island_survey_exhausted(dimension=dim):
+            return False
         if any(i not in memo.done_sectors(dimension=dim) for i in range(self.args["sectors"])): return True
         cur = memo.get_spiral_cursor(dimension=dim)
         return cur["ring"] < len(SPIRAL_RING_RADII) - 1 or cur["sector"] < 8
@@ -337,7 +343,7 @@ class DiscoverStructure(Skill):
         st, cur_dim = _require_ready_dim(ex, state, _REQUIRED_DIM[structure])
         memo = memo_for(state)
         if structure == "nether_biomes":
-            memo.record_biome(st.get("biome", ""), dimension=cur_dim)
+            memo.record_biome(st.get("biome", ""), pos=st.get("pos"), dimension=cur_dim)
             self._before_biomes = memo.biomes(dimension=cur_dim) & NETHER_BIOMES
             if self._before_biomes >= NETHER_BIOMES:
                 self._done = True; return
@@ -358,7 +364,7 @@ class DiscoverStructure(Skill):
         if eye_to_block_dist(st, target_cell) > 3.5:
             yield from _move_step(ex, _pick_approach_dest(ex, state, target_cell, cur_dim), raise_on_replan=True, structure=structure)
         st2 = state.refresh_status(ex.client, max_age_s=0)
-        memo.record_biome(st2.get("biome", ""), dimension=cur_dim)
+        memo.record_biome(st2.get("biome", ""), pos=st2.get("pos"), dimension=cur_dim)
         memo.record_landmark(structure, target_cell, dimension=cur_dim, meta={"visited": True})
         self._done = True
 

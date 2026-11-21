@@ -81,6 +81,10 @@ _LANDMARK_LABELS: dict[str, str] = {
     "dried_ghast": "失水恶魂",
     "cold_biome": "寒带群系",
     "trial_vault_ominous": "不祥宝库",
+    "savanna": "热带草原",
+    "badlands": "恶地",
+    "jungle": "丛林",
+    "warm_ocean_ruins": "暖水废墟",
 }
 _RESOURCE_LABELS: dict[str, str] = {
     "wood": "原木",
@@ -363,6 +367,21 @@ def format_world_landmarks(world_landmarks: Optional[Mapping[str, Any]]) -> str:
                     res_parts.append(f"{res_label}={int(cnt)}")
         if res_parts:
             parts.append(f"资源({', '.join(res_parts)})")
+
+    raw_biomes = world_landmarks.get("visited_biomes")
+    if isinstance(raw_biomes, Sequence) and not isinstance(raw_biomes, (str, bytes)):
+        cleaned_biomes = [
+            scrub_sensitive_text(str(b)).strip()
+            for b in raw_biomes
+            if isinstance(b, str) and b.strip()
+        ]
+        if cleaned_biomes:
+            shown_b = cleaned_biomes[:6]
+            more_b = f"+{len(cleaned_biomes) - 6}" if len(cleaned_biomes) > 6 else ""
+            parts.append(f"已探群系={','.join(shown_b)}{more_b}")
+
+    if world_landmarks.get("island_survey_exhausted"):
+        parts.append("全岛已探尽")
 
     raw_pending = world_landmarks.get("pending_landmark_goals", 0)
     if isinstance(raw_pending, int) and not isinstance(raw_pending, bool) and raw_pending > 0:

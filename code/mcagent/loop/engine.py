@@ -18,7 +18,7 @@ from ..client import FATAL, ApiError, Client
 from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint, has_equipped_armor
 from ..skills.base import Skill, failure
 from ..skills.items import bare
-from ..skills.world_memo import STRUCTURE_FINGERPRINTS, memo_for, structure_tags_for
+from ..skills.world_memo import STRUCTURE_FINGERPRINTS, entity_landmark_tags, memo_for, structure_tags_for
 from .auditor import SoakObserver
 from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
 from .policy import CampaignPlanner, PlanDecision
@@ -63,6 +63,7 @@ _ROADSIDE_DIM_STRUCTURES: dict[str, tuple[str, ...]] = {
         "village", "stronghold", "ruined_portal", "bee_nest", "trial_chambers",
         "deep_dark", "archaeology", "powder_snow", "lush_caves",
         "amethyst_geode", "pale_garden", "pillager_outpost",
+        "meadow", "swamp", "mangrove_swamp",
     ),
     "the_nether": (
         "nether_fortress", "bastion_remnant", "ruined_portal", "dried_ghast",
@@ -75,14 +76,20 @@ _ROADSIDE_OPPORTUNITY_ENTITIES: tuple[str, ...] = (
     "wandering_trader",
     "zombie_villager",
     "villager",
+    "pillager",
     "allay",
+    "breeze",
     "axolotl",
     "goat",
     "tadpole",
+    "frog",
     "armadillo",
     "shulker",
     "parrot",
     "ghast",
+    "blaze",
+    "wither_skeleton",
+    "piglin_brute",
 )
 _ROADSIDE_OPPORTUNITY_ENTITY_SET: frozenset[str] = frozenset(_ROADSIDE_OPPORTUNITY_ENTITIES)
 
@@ -239,6 +246,23 @@ class MainLoop:
         if force or newly_achieved:
             self._save_checkpoint_if_configured()
 
+    def _record_current_biome(self) -> Optional[str]:
+        """零额外 HTTP 成本：直接从当前 `/status` 快照将脚下群系及锚点坐标写入 `WorldResourceMemo`。"""
+        if not self.state.ready or self._is_dead_now():
+            return None
+        st = self.state.st or {}
+        raw_biome = st.get("biome")
+        if not isinstance(raw_biome, str) or not raw_biome.strip():
+            return None
+        dim = str(st.get("dimension") or "overworld")
+        pos = self._pos_tuple(self.state)
+        try:
+            if memo_for(self.state).record_biome(raw_biome, pos=pos, dimension=dim):
+                return bare(raw_biome).strip().lower()
+        except Exception:
+            return None
+        return None
+
     def _maybe_roadside_scan(self, force: bool = False) -> list[str]:
         """技能完成边界的沿途增量扫描：满足时间间隔或位移>=8格/切维度时探测附近结构指纹与高价值机会实体。"""
         if not self.config.enable_roadside_scan:
@@ -269,6 +293,8 @@ class MainLoop:
         limit = max(1, int(self.config.roadside_scan_limit))
         memo = memo_for(self.state)
         newly_recorded: list[str] = []
+        if new_biome := self._record_current_biome():
+            newly_recorded.append(new_biome)
 
         find_blocks = getattr(self.client, "find_blocks", None)
         if callable(find_blocks):
@@ -355,6 +381,17 @@ class MainLoop:
                                 newly_recorded.append(kind)
                         except Exception:
                             continue
+                        for mapped_tag in entity_landmark_tags(kind):
+                            if mapped_tag == kind:
+                                continue
+                            try:
+                                if memo.record_landmark(
+                                    mapped_tag, pos, dimension=dim,
+                                    meta={"entity": kind, "source": "roadside_scan"},
+                                ):
+                                    newly_recorded.append(mapped_tag)
+                            except Exception:
+                                continue
 
         if newly_recorded:
             self.log(f"[loop] 沿途增量扫描发现新地标: {', '.join(newly_recorded)}")
@@ -864,6 +901,8 @@ class MainLoop:
                         stop_reason = "transient_outage"
                         break
                     continue
+
+                self._record_current_biome()
 
                 if self._sync_and_check_target_goal():
                     self._maybe_save_checkpoint_on_goal_progress(force=True)

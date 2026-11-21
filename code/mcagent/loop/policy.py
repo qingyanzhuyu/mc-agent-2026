@@ -24,7 +24,7 @@ from ..skills.nether_portal import nether_preflight_missing
 from ..skills.survival_food import COOKED_FOODS, cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
-from .context import DecisionContext, ObjectiveRecord, is_daytime
+from .context import DecisionContext, ObjectiveRecord, count_pending_landmark_goals, is_daytime
 from .goals import (
     DEFAULT_CAMPAIGN_STAGES, GOALS, HUB_DOWNSTREAM_THRESHOLD, OFFICIAL_CAMPAIGN_STAGES,
     STONE_OR_BETTER_PICKS, GoalSpec,
@@ -51,6 +51,8 @@ _WOOL_ITEMS: tuple[str, ...] = tuple(f"{c}_wool" for c in _WOOL_COLORS)
 DEFAULT_HUB_COOLDOWN_S: float = 180.0
 DEFAULT_HUB_WAKE_MOVE_DIST: float = 32.0
 DEFAULT_HUB_MAX_RESTARTS: int = 8
+DEFAULT_RECON_INTERVAL_S: float = 900.0
+DEFAULT_RECON_INITIAL_DELAY_S: float = 300.0
 
 
 @dataclass
@@ -304,6 +306,8 @@ class RulePlanner:
         hub_cooldown_s: float = DEFAULT_HUB_COOLDOWN_S,
         hub_wake_dist: float = DEFAULT_HUB_WAKE_MOVE_DIST,
         hub_max_restarts: int = DEFAULT_HUB_MAX_RESTARTS,
+        recon_interval_s: float = DEFAULT_RECON_INTERVAL_S,
+        recon_initial_delay_s: float = DEFAULT_RECON_INITIAL_DELAY_S,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.registry = REGISTRY if registry is None else registry
@@ -339,6 +343,10 @@ class RulePlanner:
         self._hub_restart_counts: dict[str, int] = {}
         self._last_observed_pos: tuple[str, float, float] = ("overworld", 0.0, 0.0)
         self._fallback_explore_turn: int = 0
+        self.recon_interval_s: float = max(0.0, float(recon_interval_s))
+        self.recon_initial_delay_s: float = max(0.0, float(recon_initial_delay_s))
+        self._recon_started_at: float = float(self._clock())
+        self._last_recon_at: Optional[float] = None
 
     def is_hub_goal(self, goal_id: Optional[str]) -> bool:
         """基于台账 DAG 下游闭包自动判断目标是否为核心枢纽。"""
@@ -1170,6 +1178,43 @@ class RulePlanner:
             if sh is not None:
                 return PlanDecision(sh, "rule", "铁器底座补齐盾牌防身")
 
+        # 11. Periodic Biome/Structure Island Recon（仅当存在未探明地标目标、武装安全、白天且岛未探尽时按周期推进 2 扇区外扩）
+        if (
+            self.recon_interval_s > 0.0
+            and dim == "overworld"
+            and day is True
+            and safe_gt_12
+            and hp >= 16.0
+            and restore >= 14
+            and has_sword
+            and (has_equipped_armor(state) or state.count("shield") >= 1)
+            and not state.in_safe_mode
+            and not memo.is_island_survey_exhausted(dimension=dim)
+        ):
+            now_recon = float(self._clock())
+            recon_due = (
+                (now_recon - self._recon_started_at) >= self.recon_initial_delay_s
+                if self._last_recon_at is None
+                else (now_recon - self._last_recon_at) >= self.recon_interval_s
+            )
+            if recon_due:
+                pending_lm = count_pending_landmark_goals(
+                    self.active_goals, state, self.completed_advancements, memo
+                )
+                if pending_lm > 0:
+                    survey_args: dict[str, Any] = {"sectors": 2, "radius": 48}
+                    survey_cls = self.registry.get("survey_island")
+                    if survey_cls is not None and "dimension" in getattr(survey_cls, "params", {}):
+                        survey_args["dimension"] = dim
+                    recon_sk = self._try_make("survey_island", survey_args, state)
+                    if recon_sk is not None:
+                        self._last_recon_at = now_recon
+                        return PlanDecision(
+                            recon_sk,
+                            "rule",
+                            f"周期性群系与结构外扩勘探（待解锁地标目标={pending_lm}项）",
+                        )
+
         return None
 
     def choose_survival_or_safe_mode(self, state: State) -> Optional[PlanDecision]:
@@ -1423,8 +1468,21 @@ class CampaignPlanner:
         hub_cooldown_s: float = DEFAULT_HUB_COOLDOWN_S,
         hub_wake_dist: float = DEFAULT_HUB_WAKE_MOVE_DIST,
         hub_max_restarts: int = DEFAULT_HUB_MAX_RESTARTS,
+        recon_interval_s: Optional[float] = None,
+        recon_initial_delay_s: Optional[float] = None,
     ):
         from .strategy import DEFAULT_STRATEGY_REVIEW_S, StrategyOrchestrator, env_bool, env_float
+
+        resolved_recon_interval = (
+            env_float("MC_RECON_INTERVAL_S", DEFAULT_RECON_INTERVAL_S)
+            if recon_interval_s is None
+            else max(0.0, float(recon_interval_s))
+        )
+        resolved_recon_delay = (
+            env_float("MC_RECON_INITIAL_DELAY_S", DEFAULT_RECON_INITIAL_DELAY_S)
+            if recon_initial_delay_s is None
+            else max(0.0, float(recon_initial_delay_s))
+        )
 
         resolved_strategy = ("llm" if use_llm else "rule") if strategy is None else strategy
         if mode not in ("campaign", "focus"):
@@ -1449,6 +1507,8 @@ class CampaignPlanner:
             hub_cooldown_s=hub_cooldown_s,
             hub_wake_dist=hub_wake_dist,
             hub_max_restarts=hub_max_restarts,
+            recon_interval_s=resolved_recon_interval,
+            recon_initial_delay_s=resolved_recon_delay,
             clock=clock,
         )
         self.on_llm_telemetry, self.on_objective_telemetry = on_llm_telemetry, on_objective_telemetry

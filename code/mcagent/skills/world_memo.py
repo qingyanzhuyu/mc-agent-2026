@@ -70,6 +70,30 @@ STRUCTURE_FINGERPRINTS: dict[str, tuple[str, ...]] = {
     "cold_biome": ("packed_ice", "blue_ice", "snow_block", "end_stone"),
     "trial_vault_ominous": ("vault", "trial_spawner", "chiseled_tuff_bricks"),
 }
+BIOME_BLOCK_FINGERPRINTS: dict[str, tuple[str, ...]] = {
+    "savanna": ("acacia_log",),
+    "badlands": ("terracotta", "red_sand"),
+    "jungle": ("jungle_log", "bamboo", "cocoa"),
+    "warm_ocean_ruins": ("magma_block", "suspicious_sand"),
+}
+ENTITY_LANDMARK_TAGS: dict[str, tuple[str, ...]] = {
+    "villager": ("village",),
+    "iron_golem": ("village",),
+    "pillager": ("pillager_outpost",),
+    "allay": ("pillager_outpost",),
+    "breeze": ("trial_chambers",),
+    "blaze": ("nether_fortress",),
+    "wither_skeleton": ("nether_fortress",),
+    "piglin_brute": ("bastion_remnant",),
+    "shulker": ("end_city",),
+    "axolotl": ("lush_caves",),
+    "armadillo": ("savanna",),
+    "parrot": ("jungle",),
+    "goat": ("meadow",),
+    "tadpole": ("swamp",),
+    "frog": ("swamp",),
+    "sheep": ("sheep_flock",),
+}
 VALID_STATUSES: tuple[str, ...] = ("untested", "reachable", "unreachable", "protected", "depleted")
 SPIRAL_RING_RADII: tuple[int, ...] = (48, 96, 160, 240, 320)
 
@@ -275,6 +299,21 @@ def structure_tags_for(names: Iterable[str]) -> dict[str, list[str]]:
     """根据方块名集合识别命中的结构指纹，返回 `{结构标签: [命中方块...]}`。"""
     seen = {bare(n).strip().lower() for n in names if bare(n).strip()}
     return {t: m for t, ms in STRUCTURE_FINGERPRINTS.items() if (m := [x for x in ms if x in seen])} if seen else {}
+
+
+def entity_landmark_tags(entity_name: str) -> tuple[str, ...]:
+    """根据实体名称映射对应的规范结构/群系地标标签（单点真相源，供 survey 与 roadside 共用）。"""
+    ename = bare(entity_name).strip().lower() if isinstance(entity_name, str) else ""
+    return ENTITY_LANDMARK_TAGS.get(ename, ()) if ename else ()
+
+
+def _biome_tag_matches(alt: str, candidate: str) -> bool:
+    """支持精确群系/地标名与子变种前缀/后缀匹配（如 savanna -> windswept_savanna / savanna_plateau）。"""
+    c = bare(candidate).strip().lower()
+    a = bare(alt).strip().lower()
+    if not c or not a:
+        return False
+    return c == a or c.startswith(f"{a}_") or c.endswith(f"_{a}") or f"_{a}_" in c
 
 
 @dataclass
@@ -581,24 +620,75 @@ class WorldResourceMemo:
         with self._lock:
             return bool(self._portals.get(dim))
 
-    def record_biome(self, biome: str, *, dimension: str = "overworld") -> bool:
-        """记录已访问生物群系（按维度隔离）；若为首次记录返回 `True`，空值或已存在返回 `False`。"""
+    def record_biome(self, biome: str, *, pos: Any = None, dimension: str = "overworld") -> bool:
+        """记录已访问生物群系（按维度隔离）；提供 `pos` 时同步登记群系锚点，首次发现递增 `landmark_version`。"""
         b = bare(biome).strip().lower() if isinstance(biome, str) else ""
         if not b:
             return False
         dim = _norm_dim(dimension)
+        cell: Optional[Cell] = None
+        if pos is not None:
+            try:
+                cell = block_cell(pos)
+            except Exception:
+                cell = None
         with self._lock:
             biomes = self.visited_biomes.setdefault(dim, set())
-            if b in biomes:
-                return False
-            biomes.add(b)
-            return True
+            is_new = b not in biomes
+            if is_new:
+                biomes.add(b)
+            if cell is not None:
+                items = self._landmarks.setdefault((dim, b), [])
+                if len(items) < 4 and not any(math.dist(cell, existing_cell) <= 32.0 for existing_cell, _ in items):
+                    items.append((cell, {"biome": b, "source": "biome"}))
+            if is_new:
+                self.landmark_version += 1
+            return is_new
 
     def biomes(self, *, dimension: str = "overworld") -> set[str]:
         """返回指定维度已访问生物群系集合的副本。"""
         dim = _norm_dim(dimension)
         with self._lock:
             return set(self.visited_biomes.get(dim, ()))
+
+    def biome_or_landmark_positions(self, req: str, *, dimension: str = "overworld") -> list[tuple[int, int, int]]:
+        """按地标或群系表达（支持 `a|b` 与群系子变种前缀/后缀匹配）查询已记录锚点坐标。"""
+        alts = [bare(a).strip().lower() for a in str(req).split("|") if bare(a).strip()]
+        if not alts:
+            return []
+        dim = _norm_dim(dimension)
+        with self._lock:
+            out: list[tuple[int, int, int]] = []
+            seen: set[Cell] = set()
+            for (d, lk), items in self._landmarks.items():
+                if d != dim:
+                    continue
+                if any(_biome_tag_matches(alt, lk) for alt in alts):
+                    for cell, _ in items:
+                        if cell not in seen:
+                            seen.add(cell)
+                            out.append(tuple(cell))
+            return out
+
+    def is_island_survey_exhausted(self, *, dimension: str = "overworld") -> bool:
+        """判断指定维度虚空岛是否已探尽（完成全部螺旋环，或已在 >=6 个方位扇区触达虚空边界且至少完成 4 个扇区）。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            rings_done = int(self._spiral_rings_completed.get(dim, (self._spiral_cursor.get(dim) or {}).get("ring", 0)))
+            if rings_done >= len(SPIRAL_RING_RADII):
+                return True
+            edges = self._void_edges.get(dim, ())
+            sectors_done = self.survey_sectors_done.get(dim, ())
+            if len(edges) >= 6 and (len(sectors_done) >= 4 or rings_done >= 1):
+                sp = self._spawn_pos.get(dim)
+                sx, sz = (float(sp[0]), float(sp[2])) if sp is not None else (0.0, 0.0)
+                octants = {
+                    int(((math.atan2(ez - sz, ex - sx) + math.pi) / (2.0 * math.pi)) * 8.0) % 8
+                    for ex, ez in edges
+                }
+                if len(octants) >= 6:
+                    return True
+            return False
 
     def mark_sector_done(self, sector_idx: int, *, dimension: str = "overworld") -> None:
         """标记指定维度的已勘查扇区索引（必须为非布尔非负整数）。"""
@@ -1185,6 +1275,8 @@ class WorldResourceMemo:
                 summary["spiral_ring"] = int(cursor["ring"])
             if edges := self._void_edges.get(dim):
                 summary["void_edges_count"] = len(edges)
+            if self.is_island_survey_exhausted(dimension=dim):
+                summary["island_survey_exhausted"] = True
             return summary
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
@@ -1701,7 +1793,8 @@ def format_memo_summary(state: Any, **kwargs: Any) -> str:
 
 
 __all__ = [
-    "ALL_LOG_BLOCKS", "BED_BLOCKS", "CATEGORY_BLOCKS", "SPIRAL_RING_RADII", "STRUCTURE_FINGERPRINTS", "VALID_STATUSES",
-    "ResourceEntry", "WorldResourceMemo", "classify_block", "structure_tags_for",
+    "ALL_LOG_BLOCKS", "BED_BLOCKS", "BIOME_BLOCK_FINGERPRINTS", "CATEGORY_BLOCKS", "ENTITY_LANDMARK_TAGS",
+    "SPIRAL_RING_RADII", "STRUCTURE_FINGERPRINTS", "VALID_STATUSES",
+    "ResourceEntry", "WorldResourceMemo", "classify_block", "entity_landmark_tags", "structure_tags_for",
     "memo_for", "reset_all_world_memos", "format_memo_summary",
 ]

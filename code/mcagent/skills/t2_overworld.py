@@ -9,6 +9,7 @@ from .encounter import _ARROWS, _retreat_clear, shoot_projectile, verify_shot_la
 from .field import _cell, _safe_support, _standable_cell, equip_item, move_local, place_block, scan_blocks, scan_entities
 from .interaction import _clear_posture, use_item_on
 from .items import AIR, bare
+from .landmark_nav import goto_known_landmark_or_biome
 from .observations import completed_advancements, observe_block, refresh_inventory
 from .registry import register
 from .sightline import block_center, eye_to_block_dist
@@ -73,6 +74,14 @@ def _scan_req(ex, state, types, radius: int, msg: str, pred: str, *, entity: boo
         if not need or dest is not None:
             return ent
     raise _blocked(msg, pred, f"半径 {radius} 格实体")
+
+def _scan_req_or_landmark(ex, state, types, radius: int, msg: str, pred: str, *, landmark: str | None = None, entity: bool = False, reach: float = 3.5, filt=None):
+    try:
+        return _scan_req(ex, state, types, radius, msg, pred, entity=entity, reach=reach, filt=filt)
+    except EnvBlocked:
+        if not landmark or not (yield from goto_known_landmark_or_biome(ex, state, landmark)):
+            raise
+        return _scan_req(ex, state, types, radius, msg, pred, entity=entity, reach=reach, filt=filt)
 
 def _find_retreat(ex, state, away_from):
     st = state.refresh_status(ex.client, max_age_s=0)
@@ -241,7 +250,10 @@ class CatchAquaticMob(_OverworldSkill):
     def run(self, ex, state):
         self._begin(ex, state); target, radius = self.args["target"], self.args["radius"]
         species, buckets = (_FISH_SPECIES, _FISH_BUCKETS) if target == "fish" else (("axolotl",), ("axolotl_bucket",))
-        ent = _scan_req(ex, state, species, radius, f"未找到可达的 {target}", f"visible_entity:{target}", entity=True)
+        ent = yield from _scan_req_or_landmark(
+            ex, state, species, radius, f"未找到可达的 {target}", f"visible_entity:{target}",
+            landmark="lush_caves" if target == "axolotl" else None, entity=True,
+        )
         yield from _approach(ex, state, ent["pos"], reach=3.5, max_distance=radius)
         before_b = sum(state.count(b) for b in buckets)
         yield from _use_check(ex, state, ent["id"], "water_bucket", lambda _: sum(state.count(b) for b in buckets) > before_b, "捕捉水生生物后未确认获得对应生物桶")
@@ -287,7 +299,8 @@ class HarvestHoneyAndWax(_OverworldSkill):
     def run(self, ex, state):
         self._begin(ex, state); mode, radius = self.args["mode"], self.args["radius"]
         if mode == "honey":
-            npos = tuple(_scan_req(ex, state, ("bee_nest", "beehive"), radius, "未找到蜂巢或蜂箱", "visible_block:bee_nest")[0]["pos"])
+            hits = yield from _scan_req_or_landmark(ex, state, ("bee_nest", "beehive"), radius, "未找到蜂巢或蜂箱", "visible_block:bee_nest", landmark="bee_nest")
+            npos = tuple(hits[0]["pos"])
             memo_for(state).record_landmark("bee_nest", npos, dimension=_dim(state))
             yield from _approach(ex, state, npos, reach=3.5, max_distance=radius, is_block=True)
             nx, ny, nz = npos
@@ -336,7 +349,7 @@ class BiomeQuickAction(_OverworldSkill):
             return state.count("brush" if a == "brush_armadillo" else "dried_ghast") >= 1
         return state.count("crossbow") >= 1 and sum(state.count(k) for k in _ARROWS) >= 2
     def _avoid_vibration(self, ex, state, radius: int):
-        hits = _scan_req(ex, state, _SCULK_BLOCKS, radius, "未找到幽匿传感器或尖啸体", "visible_block:sculk_sensor")
+        hits = yield from _scan_req_or_landmark(ex, state, _SCULK_BLOCKS, radius, "未找到幽匿传感器或尖啸体", "visible_block:sculk_sensor", landmark="deep_dark")
         memo_for(state).record_landmark("sculk_sensor", hits[0]["pos"], dimension=_dim(state))
         ox, oy, oz = _cell(state.refresh_status(ex.client, max_age_s=0)["pos"])
         steps = next((((ox + dx + 0.5, float(oy), oz + dz + 0.5), (ox + 2 * dx + 0.5, float(oy), oz + 2 * dz + 0.5))
@@ -351,7 +364,7 @@ class BiomeQuickAction(_OverworldSkill):
         yield rec("posture", cleared, sneak=False)
     def _powder_snow(self, ex, state, radius: int):
         yield from equip_item(ex, state, "leather_boots", slot="feet")
-        hits = _scan_req(ex, state, "powder_snow", radius, "未找到细雪方块", "visible_block:powder_snow")
+        hits = yield from _scan_req_or_landmark(ex, state, "powder_snow", radius, "未找到细雪方块", "visible_block:powder_snow", landmark="powder_snow")
         memo_for(state).record_landmark("powder_snow", hits[0]["pos"], dimension=_dim(state))
         ps = next((tuple(b["pos"]) for b in hits if _is_air(ex, (b["pos"][0], b["pos"][1] + 1, b["pos"][2])) and _is_air(ex, (b["pos"][0], b["pos"][1] + 2, b["pos"][2]))), None)
         if ps is None: raise _blocked("细雪上方净空不足", "clear_above:powder_snow", f"半径 {radius} 格")
@@ -381,12 +394,12 @@ class BiomeQuickAction(_OverworldSkill):
         if action in ("avoid_vibration", "powder_snow", "dried_ghast"):
             yield from getattr(self, f"_{action}")(ex, state, radius)
         elif action == "brush_armadillo":
-            ent = _scan_req(ex, state, "armadillo", radius, "未找到可达犰狳", "visible_entity:armadillo", entity=True)
+            ent = yield from _scan_req_or_landmark(ex, state, "armadillo", radius, "未找到可达犰狳", "visible_entity:armadillo", landmark="savanna|badlands", entity=True)
             yield from _approach(ex, state, ent["pos"], reach=3.5, max_distance=radius)
             before_sc = state.count("armadillo_scute")
             yield from _use_check(ex, state, ent["id"], "brush", lambda ev: state.count("armadillo_scute") > before_sc or ev["receipt"].get("changed") is True, "刷犰狳后未确认掉落或交互成功")
         else:
-            ent = _scan_req(ex, state, "pillager", radius, "未找到可达掠夺者", "visible_entity:pillager", entity=True, reach=24.0)
+            ent = yield from _scan_req_or_landmark(ex, state, "pillager", radius, "未找到可达掠夺者", "visible_entity:pillager", landmark="pillager_outpost", entity=True, reach=24.0)
             yield from _approach(ex, state, ent["pos"], reach=24.0, max_distance=radius)
             if (retreat := _find_retreat(ex, state, ent["pos"])) is None: raise Replan("缺少同高水平撤离格")
             yield from shoot_projectile(ex, state, entity=ent, weapon="crossbow", charge_ms=1300, retreat_pos=retreat, max_distance=32)

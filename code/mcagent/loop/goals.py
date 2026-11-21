@@ -2194,6 +2194,35 @@ def chain_landmarks_satisfied(chain: Sequence[GoalSpec], memo: Any) -> bool:
     return all(goal_landmarks_satisfied(node, memo) for node in chain)
 
 
+def _locality_bonus_multiplier(goal: GoalSpec, state: State, memo: Any) -> float:
+    """若玩家正处于目标所需群系内，或距该群系/结构锚点 <=48 格，给予 1.35x 顺路加权。"""
+    if not goal.requires_landmarks:
+        return 1.0
+    st = state.st or {}
+    cur_biome = str(st.get("biome") or "").removeprefix("minecraft:").strip().lower()
+    if cur_biome:
+        for req in goal.requires_landmarks:
+            alts = [a.strip().lower() for a in str(req).split("|") if a.strip()]
+            if any(_biome_matches(alt, cur_biome) for alt in alts):
+                return 1.35
+    pos = st.get("pos")
+    if memo is not None and isinstance(pos, (list, tuple)) and len(pos) >= 3:
+        try:
+            px, pz = float(pos[0]), float(pos[2])
+        except (TypeError, ValueError):
+            return 1.0
+        if not (math.isfinite(px) and math.isfinite(pz)):
+            return 1.0
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        pos_fn = getattr(memo, "biome_or_landmark_positions", None)
+        if callable(pos_fn):
+            for req in goal.requires_landmarks:
+                for cell in pos_fn(req, dimension=dim):
+                    if math.hypot(px - (cell[0] + 0.5), pz - (cell[2] + 0.5)) <= 48.0:
+                        return 1.35
+    return 1.0
+
+
 # ============================================================================
 # 台账契约核验、阶段过滤与链路性价比排序
 # ============================================================================
@@ -2777,7 +2806,7 @@ def rank_actionable_goals(
                 active_goals_by_id=by_id,
                 memo=resolved_memo,
                 is_day=is_day,
-            )
+            ) * _locality_bonus_multiplier(g, state, resolved_memo)
         sleep_prio = (
             1
             if (
