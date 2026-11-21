@@ -79,6 +79,23 @@ _CATEGORY_LABELS: dict[str, str] = {
 }
 _STATUS_LABELS: dict[str, str] = {"untested": "未探测", "reachable": "已确认可达", "unreachable": "可重探"}
 _FALLBACK_CAT = "_pos"
+_CAMP_STATIONS: tuple[str, ...] = ("chest", "bed", "furnace", "crafting_table")
+_EDIBLE_RECOVERY_FOODS: frozenset[str] = frozenset({
+    "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken",
+    "cooked_rabbit", "cooked_cod", "cooked_salmon", "bread", "baked_potato",
+    "golden_carrot", "golden_apple", "enchanted_golden_apple", "apple",
+    "carrot", "melon_slice", "sweet_berries", "glow_berries", "pumpkin_pie",
+    "cookie", "beetroot", "beetroot_soup", "mushroom_stew", "rabbit_stew",
+    "honey_bottle", "dried_kelp", "beef", "porkchop", "mutton", "chicken",
+    "cod", "salmon",
+})
+_UNRECOVERABLE_DEATH_CAUSE_KEYWORDS: tuple[str, ...] = (
+    "lava", "void", "out_of_world", "fell_out_of_world", "in_fire", "on_fire", "magma",
+)
+_CORPSE_VALUABLE_ITEMS: frozenset[str] = frozenset({
+    "obsidian", "shield", "flint_and_steel", "lava_bucket", "water_bucket",
+    "bucket", "enchanting_table", "bow", "crossbow", "ender_pearl", "blaze_rod",
+})
 
 
 def _norm_dim(dimension: Optional[str]) -> str:
@@ -95,6 +112,79 @@ def _parse_cell(value: Any) -> Optional[Cell]:
     if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
         return None
     return (int(value[0]), int(value[1]), int(value[2]))
+
+
+def _normalize_stored_items(items: Optional[Mapping[str, Any]]) -> dict[str, int]:
+    if not isinstance(items, Mapping):
+        return {}
+    out: dict[str, int] = {}
+    for raw_name, raw_count in items.items():
+        if not isinstance(raw_name, str):
+            continue
+        name = bare(raw_name).strip().lower()
+        if not name:
+            continue
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count > 0:
+            out[name] = out.get(name, 0) + int(raw_count)
+    return out
+
+
+def _validate_strict_items(items: Any) -> Optional[dict[str, int]]:
+    if not isinstance(items, Mapping):
+        return None
+    out: dict[str, int] = {}
+    for raw_name, raw_count in items.items():
+        if not isinstance(raw_name, str):
+            return None
+        name = bare(raw_name).strip().lower()
+        if not name:
+            return None
+        if not isinstance(raw_count, int) or isinstance(raw_count, bool) or raw_count <= 0:
+            return None
+        out[name] = out.get(name, 0) + int(raw_count)
+    return out
+
+
+def _copy_camp(camp: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "pos": list(camp["pos"]),
+        "chest": list(camp["chest"]) if camp.get("chest") is not None else None,
+        "bed": list(camp["bed"]) if camp.get("bed") is not None else None,
+        "furnace": list(camp["furnace"]) if camp.get("furnace") is not None else None,
+        "crafting_table": list(camp["crafting_table"]) if camp.get("crafting_table") is not None else None,
+        "stored_items": dict(camp.get("stored_items", {})),
+    }
+
+
+def _copy_death(death: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "pos": list(death["pos"]),
+        "cause": str(death["cause"]),
+        "lost_items": dict(death.get("lost_items", {})),
+        "recorded_at": float(death["recorded_at"]),
+    }
+
+
+def _is_recovery_kit_item(name: str) -> bool:
+    b = bare(name).strip().lower()
+    if not b:
+        return False
+    return (
+        b == "shield"
+        or b == "turtle_helmet"
+        or b in _EDIBLE_RECOVERY_FOODS
+        or any(
+            len(b) > len(sfx) and b.endswith(sfx)
+            for sfx in ("_pickaxe", "_sword", "_helmet", "_chestplate", "_leggings", "_boots")
+        )
+    )
+
+
+def _is_valuable_lost_item(name: str) -> bool:
+    b = bare(name).strip().lower()
+    if not b:
+        return False
+    return b.startswith(("iron_", "diamond", "netherite_")) or b in _CORPSE_VALUABLE_ITEMS
 
 
 def _origin_dist(origin: Any, cell: Cell) -> float:
@@ -149,6 +239,8 @@ class WorldResourceMemo:
         self._blocked_regions: dict[tuple[str, tuple[int, ...]], float] = {}
         self.visited_biomes: dict[str, set[str]] = {}
         self.survey_sectors_done: dict[str, set[int]] = {}
+        self._camps: dict[str, dict[str, Any]] = {}
+        self._last_deaths: dict[str, dict[str, Any]] = {}
         self.landmark_version: int = 0
 
     def __len__(self) -> int:
@@ -164,6 +256,8 @@ class WorldResourceMemo:
             self._blocked_regions.clear()
             self.visited_biomes.clear()
             self.survey_sectors_done.clear()
+            self._camps.clear()
+            self._last_deaths.clear()
             self.landmark_version = 0
 
     def _cooldown(self, override: Optional[float]) -> float:
@@ -324,6 +418,7 @@ class WorldResourceMemo:
                         or (k == "bed" and sk.endswith("_bed"))
                         or (k == "furnace" and sk in ("blast_furnace", "smoker"))
                         or (k == "anvil" and sk in ("chipped_anvil", "damaged_anvil"))
+                        or (k == "chest" and sk in ("trapped_chest", "barrel"))
                     )
                     if not matched:
                         continue
@@ -435,6 +530,155 @@ class WorldResourceMemo:
                 return False
             return True
 
+    def _camp_has_recovery_kit_locked(self, dim: str) -> bool:
+        camp = self._camps.get(dim)
+        if camp is None or camp.get("chest") is None:
+            return False
+        return any(
+            count > 0 and _is_recovery_kit_item(name)
+            for name, count in camp.get("stored_items", {}).items()
+        )
+
+    def set_camp(
+        self,
+        pos: Any,
+        *,
+        dimension: str = "overworld",
+        chest: Any = None,
+        bed: Any = None,
+        furnace: Any = None,
+        crafting_table: Any = None,
+        stored_items: Optional[Mapping[str, int]] = None,
+    ) -> dict[str, Any]:
+        """创建或更新指定维度的主营地档案，同步登记非空工作站并返回防御性副本。"""
+        dim = _norm_dim(dimension)
+        pos_cell = block_cell(pos)
+        station_updates: dict[str, Cell] = {}
+        for kind, raw_val in (
+            ("chest", chest),
+            ("bed", bed),
+            ("furnace", furnace),
+            ("crafting_table", crafting_table),
+        ):
+            if raw_val is not None:
+                station_updates[kind] = block_cell(raw_val)
+        with self._lock:
+            existing = self._camps.get(dim)
+            camp: dict[str, Any] = {
+                "pos": list(pos_cell),
+                "chest": list(existing["chest"]) if existing and existing.get("chest") is not None else None,
+                "bed": list(existing["bed"]) if existing and existing.get("bed") is not None else None,
+                "furnace": list(existing["furnace"]) if existing and existing.get("furnace") is not None else None,
+                "crafting_table": list(existing["crafting_table"]) if existing and existing.get("crafting_table") is not None else None,
+                "stored_items": dict(existing["stored_items"]) if existing else {},
+            }
+            for kind, cell in station_updates.items():
+                camp[kind] = list(cell)
+                self._record_station_locked(kind, cell, dim)
+            if stored_items is not None:
+                camp["stored_items"] = _normalize_stored_items(stored_items)
+            self._camps[dim] = camp
+            return _copy_camp(camp)
+
+    def get_camp(self, *, dimension: str = "overworld") -> Optional[dict[str, Any]]:
+        """返回指定维度主营地档案的防御性副本，不存在时返回 `None`。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            camp = self._camps.get(dim)
+            return _copy_camp(camp) if camp is not None else None
+
+    def update_camp_stored(self, stored_items: Mapping[str, int], *, dimension: str = "overworld") -> None:
+        """更新指定维度主营地的箱内存储物品清单（若营地存在）。"""
+        dim = _norm_dim(dimension)
+        normalized = _normalize_stored_items(stored_items)
+        with self._lock:
+            camp = self._camps.get(dim)
+            if camp is not None:
+                camp["stored_items"] = normalized
+
+    def camp_has_recovery_kit(self, *, dimension: str = "overworld") -> bool:
+        """判断指定维度主营地箱子中是否存有基础恢复物资（镐/剑/盾/护甲/可食用食物）。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            return self._camp_has_recovery_kit_locked(dim)
+
+    def record_death(
+        self,
+        pos: Any,
+        *,
+        cause: str = "",
+        lost_items: Optional[Mapping[str, int]] = None,
+        dimension: str = "overworld",
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """记录指定维度的最近一次死亡位置、死因、掉落物品与时间戳，返回防御性副本。"""
+        dim = _norm_dim(dimension)
+        cell = list(block_cell(pos))
+        cause_str = str(cause or "").strip().lower()
+        items = _normalize_stored_items(lost_items or {})
+        with self._lock:
+            raw_time = self._clock() if now is None else now
+            recorded_at = _finite_float(raw_time)
+            if recorded_at is None:
+                raise ValueError(f"非法死亡时间戳: {raw_time!r}")
+            death: dict[str, Any] = {
+                "pos": cell,
+                "cause": cause_str,
+                "lost_items": items,
+                "recorded_at": recorded_at,
+            }
+            self._last_deaths[dim] = death
+            return _copy_death(death)
+
+    def get_last_death(self, *, dimension: str = "overworld") -> Optional[dict[str, Any]]:
+        """返回指定维度最近一次死亡记录的防御性副本，不存在时返回 `None`。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            death = self._last_deaths.get(dim)
+            return _copy_death(death) if death is not None else None
+
+    def clear_last_death(self, *, dimension: str = "overworld") -> None:
+        """清除指定维度的最近死亡记录。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            self._last_deaths.pop(dim, None)
+
+    def should_attempt_corpse_recovery(
+        self,
+        cur_pos: Any,
+        *,
+        dimension: str = "overworld",
+        now: Optional[float] = None,
+        max_dist: float = 80.0,
+        max_age_s: float = 240.0,
+    ) -> tuple[bool, str]:
+        """判断是否应当尝试可控捡尸：校验记录存在、非岩浆/虚空/火焰死因、时效、距离与铁级以上高价值掉落。"""
+        dim = _norm_dim(dimension)
+        with self._lock:
+            death = self._last_deaths.get(dim)
+            if death is None:
+                return (False, "no_death_record")
+            cause = str(death.get("cause", "")).strip().lower()
+            if cause == "fire" or any(kw in cause for kw in _UNRECOVERABLE_DEATH_CAUSE_KEYWORDS):
+                return (False, "unrecoverable_cause")
+            raw_time = self._clock() if now is None else now
+            cur_time = _finite_float(raw_time)
+            if cur_time is None:
+                raise ValueError(f"非法时间戳: {raw_time!r}")
+            if (cur_time - float(death["recorded_at"])) > float(max_age_s):
+                return (False, "expired")
+            cur_pt = point3(cur_pos)
+            death_pt = tuple(float(v) for v in death["pos"])
+            if math.dist(cur_pt, death_pt) >= float(max_dist):
+                return (False, "too_far")
+            has_valuables = any(
+                count > 0 and _is_valuable_lost_item(name)
+                for name, count in death.get("lost_items", {}).items()
+            )
+            if not has_valuables:
+                return (False, "no_valuable_items")
+            return (True, "eligible")
+
     def ingest_find_blocks(self, response: Any, *, dimension: str = "overworld", origin: Any = None, category: Optional[str] = None) -> int:
         """吸收 `find_blocks` 明细或摘要响应；同时记录资源分类与结构指纹标签。"""
         if not isinstance(response, Mapping):
@@ -542,6 +786,11 @@ class WorldResourceMemo:
                 summary["visited_biomes"] = sorted(bs)
             if ss := self.survey_sectors_done.get(dim):
                 summary["survey_sectors_done"] = sorted(ss)
+            if camp := self._camps.get(dim):
+                summary["has_camp"] = True
+                summary["camp_has_chest"] = camp.get("chest") is not None
+                summary["camp_has_recovery_kit"] = self._camp_has_recovery_kit_locked(dim)
+                summary["camp_stored_count"] = sum(camp["stored_items"].values())
             return summary
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
@@ -587,6 +836,8 @@ class WorldResourceMemo:
                 "resources": resources_out,
                 "visited_biomes": {dim: sorted(bs) for dim, bs in self.visited_biomes.items() if bs},
                 "survey_sectors_done": {dim: sorted(ss) for dim, ss in self.survey_sectors_done.items() if ss},
+                "camps": {dim: _copy_camp(camp) for dim, camp in self._camps.items()},
+                "last_deaths": {dim: _copy_death(death) for dim, death in self._last_deaths.items()},
             }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -776,6 +1027,62 @@ class WorldResourceMemo:
                     if parsed_sectors:
                         new_sectors.setdefault(dim, set()).update(parsed_sectors)
 
+            new_camps: dict[str, dict[str, Any]] = {}
+            if "camps" in data:
+                camps_raw = data["camps"]
+                if not isinstance(camps_raw, Mapping):
+                    return False
+                for raw_dim, camp_raw in camps_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(camp_raw, Mapping):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    pos_cell = _parse_cell(camp_raw.get("pos"))
+                    if pos_cell is None:
+                        return False
+                    parsed_camp: dict[str, Any] = {"pos": list(pos_cell)}
+                    for field in _CAMP_STATIONS:
+                        raw_station = camp_raw.get(field)
+                        if raw_station is None:
+                            parsed_camp[field] = None
+                        else:
+                            st_cell = _parse_cell(raw_station)
+                            if st_cell is None:
+                                return False
+                            parsed_camp[field] = list(st_cell)
+                    stored_items = _validate_strict_items(camp_raw.get("stored_items", {}))
+                    if stored_items is None:
+                        return False
+                    parsed_camp["stored_items"] = stored_items
+                    new_camps[dim] = parsed_camp
+
+            new_last_deaths: dict[str, dict[str, Any]] = {}
+            if "last_deaths" in data:
+                deaths_raw = data["last_deaths"]
+                if not isinstance(deaths_raw, Mapping):
+                    return False
+                for raw_dim, death_raw in deaths_raw.items():
+                    if not isinstance(raw_dim, str) or not isinstance(death_raw, Mapping):
+                        return False
+                    dim = _norm_dim(raw_dim)
+                    pos_cell = _parse_cell(death_raw.get("pos"))
+                    if pos_cell is None:
+                        return False
+                    cause_raw = death_raw.get("cause", "")
+                    if not isinstance(cause_raw, str):
+                        return False
+                    lost_items = _validate_strict_items(death_raw.get("lost_items", {}))
+                    if lost_items is None:
+                        return False
+                    recorded_at = _finite_float(death_raw.get("recorded_at"))
+                    if recorded_at is None:
+                        return False
+                    new_last_deaths[dim] = {
+                        "pos": list(pos_cell),
+                        "cause": cause_raw.strip().lower(),
+                        "lost_items": lost_items,
+                        "recorded_at": recorded_at,
+                    }
+
             with self._lock:
                 self._entries = new_entries
                 self._stations = new_stations
@@ -783,6 +1090,8 @@ class WorldResourceMemo:
                 self._portals = new_portals
                 self.visited_biomes = new_biomes
                 self.survey_sectors_done = new_sectors
+                self._camps = new_camps
+                self._last_deaths = new_last_deaths
                 self.landmark_version = lv
             return True
         except Exception:
