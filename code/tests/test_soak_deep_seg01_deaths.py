@@ -2061,6 +2061,59 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         # 不能直冲 -z（-cos(yaw) < -0.70 表示直冲僵尸）
         self.assertGreater(-math.cos(safe_yaw), -0.70, f"must not pick 180° straight into zombie, got yaw={safe_yaw}")
 
+    def test_seg21_escape_water_does_not_ping_pong_flee_when_hostile_outside_flee_dist(self) -> None:
+        # 复现 seg-21 INC-001（154× STUCK_NO_PROGRESS，[-83.3, 62.2, 17.7]）：
+        # 浮在水面且 enderman 距 10.6m（>= 9.0m 逃跑预警圈）时，escape_water_to_shore 绝不可转交 _flee_hostile
+        # 后 0 位移直接返回 True 死循环，而必须留在上岸流程（上岸/垫脚/挖松软土岸）真正脱水上岸
+        from mcagent.skills.escape import escape_water_to_shore
+
+        blocks: dict[tuple[int, int, int], str] = {
+            (-84, 61, 17): "dirt",
+            (-84, 62, 17): "water",
+            (-84, 63, 17): "air",
+            (-84, 64, 17): "air",
+            (-83, 62, 17): "grass_block",
+            (-83, 63, 17): "air",
+            (-83, 64, 17): "air",
+        }
+
+        class _EndermanBankWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-83.3, 62.2, 17.7], items={})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=7.7, food=17, armor_points=0,
+                    in_water=True, submerged=False, on_ground=False,
+                    nearest_hostile={"id": 175467, "name": "enderman", "dist": 10.6, "pos": [-93.9, 64.0, 17.7]},
+                )
+                self.controls = 0
+                self.moves = 0
+
+            def control(self, **kwargs):
+                self.controls += 1
+                return {"pos": list(self.st["pos"]), "moved": 0.0}
+
+            def move_to(self, x=None, z=None, *, y=None, entity_id=None, rng=1, pos=None, timeout=None, **kwargs):
+                self.moves += 1
+                target = pos if pos is not None else [x, y if y is not None else self.st["pos"][1], z]
+                self.st["pos"] = [float(target[0]), float(target[1]), float(target[2])]
+                self.st["in_water"] = False
+                self.st["on_ground"] = True
+                return {"pos": list(self.st["pos"])}
+
+        w = _EndermanBankWorld()
+        ex, state = w.session()
+        gen = escape_water_to_shore(ex, state, max_steps=3)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertFalse(w.st["in_water"], "bot must actually exit water onto dry shore")
+        self.assertEqual(w.controls, 0, "must not bounce into _flee_hostile control loop when enderman is outside flee_dist")
+        self.assertGreaterEqual(w.moves, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

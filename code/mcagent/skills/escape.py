@@ -259,12 +259,17 @@ def escape_water_to_shore(ex: "Executor", state: "State", *, max_steps: int = 10
     for _ in range(max(0, int(max_steps))):
         dim = str(st.get("dimension") or "overworld")
         nh_cur = st.get("nearest_hostile") if isinstance(st.get("nearest_hostile"), dict) else None
+        nh_name = bare(nh_cur.get("name")).strip().lower() if nh_cur else ""
         nh_dist_raw = nh_cur.get("dist") if nh_cur else None
         nh_dist = float(nh_dist_raw) if isinstance(nh_dist_raw, (int, float)) and not isinstance(nh_dist_raw, bool) else 99.0
         recent_hurt = state.get_recent_hurt(max_age_s=6.0) if hasattr(state, "get_recent_hurt") else None
         under_hostile_fire = (nh_cur is not None and nh_dist <= 16.0) or isinstance(recent_hurt, dict)
-        # 已浮出水面且正受敌怪近身/远程射击威胁：立即转入敌怪感知的水中疾跑逃离，禁止在 15s 慢速 move_to 中原地吃箭
-        if under_hostile_fire and not st.get("submerged") and (nh_dist <= 12.0 or isinstance(recent_hurt, dict)):
+        flee_thresh = effective_hostile_flee_dist(state, nh_name) if nh_cur else 9.0
+        # 仅当敌怪真正进入逃跑预警圈（nh_dist < flee_thresh）或 6s 内刚受击时，浮水态才转交 _flee_hostile；
+        # 敌怪在预警圈外（如 enderman 10.6m >= 9.0m）必须留在本函数继续执行上岸/垫脚/挖岸，严禁来回乒乓空转。
+        if under_hostile_fire and not st.get("submerged") and (
+            isinstance(recent_hurt, dict) or (nh_cur is not None and nh_dist < flee_thresh)
+        ):
             return (yield from _flee_hostile(ex, state))
         if (dig_cell := _find_soft_overhang(ex, st, cache, dim, tried_digs)) is not None:
             tried_digs.add(dig_cell)
@@ -1840,7 +1845,13 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             if not isinstance(nh_sw, dict) or not nh_sw:
                 return True
             sd = nh_sw.get("dist")
-            if isinstance(sd, (int, float)) and not isinstance(sd, bool) and float(sd) >= water_safe_dist and not st_cur.get("submerged"):
+            if (
+                moved_sw_xz >= 0.5
+                and isinstance(sd, (int, float))
+                and not isinstance(sd, bool)
+                and float(sd) >= water_safe_dist
+                and not st_cur.get("submerged")
+            ):
                 return True
             ux, uz, h_pos = _resolve_flee_vector(
                 ex, px, py, pz, nh_sw, cache, dim, state=state, avoid_water=False, in_water=True,
@@ -1848,12 +1859,18 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             away_yaw = math.atan2(-ux, -uz)
         if water_swim_supported and (st_cur.get("in_water") or st_cur.get("submerged")):
             nh_end = st_cur.get("nearest_hostile") or {}
+            total_sw_xz = math.hypot(px - float(pos[0]), pz - float(pos[2]))
             if not isinstance(nh_end, dict) or not nh_end:
-                return True
+                return total_sw_xz >= 0.5
             ed = nh_end.get("dist")
-            if isinstance(ed, (int, float)) and not isinstance(ed, bool) and float(ed) >= effective_hostile_flee_dist(state, h_name):
+            if (
+                total_sw_xz >= 0.5
+                and isinstance(ed, (int, float))
+                and not isinstance(ed, bool)
+                and float(ed) >= effective_hostile_flee_dist(state, h_name)
+            ):
                 return True
-            return math.hypot(px - float(pos[0]), pz - float(pos[2])) >= 2.5
+            return total_sw_xz >= 2.5
 
     # 若掩体退离/前序疾跑刚撞墙或遇服务端隐形边界回弹（burst_blocked / zero_stall）：
     # 在敌怪 <=5.0 格或零位移回弹时先沿避开 tried_yaws 的防跳崖替代角（零位移时优先切反半球且禁跳防持续回弹）脱困，
