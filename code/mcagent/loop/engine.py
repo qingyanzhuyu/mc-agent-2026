@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..client import FATAL, ApiError, Client
-from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
+from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint, has_equipped_armor
 from ..skills.base import Skill, failure
 from ..skills.items import bare
 from ..skills.world_memo import STRUCTURE_FINGERPRINTS, memo_for, structure_tags_for
@@ -384,6 +384,49 @@ class MainLoop:
                 setter(None)
             else:
                 self.state.safety_intent = None
+
+    def _maybe_set_hurt_flee_intent(self, failed_name: str, extra: dict) -> None:
+        """非战斗技能受击中断且 18 格内有敌对生物（如 11–15 格远程骷髅）时，立即写入 flee 意图防原地/乱走被点死。"""
+        if failed_name == "emergency_escape":
+            return
+        if extra.get("cause", extra.get("interrupted_by")) != "hurt":
+            return
+        st = self.state.snapshot()
+        hostile = extra.get("nearest_hostile") or st.get("nearest_hostile")
+        if not isinstance(hostile, dict) or not hostile:
+            return
+        try:
+            hdist = float(hostile.get("dist", 99.0))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(hdist) or hdist > 18.0:
+            return
+        raw_hp = extra.get("health", st.get("health", 20.0))
+        try:
+            hp = float(raw_hp)
+        except (TypeError, ValueError):
+            hp = 20.0
+        combat_skills = {"hunt_mob", "deflect_skeleton_arrow", "shoot_mob", "fire_crossbow", "sniper_duel"}
+        if failed_name in combat_skills and hp > 12.0:
+            return
+        if has_equipped_armor(self.state) and hp > 16.0:
+            return
+        hname = bare(hostile.get("name") or "hostile").strip().lower() or "hostile"
+        now = time.monotonic()
+        intent = {
+            "kind": "flee",
+            "why": f"受击应急脱险 {hname} 距离 {hdist:g}",
+            "severity": "soft",
+            "hostile": hname,
+            "dist": hdist,
+            "at": now,
+            "expires_at": now + 10.0,
+        }
+        setter = getattr(self.state, "set_safety_intent", None)
+        if callable(setter):
+            setter(intent)
+        else:
+            self.state.safety_intent = intent
 
     def _resolve_goal_spec(self, gid: str) -> Optional[GoalSpec]:
         if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "ledger_map"):
@@ -1025,6 +1068,8 @@ class MainLoop:
                             stop_fn = getattr(self.executor, "stop", None)
                             if callable(stop_fn):
                                 stop_fn(raise_on_error=False)
+                            if code == "interrupted":
+                                self._maybe_set_hurt_flee_intent(failed_name, extra)
                         if failed_name == "emergency_escape" or getattr(decision, "safety_escape", False):
                             self._acknowledge_safety_intent(completed=False)
                         environment = e if isinstance(e, EnvBlocked) and not is_death_err else None

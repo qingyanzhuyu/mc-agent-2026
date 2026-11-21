@@ -141,6 +141,63 @@ class SoakR01FixesTests(unittest.TestCase):
         self.assertEqual(state.count("cooked_beef"), 1)
         self.assertEqual(skill.verify_done(state, before), "")
 
+    def test_hurt_interrupted_by_ranged_skeleton_at_12m_sets_flee_intent(self) -> None:
+        class _HurtSkill(Skill):
+            name = "gather_wood"
+            description = "stub"
+            goal = "acq:wood"
+            verified = "offline"
+
+            def run(self, ex, state):
+                yield {"op": "move_to"}
+                raise ApiError(
+                    "interrupted",
+                    "Action move_to interrupted by hurt",
+                    {"cause": "hurt", "health": 16.0, "nearest_hostile": {"id": 9, "name": "skeleton", "dist": 12.5}},
+                )
+
+        class _Client:
+            def wait_ready(self, timeout=120):
+                return {"ready": True, "alive": True, "health": 20.0, "food": 20.0, "pos": [0.5, 64.0, 0.5], "dimension": "overworld"}
+
+            def status(self):
+                return {"ready": True, "alive": True, "health": 16.0, "food": 20.0, "pos": [0.5, 64.0, 0.5], "dimension": "overworld"}
+
+            def inventory(self):
+                return {"items": [], "empty_slots": 36}
+
+            def events(self, since=0, limit=50):
+                return {"events": [], "next": since}
+
+            def stop(self):
+                return {"stopped": True, "released": True}
+
+        class _Planner:
+            mode = "campaign"
+            rules = SimpleNamespace(active_goals=(), completed_advancements=set(), ledger_map={})
+
+            def select(self, state, recent_failures):
+                return PlanDecision(_HurtSkill(), "rule", "test")
+
+            def blocked_targets(self, *args, **kwargs):
+                return {}
+
+            def release_skill_materials(self):
+                pass
+
+        state = State()
+        with tempfile.TemporaryDirectory() as td:
+            ex = Executor(_Client(), state, log_path=str(Path(td) / "actions.jsonl"))
+            loop = MainLoop(
+                _Client(), state, ex, _Planner(),
+                config=LoopConfig(enable_monitor=False, enable_roadside_scan=False, max_steps=2),
+                log=lambda *_: None,
+            )
+            loop.run()
+        self.assertIsInstance(state.safety_intent, dict)
+        self.assertEqual(state.safety_intent["kind"], "flee")
+        self.assertEqual(state.safety_intent["hostile"], "skeleton")
+
 
 if __name__ == "__main__":
     unittest.main()
