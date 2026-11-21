@@ -421,23 +421,42 @@ class MainLoop:
                 setter(None)
             else:
                 self.state.safety_intent = None
+            if completed:
+                clear_hurt = getattr(self.state, "clear_recent_hurt", None)
+                if callable(clear_hurt):
+                    clear_hurt()
 
     def _maybe_set_hurt_flee_intent(self, failed_name: str, extra: dict) -> None:
-        """非战斗技能受击中断且 18 格内有敌对生物（如 11–15 格远程骷髅）时，立即写入 flee 意图防原地/乱走被点死。"""
+        """非战斗技能受击中断且 18 格内有敌对生物（或刚遭远程箭矢命中）时，立即写入 flee 意图防原地/乱走被点死。"""
         if failed_name == "emergency_escape":
             return
         if extra.get("cause", extra.get("interrupted_by")) != "hurt":
             return
         st = self.state.snapshot()
         hostile = extra.get("nearest_hostile") or st.get("nearest_hostile")
-        if not isinstance(hostile, dict) or not hostile:
-            return
-        try:
-            hdist = float(hostile.get("dist", 99.0))
-        except (TypeError, ValueError):
-            return
+        hname = ""
+        hdist = 99.0
+        if isinstance(hostile, dict) and hostile:
+            try:
+                raw_d = float(hostile.get("dist", 99.0))
+                if math.isfinite(raw_d):
+                    hdist = raw_d
+            except (TypeError, ValueError):
+                hdist = 99.0
+            hname = bare(hostile.get("name") or "").strip().lower()
         if not math.isfinite(hdist) or hdist > 18.0:
-            return
+            recent_hurt = self.state.get_recent_hurt(max_age_s=4.0) if hasattr(self.state, "get_recent_hurt") else None
+            if isinstance(recent_hurt, dict):
+                hurt_src = str(recent_hurt.get("source") or "").strip().lower()
+                src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
+                src_name = bare(src_ent.get("name") or "").strip().lower()
+                if hurt_src == "arrow" or src_name:
+                    hname = src_name or ("skeleton" if hurt_src == "arrow" else "hostile")
+                    hdist = min(hdist, 16.0)
+                else:
+                    return
+            else:
+                return
         raw_hp = extra.get("health", st.get("health", 20.0))
         try:
             hp = float(raw_hp)
@@ -448,12 +467,13 @@ class MainLoop:
             return
         if has_equipped_armor(self.state) and hp > 16.0:
             return
-        hname = bare(hostile.get("name") or "hostile").strip().lower() or "hostile"
+        hname = hname or "hostile"
         now = time.monotonic()
         intent = {
             "kind": "flee",
             "why": f"受击应急脱险 {hname} 距离 {hdist:g}",
             "severity": "soft",
+            "source": "hurt_interrupt",
             "hostile": hname,
             "dist": hdist,
             "at": now,

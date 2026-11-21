@@ -1152,6 +1152,21 @@ class RulePlanner:
                 if sleep_sk is not None:
                     return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
 
+        # 8.5 Nighttime Overworld Survival Guard（无床且地表黑夜：残血无甲无粮或裸装空手重生时驻留避险待天亮，禁止冲进暗林送死）
+        if dim == "overworld" and day is False and near_surface_for_camp and safe_12:
+            unarmored = not has_equipped_armor(state)
+            if hp <= 8.0 and unarmored and restore < 4:
+                return PlanDecision(None, "idle", f"夜间残血无甲无粮原地避险待天亮 (hp={hp:.1f})")
+            if (
+                unarmored
+                and not has_sword
+                and best_pickaxe(state) not in STONE_OR_BETTER_PICKS
+                and state.count("shield") < 1
+                and not can_afford_gear(state, "stone_sword", assume_no_table=True)
+                and not can_afford_gear(state, "wooden_pickaxe", assume_no_table=True)
+            ):
+                return PlanDecision(None, "idle", "夜间空手无甲避险驻留待天亮（防夜盲林区裸奔送死）")
+
         # 9. Camp Surplus Deposit (尊重 ReservationBook 预留物资；距营地 <=96 格高价/满包回存)
         if _camp_plan.has_surplus_for_deposit(state, reservations=self.reservations) and _camp_plan.is_near_camp(state, max_dist=96.0) and safe_12:
             dep = self._try_make("manage_camp_chest", {"mode": "deposit"}, state)

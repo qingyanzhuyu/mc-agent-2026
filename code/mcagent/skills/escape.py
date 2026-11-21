@@ -376,51 +376,166 @@ def _set_shield(ex: "Executor", state: "State", active: bool) -> bool:
         return False
 
 
-def _resolve_flee_vector(
-    ex: "Executor", px: float, py: float, pz: float, hostile: dict, cache: Any, dim: str,
-) -> tuple[float, float, Optional[list[float]]]:
-    """计算远离所有近场敌对生物的单位逃离向量，避免仅靠 /status 缺 pos 时盲目撞向第二只怪。"""
-    h_pos = hostile.get("pos") if isinstance(hostile, dict) else None
-    if isinstance(h_pos, (list, tuple)) and len(h_pos) >= 3:
-        dx, dz = px - float(h_pos[0]), pz - float(h_pos[2])
-        if (norm := math.hypot(dx, dz)) >= 1e-6:
-            return dx / norm, dz / norm, [float(h_pos[0]), float(h_pos[1]), float(h_pos[2])]
-
-    # 真实服务端 /status.nearest_hostile 不含 pos 字段，补一次 0~1ms 只读 get_entities 合成斥力向量
+def _collect_nearby_hostiles(
+    ex: "Executor", px: float, py: float, pz: float, hostile: dict, *, radius: int = 18,
+) -> list[dict[str, Any]]:
+    """收集 18 格内全部敌对生物（融合 get_entities 与 /status.nearest_hostile），避免逃离近怪时撞向远程骷髅或苦力怕。"""
+    collected: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
     get_ent = getattr(ex.client, "get_entities", None)
     if callable(get_ent):
         try:
-            res = get_ent(radius=12, types=["hostile"])
+            res = get_ent(radius=radius, types=["hostile"])
             ents = res.get("entities") if isinstance(res, dict) else None
         except (ApiError, AttributeError, TypeError):
             ents = None
-        if isinstance(ents, list) and ents:
-            rx, rz = 0.0, 0.0
-            nearest_pos: Optional[list[float]] = None
-            nearest_d = float("inf")
+        if isinstance(ents, list):
             for ent in ents:
                 if not isinstance(ent, dict):
                     continue
-                ep = ent.get("pos")
-                if not isinstance(ep, (list, tuple)) or len(ep) < 3:
+                ep = _valid_vec3(ent.get("pos"))
+                if ep is None:
                     continue
-                dx, dz = px - float(ep[0]), pz - float(ep[2])
-                d = math.hypot(dx, dz)
-                if d < nearest_d:
-                    nearest_d = d
-                    nearest_pos = [float(ep[0]), float(ep[1]), float(ep[2])]
-                w = 1.0 / max(0.5, d * d)
-                if d >= 1e-6:
-                    rx += (dx / d) * w
-                    rz += (dz / d) * w
-            if (norm := math.hypot(rx, rz)) >= 1e-6:
-                return rx / norm, rz / norm, nearest_pos
+                eid = ent.get("id")
+                if isinstance(eid, int) and not isinstance(eid, bool):
+                    seen_ids.add(eid)
+                collected.append(ent)
+    if isinstance(hostile, dict):
+        hp = _valid_vec3(hostile.get("pos"))
+        eid = hostile.get("id")
+        if hp is not None and not (isinstance(eid, int) and not isinstance(eid, bool) and eid in seen_ids):
+            collected.append(hostile)
+    return collected
+
+
+def _score_escape_dir(
+    px: float,
+    pz: float,
+    cx: float,
+    cz: float,
+    threats: list[tuple[float, float, str, float, Optional[int]]],
+    attacker_id: Optional[int],
+) -> float:
+    """对候选逃跑单位方向 (cx, cz) 评分：最大化对所有威胁的 4m/8m 净空，重罚朝向苦力怕/骷髅/刚偷袭者前进。"""
+    score = 0.0
+    min_clear = float("inf")
+    for hx, hz, name, d0, eid in threats:
+        is_creeper = name == "creeper"
+        is_ranged = name in _RANGED_HOSTILES
+        is_attacker = attacker_id is not None and eid == attacker_id
+        weight = 2.5 if is_creeper else (1.8 if is_ranged else 1.0)
+        if is_attacker:
+            weight *= 1.6
+        d4 = math.hypot((px + cx * 4.0) - hx, (pz + cz * 4.0) - hz)
+        d8 = math.hypot((px + cx * 8.0) - hx, (pz + cz * 8.0) - hz)
+        min_d = min(d4, d8)
+        min_clear = min(min_clear, min_d / max(1.0, weight * 0.6))
+        # 鼓励远离，惩罚接近
+        score += (d8 - d0) * weight
+        if is_creeper and min_d < 7.5:
+            score -= (7.5 - min_d) * 8.0
+        elif is_ranged and min_d < 8.5:
+            score -= (8.5 - min_d) * 4.0
+        elif min_d < 4.5:
+            score -= (4.5 - min_d) * 5.0
+        if is_attacker and d8 < d0 - 1.0:
+            score -= (d0 - d8) * 4.0
+    return score + min_clear * 2.0
+
+
+def _resolve_flee_vector(
+    ex: "Executor",
+    px: float,
+    py: float,
+    pz: float,
+    hostile: dict,
+    cache: Any,
+    dim: str,
+    *,
+    state: Optional["State"] = None,
+) -> tuple[float, float, Optional[list[float]]]:
+    """计算远离 18 格内全部敌对生物的单位逃离向量，避免避开近怪时直冲远程骷髅或苦力怕。"""
+    ents = _collect_nearby_hostiles(ex, px, py, pz, hostile, radius=18)
+    attacker_id: Optional[int] = None
+    if state is not None:
+        try:
+            from .combat_eval import recent_hurt_attacker_id
+            attacker_id = recent_hurt_attacker_id(state)
+        except Exception:
+            attacker_id = None
+
+    threats: list[tuple[float, float, str, float, Optional[int]]] = []
+    nearest_pos: Optional[list[float]] = None
+    nearest_d = float("inf")
+    for ent in ents:
+        ep = _valid_vec3(ent.get("pos"))
+        if ep is None:
+            continue
+        dx, dz = px - ep[0], pz - ep[2]
+        d = math.hypot(dx, dz)
+        name = bare(ent.get("name")).strip().lower()
+        eid = ent.get("id") if isinstance(ent.get("id"), int) and not isinstance(ent.get("id"), bool) else None
+        if d < nearest_d:
+            nearest_d = d
+            nearest_pos = [ep[0], ep[1], ep[2]]
+        threats.append((ep[0], ep[2], name, d, eid))
+
+    if len(threats) == 1:
+        hx, hz, _, d, _ = threats[0]
+        if d >= 1e-6:
+            return (px - hx) / d, (pz - hz) / d, nearest_pos
+    elif len(threats) >= 2:
+        rx, rz = 0.0, 0.0
+        for hx, hz, name, d, eid in threats:
+            if d < 1e-6:
+                continue
+            mult = 2.5 if name == "creeper" else (1.8 if name in _RANGED_HOSTILES else 1.0)
+            if attacker_id is not None and eid == attacker_id:
+                mult *= 1.6
+            w = mult / max(0.5, d * d)
+            rx += ((px - hx) / d) * w
+            rz += ((pz - hz) / d) * w
+        candidates: list[tuple[float, float]] = [
+            (math.cos(i * math.pi / 6.0), math.sin(i * math.pi / 6.0)) for i in range(12)
+        ]
+        if (rnorm := math.hypot(rx, rz)) >= 1e-6:
+            candidates.insert(0, (rx / rnorm, rz / rnorm))
+        best_dir = max(
+            candidates,
+            key=lambda c: _score_escape_dir(px, pz, c[0], c[1], threats, attacker_id),
+        )
+        return best_dir[0], best_dir[1], nearest_pos
 
     fx, fy, fz = block_cell([px, py, pz])
     for dx, dz in _CARDINALS:
         if _is_dry_standable(cache, ex.client, (fx + dx, fy, fz + dz), dim):
             return float(dx), float(dz), None
     return 1.0, 0.0, None
+
+
+def _is_ranged_los_blocked(
+    ex: "Executor", px: float, py: float, pz: float, h_pos: Optional[list[float]], cache: Any, dim: str,
+) -> bool:
+    """检查玩家当前眼位与远程敌怪眼位之间是否已有实心墙体阻挡射界。"""
+    hp = _valid_vec3(h_pos)
+    if hp is None:
+        return False
+    p_cell = block_cell([px, py, pz])
+    h_cell = block_cell(hp)
+    skip = {
+        p_cell,
+        (p_cell[0], p_cell[1] + 1, p_cell[2]),
+        h_cell,
+        (h_cell[0], h_cell[1] + 1, h_cell[2]),
+    }
+    p_eye = (px, py + 1.62, pz)
+    h_eye = (hp[0], hp[1] + 1.62, hp[2])
+    for cell in voxel_line_cells(p_eye, h_eye):
+        if cell in skip:
+            continue
+        if _is_solid_wall_block(_read_block(cache, ex.client, cell, dim)):
+            return True
+    return False
 
 
 def _is_sprint_yaw_safe(
@@ -750,7 +865,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     h_dist = float(h_dist_raw) if isinstance(h_dist_raw, (int, float)) and not isinstance(h_dist_raw, bool) else 99.0
     is_creeper = h_name == "creeper"
     is_ranged = h_name in _RANGED_HOSTILES
-    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, hostile, cache, dim)
+    ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, hostile, cache, dim, state=state)
 
     away_yaw = math.atan2(-ux, -uz)
     to_mob_yaw = math.atan2(ux, uz)
@@ -795,6 +910,23 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         hp_val = float(hp_raw) if isinstance(hp_raw, (int, float)) and not isinstance(hp_raw, bool) else 20.0
         hp_risk = float(getattr(getattr(state, "config", None), "hp_risk", 14.0) or 14.0)
         if is_ranged and h_dist < 16.0:
+            # 若刚建完挡箭墙或已处于实心掩体后方（射界已切断且无贴身近战威胁），沿背敌安全轴退离，切忌走出掩体吃箭
+            if (
+                h_dist >= 3.0
+                and h_pos is not None
+                and _is_ranged_los_blocked(ex, px, py, pz, h_pos, cache, dim)
+            ):
+                safe_hold_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, away_yaw, cache, dim)
+                if safe_hold_yaw is not None:
+                    yield from _control_step(
+                        ex,
+                        record_extra={"skeleton_cover": True},
+                        forward=True,
+                        sprint=True,
+                        yaw=safe_hold_yaw,
+                        ms=450,
+                    )
+                    return True
             cover = (
                 _find_skeleton_cover_cell(ex, px, py, pz, h_pos, cache, dim)
                 if (h_dist < 10.0 and (has_shield or not has_equipped_armor(state) or hp_val < hp_risk))
@@ -823,7 +955,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     if ok_strafe:
                         st_after_cov = _refresh_status(ex, state)
                         ap = st_after_cov.get("pos") or [px, py, pz]
-                        if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
+                        if (
+                            math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5
+                            or _is_ranged_los_blocked(ex, float(ap[0]), float(ap[1]), float(ap[2]), h_pos, cache, dim)
+                        ):
                             return True
                 moved_cover = yield from _move_to_bounded(
                     ex, [cx, cy, cz], rng=0, timeout=5.0, skeleton_cover=True,
@@ -831,7 +966,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 if moved_cover:
                     st_after_cov = _refresh_status(ex, state)
                     ap = st_after_cov.get("pos") or [px, py, pz]
-                    if math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5:
+                    if (
+                        math.hypot(float(ap[0]) - px, float(ap[2]) - pz) >= 0.5
+                        or _is_ranged_los_blocked(ex, float(ap[0]), float(ap[1]), float(ap[2]), h_pos, cache, dim)
+                    ):
                         return True
             if has_shield:
                 # 持盾面对远程怪且无近处天然掩体：锁威胁方向举盾后撤格挡箭矢，再收盾拉脱
@@ -898,6 +1036,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         rpos = st_retry.get("pos")
         if isinstance(rpos, (list, tuple)) and len(rpos) >= 3:
             px, py, pz = float(rpos[0]), float(rpos[1]), float(rpos[2])
+        # move_to 超时/失败期间角色可能已移动十余格，兜底疾跑前必须在新坐标重扫敌群，避免盲冲苦力怕/骷髅
+        retry_hostile = st_retry.get("nearest_hostile") or {}
+        if isinstance(retry_hostile, dict) and retry_hostile:
+            ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, retry_hostile, cache, dim, state=state)
+            away_yaw = math.atan2(-ux, -uz)
         retry_yaw = (
             _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
             if (burst_blocked or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
@@ -930,9 +1073,11 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         else:
             actual_d = 99.0
         if actual_d < 5.5:
-            # move_to 寻路禁疾跑，若结束时高速敌怪仍紧贴 <5.5 格，补一次防跳崖疾跑跳拉脱
+            # move_to 寻路禁疾跑，若结束时高速敌怪仍紧贴 <5.5 格，重算实时敌群方向后补一次防跳崖疾跑跳拉脱
             ap = after_pos_now if (isinstance(after_pos_now, (list, tuple)) and len(after_pos_now) >= 3) else [px, py, pz]
-            safe_follow_yaw = _pick_cliff_safe_yaw(ex, float(ap[0]), float(ap[1]), float(ap[2]), away_yaw, cache, dim)
+            f_ux, f_uz, _ = _resolve_flee_vector(ex, float(ap[0]), float(ap[1]), float(ap[2]), after_hostile, cache, dim, state=state)
+            follow_away_yaw = math.atan2(-f_ux, -f_uz)
+            safe_follow_yaw = _pick_cliff_safe_yaw(ex, float(ap[0]), float(ap[1]), float(ap[2]), follow_away_yaw, cache, dim)
             if safe_follow_yaw is not None:
                 yield from _control_step(ex, forward=True, sprint=True, jump=True, yaw=safe_follow_yaw, ms=900)
             st_after = _refresh_status(ex, state)

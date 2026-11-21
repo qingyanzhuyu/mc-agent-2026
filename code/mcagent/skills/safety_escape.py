@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Mapping
 from typing import Any, Callable, Generator, Optional
 
@@ -140,8 +141,12 @@ class EmergencyEscape(Skill):
         intent_raw = getattr(state, "safety_intent", None)
         if isinstance(intent_raw, str) and intent_raw.strip():
             return True
-        if isinstance(intent_raw, Mapping) and intent_raw.get("intent"):
-            return True
+        if isinstance(intent_raw, Mapping):
+            kind = intent_raw.get("kind") or intent_raw.get("intent")
+            if isinstance(kind, str) and kind.strip():
+                expires_at = intent_raw.get("expires_at")
+                if not (_is_number(expires_at) and time.monotonic() >= float(expires_at)):
+                    return True
         st = _state_dict(state)
         if st.get("in_water") or st.get("submerged") or st.get("in_lava") or st.get("on_fire"):
             return True

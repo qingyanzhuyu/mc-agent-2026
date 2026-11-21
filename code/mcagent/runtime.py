@@ -148,6 +148,8 @@ class State:
         self._seen_death_seqs: set[int] = set()
         self._unlinked_alive_death_mono: Optional[float] = None
         self._totem_guard: Optional[dict[str, Any]] = None
+        self.last_hurt_at: float = 0.0
+        self.last_hurt_info: dict[str, Any] = {}
 
     @_locked
     def _record_death(
@@ -312,6 +314,19 @@ class State:
     def get_active_escape(self) -> Optional[str]:
         return self.active_escape_intent
 
+    @_locked
+    def clear_recent_hurt(self) -> None:
+        self.last_hurt_at = 0.0
+        self.last_hurt_info = {}
+
+    @_locked
+    def get_recent_hurt(self, max_age_s: float = 4.0) -> Optional[dict[str, Any]]:
+        if self.last_hurt_at <= 0.0 or not self.last_hurt_info:
+            return None
+        if (time.monotonic() - self.last_hurt_at) > max_age_s:
+            return None
+        return copy.deepcopy(self.last_hurt_info)
+
     def drain(self, client: Client, limit: int = 200) -> list[dict]:
         """首次启动先追平历史积压（防数小时前旧 death 误计为实时死亡），运行期每拍读一页防挤占急停额度。"""
         with self._event_fetch:
@@ -365,6 +380,8 @@ class State:
                     self.invalidate_inventory()
                 if etype == "death":
                     self.invalidate_inventory()
+                    self.last_hurt_at = 0.0
+                    self.last_hurt_info = {}
                     if was_booted:
                         self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
                     elif ev_t_ms is not None and ref_t_ms is not None:
@@ -377,6 +394,18 @@ class State:
                             self._seen_death_t_ms.add(ev_t_ms)
                     else:
                         self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
+                elif etype == "spawn":
+                    self.last_hurt_at = 0.0
+                    self.last_hurt_info = {}
+                elif etype == "hurt" and was_booted:
+                    self.last_hurt_at = now_mono
+                    self.last_hurt_info = {
+                        "source": ev.get("source"),
+                        "source_entity": copy.deepcopy(ev.get("source_entity")),
+                        "likely_attacker": copy.deepcopy(ev.get("likely_attacker")),
+                        "damage": ev.get("damage"),
+                        "health": ev.get("health"),
+                    }
                 elif etype == "death_loop":
                     self.safe_mode_until = max(self.safe_mode_until, now_mono + self.SAFE_COOLDOWN_S)
         return out
@@ -1039,6 +1068,28 @@ class Safety:
                 hostile=hostile.get("name"),
                 dist=hostile.get("dist"),
             )
+            emitted_flee = True
+        if not emitted_flee:
+            recent_hurt = s.get_recent_hurt(max_age_s=4.0) if hasattr(s, "get_recent_hurt") else None
+            if isinstance(recent_hurt, dict):
+                hurt_src = str(recent_hurt.get("source") or "").strip().lower()
+                src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
+                att_ent = recent_hurt.get("likely_attacker") if isinstance(recent_hurt.get("likely_attacker"), dict) else {}
+                src_name = str(src_ent.get("name") or att_ent.get("name") or "").removeprefix("minecraft:").strip().lower()
+                is_arrow_or_ranged = hurt_src == "arrow" or src_name in (
+                    "skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast",
+                )
+                is_mob_attack = hurt_src in ("mob_attack", "mob_projectile", "indirect_magic") or bool(src_name)
+                if (is_arrow_or_ranged or is_mob_attack) and (not has_equipped_armor(s) or hp < self.config.hp_risk):
+                    sev = "urgent" if (hp <= self.config.hp_crit and not s.get_active_escape()) else "soft"
+                    add(
+                        "flee",
+                        f"受击应急脱险 {src_name or hurt_src or 'hostile'}",
+                        sev,
+                        hostile=src_name or hostile_name or "hostile",
+                        dist=hostile_dist if hostile else 16.0,
+                        hurt_triggered=True,
+                    )
         if st.get("on_fire") and not st.get("in_water"):
             add("douse", "着火", "soft")
         return out
@@ -1729,7 +1780,18 @@ class SafetyMonitor:
                 and self.executor.active_action in ("attack", "shoot")
             ):
                 hazard["severity"] = "urgent"
-        self.state.set_safety_intent(hazards[0] if hazards else None)
+        if hazards:
+            self.state.set_safety_intent(hazards[0])
+        else:
+            cur_intent = getattr(self.state, "safety_intent", None)
+            keep_event_intent = (
+                isinstance(cur_intent, dict)
+                and cur_intent.get("source") == "hurt_interrupt"
+                and isinstance(cur_intent.get("expires_at"), (int, float))
+                and time.monotonic() < float(cur_intent["expires_at"])
+            )
+            if not keep_event_intent:
+                self.state.set_safety_intent(None)
         active_escape = self.state.get_active_escape()
         urgent = [
             h for h in hazards
