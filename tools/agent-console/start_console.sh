@@ -15,8 +15,10 @@ PID_FILE="$REPO_ROOT/code/mcagent/logs/.agent_console_${PORT}.pid"
 LOG_FILE="$REPO_ROOT/code/mcagent/logs/.agent_console_${PORT}.log"
 
 open_url() {
-  if command -v xdg-open >/dev/null 2>&1; then
-    nohup xdg-open "$1" >/dev/null 2>&1 &
+  if command -v kde-open >/dev/null 2>&1; then
+    setsid -f kde-open "$1" >/dev/null 2>&1 || nohup kde-open "$1" >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then
+    setsid -f xdg-open "$1" >/dev/null 2>&1 || nohup xdg-open "$1" >/dev/null 2>&1 &
   elif command -v wslview >/dev/null 2>&1; then
     wslview "$1" >/dev/null 2>&1 &
   elif command -v open >/dev/null 2>&1; then
@@ -24,6 +26,7 @@ open_url() {
   else
     python3 -m webbrowser -t "$1" >/dev/null 2>&1 &
   fi
+  sleep 0.25
 }
 
 is_ready() {
@@ -31,7 +34,7 @@ is_ready() {
 import sys, urllib.request
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
-    with opener.open(f"http://{sys.argv[1]}:{sys.argv[2]}/api/runs", timeout=0.8) as r:
+    with opener.open(f"http://{sys.argv[1]}:{sys.argv[2]}/healthz", timeout=1.5) as r:
         sys.exit(0 if r.status == 200 else 1)
 except Exception:
     sys.exit(1)
