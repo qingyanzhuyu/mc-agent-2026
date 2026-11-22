@@ -563,23 +563,34 @@ class EatFood(Skill):
         raw_food_before = (state.st or {}).get("food")
         if isinstance(raw_food_before, (int, float)) and not isinstance(raw_food_before, bool):
             self._food_before = float(raw_food_before)
-        res = ex.use_item(item)
-        if isinstance(res, dict):
-            fb, fa = res.get("food_before"), res.get("food")
-            if (
-                isinstance(fb, (int, float)) and not isinstance(fb, bool)
-                and isinstance(fa, (int, float)) and not isinstance(fa, bool)
-                and float(fa) > float(fb)
-            ):
-                self._ate_confirmed = True
-        yield rec("use_item", res, item=item)
-        state.invalidate_inventory()
-        state.refresh_inventory(ex.client)
-        # 若服务端回执已确认进食且饱食上升，但 Mineflayer 槽位扣减包延迟 50~150ms 未同步，
-        # 标脏背包避免下一拍用旧槽位重发 use_item 撞上 missing_item。
-        if self._ate_confirmed and sum(state.count(f) for f in EDIBLE_FOODS) >= before_cnt:
+        for attempt in range(2):
+            res = ex.use_item(item)
+            if isinstance(res, dict):
+                fb, fa = res.get("food_before"), res.get("food")
+                if (
+                    isinstance(fb, (int, float)) and not isinstance(fb, bool)
+                    and isinstance(fa, (int, float)) and not isinstance(fa, bool)
+                    and float(fa) > float(fb)
+                ):
+                    self._ate_confirmed = True
+            yield rec("use_item", res, item=item)
             state.invalidate_inventory()
-        state.refresh_status(ex.client, max_age_s=0)
+            state.refresh_inventory(ex.client)
+            # 若服务端回执已确认进食且饱食上升，但 Mineflayer 槽位扣减包延迟 50~150ms 未同步，
+            # 标脏背包避免下一拍用旧槽位重发 use_item 撞上 missing_item。
+            if self._ate_confirmed and sum(state.count(f) for f in EDIBLE_FOODS) >= before_cnt:
+                state.invalidate_inventory()
+            st_after = state.refresh_status(ex.client, max_age_s=0) or {}
+            cur_food_after = float(st_after.get("food", 20))
+            if (
+                self._ate_confirmed
+                or sum(state.count(f) for f in EDIBLE_FOODS) < before_cnt
+                or cur_food_after >= 20
+                or (self._food_before is not None and cur_food_after > self._food_before)
+                or attempt > 0
+                or state.count(item) <= 0
+            ):
+                break
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         before_food = sum(before_counts.get(f, 0) for f in EDIBLE_FOODS)

@@ -48,44 +48,32 @@ _WOOLS = tuple(f"{c}_wool" for c in ("white", "orange", "magenta", "light_blue",
     "gray", "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"))
 _HUNT_DROPS = frozenset(RAW_MEAT_TO_COOKED) | frozenset(_WOOLS) | {"leather"}
 _SKIP_ERRS = frozenset({"not_found", "out_of_reach", "path_not_found", "unreachable", "timeout", "move_timeout", "stalled"})
-COOK_POLL_SLEEP_S: float = 0.5
+COOK_POLL_SLEEP_S: float = 1.5
+_MAX_MEMO_STATION_DIST: float = 32.0
 
 
 def inventory_food_restore(state) -> int:
     return sum(state.count(item) * pts for item, pts in FOOD_RESTORE.items())
-
-
 def cooked_food_count(state) -> int:
     return sum(state.count(item) for item in COOKED_FOODS)
-
-
 def raw_meat_count(state) -> int:
     return sum(state.count(item) for item in RAW_MEAT_TO_COOKED)
-
-
 def _state_dim(state) -> str:
     st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
     return bare((st.get("dimension") if isinstance(st, dict) else None) or "overworld") or "overworld"
 
-
 def has_ready_food_lease(state) -> bool:
     """检查当前维度是否存在已到时可取回的熟食熔炉租约。"""
     dim = _state_dim(state)
-    return any(
-        l.expected_output in COOKED_FOODS or l.consumer == "gather_food"
-        for l in lease_book_for(state).ready_leases(dimension=dim)
-    )
-
+    return any(l.expected_output in COOKED_FOODS or l.consumer == "gather_food" for l in lease_book_for(state).ready_leases(dimension=dim))
 
 def has_cookable_food(state) -> bool:
     """检查当前是否持有生肉且有可用燃料，或已有待取回熟食租约。"""
     return (raw_meat_count(state) > 0 and best_fuel_for(state, 1, allow_lava_bucket=False) is not None) or has_ready_food_lease(state)
 
-
 def _is_night(st: dict) -> bool:
     tod = st.get("time_of_day")
     return st.get("is_day") is False or (isinstance(tod, (int, float)) and not isinstance(tod, bool) and 12500 <= int(tod) % 24000 < 23459)
-
 
 def _refresh_inv(ex, state) -> dict:
     state.invalidate_inventory()
@@ -115,6 +103,12 @@ def _try_act(op: str, fn, **fields):
     return True
 
 
+def _move_bounded(ex, *, timeout: float = 20.0, **kwargs):
+    try:
+        return ex.move_to(**kwargs, timeout=timeout, retries=0)
+    except TypeError:
+        return ex.move_to(**kwargs)
+
 def _reach_block(ex, state, pos, reach: float):
     st = state.refresh_status(ex.client, max_age_s=0)
     if can_reach_block(ex, st, pos, reach=reach):
@@ -126,17 +120,18 @@ def _reach_block(ex, state, pos, reach: float):
             return True
         except Replan:
             pass
-    if not (yield from _try_act("move_to", lambda: ex.move_to(pos=list(pos), rng=2), pos=list(pos))):
+    if not (yield from _try_act("move_to", lambda: _move_bounded(ex, pos=list(pos), rng=2, timeout=20.0), pos=list(pos))):
         return False
     st = state.refresh_status(ex.client, max_age_s=0)
     return can_reach_block(ex, st, pos, reach=reach) or eye_to_block_dist(st, pos) <= reach + 1.0
-
 
 def _find_or_place_stations(ex, state, memo_kind: str, allowed: tuple[str, ...], skill_name: str):
     st = state.refresh_status(ex.client, max_age_s=0)
     dim, memo = bare(st.get("dimension") or "overworld"), memo_for(state)
     found: dict[tuple[int, int, int], str] = {}
     for cell in memo.stations(memo_kind, dimension=dim):
+        if st.get("pos") and eye_to_block_dist(st, cell) > _MAX_MEMO_STATION_DIST:
+            continue
         try:
             kind = bare(ex.client.get_block(list(cell)).get("name"))
         except ApiError as exc:
@@ -275,7 +270,7 @@ class GatherFood(Skill):
                 continue
             sec = smelt_seconds_per_item(win)
             deadline = time.monotonic() + min(22.0, sec * qty + 2.0)
-            max_polls = min(24, max(4, int(sec * min(qty, 2) / COOK_POLL_SLEEP_S) + 2))
+            max_polls = min(10, max(4, int(sec * min(qty, 2) / max(0.5, COOK_POLL_SLEEP_S)) + 2))
             for poll in range(max_polls):
                 if poll:
                     time.sleep(COOK_POLL_SLEEP_S)
@@ -325,7 +320,7 @@ class GatherFood(Skill):
                 _refresh_inv(ex, state)
             st, eid, pos = state.refresh_status(ex.client, max_age_s=0), ent["id"], list(ent["pos"])
             if eye_to_point_dist(st, pos) > ENTITY_EYE_REACH:
-                if not (yield from _try_act("move_to", lambda: ex.move_to(entity_id=eid, pos=pos, rng=2), entity_id=eid, pos=pos)):
+                if not (yield from _try_act("move_to", lambda: _move_bounded(ex, entity_id=eid, pos=pos, rng=2, timeout=18.0), entity_id=eid, pos=pos)):
                     continue
             state.foraging_passive = True
             try:

@@ -2555,6 +2555,91 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
             f"close-range escape must NOT turn 180 deg straight into west skeleton, yaw={w.control_yaws[0]}",
         )
 
+    def test_seg27_gather_food_bounds_move_to_timeout_and_skips_distant_memo_furnace(self) -> None:
+        # 复现 seg-27 1177s..1327s 150s 卡死：gather_food 的 _reach_block / _hunt_animals 曾无 timeout 调 ex.move_to
+        # 导致每个不可达熔炉/动物挂死 150s，且会跨 40+ 格去翻陈旧地下熔炉；必须透传有界 timeout<=20s 并过滤 >32m 记忆熔炉。
+        from mcagent.client import ApiError
+        from mcagent.skills.survival_food import _find_or_place_stations, _reach_block
+        from mcagent.skills.world_memo import memo_for, reset_all_world_memos
+
+        reset_all_world_memos()
+        self.addCleanup(reset_all_world_memos)
+
+        blocks = {
+            (-36, 59, 49): "stone",
+            (-26, 60, 49): "furnace",   # 10 格内近炉
+            (-96, 49, 49): "furnace",   # 60 格远陈旧地下炉
+        }
+
+        class _FoodMoveTimeoutWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-36.5, 60.0, 49.5], items={"porkchop": 2, "coal": 1})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=18.0, food=16, on_ground=False)
+                self.move_timeouts: list[float | None] = []
+
+            def move_to(self, x=None, z=None, *, y=None, entity_id=None, rng=1, pos=None, timeout=None, retries=None, **kwargs):
+                self.move_timeouts.append(timeout)
+                raise ApiError("timeout", "bounded timeout")
+
+        w = _FoodMoveTimeoutWorld()
+        ex, state = w.session()
+        memo = memo_for(state)
+        memo.record_station("furnace", (-96, 49, 49), dimension="overworld")
+        memo.record_station("furnace", (-26, 60, 49), dimension="overworld")
+
+        # 1) >32m 的陈旧地下熔炉必须被过滤，仅保留 10 格内近炉
+        gen_s = _find_or_place_stations(ex, state, "furnace", ("smoker", "furnace"), "gather_food")
+        stations = []
+        try:
+            while True:
+                next(gen_s)
+        except StopIteration as stop:
+            stations = list(stop.value or [])
+        station_cells = [tuple(p) for _, p in stations]
+        self.assertIn((-26, 60, 49), station_cells)
+        self.assertNotIn((-96, 49, 49), station_cells, "distant >32m stale underground furnace must be skipped")
+
+        # 2) _reach_block 必须传有界 timeout<=20.0，绝不裸调 150s 默认超时
+        gen_r = _reach_block(ex, state, (-26, 60, 49), 4.0)
+        ok_r = True
+        try:
+            while True:
+                next(gen_r)
+        except StopIteration as stop:
+            ok_r = bool(stop.value)
+        self.assertFalse(ok_r)
+        self.assertTrue(w.move_timeouts)
+        self.assertIsNotNone(w.move_timeouts[0])
+        self.assertLessEqual(float(w.move_timeouts[0]), 20.0)
+
+    def test_seg27_eat_food_retries_once_on_noop_use_item_after_window_close(self) -> None:
+        # 复现 seg-27 INC-003（1174.2s）：关闭熔炉窗口后瞬时 use_item("cooked_beef") 首次空返回（food 16->16），
+        # EatFood 必须自动补试 1 次并在第 2 次成功进食（food 16->20），消除 P1 SKILL_POSTCONDITION_FAIL。
+        from mcagent.loop.starter_skills import EatFood
+
+        class _FlakyEatWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks={}, pos=[-36.6, 60.0, 49.5], items={"cooked_beef": 2})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=8.2, food=16)
+                self.eat_calls = 0
+
+            def use_item(self, item: str, **kwargs):
+                self.eat_calls += 1
+                if self.eat_calls == 1:
+                    return {"used": item, "food_before": 16, "food": 16}
+                self.items[item] = max(0, self.items.get(item, 0) - 1)
+                self.st["food"] = 20
+                return {"used": item, "food_before": 16, "food": 20}
+
+        w = _FlakyEatWorld()
+        ex, state = w.session()
+        skill = EatFood()
+        before_counts = {"cooked_beef": 2}
+        recs = list(skill.run(ex, state))
+        self.assertEqual(w.eat_calls, 2)
+        self.assertEqual(len(recs), 2)
+        self.assertEqual(skill.verify_done(state, before_counts), "")
+
 
 if __name__ == "__main__":
     unittest.main()
