@@ -214,6 +214,55 @@ class ScoutRecoveryTests(unittest.TestCase):
         self.assertIn("place", [s["op"] for s in steps])
         self.assertEqual(list(RECENT_RECOVERY_LANDINGS), [])
 
+    def test_underground_overhead_fake_move_success_falls_back_to_staircase_dig(self):
+        # 复现官方服 Y=52 洞穴假成功死循环：move_to 正上方 grass_block 返回 ok=true 但原地未动，
+        # 必须拒绝假成功并切入 1x2 阶梯上挖脱困。
+        class FakeOverheadMoveWorld(ScoutFailureWorld):
+            def move_to(self, *args, **kwargs):
+                dest = list(kwargs["pos"])
+                # 模拟官方服务端：目标与当前同 X/Z 且高出 10+ 格时直接 ok=true 但不移动
+                if abs(dest[0] - self.st["pos"][0]) <= 2.0 and abs(dest[2] - self.st["pos"][2]) <= 2.0 and dest[1] > self.st["pos"][1] + 2.0:
+                    self.calls.append(("move_to", {"pos": dest}))
+                    return {"pos": list(self.st["pos"])}
+                return super().move_to(*args, **kwargs)
+
+        blocks = {
+            (0, 62, 0): "grass_block",  # 正上方地表
+            (0, 51, 0): "stone",
+            (1, 51, 0): "stone", (1, 52, 0): "stone", (1, 53, 0): "stone", (1, 54, 0): "stone",
+            (-1, 51, 0): "stone", (-1, 52, 0): "stone", (-1, 53, 0): "stone",
+            (0, 51, 1): "stone", (0, 52, 1): "stone", (0, 53, 1): "stone",
+            (0, 51, -1): "stone", (0, 52, -1): "stone", (0, 53, -1): "stone",
+        }
+        world = FakeOverheadMoveWorld(blocks=blocks)
+        world.st["pos"] = [0.5, 52.0, 0.5]
+        world.items["stone_pickaxe"] = 1
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertIn("dig", [s["op"] for s in steps])
+        self.assertGreater(state.pos[1], 52.5)
+
+    def test_survey_island_spiral_raises_replan_when_all_sectors_blocked_without_progress(self):
+        # 复现地下封死时 survey_island 外扩全扇区 path_not_found 却标 completed 导致乒乓死循环
+        from mcagent.skills.world_memo import memo_for
+
+        class BlockedSurveyWorld(ScoutFailureWorld):
+            def move_to(self, *args, **kwargs):
+                self.calls.append(("move_to", {"pos": list(kwargs.get("pos") or [0, 52, 0])}))
+                raise ApiError("path_not_found", "boxed in underground")
+
+        blocks = {(x, 51, z): "stone" for x in range(-6, 7) for z in range(-6, 7)}
+        world = BlockedSurveyWorld(blocks=blocks)
+        world.st["pos"] = [0.5, 52.0, 0.5]
+        world.st["dimension"] = "overworld"
+        world.items["stone_pickaxe"] = 1
+        ex, state = world.session()
+        memo = memo_for(state)
+        for idx in range(2):
+            memo.mark_sector_done(idx, dimension="overworld")
+        with self.assertRaisesRegex(Replan, "全部移动受阻"):
+            drive(make("survey_island", {"dimension": "overworld", "sectors": 2, "radius": 32}), ex, state)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -935,8 +935,15 @@ class ScoutIsland(Skill):
                         surface_targets.append([gp[0] + 0.5, float(gp[1] + 1), gp[2] + 0.5])
             except ApiError:
                 pass
-            surface_targets.sort(key=lambda t: (abs(t[1] - cur[1]) > 24.0, math.hypot(t[0] - cur[0], t[2] - cur[2])))
+            surface_targets.sort(
+                key=lambda t: (
+                    abs(t[1] - cur[1]) > 24.0,
+                    math.hypot(t[0] - cur[0], t[2] - cur[2]) < 2.5,
+                    math.hypot(t[0] - cur[0], t[2] - cur[2]),
+                )
+            )
             for dest in surface_targets[:4]:
+                before_s = list(cur)
                 try:
                     moved_s = _bounded_move_to(ex, dest, rng=2, timeout=30.0)
                 except Replan as e:
@@ -947,6 +954,11 @@ class ScoutIsland(Skill):
                     continue
                 yield rec("move_to", moved_s, pos=dest, fingerprints=hits)
                 st, cur = _refresh_stance(ex, state)
+                # 防止官方服务端因同 X/Z（水平距 <= rng）直接返 ok=true 却原地未攀升（如地下 Y=52 目标正上方 Y=63）
+                climbed = (float(cur[1]) - float(before_s[1])) >= 0.8
+                reached = math.dist(cur, dest) <= 3.0
+                if math.dist(cur, before_s) < 0.8 or (not climbed and not reached):
+                    continue
                 VISITED_ANCHORS.append((float(cur[0]), float(cur[2])))
                 if _is_valid_pos3(cur):
                     memo.mark_grid_visited(cur, dimension=dim)
@@ -987,6 +999,7 @@ class ScoutIsland(Skill):
                     continue
                 raise
             attempts += 1
+            before_c = list(cur)
             try:
                 moved = _bounded_move_to(ex, dest, rng=2, timeout=30.0)
             except Replan as e:
@@ -1006,7 +1019,13 @@ class ScoutIsland(Skill):
                     break
                 continue
             yield rec("move_to", moved, pos=dest, fingerprints=hits)
-            arrived = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+            st, cur = _refresh_stance(ex, state)
+            arrived = list(cur)
+            # 防止同 X/Z 假成功：原地未位移且距目标仍 > 3 格时不视为到达，继续尝试或转脱困
+            if math.dist(arrived, before_c) < 0.8 and math.dist(arrived, dest) > 3.0:
+                if attempts >= 3:
+                    break
+                continue
             VISITED_ANCHORS.append((float(arrived[0]), float(arrived[2])))
             if _is_valid_pos3(arrived):
                 memo.mark_grid_visited(arrived, dimension=dim)
