@@ -305,7 +305,7 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
     def test_nighttime_naked_and_low_hp_survival_guard(self) -> None:
         planner = RulePlanner(min_verified="offline")
 
-        # 1) 夜间地表空手裸装重生 -> 驻留避险待天亮
+        # 1) 夜间地表空手裸装重生 -> 优先挖洞封口避险；若避难所冷却中则回退原地驻留待天亮
         st_naked_night = State()
         st_naked_night.set_status({
             "ready": True,
@@ -321,10 +321,11 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         dec_naked = planner.choose_proactive_survival(st_naked_night)
         self.assertIsNotNone(dec_naked)
         assert dec_naked is not None
-        self.assertIsNone(dec_naked.skill)
-        self.assertEqual(dec_naked.source, "idle")
+        self.assertIsNotNone(dec_naked.skill)
+        assert dec_naked.skill is not None
+        self.assertEqual(dec_naked.skill.name, "night_shelter")
 
-        # 2) 夜间地表残血无甲无粮（复现 Death #1 hp=5, food=16）-> 驻留避险，不再强推 smelt_iron
+        # 2) 夜间地表残血无甲无粮（复现 Death #1 hp=5, food=16）-> 优先挖洞避险，不再强推 smelt_iron
         st_low_night = State()
         st_low_night.set_status({
             "ready": True,
@@ -340,8 +341,9 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         dec_low = planner.choose_proactive_survival(st_low_night)
         self.assertIsNotNone(dec_low)
         assert dec_low is not None
-        self.assertIsNone(dec_low.skill)
-        self.assertEqual(dec_low.source, "idle")
+        self.assertIsNotNone(dec_low.skill)
+        assert dec_low.skill is not None
+        self.assertEqual(dec_low.skill.name, "night_shelter")
 
         # 3) 白天或地下矿洞或健康武装状态不得被拦截
         st_day = State()
@@ -927,9 +929,17 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         dec = planner.choose_proactive_survival(st)
         self.assertIsNotNone(dec)
         assert dec is not None
-        self.assertIsNone(dec.skill)
-        self.assertEqual(dec.source, "idle")
-        self.assertIn("夜间残血无甲", dec.reason)
+        self.assertIsNotNone(dec.skill)
+        assert dec.skill is not None
+        self.assertEqual(dec.skill.name, "night_shelter")
+        # 若 night_shelter 处于冷却，则必须安全回退到夜间残血原地驻留（绝不派发探图）
+        dec.skill.mark_failed()
+        dec_fb = planner.choose_proactive_survival(st)
+        self.assertIsNotNone(dec_fb)
+        assert dec_fb is not None
+        self.assertIsNone(dec_fb.skill)
+        self.assertEqual(dec_fb.source, "idle")
+        self.assertIn("夜间残血无甲", dec_fb.reason)
 
     def test_unshielded_close_creeper_flee_uses_instant_sprint_burst_before_move_to(self) -> None:
         # 复现 seg-07 t=337s：无盾直面 2.8m 贴脸苦力怕时，必须立即原生疾跑跳脱离起爆半径，而非直接慢速 move_to 被炸死
@@ -1151,9 +1161,17 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         dec = planner.choose_proactive_survival(st)
         self.assertIsNotNone(dec)
         assert dec is not None
-        self.assertIsNone(dec.skill)
-        self.assertEqual(dec.source, "idle")
-        self.assertIn("夜间空手无甲", dec.reason)
+        self.assertIsNotNone(dec.skill)
+        assert dec.skill is not None
+        self.assertEqual(dec.skill.name, "night_shelter")
+        # 若 night_shelter 处于冷却，则仍必须安全回退至夜间空手驻留而非裸奔砍树
+        dec.skill.mark_failed()
+        dec_fb = planner.choose_proactive_survival(st)
+        self.assertIsNotNone(dec_fb)
+        assert dec_fb is not None
+        self.assertIsNone(dec_fb.skill)
+        self.assertEqual(dec_fb.source, "idle")
+        self.assertIn("夜间空手无甲", dec_fb.reason)
 
     def test_smelt_iron_filters_deep_cave_ores_when_unarmored_at_10_3_hp_no_food(self) -> None:
         # 复现 seg-10 t=62s：hp=10.3 无甲无盾无粮时，禁止再追 Y=48 远距深洞暴露矿，优先转安全矿井或地表浅矿

@@ -11,7 +11,7 @@ from .base import failure, rec
 from .items import AIR, PASSABLE_COVER, PLACEABLE_BLOCKS, bare
 from .observations import observe_block as _observed_block
 from .sightline import API_DIG_EYE_REACH, can_reach_block
-from .voxel_cache import voxel_cache_for
+from .voxel_cache import has_batch_get_blocks, voxel_cache_for
 
 
 _UNSAFE_SUPPORT = AIR | {"water", "lava", "bubble_column", "fire", "soul_fire",
@@ -63,12 +63,17 @@ def _scan_result(snapshot, observed_at, radius, key, hits, *, ready=True):
     }
 
 
-def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None, skill_name: str = ""):
+def scan_blocks(
+    ex, state, types=None, *, radius=16, limit=12, properties=None, mature=None, skill_name: str = "", verify: bool = True,
+):
     """§3.1、§3.3–3.4：ready=true 时复读最多 limit 个暴露候选；加载期间返回 ready=false。"""
     _bounded(radius, 1, 64, "方块搜索半径")
     _bounded(limit, 1, 64, "方块搜索条数")
     names = {bare(name) for name in ([types] if isinstance(types, str) else types or ())}
-    snapshot = state.refresh_status(ex.client, max_age_s=0)
+    raw_rtt = getattr(getattr(ex, "client", None), "smoothed_rtt_s", 0.0)
+    client_rtt = float(raw_rtt) if isinstance(raw_rtt, (int, float)) and not isinstance(raw_rtt, bool) else 0.0
+    status_max_age = 0.8 if client_rtt > 0.20 else 0
+    snapshot = state.refresh_status(ex.client, max_age_s=status_max_age)
     observed_at = time.monotonic()
     if snapshot.get("ready") is False:
         return _scan_result(snapshot, observed_at, radius, "blocks", [], ready=False)
@@ -93,14 +98,30 @@ def scan_blocks(ex, state, types=None, *, radius=16, limit=12, properties=None, 
         summaries = sorted(blocks.items(), key=lambda entry: entry[1].get("dist", math.inf))
         blocks = ({"name": name, "pos": summary.get("nearest"), "dist": summary.get("dist")}
                   for name, summary in summaries)
-    hits = []
+    filtered = []
     for candidate in islice(blocks, limit):
         if not candidate.get("pos") or not (name := bare(candidate.get("name"))):
             continue
         pos = _cell(candidate["pos"])
         if cache.is_unreachable(skill_name, pos, dimension=dim, stance_cell=stance_cell):
             continue
-        observed = _observed_block(ex, pos)
+        filtered.append((candidate, name, pos))
+    # 广谱普查（types=None 且无属性过滤）或显式 verify=False 时直接信任刚返回的 /find_blocks，
+    # 消除官方高 RTT 下 17~64 次串行 /get_block 复查造成的 15~45s 卡顿。
+    skip_verify = (not verify) or (not names and properties is None and mature is None)
+    if skip_verify:
+        hits = [{**candidate, "pos": list(pos), "name": name} for candidate, name, pos in filtered]
+        return _scan_result(snapshot, observed_at, radius, "blocks", hits, ready=True)
+    prefetched = {}
+    if len(filtered) > 1 and has_batch_get_blocks(getattr(ex, "client", None)):
+        prefetched = cache.get_blocks_batch(
+            ex.client, [pos for _, _, pos in filtered], dimension=dim, force=True,
+        )
+    hits = []
+    for candidate, name, pos in filtered:
+        observed = prefetched.get(pos) if pos in prefetched else _observed_block(ex, pos)
+        if not isinstance(observed, dict):
+            observed = {}
         if _block_matches(observed, names or {name}, properties, mature):
             hits.append({**candidate, **observed, "pos": list(pos), "name": bare(observed["name"])})
         else:

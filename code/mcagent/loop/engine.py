@@ -94,6 +94,11 @@ _ROADSIDE_OPPORTUNITY_ENTITIES: tuple[str, ...] = (
 _ROADSIDE_OPPORTUNITY_ENTITY_SET: frozenset[str] = frozenset(_ROADSIDE_OPPORTUNITY_ENTITIES)
 
 
+_NON_BLOCK_ROADSIDE_NAMES: dict[str, str] = {
+    "glow_berries": "cave_vines_plant",
+}
+
+
 def _roadside_structure_blocks(dimension: str) -> list[str]:
     dim = bare(dimension).strip().lower() or "overworld"
     if "nether" in dim:
@@ -106,9 +111,10 @@ def _roadside_structure_blocks(dimension: str) -> list[str]:
     seen: set[str] = set()
     for tag in _ROADSIDE_DIM_STRUCTURES.get(bucket, ()):
         for bname in STRUCTURE_FINGERPRINTS.get(tag, ()):
-            if bname not in seen:
-                seen.add(bname)
-                blocks.append(bname)
+            eff = _NON_BLOCK_ROADSIDE_NAMES.get(bname, bname)
+            if eff and eff not in seen:
+                seen.add(eff)
+                blocks.append(eff)
     return blocks
 
 
@@ -318,7 +324,14 @@ class MainLoop:
             elif math.dist(cur_pos, self._last_roadside_scan_pos) >= move_dist:
                 moved_trigger = True
         interval_s = max(0.0, float(self.config.roadside_scan_interval_s))
-        if not force and not moved_trigger and (now - self._last_roadside_scan_at) < interval_s:
+        raw_rtt = getattr(self.client, "smoothed_rtt_s", 0.0)
+        high_rtt = (float(raw_rtt) if isinstance(raw_rtt, (int, float)) and not isinstance(raw_rtt, bool) else 0.0) > 0.25
+        if high_rtt:
+            # 高 RTT 下原地未移动不靠 5s 定时白发 find_blocks + get_entities；放大静止间隔至 45s
+            eff_interval_s = max(interval_s, 45.0)
+        else:
+            eff_interval_s = interval_s
+        if not force and not moved_trigger and (now - self._last_roadside_scan_at) < eff_interval_s:
             return []
         self._last_roadside_scan_at = now
         self._last_roadside_scan_pos = cur_pos
