@@ -333,6 +333,18 @@ test("control wait:false returns immediately, exposes held_controls, supports ta
   assert.deepEqual(r3.released, ["left"]);
   assert.equal(bot.getControlState("left"), false);
   assert.equal(session.getStatus().held_controls, null);
+
+  // wait:false with multiple hits swings first hit immediately and schedules remainder
+  let swings = 0;
+  bot.swingArm = () => { swings += 1; };
+  const r4 = await session.control({ forward: true, hit: 2, hit_interval_ms: 50, ms: 120.5, wait: false });
+  assert.equal(r4.hits.length, 1);
+  assert.equal(r4.scheduled_hits, 1);
+  assert.equal(swings, 1);
+  await session.control({ wait: false });
+
+  // hit_interval_ms without hit must reject with bad_args (matches official mc-agent-api)
+  await assert.rejects(session.control({ forward: true, hit_interval_ms: 100, ms: 200 }), { code: "bad_args" });
 });
 
 test("chat runs concurrently alongside blocking actions and does not release held controls (v1.3.19)", async () => {

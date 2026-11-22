@@ -1817,6 +1817,54 @@ def probe_local_bridge(base_url: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 data = {"raw": body[:300]}
             return {"ok": resp.status == 200, "status": resp.status, "ms": ms, "url": health_url, "data": data}
+    except urllib.error.HTTPError as http_err:
+        err_code = http_err.code
+        try:
+            http_err.close()
+        except Exception:
+            pass
+        # D10 兼容：官方开源 mc-agent-api 无 /healthz（返 404），回退探测 /api/v1/status 401 unauthorized
+        if err_code == 404:
+            status_url = f"{origin}/api/v1/status"
+            req2 = urllib.request.Request(status_url, method="GET")
+            try:
+                with opener.open(req2, timeout=2.5) as resp2:
+                    ms = round((time.monotonic() - t0) * 1000, 1)
+                    return {
+                        "ok": resp2.status == 200,
+                        "status": resp2.status,
+                        "ms": ms,
+                        "url": status_url,
+                        "data": {"ok": True, "server_type": "mc-agent-api"},
+                    }
+            except urllib.error.HTTPError as status_err:
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                st_code = status_err.code
+                try:
+                    raw_err = status_err.read().decode("utf-8", errors="replace")
+                finally:
+                    try:
+                        status_err.close()
+                    except Exception:
+                        pass
+                try:
+                    err_json = json.loads(raw_err)
+                except json.JSONDecodeError:
+                    err_json = {}
+                if st_code == 401 and (err_json.get("error") or {}).get("code") == "unauthorized":
+                    return {
+                        "ok": True,
+                        "status": 401,
+                        "ms": ms,
+                        "url": status_url,
+                        "data": {"ok": True, "server_type": "mc-agent-api", "probe": "status_401_unauthorized"},
+                    }
+                return {"ok": False, "status": st_code, "ms": ms, "url": status_url, "error": f"HTTPError: {st_code}"}
+            except Exception as exc2:
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                return {"ok": False, "ms": ms, "url": status_url, "error": f"{type(exc2).__name__}: {exc2}"}
+        ms = round((time.monotonic() - t0) * 1000, 1)
+        return {"ok": False, "status": err_code, "ms": ms, "url": health_url, "error": f"HTTPError: {err_code}"}
     except Exception as exc:
         ms = round((time.monotonic() - t0) * 1000, 1)
         return {"ok": False, "ms": ms, "url": health_url, "error": f"{type(exc).__name__}: {exc}"}

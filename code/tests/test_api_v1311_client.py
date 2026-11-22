@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from mcagent.client import CODE_CLASS, FATAL, REPLAN, ApiError, Client, Config
+from mcagent.client import CODE_CLASS, FATAL, REPLAN, RETRY, ApiError, Client, Config
 from mcagent.planner.decision import validate as validate_decision
 from mcagent.runtime import Executor, Fatal, Replan, State
 from tests.test_d0_core import FakeResponse, FakeSession
@@ -32,6 +32,12 @@ class CodeClassTests(unittest.TestCase):
     def test_required_route_unknown_api_stays_fatal(self) -> None:
         self.assertEqual(CODE_CLASS["unknown_api"], FATAL)
         self.assertEqual(CODE_CLASS["bad_args"], REPLAN)
+
+    def test_v1315_v1316_codes_classified_properly(self) -> None:
+        self.assertEqual(CODE_CLASS["backend_unavailable"], RETRY)
+        self.assertEqual(CODE_CLASS["routing_unavailable"], RETRY)
+        self.assertEqual(CODE_CLASS["body_too_large"], REPLAN)
+        self.assertEqual(CODE_CLASS["death_loop_cooldown"], RETRY)
 
 
 class ControlLookBodyTests(unittest.TestCase):
@@ -70,6 +76,35 @@ class ControlLookBodyTests(unittest.TestCase):
         self.assertEqual(self.calls[-1][1]["interval_ms"], 300)
         self.client.attack(812)
         self.assertNotIn("max_hits", self.calls[-1][1])
+        self.assertNotIn("chase", self.calls[-1][1])
+        self.assertNotIn("feedback", self.calls[-1][1])
+
+    def test_control_wait_false_and_empty_release(self) -> None:
+        self.client.control(forward=True, sprint=True, ms=200, wait=False)
+        route, body = self.calls[-1]
+        self.assertEqual(route, "control")
+        self.assertEqual(body, {"forward": True, "sprint": True, "ms": 200, "wait": False, "stop_on": ["hurt", "death"]})
+
+        self.client.control(wait=False)
+        route2, body2 = self.calls[-1]
+        self.assertEqual(route2, "control")
+        self.assertEqual(body2, {"wait": False, "stop_on": ["hurt", "death"]})
+
+        ex = Executor(self.client, State(), log=lambda *_: None)
+        ex.control(forward=True, ms=200, wait=False)
+        self.assertEqual(self.calls[-1][1]["wait"], False)
+
+    def test_attack_chase_false_and_feedback_true(self) -> None:
+        self.client.attack(812, timeout_ms=None, max_hits=2, chase=False, feedback=True)
+        route, body = self.calls[-1]
+        self.assertEqual(route, "attack")
+        self.assertEqual(body, {"entity_id": 812, "max_hits": 2, "chase": False, "feedback": True, "stop_on": ["death"]})
+
+        ex = Executor(self.client, State(), log=lambda *_: None)
+        ex.attack(812, timeout_ms=1500, chase=False, feedback=True)
+        self.assertEqual(self.calls[-1][1]["chase"], False)
+        self.assertEqual(self.calls[-1][1]["feedback"], True)
+        self.assertEqual(self.calls[-1][1]["timeout"], 1500)
 
 
 class CapabilityProbeTests(unittest.TestCase):
