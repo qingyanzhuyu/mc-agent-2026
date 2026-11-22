@@ -1025,7 +1025,28 @@ class Safety:
             hostile_dist = float(raw_dist)
         else:
             hostile_dist = 99.0
-        creeper_urgent = hostile_name == "creeper" and hostile_dist < self.config.creeper_urgent_dist
+        offhand_name = (
+            str((st.get("offhand") or {}).get("name") or "").removeprefix("minecraft:").strip().lower()
+            if isinstance(st.get("offhand"), dict)
+            else ""
+        )
+        has_shield_def = offhand_name == "shield" or (hasattr(s, "count") and s.count("shield") >= 1)
+        pos_now = st.get("pos")
+        in_underground_cave = (
+            isinstance(pos_now, (list, tuple))
+            and len(pos_now) >= 3
+            and isinstance(pos_now[1], (int, float))
+            and not isinstance(pos_now[1], bool)
+            and float(pos_now[1]) < 56.0
+        )
+        # 困难模式无甲无盾身处地下矿洞（Y<56，地形狭窄易卡墙）时，苦力怕 4.5m 贴爆即满血秒杀（20->0）：
+        # 将地下无甲无盾 urgent 抢占半径由 5.0m 扩至 7.5m，避免长距 move_to 走进深坑逼近至 4.5m 才急停。
+        creeper_urgent_thresh = (
+            max(float(self.config.creeper_urgent_dist), 7.5)
+            if (in_underground_cave and not has_equipped_armor(s) and not has_shield_def)
+            else float(self.config.creeper_urgent_dist)
+        )
+        creeper_urgent = hostile_name == "creeper" and hostile_dist < creeper_urgent_thresh
         if creeper_urgent:
             add(
                 "flee",

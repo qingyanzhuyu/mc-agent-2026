@@ -2687,6 +2687,40 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         _, st_f = w_full.session()
         self.assertEqual(AllayDeliverItem.blocked(st_f), "")
 
+    def test_seg29_unarmored_unshielded_creeper_preempts_urgent_at_7_5m(self) -> None:
+        # 复现 seg-29 17.1s Y=16->0 矿洞满血秒杀（20->0）：无甲无盾下 smelt_iron move_to 走近苦力怕至 6.9m 时
+        # 旧 5.0m 阈值仍判 soft 不抢占，直到 4.5m 才急停被卡墙贴爆满血秒死；无甲无盾必须扩至 7.5m 立即 urgent 抢占，
+        # 而穿甲或持盾时保持默认 5.0m 避免过度打断。
+        from mcagent.runtime import RuntimeConfig, Safety
+
+        safety = Safety(RuntimeConfig())
+
+        # 无甲无盾 + 苦力怕 6.9m -> urgent flee
+        st_bare = State()
+        st_bare.set_status({
+            "ready": True, "alive": True, "health": 20.0, "food": 20, "armor_points": 0,
+            "pos": [-40.3, 0.9, 91.5],
+            "nearest_hostile": {"id": 195355, "name": "creeper", "dist": 6.9, "pos": [-39.5, 0.0, 98.4]},
+        })
+        st_bare.set_inventory({"items": [{"name": "stone_pickaxe", "count": 1, "slot": 0}]})
+        hz_bare = safety.hazards(st_bare)
+        flee_bare = [h for h in hz_bare if h.get("kind") == "flee"]
+        self.assertTrue(flee_bare)
+        self.assertEqual(flee_bare[0].get("severity"), "urgent")
+        self.assertTrue(flee_bare[0].get("creeper"))
+
+        # 持盾 + 苦力怕 6.9m -> 保持默认 5.0m（非 urgent）
+        st_shield = State()
+        st_shield.set_status({
+            "ready": True, "alive": True, "health": 20.0, "food": 20, "armor_points": 0,
+            "offhand": {"name": "shield", "count": 1},
+            "pos": [-40.3, 0.9, 91.5],
+            "nearest_hostile": {"id": 195355, "name": "creeper", "dist": 6.9, "pos": [-39.5, 0.0, 98.4]},
+        })
+        hz_shield = safety.hazards(st_shield)
+        flee_shield = [h for h in hz_shield if h.get("kind") == "flee"]
+        self.assertFalse(any(h.get("severity") == "urgent" for h in flee_shield))
+
 
 if __name__ == "__main__":
     unittest.main()
