@@ -17,6 +17,7 @@ from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, can_reach_block, eye_to
 from .voxel_cache import voxel_cache_for
 from .windows import is_storage_window, take_container_item, window_amount, window_section, window_view
 from .world_memo import memo_for
+from .workstations import find_known_station, reclaim_field_station
 
 _GOLD_ARMOR = (("golden_helmet", "head"), ("golden_chestplate", "torso"), ("golden_leggings", "legs"), ("golden_boots", "feet"))
 _GOLD_NAMES = frozenset(n for n, _ in _GOLD_ARMOR)
@@ -310,16 +311,24 @@ class ChargeRespawnAnchor(Skill):
             if state.count("respawn_anchor") < 1:
                 if state.count("crying_obsidian") < 6 or state.count("glowstone") < 3:
                     raise Replan("合成重生锚缺少哭泣的黑曜石（需 6）或萤石（需 3）")
+                temp_table_pos = None
                 try:
                     yield from _table_position(ex, state)
                 except EnvBlocked:
-                    if state.count("crafting_table") < 1 or (tpos := _find_place_cell(ex, state.refresh_status(ex.client, max_age_s=0))) is None:
-                        raise
-                    yield from place_block(ex, state, "crafting_table", tpos)
+                    if (known := find_known_station(ex, state, "crafting_table", dimension="the_nether", max_dist=16.0)) is not None:
+                        if eye_to_block_dist(state.refresh_status(ex.client, max_age_s=0), known) > STATION_EYE_REACH:
+                            yield from _move_to_cell(ex, state, known, rng=2)
+                    else:
+                        if state.count("crafting_table") < 1 or (tpos := _find_place_cell(ex, state.refresh_status(ex.client, max_age_s=0))) is None:
+                            raise
+                        yield from place_block(ex, state, "crafting_table", tpos)
+                        temp_table_pos = tuple(tpos)
                 before_cnt = state.count("respawn_anchor")
                 yield rec("craft", ex.craft("respawn_anchor", 1), item="respawn_anchor", count=1)
                 if _fresh_bag(ex, state).count("respawn_anchor") <= before_cnt:
                     raise Replan("合成重生锚后背包未确认增加")
+                if temp_table_pos is not None:
+                    yield from reclaim_field_station(ex, state, "crafting_table", temp_table_pos, dimension="the_nether", newly_placed=True)
             if (place_cell := _find_place_cell(ex, state.refresh_status(ex.client, max_age_s=0))) is None:
                 raise Replan("未找到可放置重生锚的安全空位")
             yield from place_block(ex, state, "respawn_anchor", place_cell)

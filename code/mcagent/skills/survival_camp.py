@@ -1,22 +1,26 @@
 """夜间复用或建造安全床位并验证睡眠。"""
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
 
+from ..client import ApiError
 from ..runtime import EnvBlocked, Replan
 from .base import Skill, failure, rec
+from .camp_plan import is_protected_cell, record_protected_cell, state_snap
 from .field import collect_drops, move_local, place_block, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
 from .recipes import RECIPES, _ingredient_items, craft_recipe
 from .registry import register
-from .sightline import ENTITY_EYE_REACH, block_center
+from .sightline import DIG_EYE_REACH, ENTITY_EYE_REACH, block_center, eye_to_block_dist
 from .survival import (
     _PLANKS, _SLEEP_PROGRESS, _SUPPORT, _above, _approach, _block, _can_reach, _cell,
     _fresh_inventory, _has_progress, _neighbors, _on_ground, _plank_plan,
     _site_missing, _stand_for, _standable,
 )
+from .voxel_cache import voxel_cache_for
 from .world_memo import memo_for
 
 
@@ -33,6 +37,91 @@ _DYE_SOURCES: dict[str, tuple[tuple[str, int], ...]] = {
     "light_gray_dye": (("azure_bluet", 1), ("oxeye_daisy", 1), ("white_tulip", 1)),
 }
 _BED_RADIUS, _EARLY_NIGHT_START, _NIGHT_END = 12, 12542, 23459
+_HOSTILE_MOB_NAMES = frozenset({
+    "zombie", "skeleton", "creeper", "spider", "cave_spider", "enderman", "witch",
+    "drowned", "husk", "stray", "bogged", "phantom", "pillager", "vindicator",
+    "evoker", "ravager", "slime", "breeze", "silverfish", "vex", "guardian",
+    "warden", "piglin_brute", "blaze", "ghast", "wither_skeleton", "zoglin",
+    "hoglin", "magma_cube", "shulker",
+})
+
+
+def is_area_hostile_free(ex, state, *, radius: float = 30.0) -> bool:
+    """确认当前状态与 30 格扫描范围内均无敌对生物，供野外临时床安全回收判定使用。"""
+    st = state_snap(state)
+    nh = st.get("nearest_hostile")
+    if nh is not None:
+        if isinstance(nh, Mapping):
+            dist = nh.get("dist")
+            if isinstance(dist, (int, float)) and not isinstance(dist, bool) and math.isfinite(float(dist)):
+                if float(dist) <= radius:
+                    return False
+            else:
+                return False
+        else:
+            return False
+
+    query_radius = int(radius) if float(radius).is_integer() else radius
+    try:
+        raw = ex.client.get_entities(radius=query_radius)
+    except Exception:
+        return False
+
+    entities = (raw.get("entities") if isinstance(raw, Mapping) else raw) or ()
+    raw_pos = st.get("pos")
+    origin = (
+        (float(raw_pos[0]), float(raw_pos[1]), float(raw_pos[2]))
+        if isinstance(raw_pos, Sequence) and not isinstance(raw_pos, (str, bytes)) and len(raw_pos) >= 3
+        else None
+    )
+    for ent in entities:
+        if not isinstance(ent, Mapping):
+            continue
+        ename = bare(ent.get("name")).strip().lower()
+        if ent.get("type") != "hostile" and ename not in _HOSTILE_MOB_NAMES:
+            continue
+        edist = ent.get("dist")
+        if isinstance(edist, (int, float)) and not isinstance(edist, bool) and math.isfinite(float(edist)):
+            if float(edist) <= radius:
+                return False
+            continue
+        epos = ent.get("pos")
+        if origin is not None and isinstance(epos, Sequence) and not isinstance(epos, (str, bytes)) and len(epos) >= 3:
+            if math.dist(origin, (float(epos[0]), float(epos[1]), float(epos[2]))) <= radius:
+                return False
+            continue
+        return False
+    return True
+
+
+def _reclaim_bed_if_safe(ex, state, pos, bed: str, after_st):
+    """醒来后若非保护区、非营地常驻床且 30 格无敌对生物，顺手挖回野外临时床并销账。"""
+    if not isinstance(after_st, Mapping) or after_st.get("is_sleeping") is not False:
+        return False
+    if after_st.get("alive") is False:
+        return False
+    if is_protected_cell(pos) or memo_for(state).is_camp_station("bed", pos, dimension="overworld"):
+        return False
+    try:
+        if eye_to_block_dist(after_st, pos) > DIG_EYE_REACH:
+            return False
+    except Exception:
+        return False
+    if not is_area_hostile_free(ex, state, radius=30.0):
+        return False
+    try:
+        res_dig = ex.dig(list(pos), collect=True)
+    except (Replan, ApiError) as exc:
+        code = failure(exc)[0]
+        if code == "protected_region":
+            record_protected_cell(pos, memo_for(state), "overworld")
+        if code in ("interrupted", "dead", "not_connected", "death_loop_cooldown") or "抢占" in str(exc):
+            raise
+        return False
+    voxel_cache_for(state).invalidate(pos, dimension="overworld")
+    memo_for(state).remove_station("bed", pos, dimension="overworld")
+    yield rec("dig", res_dig, pos=list(pos), collect=True, item=bed, reason="reclaim_bed_30m_safe")
+    return True
 
 
 def _can_sleep_now(status):
@@ -384,6 +473,7 @@ class SleepInBed(Skill):
                 raise Replan("点床返回 woke=true，但角色状态仍为睡眠中")
             if _has_progress(ex, _SLEEP_PROGRESS):
                 yield rec("verify_sleep", {"advancement_confirmed": True, "woke": True})
+                yield from _reclaim_bed_if_safe(ex, state, pos, bed, after_wake)
                 return
             _sleep_window(after_wake)
             if not _bed_observed(ex, pos, bed):
@@ -391,3 +481,4 @@ class SleepInBed(Skill):
             since = _since_seq(ex, state)
             evidence = yield from _click_bed(ex, state, pos)
         yield rec("verify_sleep", _sleep_confirmed(ex, evidence, since))
+        yield from _reclaim_bed_if_safe(ex, state, pos, bed, evidence["after"]["status"])

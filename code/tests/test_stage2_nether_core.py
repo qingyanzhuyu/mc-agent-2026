@@ -339,6 +339,13 @@ class NetherCoreTests(unittest.TestCase):
         self.assertEqual((best_fuel_for(st_lava, 10), best_fuel_for(st_lava, 10, allow_lava_bucket=False)), (("lava_bucket", 1), None))
         for fuel in ("coal", "oak_planks", "stick"):
             self.assertEqual(best_fuel_for(NetherWorld(items={fuel: 8}).session()[1], 2)[0], fuel)
+        st_log_plank = NetherWorld(items={"oak_log": 4, "oak_planks": 4}).session()[1]
+        self.assertEqual(best_fuel_for(st_log_plank, 2), ("oak_planks", 2))
+        st_log_coal = NetherWorld(items={"oak_log": 4, "oak_planks": 4, "coal": 1}).session()[1]
+        self.assertEqual(best_fuel_for(st_log_coal, 2), ("coal", 1))
+        st_log_only = NetherWorld(items={"oak_log": 4}).session()[1]
+        self.assertEqual(best_fuel_for(st_log_only, 2, allow_logs=False), None)
+        self.assertEqual(best_fuel_for(st_log_only, 2, allow_logs=True), ("oak_log", 2))
 
         now = [100.0]
         book, st_r, rbook = FurnaceLeaseBook(clock=lambda: now[0]), NetherWorld(items={"raw_iron": 4, "coal": 2}).session()[1], ReservationBook()

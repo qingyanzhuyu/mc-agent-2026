@@ -18,6 +18,7 @@ from .sightline import STATION_EYE_REACH, can_reach_block
 from .windows import (
     _receipt_inventory_full, apply_window_ops, take_container_item, window_amount, window_section, window_view,
 )
+from .workstations import find_known_station, reclaim_field_station, record_placed_station
 
 
 _ADVANCEMENT = "minecraft:story/enchant_item"
@@ -532,10 +533,32 @@ class EnchantItem(Skill):
                     yield rec("enchantment_evidence", None, held_product=True, advancement_confirmed=False)
                     return
                 raise Replan("缺少未附魔的书或装备")
+        newly_placed_table = False
         candidates = _nearby_blocks(ex, state, (_STATION,))
+        pos = None
         if candidates:
             pos = yield from _approach_block(ex, state, candidates[0])
-        else:
+            record_placed_station(state, _STATION, pos)
+        elif (known_pos := find_known_station(ex, state, _STATION, max_dist=16.0)) is not None:
+            status = _site_state(ex, state)
+            if _face_reachable(ex, status, known_pos):
+                pos = yield from _approach_block(ex, state, (known_pos, _STATION, None))
+            else:
+                for dy in (0, -1, 1):
+                    for dx, dz in _ADJACENT:
+                        stand = (known_pos[0] + dx, known_pos[1] + dy, known_pos[2] + dz)
+                        if not _standable_cell(ex, stand):
+                            continue
+                        feet = (stand[0] + 0.5, float(stand[1]), stand[2] + 0.5)
+                        if _face_reachable(ex, {"pos": feet, "sneaking": status.get("sneaking")}, known_pos):
+                            yield from move_local(ex, state, feet, max_distance=20)
+                            cur_st = _site_state(ex, state)
+                            if bare(_observed_block(ex, known_pos).get("name")) == _STATION and _face_reachable(ex, cur_st, known_pos):
+                                pos = list(known_pos)
+                            break
+                    if pos is not None:
+                        break
+        if pos is None:
             craft = _enchant_crafts(state, item)
             books_needed = (1 if state.count(_STATION) == 0 else 0) + (1 if item == "book" else 0)
             if (state.count("book") < books_needed
@@ -557,4 +580,6 @@ class EnchantItem(Skill):
             if not sites:
                 raise Replan("附魔台制作后需找到承重和可撤的落点")
             pos = yield from _place_checked(ex, state, _STATION, sites[0])
+            newly_placed_table = True
         yield from _enchant_once(ex, state, pos, item)
+        yield from reclaim_field_station(ex, state, _STATION, pos, newly_placed=newly_placed_table)

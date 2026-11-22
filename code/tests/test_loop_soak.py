@@ -289,7 +289,11 @@ class MainLoopDeathAndProgressionTests(unittest.TestCase):
             orig_dig = world.dig
 
             def inject_once(pos, collect=True, *, stop_on=None):
-                if world.items.get("wooden_pickaxe", 0) >= 1 and not getattr(inject_once, "fired", False):
+                if (
+                    world.items.get("wooden_pickaxe", 0) >= 1
+                    and world.blocks.get(tuple(pos)) == "stone"
+                    and not getattr(inject_once, "fired", False)
+                ):
                     inject_once.fired = True
                     world.die_on_next_dig = True
                     # 模拟死前处于潜行态：按规范 §4.11 死亡自动复位，不应误判姿态泄漏也不应调 /posture
@@ -321,14 +325,18 @@ class MainLoopDeathAndProgressionTests(unittest.TestCase):
             obs = SoakObserver(tmp, world_snapshot_id="void-snap-drop", source="local-target")
             planner = CampaignPlanner(mode="campaign", min_verified="offline")
             cfg = LoopConfig(
-                max_steps=22, idle_sleep_s=0.0, respawn_poll_s=0.001, enable_monitor=False
+                max_steps=26, idle_sleep_s=0.0, respawn_poll_s=0.001, enable_monitor=False
             )
             loop = MainLoop(world, state, ex, planner, config=cfg, observer=obs, log=lambda *_: None)
 
             orig_dig = world.dig
 
             def wipe_once(pos, collect=True, *, stop_on=None):
-                if world.items.get("wooden_pickaxe", 0) >= 1 and not getattr(wipe_once, "fired", False):
+                if (
+                    world.items.get("wooden_pickaxe", 0) >= 1
+                    and world.blocks.get(tuple(pos)) == "stone"
+                    and not getattr(wipe_once, "fired", False)
+                ):
                     wipe_once.fired = True
                     world.die_on_next_dig = True
                 return orig_dig(pos, collect=collect, stop_on=stop_on)

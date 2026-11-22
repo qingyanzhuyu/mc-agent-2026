@@ -24,7 +24,7 @@ from ..planner.objective import (
 )
 from ..runtime import State, _inv_fingerprint, has_equipped_armor
 from ..skills.items import best_pickaxe
-from ..skills.survival_food import inventory_food_restore
+from ..skills.survival_food import TWO_DAY_FOOD_RESTORE, effective_food_restore, inventory_food_restore
 from ..skills.world_memo import memo_for
 from .goals import (
     GOALS,
@@ -218,6 +218,17 @@ def summarize_inventory_and_status(state: State, *, max_items: int = 16) -> str:
     armor_str = _summarize_armor(state)
     edible = best_food(state) or "无"
     food_restore = inventory_food_restore(state)
+    eff_food = effective_food_restore(state)
+    food_tag = (
+        "够2天-勿补粮"
+        if eff_food >= TWO_DAY_FOOD_RESTORE
+        else f"约{eff_food / (TWO_DAY_FOOD_RESTORE / 2.0):.1f}天"
+    )
+    food_detail = (
+        f"{food_restore}({food_tag})"
+        if eff_food == food_restore
+        else f"{food_restore}/有效{eff_food}({food_tag})"
+    )
     logs_n = total_logs(state)
     planks_n = total_planks(state)
     cobble_n = total_cobble(state)
@@ -234,7 +245,7 @@ def summarize_inventory_and_status(state: State, *, max_items: int = 16) -> str:
 
     return (
         f"状态：维度={dim} | 血量={hp} | 饱食={food} | 安全模式={'是' if state.in_safe_mode else '否'} | 邻近威胁={threat}\n"
-        f"关键装备与汇总：最优镐={pick} | 最优斧={axe} | 护甲={armor_str} | 食物={edible} | 食物量={food_restore} | 原木={logs_n} | 木板={planks_n} | 圆石={cobble_n}\n"
+        f"关键装备与汇总：最优镐={pick} | 最优斧={axe} | 护甲={armor_str} | 食物={edible} | 食物量={food_detail} | 原木={logs_n} | 木板={planks_n} | 圆石={cobble_n}\n"
         f"背包明细：{bag_str}"
     )
 

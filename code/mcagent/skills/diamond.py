@@ -18,11 +18,16 @@ from .mine_shaft import (
 )
 from .mining import SOLID_SUPPORT, MineStepUnsafe, mine_step
 from .observations import refresh_inventory as _fresh_inventory
+from .ore_ledger import (
+    OVERWORLD_ALL_ORES, mine_reachable_ores_and_record, ore_category,
+    query_harvestable_memo_ores, record_ore_observations,
+)
 from .recipes import RECIPES, craft_recipe
 from .registry import register
 from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, eye_to_block_dist
 from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks
 from .windows import is_storage_window, take_container_item, window_amount, window_view
+from .workstations import reclaim_field_station
 
 _ARMOR = ("diamond_boots", "diamond_chestplate", "diamond_helmet", "diamond_leggings")
 _DIAMOND_PICKS = ("diamond_pickaxe", "netherite_pickaxe")
@@ -395,6 +400,11 @@ class MineDiamond(Skill):
             else CARDINALS[0]
         )
         stairs = 0
+        shaft_sealed = False
+        try:
+            from .mine_shaft import seal_shaft_entrance
+        except ImportError:
+            seal_shaft_entrance = None
         vc = _voxel_cache(state)
         reach_mod = _reach_mod()
         try:
@@ -409,13 +419,75 @@ class MineDiamond(Skill):
                         {"blocks": [{"pos": list(o), "name": "diamond_ore"} for o in ores]},
                         dimension="overworld",
                     )
+                if memo is not None and ores:
+                    record_ore_observations(
+                        state,
+                        [{"pos": list(o), "name": "diamond_ore"} for o in ores],
+                        dimension="overworld",
+                        origin=status,
+                    )
+                memo_ore_cells: set[tuple[int, int, int]] = set()
+                if not ores and memo is not None:
+                    memo_diamonds = query_harvestable_memo_ores(
+                        state,
+                        ("diamond_ore",),
+                        dimension="overworld",
+                        max_dist=64.0,
+                        excluded=tried_ores,
+                        origin=status,
+                    )
+                    for _, cell in memo_diamonds:
+                        if cell in tried_ores:
+                            continue
+                        if vc is not None and vc.is_unreachable(
+                            "mine_diamond", cell, dimension="overworld", stance_cell=origin,
+                        ):
+                            continue
+                        memo_ore_cells.add(cell)
+                        ores.append(cell)
                 for ore in ores:
                     if ore in tried_ores or len(tried_ores) >= _MAX_ORES:
                         continue
                     if vc is not None and vc.is_unreachable("mine_diamond", ore, dimension="overworld", stance_cell=origin):
                         continue
+                    if ore in memo_ore_cells:
+                        if math.dist(origin, ore) > 5.0:
+                            try:
+                                yield rec("move_to", _bounded_move_to(ex, list(ore), rng=2, timeout=30.0), pos=list(ore))
+                            except Replan as exc:
+                                code, _ = failure(exc)
+                                if (isinstance(exc, EnvBlocked) or code == "interrupted"
+                                        or "抢占" in str(exc) or code not in _CLEAR_FAIL_CODES):
+                                    raise
+                                tried_ores.add(ore)
+                                if vc is not None:
+                                    vc.mark_unreachable("mine_diamond", ore, dimension="overworld", stance_cell=origin)
+                                if memo is not None:
+                                    memo.mark_unreachable(
+                                        ore, dimension="overworld", category="diamond_ore", error_code=code,
+                                    )
+                                yield rec("ore_skip", pos=list(ore), error_code=code)
+                                continue
+                            status = _safe_status(ex, state, "overworld")
+                            origin = _cell(status["pos"])
+                            if math.dist(origin, path[-1]) > 4.0:
+                                path = [origin]
+                            elif origin != path[-1]:
+                                path.append(origin)
+                            waypoints.append(status["pos"])
+                            visited_columns.add((origin[0], origin[2]))
+                        if _in_reach(ex, status, ore, reach=DIG_EYE_REACH) or math.dist(origin, ore) <= 6.0:
+                            if _dry_name(_block(ex, ore)) not in DIAMOND_ORES:
+                                if memo is not None:
+                                    memo.mark_depleted(ore, dimension="overworld", category="diamond_ore")
+                                if vc is not None:
+                                    vc.invalidate(ore, dimension="overworld")
+                                tried_ores.add(ore)
+                                continue
                     # Adjacent safe stances may extend the four-block digging budget by one.
                     if math.dist(origin, ore) > 6 or not _safe_excavation(ex, origin, (ore,), path):
+                        if ore in memo_ore_cells:
+                            tried_ores.add(ore)
                         continue
                     stand = yield from _approach(ex, state, ore, status, dimension="overworld", protected=path)
                     if stand is None:
@@ -454,12 +526,25 @@ class MineDiamond(Skill):
                         if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
                             if vc is not None:
                                 vc.mark_unreachable("mine_diamond", ore, dimension="overworld", stance_cell=origin)
+                            if memo is not None:
+                                if code == "protected_region":
+                                    memo.mark_protected(ore, dimension="overworld", category="diamond_ore")
+                                else:
+                                    memo.mark_unreachable(
+                                        ore, dimension="overworld", category="diamond_ore", error_code=code,
+                                    )
                             _safe_status(ex, state, "overworld")
                             yield rec("ore_skip", pos=list(ore), error_code=code)
                             break
                         raise
                     if vc is not None:
                         vc.invalidate(ore, dimension="overworld")
+                    if memo is not None:
+                        memo.mark_depleted(
+                            ore,
+                            dimension="overworld",
+                            category=ore_category("diamond_ore") or "diamond_ore",
+                        )
                     after_mine = _safe_status(ex, state, "overworld")
                     if state.count("diamond") >= goal_qty:
                         if _cell(after_mine["pos"])[1] <= 0 and bonus_mined < _MAX_BONUS_ORES:
@@ -504,7 +589,7 @@ class MineDiamond(Skill):
                                 target_ores=DIAMOND_ORES,
                                 bonus_ores=tuple(BONUS_ORES),
                                 allowed_picks=frozenset(_IRON_PICKS),
-                                max_length=12,
+                                max_length=16,
                                 scan_stride=3,
                                 scan_radius=_SCAN_RADIUS,
                                 dimension="overworld",
@@ -550,12 +635,25 @@ class MineDiamond(Skill):
                                 lowest_pos=path[-1],
                                 heading=heading,
                             )
+                    if (
+                        not shaft_sealed
+                        and callable(seal_shaft_entrance)
+                        and stairs >= 3
+                        and path[0][1] >= 48
+                        and path[-1][1] <= path[0][1] - 2
+                    ):
+                        if (yield from seal_shaft_entrance(ex, state, dimension="overworld")):
+                            shaft_sealed = True
                     if stairs % 4 == 0:
-                        minerals = ["lapis_ore", "deepslate_lapis_ore", "iron_ore", "deepslate_iron_ore"]
-                        if path[-1][1] <= 0:
-                            minerals += ["redstone_ore", "deepslate_redstone_ore"]
-                        observed = scan_blocks(ex, state, minerals, radius=8, limit=6)
+                        minerals = list(OVERWORLD_ALL_ORES)
+                        observed = scan_blocks(ex, state, minerals, radius=8, limit=12)
                         if observed["blocks"]:
+                            record_ore_observations(
+                                state,
+                                observed["blocks"],
+                                dimension="overworld",
+                                origin={"pos": list(waypoints[-1])},
+                            )
                             yield rec("diamond_prospect", observed)
                             if (path[-1][1] <= 0 and bonus_mined < _MAX_BONUS_ORES
                                     and any(bare(b.get("name")) in BONUS_ORES for b in observed["blocks"])):
@@ -566,6 +664,24 @@ class MineDiamond(Skill):
                                     tried=tried_bonus,
                                     max_blocks=min(2, _MAX_BONUS_ORES - bonus_mined),
                                     observed=observed,
+                                )
+                            if (bonus_mined < _MAX_BONUS_ORES
+                                    and any(
+                                        bare(b.get("name")) not in BONUS_ORES
+                                        and bare(b.get("name")) not in DIAMOND_ORES
+                                        for b in observed["blocks"]
+                                    )):
+                                preserved_cells = {_above(cell, dy) for cell in path for dy in (-1, 0, 1)}
+                                bonus_mined += yield from mine_reachable_ores_and_record(
+                                    ex,
+                                    state,
+                                    blocks=observed["blocks"],
+                                    max_mine=min(2, _MAX_BONUS_ORES - bonus_mined),
+                                    dimension="overworld",
+                                    excluded=tried_bonus | preserved_cells,
+                                    target_ores=DIAMOND_ORES | BONUS_ORES,
+                                    skip_target_ores=True,
+                                    allow_scan=False,
                                 )
         except Replan:
             collected = state.count("diamond")
@@ -634,12 +750,31 @@ class MineDiamond(Skill):
     def _down_step(self, ex, state, origin, path, visited_columns, heading):
         x, y, z = origin
         dirs = (heading, *(d for d in CARDINALS if d != heading))
-        for dx, dz in dirs:
+        try:
+            from .mine_shaft import column_touches_natural_cave
+        except ImportError:
+            column_touches_natural_cave = None
+        safe_dirs = [
+            (dx, dz) for dx, dz in dirs
+            if (x + dx, z + dz) not in visited_columns
+            and _safe_excavation(
+                ex,
+                origin,
+                tuple(_above((x + dx, y - 1, z + dz), dy) for dy in (0, 1, 2)),
+                path,
+                landing=(x + dx, y - 1, z + dz),
+            )
+        ]
+        if callable(column_touches_natural_cave) and len(safe_dirs) > 1:
+            non_cave = [
+                d for d in safe_dirs
+                if not column_touches_natural_cave(ex, (x + d[0], y - 1, z + d[1]), prev_cell=origin)
+            ]
+            ordered_dirs = non_cave + [d for d in safe_dirs if d not in non_cave]
+        else:
+            ordered_dirs = safe_dirs
+        for dx, dz in ordered_dirs:
             landing = (x + dx, y - 1, z + dz)
-            column = (landing[0], landing[2])
-            cuts = tuple(_above(landing, dy) for dy in (0, 1, 2))
-            if column in visited_columns or not _safe_excavation(ex, origin, cuts, path, landing=landing):
-                continue
             try:
                 return (yield from self._cut_descent(ex, state, origin, path, visited_columns, landing))
             except MineStepUnsafe as exc:
@@ -719,6 +854,8 @@ class CraftDiamondGear(Skill):
         dim = bare(current.get("dimension")) or "overworld"
         tables = _nearby(ex, state, ("crafting_table",), radius=4, limit=5)
         table = next((c for c in tables if _in_reach(ex, current, c, reach=STATION_EYE_REACH)), None)
+        newly_placed_table = False
+        active_table_pos = table
         if table is not None:
             _record_station(state, "crafting_table", table, dimension=dim)
         else:
@@ -732,7 +869,13 @@ class CraftDiamondGear(Skill):
                                  wake_on="chunk_moved")
             yield from place_block(ex, state, "crafting_table", sites[0])
             _record_station(state, "crafting_table", sites[0], dimension=dim)
+            active_table_pos = sites[0]
+            newly_placed_table = True
             _fresh_inventory(ex, state)
         yield from craft_recipe(ex, state, item, goal_qty=1)
         if not _already_has_gear(item, state):
             raise Replan("钻石装备合成后未确认可用成品，检查背包和耐久")
+        if newly_placed_table and active_table_pos is not None:
+            yield from reclaim_field_station(
+                ex, state, "crafting_table", active_table_pos, dimension=dim, newly_placed=True,
+            )

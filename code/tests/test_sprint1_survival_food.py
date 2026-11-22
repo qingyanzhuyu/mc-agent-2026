@@ -411,17 +411,20 @@ class TestRegistryAndContract(unittest.TestCase):
 
         skill = make("gather_food")
         self.assertIsInstance(skill, GatherFood)
-        self.assertEqual(skill.args, {"target_restore": 16, "cook": True})
+        self.assertEqual(skill.args, {"target_restore": 32, "cook": True, "hunt": True})
 
     def test_gather_food_param_bounds_and_types(self):
         self.assertEqual(make("gather_food", {"target_restore": 4, "cook": False}).args,
-                         {"target_restore": 4, "cook": False})
+                         {"target_restore": 4, "cook": False, "hunt": True})
+        self.assertEqual(make("gather_food", {"target_restore": 32, "cook": True, "hunt": False}).args,
+                         {"target_restore": 32, "cook": True, "hunt": False})
         self.assertEqual(make("gather_food", {"target_restore": 64}).args["target_restore"], 64)
         for bad in (
             {"target_restore": 3},
             {"target_restore": 65},
             {"target_restore": True},
             {"cook": "yes"},
+            {"hunt": "no"},
             {"pos": [1, 64, 0]},
         ):
             with self.subTest(bad=bad):
@@ -538,6 +541,66 @@ class TestDaytimeHunting(unittest.TestCase):
         drive(skill, ex, state)
 
         self.assertEqual([op for op, _ in world.calls if op == "attack"], [])
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_hunting_uses_unbounded_attack_and_follows_up_until_animal_dies(self):
+        class FleeingCowWorld(FoodWorld):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.cow_attempts = 0
+
+            def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
+                self.calls.append(("attack", {"entity_id": entity_id, "max_hits": max_hits, "stop_on": stop_on}))
+                self.cow_attempts += 1
+                ent = next((e for e in self.entities if e.get("id") == entity_id), None)
+                if ent is None:
+                    raise ApiError("no_such_entity", f"entity {entity_id} not found")
+                if self.cow_attempts == 1:
+                    # First call lands 3 hits and cow flees 6 blocks away while still alive
+                    ent["pos"] = [ent["pos"][0] + 6.0, ent["pos"][1], ent["pos"][2]]
+                    ent["health"] = 4
+                    return {"killed": False, "hits": 3}
+                return super().attack(entity_id, timeout_ms=timeout_ms, max_hits=max_hits, interval_ms=interval_ms, stop_on=stop_on)
+
+        world = FleeingCowWorld(
+            items={"stone_sword": 1, "white_wool": 3},
+            entities=[_animal("cow", 210, (2.5, 64.0, 0.5))],
+        )
+        ex, state = world.session()
+        skill = make("gather_food", {"target_restore": 4, "cook": False})
+
+        drive(skill, ex, state)
+
+        attack_reqs = [req for op, req in world.calls if op == "attack"]
+        self.assertGreaterEqual(len(attack_reqs), 2)
+        self.assertTrue(all(req["entity_id"] == 210 for req in attack_reqs))
+        self.assertTrue(all(req["max_hits"] is None for req in attack_reqs))
+        self.assertGreaterEqual(world.items.get("beef", 0), 2)
+        self.assertEqual(skill.verify_done(state), "")
+
+    def test_hunting_skips_zero_hit_unreachable_animal_and_kills_next(self):
+        class ZeroHitFirstWorld(FoodWorld):
+            def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
+                if entity_id == 220:
+                    self.calls.append(("attack", {"entity_id": entity_id, "max_hits": max_hits, "stop_on": stop_on}))
+                    return {"killed": False, "hits": 0}
+                return super().attack(entity_id, timeout_ms=timeout_ms, max_hits=max_hits, interval_ms=interval_ms, stop_on=stop_on)
+
+        world = ZeroHitFirstWorld(
+            items={"stone_sword": 1, "white_wool": 3},
+            entities=[
+                _animal("cow", 220, (2.5, 64.0, 0.5)),
+                _animal("pig", 221, (3.0, 64.0, 0.5)),
+            ],
+        )
+        ex, state = world.session()
+        skill = make("gather_food", {"target_restore": 4, "cook": False})
+
+        drive(skill, ex, state)
+
+        attacks = [req["entity_id"] for op, req in world.calls if op == "attack"]
+        self.assertEqual(attacks, [220, 221])
+        self.assertGreaterEqual(world.items.get("porkchop", 0), 2)
         self.assertEqual(skill.verify_done(state), "")
 
 
@@ -702,6 +765,55 @@ class TestFurnaceCooking(unittest.TestCase):
 
         self.assertEqual(world.items.get("cooked_mutton", 0), 2)
         self.assertEqual(skill.verify_done(state), "")
+
+    def test_cooks_raw_meat_converts_logs_to_planks_instead_of_burning_raw_logs(self):
+        world = FoodWorld(
+            items={"beef": 3, "oak_log": 1},
+            blocks={(2, 64, 0): "furnace"},
+            is_day=True,
+        )
+        ex, state = world.session()
+        skill = make("gather_food", {"target_restore": 16, "cook": True})
+
+        with patch("time.sleep", return_value=None):
+            drive(skill, ex, state)
+
+        crafted = [req["item"] for op, req in world.calls if op == "craft"]
+        self.assertIn("oak_planks", crafted)
+        fuel_puts = [
+            op["item"]
+            for op_name, req in world.calls
+            if op_name == "window_act"
+            for op in req["ops"]
+            if op.get("op") == "put" and op.get("to") == "fuel"
+        ]
+        self.assertEqual(fuel_puts, ["oak_planks"])
+        self.assertEqual(world.items.get("cooked_beef", 0), 3)
+        self.assertEqual(world.items.get("oak_log", 0), 0)
+        self.assertEqual(world.items.get("oak_planks", 0), 2)
+
+    def test_cooks_raw_meat_prefers_planks_over_logs_when_both_owned(self):
+        world = FoodWorld(
+            items={"beef": 2, "oak_log": 4, "oak_planks": 4},
+            blocks={(2, 64, 0): "furnace"},
+            is_day=True,
+        )
+        ex, state = world.session()
+        skill = make("gather_food", {"target_restore": 16, "cook": True})
+
+        with patch("time.sleep", return_value=None):
+            drive(skill, ex, state)
+
+        fuel_puts = [
+            op["item"]
+            for op_name, req in world.calls
+            if op_name == "window_act"
+            for op in req["ops"]
+            if op.get("op") == "put" and op.get("to") == "fuel"
+        ]
+        self.assertEqual(fuel_puts, ["oak_planks"])
+        self.assertEqual(world.items.get("oak_log", 0), 4)
+        self.assertEqual(world.items.get("oak_planks", 0), 2)
 
 
 class TestBlockingGates(unittest.TestCase):

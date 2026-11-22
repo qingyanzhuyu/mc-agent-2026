@@ -38,9 +38,11 @@ class SmeltIronSightlineTests(unittest.TestCase):
             views=[_furnace_view(), _furnace_view(output=1), _furnace_view()],
         )
         ex, state = world.session()
-        drive(SmeltIron(count=1), ex, state)
+        steps = drive(SmeltIron(count=1), ex, state)
         self.assertFalse(any(op == "move_to" for op, _ in world.calls))
-        self.assertEqual([args["pos"] for op, args in world.calls if op == "dig"], [[1, 68, 0]])
+        mine_digs = [s["pos"] for s in steps if s.get("op") == "dig" and s.get("reason") != "reclaim_station"]
+        self.assertEqual(mine_digs, [[1, 68, 0]])
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
         self.assertEqual(state.count("iron_ingot"), 1)
 
     def test_wall_occluded_iron_ore_moves_first_and_is_excluded_from_in_reach_scan(self):
@@ -78,9 +80,10 @@ class SmeltIronSightlineTests(unittest.TestCase):
 
         world2.move_to = move_around_wall
         ex2, state2 = world2.session()
-        drive(SmeltIron(count=1), ex2, state2)
-        action_order = [op for op, _ in world2.calls if op in ("move_to", "dig")]
+        steps2 = drive(SmeltIron(count=1), ex2, state2)
+        action_order = [s["op"] for s in steps2 if s.get("op") in ("move_to", "dig") and s.get("reason") != "reclaim_station"]
         self.assertEqual(action_order, ["move_to", "dig"])
+        self.assertEqual(steps2[-1].get("reason"), "reclaim_station")
         self.assertEqual(state2.count("iron_ingot"), 1)
 
 

@@ -20,12 +20,14 @@ from ..skills import nav
 from ..skills.base import Param, Skill, failure, rec
 from ..skills.items import AIR, MINE_TRAILS, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, pick_placeable, total_placeable
 from ..skills.mine_return import is_underground_in_mine, return_to_surface_from_mine
+from ..skills.ore_ledger import mine_reachable_ores_and_record
 from ..skills.recipes import craft_recipe
 from ..skills.registry import register
 from ..skills.sightline import (
     API_DIG_EYE_REACH, DIG_EYE_REACH, STATION_EYE_REACH,
     block_center, can_reach_block, eye_pos, eye_to_block_dist, voxel_line_cells,
 )
+from ..skills.workstations import reclaim_field_station
 from ..skills.world_memo import WorldResourceMemo, memo_for, reset_all_world_memos
 
 if TYPE_CHECKING:
@@ -1715,6 +1717,7 @@ class CraftGear(Skill):
             st, cur_pos_now = _refresh_stance(ex, state)
 
         table_ready = False
+        newly_placed_table = False
         active_table_pos: Optional[list] = None
         for tb in valid_tables:
             tpos, from_memo = tb["pos"], bool(tb.get("from_memo"))
@@ -1723,6 +1726,7 @@ class CraftGear(Skill):
                 if probed is not None and probed != "crafting_table":
                     _forget_known_table(tpos)
                     memo.mark_depleted(tpos, dimension=dim, category="station")
+                    memo.remove_station("crafting_table", tpos, dimension=dim)
                     continue
                 if probed is None and eye_to_block_dist(st, tpos) <= STATION_EYE_REACH:
                     continue
@@ -1744,6 +1748,7 @@ class CraftGear(Skill):
                     _forget_known_table(tpos)
                     if probed is not None:
                         memo.mark_depleted(tpos, dimension=dim, category="station")
+                        memo.remove_station("crafting_table", tpos, dimension=dim)
                     continue
                 if not can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
                     _forget_known_table(tpos)
@@ -1779,6 +1784,7 @@ class CraftGear(Skill):
                 memo.mark_reachable(placed_pos, dimension=dim, category="station", block="crafting_table")
                 _record_station(memo, "crafting_table", placed_pos, dim)
                 active_table_pos = placed_pos
+                newly_placed_table = True
                 yield rec("place", placed, item="crafting_table")
             except Replan as e:
                 if failure(e)[0] == "protected_region":
@@ -1789,6 +1795,12 @@ class CraftGear(Skill):
         yield from _prepare_recipe_planks(ex, state, p_need, target)
         yield from _craft_with_space(ex, state, target, table_pos=active_table_pos)
         state.refresh_inventory(ex.client)
+        if newly_placed_table and active_table_pos is not None:
+            reclaimed = yield from reclaim_field_station(
+                ex, state, "crafting_table", active_table_pos, dimension=dim, newly_placed=True,
+            )
+            if reclaimed:
+                _forget_known_table(active_table_pos)
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         target = str(self.args["item"])
@@ -1884,6 +1896,14 @@ class MineStone(Skill):
         stair_step, stair_steps_taken, approach_moves = 0, 0, 0
         stair_columns: set[tuple[int, int]] = set()
         tried_approaches: set[tuple[int, int, int]] = set()
+        shaft_sealed = False
+        scanned_ores_once = False
+        try:
+            from ..skills.mine_shaft import column_touches_natural_cave, plug_cave_breach, seal_shaft_entrance
+        except ImportError:
+            column_touches_natural_cave = None
+            plug_cave_breach = None
+            seal_shaft_entrance = None
 
         for _ in range(want + 18):
             if total_cobble(state) - start_cobble >= want:
@@ -1892,6 +1912,18 @@ class MineStone(Skill):
             dim = _dim_of(st)
             cur_cell = (math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2]))
             vc and vc.clear_stance_blacklist_if_moved(cur)
+            if not scanned_ores_once:
+                scanned_ores_once = True
+                ores_mined = yield from mine_reachable_ores_and_record(
+                    ex, state, scan_radius=8, max_mine=3, dimension=dim,
+                    excluded=bad_positions, skip_target_ores=False, allow_scan=True,
+                )
+                if ores_mined:
+                    st, cur = _refresh_stance(ex, state)
+                    dim = _dim_of(st)
+                    cur_cell = (math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2]))
+                    if total_cobble(state) - start_cobble >= want:
+                        return
             found_stones = ex.client.find_blocks(types=list(STONE_Targets), radius=24, limit=48)
             vc and vc.ingest_find_blocks(found_stones, dimension=dim, client=ex.client)
             stones = found_stones.get("blocks") or []
@@ -1922,6 +1954,7 @@ class MineStone(Skill):
                         ],
                         dim,
                     )
+                    safe_stair_dirs: list[tuple[int, int]] = []
                     for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         sx1, sz1 = ix + dx, iz + dz
                         if (sx1, sz1) in stair_columns or _is_protected([sx1, fy - 1, sz1]) or memo.is_blocked([sx1, fy - 1, sz1], dimension=dim):
@@ -1929,8 +1962,22 @@ class MineStone(Skill):
                         if bare(_get_block(ex, vc, [sx1, fy, sz1], dim).get("name", "")) == "crafting_table":
                             continue
                         if self._safe_stair_column(ex, sx1, fy - 1, sz1, vc=vc, dim=dim):
-                            stair_origin, stair_step = (ix, fy, iz, dx, dz), 1
-                            break
+                            safe_stair_dirs.append((dx, dz))
+                    if safe_stair_dirs:
+                        chosen_dir = safe_stair_dirs[0]
+                        if callable(column_touches_natural_cave) and len(safe_stair_dirs) > 1:
+                            non_cave_dir = next(
+                                (
+                                    d for d in safe_stair_dirs
+                                    if not column_touches_natural_cave(
+                                        ex, [ix + d[0], fy - 1, iz + d[1]], prev_cell=(ix, fy, iz),
+                                    )
+                                ),
+                                None,
+                            )
+                            if non_cave_dir is not None:
+                                chosen_dir = non_cave_dir
+                        stair_origin, stair_step = (ix, fy, iz, chosen_dir[0], chosen_dir[1]), 1
                 if stair_origin is not None and stair_steps_taken < 6:
                     ox, ofy, oz, dx, dz = stair_origin
                     sx, sy, sz = ox + stair_step * dx, ofy - stair_step, oz + stair_step * dz
@@ -1961,6 +2008,22 @@ class MineStone(Skill):
                                 )
                                 dug_stair_cells[clear_y] = bname
                                 vc and vc.invalidate_radius([sx, clear_y, sz], radius=1, dimension=dim)
+                                if callable(plug_cave_breach):
+                                    prev_c = (
+                                        ox + (stair_step - 1) * dx,
+                                        ofy - (stair_step - 1),
+                                        oz + (stair_step - 1) * dz,
+                                    )
+                                    known_stair_air = {
+                                        (prev_c[0], prev_c[1] + dy, prev_c[2]) for dy in (0, 1, 2)
+                                    } | {(sx, dy_k, sz) for dy_k in dug_stair_cells}
+                                    if (yield from plug_cave_breach(
+                                        ex, state, [sx, clear_y, sz],
+                                        known_air=known_stair_air,
+                                        player_cell=prev_c,
+                                    )):
+                                        stair_origin, reobserve_stair = None, True
+                                        break
                                 state.refresh_inventory(ex.client)
                                 if total_cobble(state) - start_cobble >= want:
                                     return
@@ -2002,6 +2065,24 @@ class MineStone(Skill):
                                 MINE_TRAILS[-1].append(step_pt)
                             else:
                                 MINE_TRAILS.append([entry_pt, step_pt])
+                            if memo.get_mine_shaft(dimension=dim) is None:
+                                memo.set_mine_shaft(
+                                    (ox, ofy, oz), dimension=dim, lowest_y=sy, lowest_pos=(sx, sy, sz), heading=(dx, dz),
+                                )
+                            else:
+                                memo.update_mine_shaft(
+                                    dimension=dim, lowest_y=sy, lowest_pos=(sx, sy, sz), heading=(dx, dz),
+                                )
+                            if (
+                                not shaft_sealed
+                                and callable(seal_shaft_entrance)
+                                and stair_steps_taken >= 3
+                                and ofy >= 48
+                                and sy <= ofy - 2
+                            ):
+                                if (yield from seal_shaft_entrance(ex, state, dimension=dim)):
+                                    shaft_sealed = True
+                            scanned_ores_once = False
                         except Replan as e:
                             code, _ = failure(e)
                             if code not in NAV_FAIL_CODES:

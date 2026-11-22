@@ -13,6 +13,7 @@ from .field import (
     scan_blocks, scan_entities,
 )
 from .furnace import collect_furnace, load_furnace
+from .furnace_lease import ensure_plank_fuel
 from .interaction import _clear_posture, use_item_on
 from .items import AIR, STONE_OR_BETTER_PICKS, bare, best_pickaxe
 from .landmark_nav import goto_known_landmark_or_biome
@@ -26,6 +27,7 @@ from .sightline import (
 from .voxel_cache import voxel_cache_for
 from .windows import window_amount, window_section, window_view
 from .world_memo import memo_for
+from .workstations import find_known_station, reclaim_field_station
 
 _CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _OVERWORLD_WOODS = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "cherry", "mangrove", "pale_oak")
@@ -51,13 +53,17 @@ _FISH_SPECIES = ("cod", "salmon", "pufferfish", "tropical_fish")
 _FISH_BUCKETS = tuple(f"{s}_bucket" for s in _FISH_SPECIES)
 _SCULK_BLOCKS = ("sculk_sensor", "sculk_shrieker", "calibrated_sculk_sensor")
 _WATER_PASSABLE = AIR | {"water", "flowing_water"}
+_BURNABLE_PLANK_ITEMS = tuple(f"{w}_planks" for w in _OVERWORLD_WOODS) + ("bamboo_planks",)
+_BURNABLE_LOG_ITEMS = tuple(
+    n for w in _OVERWORLD_WOODS for n in (f"{w}_log", f"stripped_{w}_log", f"{w}_wood", f"stripped_{w}_wood")
+)
 _SMELT_FUELS: tuple[tuple[str, float], ...] = (
     ("coal", 8.0),
     ("charcoal", 8.0),
     ("coal_block", 80.0),
-    *((p, 1.5) for p in _PLANK_ITEMS),
-    *((lg, 1.5) for lg in _LOG_ITEMS),
+    *((p, 1.5) for p in _BURNABLE_PLANK_ITEMS),
     ("stick", 0.5),
+    *((lg, 1.5) for lg in _BURNABLE_LOG_ITEMS),
 )
 
 
@@ -400,16 +406,25 @@ def _smelt_copper_ingots(ex, state, target_ingots: int, radius: int):
         return
     scan = scan_blocks(ex, state, ("blast_furnace", "furnace"), radius=16, limit=6)
     fpos = None
+    station_kind = "furnace"
+    newly_placed = False
     if scan.get("ready") is not False and scan["blocks"]:
         st = state.refresh_status(ex.client, max_age_s=0)
-        fpos = tuple(min(scan["blocks"], key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+        best = min(scan["blocks"], key=lambda b: eye_to_block_dist(st, b["pos"]))
+        fpos = tuple(best["pos"])
+        station_kind = bare(best.get("name")) or "furnace"
+    elif (known := find_known_station(ex, state, "furnace", max_dist=16.0)) is not None:
+        fpos = known
     else:
         bag_furnace = "blast_furnace" if state.count("blast_furnace") >= 1 else ("furnace" if state.count("furnace") >= 1 else None)
         if bag_furnace and (site := _clear_floor_site(ex, state, 3)) is not None:
             yield from place_block(ex, state, bag_furnace, site)
             fpos = site
+            station_kind = bag_furnace
+            newly_placed = True
     if fpos is None:
         return
+    yield from ensure_plank_fuel(ex, state, need, allow_lava_bucket=False)
     fuel_choice = _pick_smelt_fuel(state, need)
     if fuel_choice is None:
         return
@@ -424,6 +439,7 @@ def _smelt_copper_ingots(ex, state, target_ingots: int, radius: int):
     if ready_out := window_amount(view, "output", "copper_ingot"):
         yield from collect_furnace(ex, state, target, item="copper_ingot", count=ready_out, section="output", view=view, inspect_after=False)
         if state.count("copper_ingot") >= target_ingots:
+            yield from reclaim_field_station(ex, state, station_kind, fpos, newly_placed=newly_placed, furnace_emptied=True)
             return
         view = yield from window_view(ex, target)
     if not window_section(view, "input"):
@@ -438,8 +454,10 @@ def _smelt_copper_ingots(ex, state, target_ingots: int, radius: int):
         if ready_out := window_amount(view, "output", "copper_ingot"):
             yield from collect_furnace(ex, state, target, item="copper_ingot", count=ready_out, section="output", view=view, inspect_after=False)
             if state.count("copper_ingot") >= target_ingots:
+                yield from reclaim_field_station(ex, state, station_kind, fpos, newly_placed=newly_placed, furnace_emptied=True)
                 return
         elif not window_section(view, "input"):
+            yield from reclaim_field_station(ex, state, station_kind, fpos, newly_placed=newly_placed, furnace_emptied=True)
             return
 
 

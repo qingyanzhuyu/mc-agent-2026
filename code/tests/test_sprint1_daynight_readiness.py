@@ -522,14 +522,15 @@ class TestSurvivalPolicyLayer(unittest.TestCase):
         _reset_globals()
 
     def test_food_reserve_gate_conditions(self) -> None:
-        # 1) Daytime + food_restore < 10 + stone_sword=1 -> gather_food(target_restore=16, cook=True)
+        # 1) Daytime + effective_food_restore < 14 + stone_sword=1 -> gather_food(target_restore=32, cook=True, hunt=True)
         st_sword = _make_state(items={"stone_sword": 1}, is_day=True)
         dec = self.planner.choose_survival_or_safe_mode(st_sword)
         self.assertIsNotNone(dec)
         self.assertIsNotNone(dec.skill)
         self.assertEqual(dec.skill.name, "gather_food")
-        self.assertEqual(dec.skill.args.get("target_restore"), 16)
+        self.assertEqual(dec.skill.args.get("target_restore"), 32)
         self.assertEqual(dec.skill.args.get("cook"), True)
+        self.assertEqual(dec.skill.args.get("hunt"), True)
 
         # 2) Daytime + food_restore < 10 + empty bag + food=16 (and also hp=16) -> gather_food
         for st_low in (

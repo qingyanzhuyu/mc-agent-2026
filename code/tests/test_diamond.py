@@ -401,8 +401,8 @@ class DiamondTests(unittest.TestCase):
         world.queue("craft", _craft)
         ex, state = world.session()
         steps = drive(CraftDiamondGear(item="diamond_boots"), ex, state)
-        self.assertEqual([row["op"] for row in steps], ["place", "craft"])
-        self.assertEqual(world.blocks[TABLE], "crafting_table")
+        self.assertEqual([row["op"] for row in steps], ["place", "craft", "dig"])
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
         self.assertEqual(state.count("diamond_boots"), 1)
         world.assert_exhausted()
 

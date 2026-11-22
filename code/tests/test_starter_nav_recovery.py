@@ -717,11 +717,11 @@ class CraftGearAndMineStoneStalledHandlingTests(unittest.TestCase):
         KNOWN_TABLES.append((10, 64, 0))
 
         steps = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex, state)
-        self.assertEqual([s["op"] for s in steps], ["move_to", "craft", "place", "craft"])
+        self.assertEqual([s["op"] for s in steps], ["move_to", "craft", "place", "craft", "dig"])
         self.assertEqual(steps[0]["error_code"], "stalled")
         self.assertEqual(state.count("stone_pickaxe"), 1)
         self.assertNotIn((10, 64, 0), KNOWN_TABLES)
-        self.assertTrue(has_known_table(state.pos))
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
         self.assertTrue(memo_for(state).is_blocked((10, 64, 0), category="station"))
 
     def test_mine_stone_handles_stalled_on_stone_and_mines_alternative(self):

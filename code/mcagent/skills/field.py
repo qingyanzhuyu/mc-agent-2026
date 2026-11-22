@@ -238,6 +238,8 @@ def place_block(ex, state, item, pos, *, expected_block=None, properties=None):
     after = _observed_block(ex, pos)
     if not _block_matches(after, names, properties):
         raise Replan(f"放置后 {pos} 未确认 {expected_block or item} 及要求属性")
+    from .workstations import record_placed_station
+    record_placed_station(state, after.get("name") or item, pos, dimension=_state_dim(state))
     return after
 
 

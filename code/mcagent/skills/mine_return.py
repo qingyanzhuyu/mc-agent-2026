@@ -26,9 +26,10 @@ from .items import (
     pick_placeable,
     total_placeable,
 )
+from .mine_shaft import unseal_shaft_entrance
 from .mining import SOLID_SUPPORT, prepare_mining_pick
 from .recipes import RECIPES, craft_recipe
-from .sightline import STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
+from .sightline import DIG_EYE_REACH, STATION_EYE_REACH, block_cell, can_reach_block, eye_to_block_dist
 from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
 from .world_memo import ALL_LOG_BLOCKS, memo_for
 
@@ -340,6 +341,42 @@ def _try_move_wp(ex: Executor, state: State, wp: Sequence[float], *, reason: str
     return True, _cur_status(ex, state)[1]
 
 
+def _unseal_shaft_from_inside(
+    ex: Executor, state: State, dim: str, cur: Sequence[float],
+) -> Generator[dict, None, tuple[bool, list[float]]]:
+    """若主矿井井口已被封堵，从矿道内侧靠近封堵下方并拆开封堵后再继续返程。"""
+    memo = memo_for(state)
+    shaft = memo.get_mine_shaft(dimension=dim)
+    if not isinstance(shaft, Mapping) or not shaft.get("sealed") or not shaft.get("seal_cells"):
+        return False, list(cur)
+    seal_cells = [block_cell(c) for c in shaft["seal_cells"]]
+    lowest_seal = min(seal_cells, key=lambda c: c[1])
+    if math.dist(cur, lowest_seal) > 96.0:
+        return False, list(cur)
+    raw_h = shaft.get("heading") or (1, 0)
+    hx, hz = int(raw_h[0]), int(raw_h[1])
+    candidates = (
+        (lowest_seal[0], lowest_seal[1] - 1, lowest_seal[2]),
+        (lowest_seal[0] + hx, lowest_seal[1] - 1, lowest_seal[2] + hz),
+        (lowest_seal[0] + hx, lowest_seal[1] - 2, lowest_seal[2] + hz),
+    )
+    vc = voxel_cache_for(state)
+    approach_cell = next(
+        (c for c in candidates if _probe_name(ex, c, vc=vc, dim=dim) in AIR),
+        candidates[0],
+    )
+    underside = [approach_cell[0] + 0.5, float(approach_cell[1]), approach_cell[2] + 0.5]
+    st_now, cur_now, _ = _cur_status(ex, state)
+    stance_now = st_now if st_now.get("pos") is not None else cur_now
+    if eye_to_block_dist(stance_now, lowest_seal) > DIG_EYE_REACH:
+        for wp in _shaft_return_waypoints(cur_now, underside):
+            ok, cur_now = yield from _try_move_wp(ex, state, wp, reason="approach_shaft_seal")
+            if not ok:
+                break
+    dug = yield from unseal_shaft_entrance(ex, state, dimension=dim, shaft=shaft)
+    return dug > 0, _cur_status(ex, state)[1]
+
+
 def return_to_surface_from_mine(
     ex: Executor, state: State, *, target_y: Optional[float] = None, max_climb_steps: int = 64,
 ) -> Generator[dict, None, bool]:
@@ -358,6 +395,25 @@ def return_to_surface_from_mine(
         # 不得继续强追 Y=73 山顶营地/出生点导致跌入河谷反复超时。
         return target_y is None and py_now >= 57.0 and not _has_solid_mine_ceiling(ex, pt)
 
+    shaft_init = memo.get_mine_shaft(dimension=dim)
+    if (
+        isinstance(shaft_init, Mapping)
+        and shaft_init.get("sealed")
+        and shaft_init.get("seal_cells")
+        and isinstance(shaft_init.get("entry"), (list, tuple))
+        and len(shaft_init["entry"]) >= 3
+        and float(cur[1]) < float(shaft_init["entry"][1]) - 0.5
+        and math.dist(cur, shaft_init["entry"]) <= 96.0
+    ):
+        unsealed, cur = yield from _unseal_shaft_from_inside(ex, state, dim, cur)
+        if unsealed:
+            entry_dest = [float(shaft_init["entry"][0]) + 0.5, float(shaft_init["entry"][1]), float(shaft_init["entry"][2]) + 0.5]
+            ok_entry, cur = yield from _try_move_wp(ex, state, entry_dest, reason="return_primary_mine_shaft")
+            if ok_entry and _at_surface(cur):
+                return True
+            if _at_surface(cur):
+                return True
+
     if _at_surface(cur):
         return True
 
@@ -374,7 +430,13 @@ def return_to_surface_from_mine(
             for wp in wps_t:
                 ok, cur = yield from _try_move_wp(ex, state, wp, reason="return_mine_trail")
                 if not ok:
-                    break
+                    shaft_now = memo.get_mine_shaft(dimension=dim)
+                    if isinstance(shaft_now, Mapping) and shaft_now.get("sealed") and shaft_now.get("seal_cells"):
+                        unsealed_t, cur = yield from _unseal_shaft_from_inside(ex, state, dim, cur)
+                        if unsealed_t:
+                            ok, cur = yield from _try_move_wp(ex, state, wp, reason="return_mine_trail")
+                    if not ok:
+                        break
                 if _at_surface(cur):
                     if MINE_TRAILS and MINE_TRAILS[-1] is trail:
                         MINE_TRAILS.pop()
@@ -410,6 +472,14 @@ def return_to_surface_from_mine(
                 if _at_surface(cur):
                     return True
                 continue
+            if label == "primary_mine_shaft":
+                shaft_now = memo.get_mine_shaft(dimension=dim)
+                if isinstance(shaft_now, Mapping) and shaft_now.get("sealed") and shaft_now.get("seal_cells"):
+                    unsealed_a, cur = yield from _unseal_shaft_from_inside(ex, state, dim, cur)
+                    if unsealed_a:
+                        ok_retry, cur = yield from _try_move_wp(ex, state, wps[-1], reason=f"return_{label}_direct")
+                        if ok_retry and _at_surface(cur):
+                            return True
             if idx < len(wps) - 1 and math.dist(cur, anchor) <= 64.0:
                 ok2, cur = yield from _try_move_wp(ex, state, wps[-1], reason=f"return_{label}_direct")
                 if ok2 and _at_surface(cur):
@@ -502,15 +572,21 @@ def ensure_crafting_table_ready(
         if observed.get("blocks"):
             return None
 
+    from .workstations import verify_or_prune_station
+
     underground = is_underground_in_mine(ex, state)
     memo = memo_for(state)
     camp = memo.get_camp(dimension=dim)
     known_tables: list[list[int]] = []
     if isinstance(camp, Mapping) and isinstance(camp.get("crafting_table"), (list, tuple)) and len(camp["crafting_table"]) >= 3:
-        known_tables.append([int(v) for v in camp["crafting_table"][:3]])
+        c_camp = [int(v) for v in camp["crafting_table"][:3]]
+        if verify_or_prune_station(ex, state, "crafting_table", c_camp, dimension=dim) or tuple(c_camp) in memo.stations("crafting_table", dimension=dim):
+            known_tables.append(c_camp)
     for spos in memo.stations("crafting_table", dimension=dim):
         c = [int(v) for v in spos[:3]]
-        if c not in known_tables:
+        if c in known_tables:
+            continue
+        if verify_or_prune_station(ex, state, "crafting_table", spos, dimension=dim) or tuple(c) in memo.stations("crafting_table", dimension=dim):
             known_tables.append(c)
 
     # 1. 若背包已有工作台，或扣除目标配方所需木板后仍有 >=4 木板等价木材，优先就地合成并放置登记
@@ -543,6 +619,8 @@ def ensure_crafting_table_ready(
 
     for tpos in sorted(known_tables, key=lambda p: eye_to_block_dist(st, p)):
         if math.dist(cur, tpos) > 96.0:
+            continue
+        if not verify_or_prune_station(ex, state, "crafting_table", tpos, dimension=dim) and tuple(tpos) not in memo.stations("crafting_table", dimension=dim):
             continue
         if can_reach_block(ex, st, tpos, reach=STATION_EYE_REACH):
             return tpos

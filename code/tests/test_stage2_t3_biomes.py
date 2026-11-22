@@ -672,7 +672,8 @@ class BoatWithGoatTests(unittest.TestCase):
         steps2 = drive(s2, ex2, st2)
         crafted = [s.get("item") for s in steps2 if s["op"] == "craft"]
         self.assertEqual(crafted, ["oak_planks", "oak_planks", "oak_boat"])
-        self.assertIn("crafting_table", w_logs.blocks.values())
+        self.assertTrue(any(s["op"] == "place" and s.get("item") == "crafting_table" for s in steps2))
+        self.assertTrue(any(s["op"] == "dig" and s.get("reason") == "reclaim_station" for s in steps2))
         self.assertEqual(s2.verify_done(st2), "")
         self.assertFalse(w_logs.st["in_vehicle"])
 

@@ -25,6 +25,10 @@ from .mining import (
     SOLID_SUPPORT, MineStepUnsafe, mine_step, prepare_mining_pick, safe_mine_column,
     under_feet,
 )
+from .ore_ledger import (
+    mine_reachable_ores_and_record, ore_category, query_harvestable_memo_ores,
+    record_ore_observations,
+)
 from .recipes import craft_recipe
 from .registry import register
 from .sightline import (
@@ -33,6 +37,7 @@ from .sightline import (
 from .survival_food import inventory_food_restore
 from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
 from .windows import window_amount, window_section, window_view
+from .workstations import find_known_station, reclaim_field_station
 from .world_memo import memo_for
 
 if TYPE_CHECKING:
@@ -56,13 +61,17 @@ def _fuel_units(item: str) -> int:
     return int(round(EXTENDED_FUEL_BURNS[item] * 2))
 
 
-# 半个冶炼单位：煤/木炭 8 个，木板/原木 1.5 个；退役木镐 1 个、木棍 0.5 个仅作兜底。
-_BASE_FUEL_NAMES = (
+# 半个冶炼单位：煤/木炭 8 个，木板/原木 1.5 个；退役木镐 1 个、木棍 0.5 个仅作兜底；原木排在末尾仅在无法拆板时兜底。
+_PREFERRED_FUEL_NAMES = (
     "coal", "charcoal", "coal_block", "dried_kelp_block", "blaze_rod",
     *(f"{w}_planks" for w in WOODS),
-    "bamboo_planks", "bamboo_mosaic", "bamboo_block",
+    "bamboo_planks", "bamboo_mosaic",
+)
+_RAW_LOG_FUEL_NAMES = (
+    "bamboo_block",
     *(f"{w}_log" for w in WOODS),
 )
+_BASE_FUEL_NAMES = _PREFERRED_FUEL_NAMES + _RAW_LOG_FUEL_NAMES
 BASE_FUELS = tuple((name, _fuel_units(name)) for name in _BASE_FUEL_NAMES)
 RADIUS = 32
 MINING_REACH = DIG_EYE_REACH
@@ -275,13 +284,15 @@ def _session_excluded_for(client: object, state: "State", status: dict) -> set[t
 
 
 def _fuels_for(state: "State") -> tuple[tuple[str, int], ...]:
+    preferred = tuple((name, _fuel_units(name)) for name in _PREFERRED_FUEL_NAMES)
     extra: list[tuple[str, int]] = []
     if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
         extra.append(("wooden_pickaxe", 2))
     extra.append(("stick", _fuel_units("stick")))
     extra.append(("leaf_litter", _fuel_units("leaf_litter")))
     extra.append(("lava_bucket", _fuel_units("lava_bucket")))
-    return BASE_FUELS + tuple(extra)
+    raw_logs = tuple((name, _fuel_units(name)) for name in _RAW_LOG_FUEL_NAMES)
+    return preferred + tuple(extra) + raw_logs
 
 
 class _OreRouteUnconfirmed(Replan):
@@ -289,11 +300,17 @@ class _OreRouteUnconfirmed(Replan):
 
 
 def _log_for_fuel(stock, fuels, count: int) -> Optional[str]:
-    non_log = sum(stock(n) * u // 2 for n, u in fuels if not n.endswith("_log"))
-    direct = sum(stock(n) * u // 2 for n, u in fuels)
-    if non_log >= count or (direct >= count and count < 3):
+    preferred_non_log = sum(
+        stock(n) * u // 2
+        for n, u in fuels
+        if not n.endswith("_log") and n not in ("bamboo_block", "lava_bucket", "stick")
+    )
+    if preferred_non_log >= count:
         return None
-    return next((w for w in WOODS if stock(f"{w}_log") > 0), None)
+    return (
+        next((w for w in WOODS if stock(f"{w}_log") > 0 and stock(f"{w}_planks") > 0), None)
+        or next((w for w in WOODS if stock(f"{w}_log") > 0), None)
+    )
 
 
 def _fuel_batches(stock, fuels, remaining: int) -> tuple[list[tuple[str, int, int]], int]:
@@ -432,6 +449,11 @@ class SmeltIron(Skill):
             raise _OreRouteUnconfirmed(f"移动后未确认到达矿点 {pos} 的挖掘范围")
         block_type = bare(ex.client.get_block(pos).get("name"))
         if block_type not in ores:
+            memo_for(state).mark_depleted(
+                pos,
+                dimension=dim_name,
+                category="coal_ore" if drop == "coal" else "iron_ore",
+            )
             raise Replan(f"到达 {pos} 后 get_block 未确认目标矿 {ores}")
         # move_to / clear_line_of_sight 可能触发服务端自动切换手持物品，开挖前无条件复核持镐
         yield from prepare_mining_pick(ex, state)
@@ -449,6 +471,11 @@ class SmeltIron(Skill):
         result = ex.dig(pos, collect=True)
         yield rec("dig", result, pos=pos)
         voxel_cache_for(state).invalidate(pos, dimension=dim_name)
+        memo_for(state).mark_depleted(
+            pos,
+            dimension=dim_name,
+            category=ore_category(block_type) or ("coal_ore" if drop == "coal" else "iron_ore"),
+        )
         state.refresh_inventory(ex.client)
         if result.get("warning"):
             raise Replan(f"挖掘 {pos} 后背包 {expected_drop} 未确认增加或工具告警：{result.get('warning', '')}")
@@ -481,6 +508,7 @@ class SmeltIron(Skill):
         vc = voxel_cache_for(state)
         vc.ingest_find_blocks(found, dimension=dim, client=ex.client)
         vc.clear_stance_blacklist_if_moved(cur)
+        memo_for(state).ingest_find_blocks(found, dimension=dim, origin=stance)
         raw_hp = status.get("health", 20.0)
         hp_val = float(raw_hp) if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp) else 20.0
         low_hp_fragile = (
@@ -512,6 +540,36 @@ class SmeltIron(Skill):
                     eye_to_block_dist(stance, p),
                 )
             )
+        if not in_reach_only and not cands:
+            memo_max_dist = float(radius) if radius <= 8 else float(max(radius, 48))
+            memo_hits = query_harvestable_memo_ores(
+                state,
+                ("iron_ore",),
+                dimension=dim,
+                max_dist=memo_max_dist,
+                excluded=excluded,
+                origin=stance,
+            )
+            memo_filtered = [
+                list(cell) for _, cell in memo_hits
+                if not vc.is_unreachable("smelt_iron", cell, dimension=dim, stance_cell=cur_cell)
+                and (max_dy is None or abs(cell[1] - cur[1]) <= max_dy)
+                and not under_feet(cur, cell)
+                and not (
+                    low_hp_fragile
+                    and cell[1] < 58
+                    and eye_to_block_dist(stance, cell) > MINING_REACH
+                    and (cell[1] < cur[1] - 3 or eye_to_block_dist(stance, cell) > 10.0)
+                )
+            ]
+            if len(memo_filtered) > 1:
+                memo_filtered.sort(
+                    key=lambda p: (
+                        0 if abs(p[1] - cur[1]) <= 8.0 else (1 if abs(p[1] - cur[1]) <= 12.0 else 2),
+                        eye_to_block_dist(stance, p),
+                    )
+                )
+            return memo_filtered
         return cands
 
     @staticmethod
@@ -618,6 +676,12 @@ class SmeltIron(Skill):
 
         reach_mod = _reach_mod()
         stance_retries = 0
+        shaft_sealed = False
+        try:
+            from .mine_shaft import column_touches_natural_cave, seal_shaft_entrance
+        except ImportError:
+            column_touches_natural_cave = None
+            seal_shaft_entrance = None
 
         try:
             while completed_steps < max_steps:
@@ -638,9 +702,19 @@ class SmeltIron(Skill):
                 x, y, z = map(math.floor, cur)
                 visited.add((x, z))
                 dirs = (heading,) + tuple(d for d in ((1, 0), (-1, 0), (0, 1), (0, -1)) if d != heading)
-                pos = next(([x + dx, y - 1, z + dz] for dx, dz in dirs
-                            if (x + dx, z + dz) not in visited
-                            and safe_mine_column(ex, [x + dx, y - 1, z + dz])), None)
+                safe_candidates = [
+                    [x + dx, y - 1, z + dz] for dx, dz in dirs
+                    if (x + dx, z + dz) not in visited
+                    and safe_mine_column(ex, [x + dx, y - 1, z + dz])
+                ]
+                if callable(column_touches_natural_cave) and safe_candidates:
+                    non_cave = [
+                        cand for cand in safe_candidates
+                        if not column_touches_natural_cave(ex, cand, prev_cell=(x, y, z))
+                    ]
+                    pos = non_cave[0] if non_cave else safe_candidates[0]
+                else:
+                    pos = safe_candidates[0] if safe_candidates else None
                 if pos is None:
                     has_water = any(
                         (x + dx, z + dz) not in visited and column_has_water(ex, [x + dx, y - 1, z + dz])
@@ -711,6 +785,26 @@ class SmeltIron(Skill):
                     memo.update_mine_shaft(
                         dimension=dim, lowest_y=int(pos[1]), lowest_pos=pos, heading=heading,
                     )
+                if (
+                    not shaft_sealed
+                    and callable(seal_shaft_entrance)
+                    and completed_steps >= 3
+                    and int(pos[1]) <= start_y - 2
+                ):
+                    if (yield from seal_shaft_entrance(ex, state, dimension=dim)):
+                        shaft_sealed = True
+                if completed_steps > 0 and completed_steps % 4 == 0:
+                    yield from mine_reachable_ores_and_record(
+                        ex,
+                        state,
+                        scan_radius=8,
+                        max_mine=2,
+                        dimension=dim,
+                        excluded=excluded,
+                        target_ores=IRON_ORES,
+                        skip_target_ores=True,
+                        allow_scan=True,
+                    )
                 candidates = self._ore_candidates(ex, state, excluded=excluded, in_reach_only=in_reach_only)
                 if candidates:
                     return candidates
@@ -727,7 +821,7 @@ class SmeltIron(Skill):
                 target_ores=IRON_ORES,
                 bonus_ores=("coal_ore", "deepslate_coal_ore"),
                 scan_radius=16,
-                max_length=12,
+                max_length=16,
                 scan_stride=3,
                 dimension=dim,
                 excluded=excluded,
@@ -911,13 +1005,18 @@ class SmeltIron(Skill):
 
     def _prepare_fuel(self, ex: "Executor", state: "State", count: int) -> Iterator[dict]:
         fuels = _fuels_for(state)
-        # 1 原木合成 4 木板可将可熔炼件数由 1 件提升至 6 件；需熔 ≥3 件或直接燃料不足时优先拆板。
+        # 1 原木合成 4 木板可将可熔炼件数由 1 件提升至 6 件；非原木燃料不足时优先拆板，避免直烧原木。
         for _ in range(count):
             log_wood = _log_for_fuel(state.count, fuels, count)
             if log_wood is None:
                 break
             plank = f"{log_wood}_planks"
-            yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 1)
+            try:
+                yield from craft_recipe(ex, state, plank, goal_qty=state.count(plank) + 1)
+            except Replan as exc:
+                if failure(exc)[0] == "inventory_full":
+                    break
+                raise
 
         # 若背包燃料仍不足（如起步造完工具仅剩 1 木板）且附近地表有树，顺手补砍 1 块原木转 4 木板。
         if _fuel_batches(state.count, fuels, count)[1]:
@@ -974,6 +1073,7 @@ class SmeltIron(Skill):
         )
 
     def _furnace(self, ex: "Executor", state: "State", *, item: str = "raw_iron") -> Iterator[dict]:
+        self._furnace_newly_placed = False
         valid_stations = stations_for_item(item)
         dim = str((state.st or {}).get("dimension") or "overworld")
         stance = state.st if (state.st or {}).get("pos") is not None else state.pos
@@ -993,6 +1093,22 @@ class SmeltIron(Skill):
             _record_station(state, block_name, pos, dimension=dim)
             self._station_kind = block_name
             return pos
+        # 附近 16 格未见熔炉时，回查世界台账 32 格内已知熔炉复用，避免重复放置。
+        known = find_known_station(
+            ex, state, "furnace", dimension=dim, max_dist=32.0, expected_names=valid_stations,
+        )
+        if known is not None:
+            k_pos = list(known)
+            try:
+                yield rec("move_to", _bounded_move_to(ex, k_pos, rng=2, timeout=30.0), pos=k_pos)
+                k_name = bare(ex.client.get_block(k_pos).get("name"))
+                if k_name in valid_stations:
+                    _record_station(state, k_name, k_pos, dimension=dim)
+                    self._station_kind = k_name
+                    return k_pos
+                memo_for(state).remove_station("furnace", k_pos, dimension=dim)
+            except Replan:
+                pass
         station_item = next((kind for kind in valid_stations if state.count(kind) >= 1), None)
         if station_item is None:
             raise Replan("背包缺熔炉，find_blocks 半径 16 内也未观察到已有熔炉")
@@ -1025,6 +1141,7 @@ class SmeltIron(Skill):
                     raise Replan(f"放置后 get_block 在 {pos} 未确认熔炉")
                 _record_station(state, station_item, pos, dimension=dim)
                 self._station_kind = station_item
+                self._furnace_newly_placed = True
                 return pos
         # 地下狭窄矿井兜底：若四向皆为安全实心岩壁且有石级镐，侧向凿出 1x2 壁龛放炉。
         if best_pickaxe(state) in STONE_OR_BETTER_PICKS:
@@ -1057,6 +1174,7 @@ class SmeltIron(Skill):
                         raise Replan(f"放置后 get_block 在 {pos} 未确认熔炉")
                     _record_station(state, station_item, pos, dimension=dim)
                     self._station_kind = station_item
+                    self._furnace_newly_placed = True
                     return pos
         raise Replan("观察脚边四个方向的落点/净空/底板后无安全熔炉位置，环境缺安全承重落点")
 
@@ -1182,6 +1300,12 @@ class SmeltIron(Skill):
             for _ in range(2):
                 coal = ex.client.find_blocks(types=["coal_ore", "deepslate_coal_ore"], radius=16, limit=12).get("blocks") or []
                 cur = state.refresh_status(ex.client, max_age_s=0).get("pos") or state.pos
+                record_ore_observations(
+                    state,
+                    coal,
+                    dimension=str((state.st or {}).get("dimension") or "overworld"),
+                    origin=cur,
+                )
                 nearby = [b["pos"] for b in coal if isinstance(b.get("pos"), list)
                           and len(b["pos"]) == 3 and not under_feet(cur, b["pos"])]
                 if not nearby:
@@ -1243,6 +1367,24 @@ class SmeltIron(Skill):
                 )
                 if bucket_res.get("view") is not None:
                     view = bucket_res["view"]
+        if getattr(self, "_furnace_newly_placed", False):
+            dim_now = str((state.st or {}).get("dimension") or "overworld")
+            emptied = (
+                isinstance(view, dict)
+                and not window_section(view, "input")
+                and not window_section(view, "output")
+                and not window_section(view, "fuel")
+            )
+            if emptied:
+                yield from reclaim_field_station(
+                    ex,
+                    state,
+                    station_kind,
+                    pos,
+                    dimension=dim_now,
+                    newly_placed=True,
+                    furnace_emptied=True,
+                )
 
     def verify_done(self, state: "State", before_counts: dict[str, int]) -> str:
         if state.count("iron_ingot") > before_counts.get("iron_ingot", 0):

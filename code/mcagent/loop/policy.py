@@ -22,7 +22,17 @@ from ..skills.furnace_lease import best_fuel_for, lease_book_for
 from ..skills.items import best_pickaxe
 from ..skills.nether_portal import nether_preflight_missing
 from ..skills.survival_camp import _can_sleep_now
-from ..skills.survival_food import COOKED_FOODS, cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
+from ..skills.survival_food import (
+    COOKED_FOODS,
+    FOOD_RESERVE_LOW_WATER,
+    TWO_DAY_FOOD_RESTORE,
+    cooked_food_count,
+    cooked_food_restore,
+    effective_food_restore,
+    has_ready_food_lease,
+    inventory_food_restore,
+    raw_meat_count,
+)
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
 from .context import DecisionContext, ObjectiveRecord, count_pending_landmark_goals, is_daytime
@@ -366,11 +376,13 @@ def build_state_summary(state: State, *, goal_hint: str = "") -> str:
     """给技能级模型选择（兼容 `--llm`）的一屏状态摘要（遵守 J17）。战略层上下文见 `loop/context.py`。"""
     st = state.snapshot()
     pick = best_pickaxe(state) or "无"
+    eff_food = effective_food_restore(state)
+    food_tag = "够2天-勿补粮" if eff_food >= TWO_DAY_FOOD_RESTORE else f"约{eff_food / (TWO_DAY_FOOD_RESTORE / 2.0):.1f}天"
     lines = [
         f"位置={st.get('pos')} 维度={st.get('dimension', 'overworld')} 昼夜={'白天' if st.get('is_day', True) else '夜晚'}({st.get('time_of_day')})",
         f"血量={st.get('health', 20)} 饱食={st.get('food', 20)} 氧气={st.get('oxygen', OXYGEN_FULL)} 安全模式={state.in_safe_mode}",
         f"最近敌对={ (st.get('nearest_hostile') or {}).get('name', '无') } 距离={ (st.get('nearest_hostile') or {}).get('dist', '-') }",
-        f"物资：最优镐={pick} 原木={total_logs(state)} 木板={total_planks(state)} 木棍={state.count('stick')} "
+        f"物资：最优镐={pick} 食物有效={eff_food}/{TWO_DAY_FOOD_RESTORE}({food_tag}) 原木={total_logs(state)} 木板={total_planks(state)} 木棍={state.count('stick')} "
         f"工作台={state.count('crafting_table')} 圆石={total_cobble(state)} 熔炉={state.count('furnace')} 石剑={state.count('stone_sword')}",
     ]
     if PROTECTED_ZONES:
@@ -1239,29 +1251,30 @@ class RulePlanner:
             for l in ready_leases
         )
         if has_near_food_lease and safe_12 and lease_hp_ok:
-            gf_lease = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+            gf_lease = self._try_make("gather_food", {"target_restore": TWO_DAY_FOOD_RESTORE, "cook": True, "hunt": False}, state)
             if gf_lease is not None:
                 return PlanDecision(gf_lease, "rule", "熟食熔炉租约已就绪，回炉取回熟肉防遗弃")
         if any(l.expected_output == "iron_ingot" and _lease_nearby(l) for l in ready_leases) and safe_12 and lease_hp_ok:
             ir_lease = self._try_make("smelt_iron", {"count": 12, "async_lease": True}, state)
             if ir_lease is not None:
                 return PlanDecision(ir_lease, "rule", "铁锭熔炉租约已就绪，回炉取回铁锭防遗弃")
+        eff_restore = effective_food_restore(state)
         needs_food_now = food <= 17.0 or hp < 18.0
         proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
-        if near_surface_for_camp and restore < 14 and day is True and not _is_dusk_or_night(state) and safe_12 and (needs_food_now or proactive_food_ok):
-            gf = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+        if near_surface_for_camp and eff_restore < FOOD_RESERVE_LOW_WATER and day is True and not _is_dusk_or_night(state) and safe_12 and (needs_food_now or proactive_food_ok):
+            gf = self._try_make("gather_food", {"target_restore": TWO_DAY_FOOD_RESTORE, "cook": True, "hunt": True}, state)
             if gf is not None:
-                return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<14)，白天补粮")
+                return PlanDecision(gf, "rule", f"食物底仓不足(有效={eff_restore}<{FOOD_RESERVE_LOW_WATER})，白天补粮至两天量({TWO_DAY_FOOD_RESTORE})")
         if (
             raw_meat_count(state) >= 1
-            and cooked_food_count(state) < 6
+            and cooked_food_restore(state) < TWO_DAY_FOOD_RESTORE
             and best_fuel_for(state, 1, allow_lava_bucket=False) is not None
             and has_furnace_ready
             and safe_12
         ):
-            gf_cook = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+            gf_cook = self._try_make("gather_food", {"target_restore": TWO_DAY_FOOD_RESTORE, "cook": True, "hunt": False}, state)
             if gf_cook is not None:
-                return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})与燃料，烤肉熟化补仓")
+                return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})与燃料，仅烤肉熟化(不狩猎)")
 
         # 8. Night Bed Sleep Fast-Path（提前到原版早夜 12542 / 雷暴抢睡，抢在 13000 刷怪前 23s 过夜）
         has_existing_or_held_bed = (
@@ -1282,8 +1295,16 @@ class RulePlanner:
                 if sleep_sk is not None:
                     return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
 
-        # 8.5 Nighttime/Dusk Overworld Dig-and-Cover Shelter Guard（放宽触发条件：黄昏 11800 起或黑夜，
-        # 无甲/低护甲(<10)/低血(<=14)/无盾非满血且无可用床时，优先挖洞封口避险，彻底替代露天原地罚站送死）
+        # 8.2 Nighttime/Dusk Sealed Underground Mining（夜间未睡觉时，持镐且血量安全则优先转入封口矿道挖矿，
+        # 挖穿自然矿洞即封堵、入井后封堵地表井口挡怪；缺镐/残血/敌怪逼近时再退回 8.5 应急挖洞避险）
+        if dim == "overworld" and _is_dusk_or_night(state):
+            nm = self._choose_night_mining_skill(state, hp=hp, hdist=hdist, cur_pos_y=cur_pos_y)
+            if nm is not None:
+                nm_sk, nm_reason = nm
+                return PlanDecision(nm_sk, "rule", nm_reason)
+
+        # 8.5 Nighttime/Dusk Overworld Dig-and-Cover Shelter Guard（夜间应急避险兜底：
+        # 缺镐/残血/safe_mode/敌怪逼近或挖矿不可用时，挖洞封口避险，替代露天罚站送死）
         if dim == "overworld" and near_surface_for_camp and _is_dusk_or_night(state):
             if (ns_why := _night_shelter_reason(state)) is not None:
                 ns = self._try_make("night_shelter", {}, state)
@@ -1483,6 +1504,56 @@ class RulePlanner:
         self._last_selected_goal_id = None
         return gid
 
+    def _choose_night_mining_skill(
+        self,
+        state: State,
+        *,
+        hp: float,
+        hdist: float,
+        cur_pos_y: Optional[float],
+    ) -> Optional[tuple[Skill, str]]:
+        """夜间无睡眠时优先转入封口矿道安全挖矿（避怪且持续推进石/铁/钻进度）。"""
+        st = state.snapshot()
+        if st.get("ready") is False or st.get("alive") is False:
+            return None
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        if dim != "overworld" or not _is_dusk_or_night(state):
+            return None
+        if state.in_safe_mode or hp <= 10.0:
+            return None
+        if any(st.get(flag) for flag in ("in_water", "submerged", "in_lava", "on_fire")):
+            return None
+        is_sealed = getattr(state, "is_in_sealed_shelter", None)
+        if callable(is_sealed) and is_sealed():
+            return None
+        get_hurt = getattr(state, "get_recent_hurt", None)
+        if callable(get_hurt) and get_hurt(max_age_s=2.0):
+            return None
+        pick = best_pickaxe(state)
+        if pick is None:
+            return None
+        on_surface = cur_pos_y is None or cur_pos_y >= 52.0
+        if on_surface and hdist < 10.0:
+            return None
+
+        candidates: list[tuple[str, dict[str, Any], str]] = []
+        if pick in ("iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe") and state.count("diamond") < 5:
+            candidates.append(("mine_diamond", {"count": 3}, "夜间无睡眠，转入封口矿道深层采钻"))
+        if pick in STONE_OR_BETTER_PICKS and (
+            state.count("iron_ingot") < 12
+            or not has_equipped_armor(state)
+            or state.count("shield") < 1
+            or state.count("iron_pickaxe") < 1
+        ):
+            candidates.append(("smelt_iron", {"count": 6}, "夜间无睡眠，转入封口矿道采铁冶炼"))
+        candidates.append(("mine_stone", {"count": 12}, "夜间无睡眠，转入封口矿道安全采石"))
+
+        for sname, sargs, reason in candidates:
+            sk = self._try_make(sname, sargs, state)
+            if sk is not None:
+                return sk, reason
+        return None
+
     def _choose_explore_fallback(
         self,
         state: State,
@@ -1507,13 +1578,23 @@ class RulePlanner:
                 cur_y = float(pos_snap[1])
             except (TypeError, ValueError):
                 cur_y = None
-        # 主世界黄昏/黑夜地表且无甲/低护甲时，硬禁止派发地表盲探图送死，转而优先挖洞避险
+        # 主世界黄昏/黑夜地表且无甲/低护甲时，硬禁止派发地表盲探图送死，优先转入封口挖矿，否则挖洞避险
         if (
             survey_dim == "overworld"
             and (cur_y is None or cur_y >= 50.0)
             and _is_dusk_or_night(state)
             and (not has_equipped_armor(state) or _armor_points_of(state) < 10.0)
         ):
+            raw_hp_f = st_snap.get("health", 20.0)
+            hp_f = float(raw_hp_f) if isinstance(raw_hp_f, (int, float)) and not isinstance(raw_hp_f, bool) and math.isfinite(raw_hp_f) else 20.0
+            hostile_f = st_snap.get("nearest_hostile") or {}
+            try:
+                hdist_f = float(hostile_f.get("dist", 99.0)) if isinstance(hostile_f, Mapping) and hostile_f else 99.0
+            except (TypeError, ValueError):
+                hdist_f = 99.0
+            nm_fb = self._choose_night_mining_skill(state, hp=hp_f, hdist=hdist_f, cur_pos_y=cur_y)
+            if nm_fb is not None:
+                return nm_fb[0], f"夜间禁止地表盲探图，改为封口挖矿 ({nm_fb[1]})", False
             if (ns_why := _night_shelter_reason(state)) is not None:
                 ns_inst, _, ns_cool = self._diagnose_skill("night_shelter", {}, state)
                 if ns_inst is not None:
@@ -1862,7 +1943,7 @@ class CampaignPlanner:
             return choice
         if choice.skill.name not in ("smelt_iron", "mine_diamond"):
             return choice
-        restore = inventory_food_restore(state)
+        restore = effective_food_restore(state)
         now = time.monotonic()
         if restore >= 8 or (now - getattr(self, "_pre_mine_food_scout_ts", 0.0)) >= 300.0:
             self._pre_mine_food_scouts = 0
@@ -1883,9 +1964,9 @@ class CampaignPlanner:
                 pass
         if not any(state.count(s) >= 1 for s in _SURVIVAL_SWORDS):
             return choice
-        gf = self.rules._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
+        gf = self.rules._try_make("gather_food", {"target_restore": TWO_DAY_FOOD_RESTORE, "cook": True, "hunt": True}, state)
         if gf is not None:
-            return PlanDecision(gf, "rule", f"下矿前食物底仓不足(restore={restore}<8)，白天先在地表储备熟食")
+            return PlanDecision(gf, "rule", f"下矿前食物底仓不足(有效={restore}<8)，白天先在地表储备两天熟食({TWO_DAY_FOOD_RESTORE})")
         scouts_used = int(getattr(self, "_pre_mine_food_scouts", 0))
         if scouts_used < 3 and self.rules.environment_block("survival:gather_food") is not None:
             sc = self.rules._try_make("scout_island", {"radius": 36}, state)
