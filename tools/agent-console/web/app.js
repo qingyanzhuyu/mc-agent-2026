@@ -1111,13 +1111,30 @@
       showToast(`初始化失败: ${err.message}`, "bad");
     }
 
-    // 实时轮询：运行中 1.5s，空闲 5s
-    state.pollTimer = setInterval(async () => {
+    // 串行轮询：防止慢请求堆叠阻塞浏览器 6 连接池（运行中 2.5s，空闲 6s）
+    let polling = false;
+    let pollTick = 0;
+    const schedulePoll = () => {
       const running = Boolean(state.process && state.process.running);
-      if (running || document.visibilityState === "visible") {
-        await refreshAll();
-      }
-    }, 2000);
+      const delay = running ? 2500 : 6000;
+      state.pollTimer = setTimeout(async () => {
+        if (!polling && (running || document.visibilityState === "visible")) {
+          polling = true;
+          pollTick += 1;
+          try {
+            if (running && state.selectedRunId && pollTick % 4 !== 0) {
+              await loadSelectedRun();
+            } else {
+              await refreshAll();
+            }
+          } finally {
+            polling = false;
+          }
+        }
+        schedulePoll();
+      }, delay);
+    };
+    schedulePoll();
   }
 
   // ==========================================================================

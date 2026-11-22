@@ -677,44 +677,114 @@ def _read_first_and_last_jsonl(path: Path) -> tuple[dict[str, Any], dict[str, An
     return first, last
 
 
+_DISCOVER_CACHE_LOCK = threading.Lock()
+_DISCOVER_CACHE: dict[tuple[Optional[str], int], tuple[float, list[dict[str, Any]]]] = {}
+_RUN_SUMMARY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_RUN_DETAIL_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+_DISCOVER_TTL_S = 4.0
+
+
+def invalidate_run_caches() -> None:
+    with _DISCOVER_CACHE_LOCK:
+        _DISCOVER_CACHE.clear()
+
+
 def discover_runs(active_run_id: Optional[str] = None, limit: int = 60) -> list[dict[str, Any]]:
-    """递归发现 `code/mcagent/logs/` 与 `results/` 下所有运行记录。"""
-    candidates: list[Path] = []
-    seen: set[Path] = set()
+    """快速发现 `code/mcagent/logs/` 与 `results/` 下最新的运行记录（带目录剪枝与 mtime 缓存，避免海量历史目录拖慢 UI）。"""
+    cache_key = (active_run_id, limit)
+    now = time.monotonic()
+    with _DISCOVER_CACHE_LOCK:
+        cached = _DISCOVER_CACHE.get(cache_key)
+        if cached is not None and (now - cached[0]) < _DISCOVER_TTL_S:
+            return [dict(item) for item in cached[1]]
+
+    skip_names = {"incidents", "worktrees", "__pycache__", "probe", "replay-sample"}
+    marker_names = ("timeline.jsonl", "progress_curve.jsonl", "console.log")
+    # 收集 (approx_mtime, path)，按 mtime 剪枝只解析最新的一批目录，防止 2500+ ep 目录全盘 IO
+    raw_candidates: list[tuple[float, Path]] = []
+    seen: set[str] = set()
 
     def _scan(root: Path, depth: int) -> None:
-        if not root.is_dir() or depth < 0:
+        if depth < 0:
             return
         try:
-            entries = list(root.iterdir())
+            with os.scandir(root) as it:
+                entries = list(it)
         except OSError:
             return
-        has_data = any(
-            (root / fn).is_file() for fn in ("timeline.jsonl", "progress_curve.jsonl", "console.log")
-        )
-        if has_data and root != LOGS_ROOT and root != RESULTS_ROOT:
-            rp = root.resolve()
-            if rp not in seen:
-                seen.add(rp)
-                candidates.append(root)
-        if depth > 0:
-            for ent in entries:
-                if ent.is_dir() and ent.name not in ("incidents", "worktrees", "__pycache__", "probe", "replay-sample"):
-                    _scan(ent, depth - 1)
 
-    _scan(LOGS_ROOT, 3)
-    _scan(RESULTS_ROOT, 2)
+        has_data = False
+        newest_marker_mtime = 0.0
+        subdirs: list[tuple[float, Path]] = []
+        for ent in entries:
+            try:
+                if ent.is_file(follow_symlinks=False):
+                    if ent.name in marker_names:
+                        has_data = True
+                        st_m = ent.stat(follow_symlinks=False).st_mtime
+                        if st_m > newest_marker_mtime:
+                            newest_marker_mtime = st_m
+                elif depth > 0 and ent.is_dir(follow_symlinks=False) and ent.name not in skip_names:
+                    st_m = ent.stat(follow_symlinks=False).st_mtime
+                    subdirs.append((st_m, Path(ent.path)))
+            except OSError:
+                continue
+
+        if has_data and root != LOGS_ROOT and root != RESULTS_ROOT:
+            key = str(root)
+            if key not in seen:
+                seen.add(key)
+                raw_candidates.append((newest_marker_mtime, root))
+
+        if subdirs:
+            subdirs.sort(key=lambda x: -x[0])
+            # 单父目录下有上千 ep-* 子目录时只扫最新 80 个，保证毫秒级返回
+            for _, sub in subdirs[: max(limit + 20, 80)]:
+                _scan(sub, depth - 1)
+
+    if LOGS_ROOT.is_dir():
+        _scan(LOGS_ROOT, 3)
+    if RESULTS_ROOT.is_dir():
+        _scan(RESULTS_ROOT, 2)
+
+    # 确保当前活跃运行一定在候选集中
+    if active_run_id:
+        active_path = resolve_run_id(active_run_id)
+        if active_path is not None and str(active_path) not in seen:
+            try:
+                raw_candidates.append((active_path.stat().st_mtime + 1e9, active_path))
+            except OSError:
+                pass
+
+    raw_candidates.sort(key=lambda x: -x[0])
+    top_candidates = raw_candidates[: max(limit + 10, 70)]
 
     runs: list[dict[str, Any]] = []
-    for rdir in candidates:
+    for _, rdir in top_candidates:
         rid = run_id_for_path(rdir)
         tl = rdir / "timeline.jsonl"
         pc = rdir / "progress_curve.jsonl"
         sm = rdir / "summary.md"
         cl = rdir / "console.log"
 
-        mtimes = [p.stat().st_mtime for p in (tl, pc, sm, cl) if p.is_file()]
-        mtime = max(mtimes) if mtimes else rdir.stat().st_mtime
+        mtimes = []
+        for p in (tl, pc, sm, cl):
+            try:
+                if p.is_file():
+                    mtimes.append(p.stat().st_mtime)
+            except OSError:
+                pass
+        try:
+            mtime = max(mtimes) if mtimes else rdir.stat().st_mtime
+        except OSError:
+            continue
+
+        cached_row = _RUN_SUMMARY_CACHE.get(rid)
+        if cached_row is not None and cached_row[0] == mtime:
+            row = dict(cached_row[1])
+            row["is_active"] = rid == active_run_id
+            runs.append(row)
+            continue
 
         first_tl, last_tl = _read_first_and_last_jsonl(tl)
         _, last_pc = _read_first_and_last_jsonl(pc)
@@ -729,7 +799,7 @@ def discover_runs(active_run_id: Optional[str] = None, limit: int = 60) -> list[
         stop_reason = last_tl.get("stop_reason") if last_tl.get("event") == "run_end" else None
         total_tok_hint = int(last_pc.get("total_tokens") or 0)
 
-        runs.append({
+        row = {
             "id": rid,
             "label": rid.split("/", 1)[-1],
             "group": "results" if rid.startswith("results/") else "logs",
@@ -747,10 +817,15 @@ def discover_runs(active_run_id: Optional[str] = None, limit: int = 60) -> list[
             "is_active": rid == active_run_id,
             "has_timeline": tl.is_file(),
             "has_summary": sm.is_file(),
-        })
+        }
+        _RUN_SUMMARY_CACHE[rid] = (mtime, dict(row))
+        runs.append(row)
 
     runs.sort(key=lambda r: (not r["is_active"], -r["mtime"]))
-    return runs[:limit]
+    result = runs[:limit]
+    with _DISCOVER_CACHE_LOCK:
+        _DISCOVER_CACHE[cache_key] = (time.monotonic(), [dict(item) for item in result])
+    return result
 
 
 def _extract_goal_from_reason(reason: str) -> Optional[str]:
@@ -1746,6 +1821,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             try:
                 spec = build_launch_spec(body)
                 status = PROCESS_MGR.start(spec)
+                invalidate_run_caches()
                 self._send_json({"ok": True, "status": status, "run_id": status.get("run_id")})
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -1756,10 +1832,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/run/stop":
+            invalidate_run_caches()
             self._send_json(PROCESS_MGR.stop(force=False))
             return
 
         if path == "/api/run/kill":
+            invalidate_run_caches()
             self._send_json(PROCESS_MGR.stop(force=True))
             return
 
