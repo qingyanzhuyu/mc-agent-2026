@@ -90,12 +90,17 @@ def _read_block(cache: Any, client: Any, cell: Cell, dim: str) -> Optional[dict]
 
 def _is_dry_standable(cache: Any, client: Any, cell: Cell, dim: str) -> bool:
     sx, sy, sz = cell
-    below = _read_block(cache, client, (sx, sy - 1, sz), dim)
+    # 先查 body：在洞穴岩壁与水体中 85%+ 候选格 body 为实心岩/水，单次 get_block 即可短路淘汰
     body = _read_block(cache, client, cell, dim)
-    above = _read_block(cache, client, (sx, sy + 1, sz), dim)
-    if not (below and body and above) or _is_water_cell(body) or _is_water_cell(above):
+    if not body or _is_water_cell(body) or not is_clear_space(body):
         return False
-    return is_safe_solid_floor(below) and is_clear_space(body) and is_clear_space(above)
+    below = _read_block(cache, client, (sx, sy - 1, sz), dim)
+    if not below or not is_safe_solid_floor(below):
+        return False
+    above = _read_block(cache, client, (sx, sy + 1, sz), dim)
+    if not above or _is_water_cell(above) or not is_clear_space(above):
+        return False
+    return True
 
 
 def _exec_step(
@@ -209,12 +214,27 @@ def _find_soft_overhang(ex: "Executor", st: dict, cache: Any, dim: str, tried_di
     return None
 
 
-def _find_dry_shore(ex: "Executor", st: dict, cache: Any, dim: str, tried_shores: set[Cell]) -> Optional[Cell]:
+def _find_dry_shore(
+    ex: "Executor",
+    st: dict,
+    cache: Any,
+    dim: str,
+    tried_shores: set[Cell],
+    *,
+    max_radius: int = 6,
+    max_cols: int = 80,
+) -> Optional[Cell]:
     pos = st.get("pos")
     if not pos or len(pos) < 3:
         return None
     fx, fy, fz = block_cell(pos)
+    probed_cols = 0
     for dx, dz in _SHORE_OFFSETS:
+        if max(abs(dx), abs(dz)) > max_radius:
+            break
+        if probed_cols >= max_cols:
+            break
+        probed_cols += 1
         sx, sz = fx + dx, fz + dz
         for dy in (0, 1, 2, -1):
             cand = (sx, fy + dy, sz)
@@ -601,38 +621,54 @@ def _find_safe_dry_shore_away(
     threats: list[tuple[float, float, str, float, Optional[int]]],
     *,
     tried_shores: set[Cell] = frozenset(),
+    max_radius: int = 4,
+    max_cols: int = 48,
 ) -> Optional[Cell]:
-    """水中脱险时优先寻找 6 格内远离敌怪（不贴近苦力怕/近怪）的实心干岸格。"""
+    """水中脱险时优先寻找近处远离敌怪（不贴近苦力怕/近怪）的实心干岸格；几何先筛 + 环层早停 + 列预算上限防止 900+ 次 get_block 阻塞。"""
     pos = _valid_vec3(st.get("pos"))
     if pos is None:
         return None
     px, py, pz = pos
     fx, fy, fz = block_cell([px, py, pz])
     best: Optional[tuple[float, Cell]] = None
+    best_climbable_ring: Optional[int] = None
+    probed_cols = 0
     for dx, dz in _SHORE_OFFSETS:
+        ring = max(abs(dx), abs(dz))
+        if ring > max_radius:
+            break
+        # 一旦当前内环已经找到可直接一步登岸（dy <= 1）的安全干岸，完成该环即提前退出，绝不继续外扩扫图
+        if best_climbable_ring is not None and ring > best_climbable_ring:
+            break
         sx, sz = fx + dx, fz + dz
+        cx, cz = sx + 0.5, sz + 0.5
+        # 先纯算几何威胁净空（0 HTTP 开销），直接淘汰朝向苦力怕/近怪方向的所有列
+        safe = True
+        min_clearance = 18.0
+        for hx, hz, name, d0, _ in threats:
+            d_cand = math.hypot(cx - hx, cz - hz)
+            if name == "creeper" and d_cand < max(6.5, min(d0, 8.0)):
+                safe = False
+                break
+            if d0 < 9.0 and d_cand < max(4.5, d0 - 0.5):
+                safe = False
+                break
+            min_clearance = min(min_clearance, d_cand)
+        if not safe:
+            continue
+        if probed_cols >= max_cols:
+            break
+        probed_cols += 1
+        d_self = math.hypot(cx - px, cz - pz)
         for dy in (0, 1, 2, -1):
             cand = (sx, fy + dy, sz)
             if cand in tried_shores or not _is_dry_standable(cache, ex.client, cand, dim):
                 continue
-            cx, cz = cand[0] + 0.5, cand[2] + 0.5
-            d_self = math.hypot(cx - px, cz - pz)
-            safe = True
-            min_clearance = 18.0
-            for hx, hz, name, d0, _ in threats:
-                d_cand = math.hypot(cx - hx, cz - hz)
-                if name == "creeper" and d_cand < max(6.5, min(d0, 8.0)):
-                    safe = False
-                    break
-                if d0 < 9.0 and d_cand < max(4.5, d0 - 0.5):
-                    safe = False
-                    break
-                min_clearance = min(min_clearance, d_cand)
-            if not safe:
-                continue
             score = min_clearance - 0.85 * d_self - (6.0 if dy >= 2 else 0.0)
             if best is None or score > best[0]:
                 best = (score, cand)
+            if dy <= 1 and best_climbable_ring is None:
+                best_climbable_ring = ring
             break
     return best[1] if best is not None else None
 
@@ -1410,8 +1446,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     )
     use_bisector = has_shield and (abs(shield_yaw - to_mob_yaw) > 0.15 or hurt_attacker_id is not None)
 
-    # 苦力怕贴脸（<=3.5 格，或水中 <=6.5 格）时：持盾先举盾后退挡爆，无盾则立即原生疾跑跳/泳离爆炸半径
-    creeper_burst_range = 6.5 if st.get("in_water") else 3.5
+    # 苦力怕贴脸/近距（无盾或水中 <=6.5 格，持盾 <=3.5 格）时：
+    # 苦力怕 4.8m 仅需 ~0.55s 即进入 3.0m 引爆圈并在 1.5s 内爆炸（快于 move_to 2.2s 超时），
+    # 故持盾近距先举盾后退挡爆，无盾 <=6.5m 严禁落入慢速 A* move_to，立即原生防跳崖疾跑跳拉开爆炸半径。
+    creeper_burst_range = 6.5 if (st.get("in_water") or not has_shield) else 3.5
     if is_creeper and h_dist <= creeper_burst_range:
         if has_shield and h_dist <= 3.5:
             shield_up = _set_shield(ex, state, True)
@@ -1431,31 +1469,65 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             if mid_pos and len(mid_pos) >= 3:
                 px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
         else:
-            # 无盾直面贴脸/起爆苦力怕（<=3.5 格，引信 1.5s）：跳过慢速 A* move_to，立即原生疾跑跳拉脱爆炸半径
-            creeper_pref_yaw = (
-                _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim)
-                if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim)
-                else away_yaw
-            )
-            safe_creeper_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, creeper_pref_yaw, cache, dim)
-            if safe_creeper_yaw is not None:
-                ok_cb, _ = yield from _control_step(
-                    ex, forward=True, sprint=True, jump=True, yaw=safe_creeper_yaw, ms=900,
+            # 无盾直面近距/起爆苦力怕（<=6.5 格）：跳过慢速 A* move_to，立即原生疾跑跳（至多 2 段）拉脱爆炸半径
+            for cb_idx in range(2):
+                creeper_pref_yaw = (
+                    _pick_alternate_escape_yaw(
+                        ex, px, py, pz, ux, uz, cache, dim,
+                        tried_yaws=tried_yaws, in_water=in_water_init, prefer_opposite=zero_stall,
+                    )
+                    if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
+                    else away_yaw
                 )
-                if ok_cb:
-                    st_mid = _refresh_status(ex, state)
-                    if st_mid.get("alive") is False:
-                        return False
-                    mid_hostile = st_mid.get("nearest_hostile") or {}
-                    if not mid_hostile or (
-                        isinstance(mid_hostile.get("dist"), (int, float))
-                        and not isinstance(mid_hostile.get("dist"), bool)
-                        and float(mid_hostile["dist"]) >= 9.0
-                    ):
-                        return True
-                    mid_pos = st_mid.get("pos")
-                    if mid_pos and len(mid_pos) >= 3:
-                        px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+                safe_creeper_yaw = _pick_cliff_safe_yaw(
+                    ex, px, py, pz, creeper_pref_yaw, cache, dim,
+                    avoid_water=not in_water_init,
+                    hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                )
+                if safe_creeper_yaw is None:
+                    break
+                before_cb = (px, py, pz)
+                cb_jump = (not zero_stall) or _needs_step_jump(ex, px, py, pz, safe_creeper_yaw, cache, dim)
+                ok_cb, _ = yield from _control_step(
+                    ex, forward=True, sprint=True, jump=cb_jump, yaw=safe_creeper_yaw, ms=900 if cb_idx == 0 else 800,
+                )
+                if not ok_cb:
+                    break
+                st_mid = _refresh_status(ex, state)
+                if st_mid.get("alive") is False:
+                    return False
+                mid_hostile = st_mid.get("nearest_hostile") or {}
+                if not mid_hostile or (
+                    isinstance(mid_hostile.get("dist"), (int, float))
+                    and not isinstance(mid_hostile.get("dist"), bool)
+                    and float(mid_hostile["dist"]) >= 9.0
+                ):
+                    return True
+                mid_pos = st_mid.get("pos")
+                if mid_pos and len(mid_pos) >= 3:
+                    px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
+                    moved_cb_xz = math.hypot(px - before_cb[0], pz - before_cb[2])
+                    if math.dist(before_cb, (px, py, pz)) < 1.5:
+                        burst_blocked = True
+                        tried_yaws.append(safe_creeper_yaw)
+                    else:
+                        burst_blocked = False
+                    if moved_cb_xz < 0.35:
+                        zero_stall = True
+                        _record_blocked_yaw(state, dim, px, pz, safe_creeper_yaw)
+                    elif moved_cb_xz >= 1.5:
+                        zero_stall = False
+                in_water_init = bool(st_mid.get("in_water") or st_mid.get("submerged"))
+                if in_water_init:
+                    break
+                mid_d = mid_hostile.get("dist")
+                if not (isinstance(mid_d, (int, float)) and not isinstance(mid_d, bool) and float(mid_d) <= 6.5):
+                    break
+                ux, uz, h_pos = _resolve_flee_vector(
+                    ex, px, py, pz, mid_hostile, cache, dim, state=state,
+                    avoid_water=True, in_water=False,
+                )
+                away_yaw = math.atan2(-ux, -uz)
     else:
         sealed = yield from _try_seal_underground_tunnel(ex, state, st, h_pos, cache, dim)
         if sealed:

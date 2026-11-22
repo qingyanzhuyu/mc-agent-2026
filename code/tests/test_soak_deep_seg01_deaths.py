@@ -2301,6 +2301,159 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertIn((-7, 5, 49), excl_other_chunk)
         self.assertIn((-7, 5, 48), excl_other_chunk)
 
+    def test_seg25_safe_dry_shore_away_caps_get_block_probes_and_early_exits(self) -> None:
+        # 复现 seg-25 INC-004 死前 2.37s 卡顿（440.15s..442.52s）：地下洞穴水池 [57, 40, -158] 遇 7.7m 苦力怕时，
+        # _find_safe_dry_shore_away 曾对 168 列×4 高度发 917 次同步 /get_block 冻结 2.37s 致苦力怕逼近至 3.2m 引爆；
+        # 必须几何先筛 + 环层早停 + 列预算封顶，将探测次数压低一个数量级。
+        from mcagent.skills.escape import _find_safe_dry_shore_away
+        from mcagent.skills.voxel_cache import voxel_cache_for
+
+        class _CountingCaveWorld(GridWorld):
+            def __init__(self, blocks: dict[tuple[int, int, int], str]) -> None:
+                super().__init__(blocks=blocks, pos=[57.7, 40.7, -157.1], items={})
+                self.st.update(dimension="overworld", ready=True, alive=True, in_water=True)
+                self.get_block_calls = 0
+
+            def get_block(self, pos):
+                self.get_block_calls += 1
+                key = (int(pos[0]), int(pos[1]), int(pos[2]))
+                return {"name": self.blocks.get(key, "stone"), "pos": list(key)}
+
+        # 场景 A：全岩壁/水体无干岸的洞穴，苦力怕在西侧 (50.6, -156.7)
+        w_empty = _CountingCaveWorld({(57, 40, -158): "water", (57, 41, -158): "air"})
+        ex_e, st_e = w_empty.session()
+        threats = [(50.6, -156.7, "creeper", 7.1, 184282)]
+        res_e = _find_safe_dry_shore_away(
+            ex_e, st_e.snapshot(), voxel_cache_for(st_e), "overworld", threats,
+        )
+        self.assertIsNone(res_e)
+        self.assertLessEqual(
+            w_empty.get_block_calls, 220,
+            f"all-stone cave probe must stay <=220 get_block calls (was 917), got {w_empty.get_block_calls}",
+        )
+
+        # 场景 B：东侧 2 格处 (59, 40, -158) 存在可直接登岸（dy=0）的安全干岸，必须在第 2 环完成即早停
+        blocks_ledge = {
+            (57, 40, -158): "water",
+            (59, 39, -158): "stone",
+            (59, 40, -158): "air",
+            (59, 41, -158): "air",
+        }
+        w_ledge = _CountingCaveWorld(blocks_ledge)
+        ex_l, st_l = w_ledge.session()
+        res_l = _find_safe_dry_shore_away(
+            ex_l, st_l.snapshot(), voxel_cache_for(st_l), "overworld", threats,
+        )
+        self.assertEqual(res_l, (59, 40, -158))
+        self.assertLessEqual(
+            w_ledge.get_block_calls, 90,
+            f"ring-2 climbable shore must early-exit <=90 get_block calls, got {w_ledge.get_block_calls}",
+        )
+
+    def test_seg25_unshielded_creeper_at_4_8m_sprints_immediately_without_move_to(self) -> None:
+        # 复现 seg-25 414.3s 苦力怕 #1 炸残血（hp 11.5 -> 2.0）：无盾在 4.8m 遇苦力怕时，
+        # 严禁先走慢速 2.2s move_to（6/6 超时并让苦力怕在 2.05s 内引爆），必须立即防跳崖疾跑跳拉开至 9m+。
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks = {(x, 42, z): "stone" for x in range(44, 70) for z in range(-152, -138)}
+
+        class _CreeperCaveWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[52.7, 43.0, -144.3], items={"stone_pickaxe": 1})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=11.5, food=10,
+                    armor_points=0, in_water=False, on_ground=True,
+                    nearest_hostile={"id": 184594, "name": "creeper", "dist": 4.8, "pos": [48.4, 43.0, -144.5]},
+                )
+                self.moves = 0
+                self.controls = 0
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                return {"pos": list(self.st["pos"])}
+
+            def control(self, **kwargs):
+                self.controls += 1
+                self.st["pos"] = [58.0, 43.0, -144.3]
+                self.st["nearest_hostile"] = {"id": 184594, "name": "creeper", "dist": 9.6, "pos": [48.4, 43.0, -144.5]}
+                return {"pos": list(self.st["pos"]), "moved": 5.3}
+
+        w = _CreeperCaveWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        ok = False
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        self.assertEqual(w.moves, 0, "unshielded creeper at 4.8m must NOT gamble slow move_to before sprint burst")
+        self.assertGreaterEqual(w.controls, 1)
+
+    def test_seg25_climb_out_stairs_ignores_leaf_litter_and_stops_on_non_rising_steps(self) -> None:
+        # 复现 seg-25 INC-001（gather_wood STUCK_NO_PROGRESS ×4）：地表 Y=64 铺满 leaf_litter 时，
+        # _climb_out_stairs 不得把非实体地被植物（leaf_litter/short_grass）当成实体台阶反复在 47.5<->48.5 横跳 45 步；
+        # 且一旦 move_to 返回但海拔未上升 >=0.5，必须在 <=3 步内及时中止而非空转 64 步。
+        from mcagent.skills.mine_return import _climb_out_stairs
+
+        blocks = {
+            (47, 63, 50): "grass_block",
+            (48, 63, 50): "grass_block",
+            (46, 63, 50): "grass_block",
+            (47, 63, 51): "grass_block",
+            (47, 63, 49): "grass_block",
+            (48, 64, 50): "leaf_litter",
+            (46, 64, 50): "short_grass",
+            (47, 64, 51): "leaf_litter",
+            (47, 64, 49): "poppy",
+        }
+        w = GridWorld(blocks=blocks, pos=[47.5, 64.0, 50.5], items={"stone_pickaxe": 1})
+        w.st.update(dimension="overworld", ready=True, alive=True, health=11.5, food=7)
+        ex, state = w.session()
+        recs = []
+        gen = _climb_out_stairs(ex, state, target_y=69.0, max_steps=12)
+        ok = True
+        try:
+            while True:
+                recs.append(next(gen))
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertFalse(ok)
+        self.assertEqual(recs, [], "must not treat leaf_litter/short_grass/poppy as climbable solid stairs")
+
+        # 场景 B：即使存在实心石块台阶，但 move_to(rng=1) 未实际抬升 Y（停在 Y=64），必须在 <=3 步内中止
+        blocks_solid = {
+            (47, 63, 50): "stone",
+            (48, 64, 50): "stone",
+            (46, 64, 50): "stone",
+            (47, 64, 51): "stone",
+            (47, 64, 49): "stone",
+        }
+
+        class _NoRiseWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks_solid, pos=[47.5, 64.0, 50.5], items={"stone_pickaxe": 1})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=11.5, food=7)
+                self.moves = 0
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                # 模拟 rng=1 停留在同层 Y=64 未爬升
+                return {"pos": [47.5, 64.0, 50.5]}
+
+        w2 = _NoRiseWorld()
+        ex2, st2 = w2.session()
+        gen2 = _climb_out_stairs(ex2, st2, target_y=69.0, max_steps=20)
+        ok2 = True
+        try:
+            while True:
+                next(gen2)
+        except StopIteration as stop:
+            ok2 = bool(stop.value)
+        self.assertFalse(ok2)
+        self.assertLessEqual(w2.moves, 3, f"must abort within <=3 non-rising move_to steps, got {w2.moves}")
+
 
 if __name__ == "__main__":
     unittest.main()
