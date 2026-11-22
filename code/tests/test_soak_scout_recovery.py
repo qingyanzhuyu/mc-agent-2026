@@ -494,6 +494,75 @@ class ScoutRecoveryTests(unittest.TestCase):
         self.assertIn("place", ops)
         self.assertGreaterEqual(state.pos[1], 62.0)
 
+    def test_underground_staircase_digs_continuously_up_to_surface_without_stopping_at_two(self):
+        # 地下 Y=54 持石镐（目标地表 Y=61）：一次 scout_island 内应连续挖阶梯直抵地表附近（>=6 级），
+        # 不再每挖 2 级就退出重规划，且阶梯开挖使用 collect=False 避免每块额外触发捡掉落物寻路。
+        dig_collect_flags = []
+
+        class TrackDigWorld(ScoutFailureWorld):
+            def dig(self, pos, collect=True, *, stop_on=None):
+                dig_collect_flags.append(bool(collect))
+                return super().dig(pos, collect=collect, stop_on=stop_on)
+
+        blocks = {
+            (18, 60, 0): "grass_block",
+            (22, 60, 0): "grass_block",
+        }
+        for x in range(-2, 10):
+            for y in range(53, 61):
+                for z in range(-2, 3):
+                    blocks[(x, y, z)] = "stone"
+        del blocks[(0, 54, 0)]
+        del blocks[(0, 55, 0)]
+        world = TrackDigWorld(
+            blocks=blocks,
+            failures={(18.5, 61, 0.5): "path_not_found", (22.5, 61, 0.5): "path_not_found"},
+        )
+        world.st["pos"] = [0.5, 54.0, 0.5]
+        world.items["stone_pickaxe"] = 1
+        ex, state = world.session()
+        drive(make("scout_island"), ex, state, max_steps=60)
+        self.assertGreaterEqual(state.pos[1], 60.0)
+        self.assertTrue(dig_collect_flags)
+        self.assertTrue(all(flag is False for flag in dig_collect_flags))
+
+    def test_mine_return_climb_out_stairs_uses_batch_prefetch_and_tight_rng(self):
+        # 验证 mine_return._climb_out_stairs 启用并发批查 get_blocks_batch 且用 rng=0.4 避免官方服 GoalNear(rng=1) 假成功
+        import math
+        from mcagent.skills.mine_return import _climb_out_stairs
+
+        class BatchOfficialClimbWorld(ScoutFailureWorld):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.batch_calls = 0
+
+            def get_blocks_batch(self, positions, max_workers=8, use_cache=True):
+                self.batch_calls += 1
+                return {tuple(p): self.get_block(p) for p in positions}
+
+            def move_to(self, *args, **kwargs):
+                dest = list(kwargs["pos"])
+                rng = float(kwargs.get("rng", 1))
+                cur = list(self.st["pos"])
+                if math.hypot(dest[0] - cur[0], dest[2] - cur[2]) <= rng:
+                    return {"pos": cur}
+                return super().move_to(*args, **kwargs)
+
+        blocks = {}
+        for x in range(-2, 8):
+            for y in range(52, 60):
+                for z in range(-2, 3):
+                    blocks[(x, y, z)] = "stone"
+        del blocks[(0, 54, 0)]
+        del blocks[(0, 55, 0)]
+        world = BatchOfficialClimbWorld(blocks=blocks)
+        world.st["pos"] = [0.7, 54.0, 0.5]  # 水平距 [1.5, 55, 0.5] 仅 0.8 <= rng=1
+        world.items["stone_pickaxe"] = 1
+        ex, state = world.session()
+        drive(_climb_out_stairs(ex, state, target_y=60.0, max_steps=6), ex, state, max_steps=40)
+        self.assertGreater(world.batch_calls, 0)
+        self.assertGreaterEqual(state.pos[1], 58.0)
+
 
 if __name__ == "__main__":
     unittest.main()

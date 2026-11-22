@@ -824,28 +824,42 @@ class ScoutIsland(Skill):
                 return True
 
             dug_any_stair = False
-            for _step in range(4):
-                if float(cur[1]) > target_y + 1.5:
+            last_stair_dir: Optional[tuple[int, int]] = None
+            state.refresh_inventory(ex.client)
+            # 已知上方目标高度（如地表 Y=64）时单次允许连续挖 8 级，避免每挖 2 级就退回外层重规划+12s冷却+3次死寻路；
+            # 无明确 goal_y（如纯地下盲探）时维持 2 级步进保持快响应。
+            stair_max_steps = 8 if (goal_y is not None and float(goal_y) > start_y + 1.5) else 4
+            stair_stop_y = (
+                min(start_y + 8.0, float(goal_y)) - 0.2
+                if (goal_y is not None and float(goal_y) > start_y + 1.5)
+                else target_y + 1.5
+            )
+            for _step in range(stair_max_steps):
+                if float(cur[1]) > stair_stop_y:
                     break
-                state.refresh_inventory(ex.client)
                 pick = best_pickaxe(state)
                 ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
                 chosen_dir = None
                 used_falling_solid = False
                 overhead_cells: list[list[int]] = [[ix, fy + 2, iz]]
+                dir_order: list[tuple[int, int]] = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                if last_stair_dir in dir_order:
+                    dir_order.remove(last_stair_dir)
+                    dir_order.insert(0, last_stair_dir)
                 _prefetch_blocks(
                     ex, vc,
                     [[ix, fy + 2, iz]] + [
                         [ix + dx, fy + k, iz + dz]
-                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)) for k in (0, 1, 2, 3)
+                        for dx, dz in dir_order for k in (0, 1, 2, 3)
                     ],
                     dim,
                 )
                 for allow_fs in (False, True):
-                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    for dx, dz in dir_order:
                         if _valid_step_dir(ix, fy, iz, dx, dz, bool(pick), allow_falling_solid=allow_fs):
                             chosen_dir = (ix + dx, fy, iz + dz)
                             used_falling_solid = allow_fs
+                            last_stair_dir = (dx, dz)
                             break
                     if chosen_dir is not None:
                         break
@@ -854,7 +868,7 @@ class ScoutIsland(Skill):
                     # 先找非流沙/砂砾顶，若四向全为沙/砂砾坑则降级允许向沙/砂砾方向开凿。
                     for allow_fs in (False, True):
                         for step_dist in (1, 2, 3):
-                            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                            for dx, dz in dir_order:
                                 mx, mz = ix + dx * step_dist, iz + dz * step_dist
                                 if not _valid_step_dir(mx, fy, mz, dx, dz, bool(pick), allow_falling_solid=allow_fs):
                                     continue
@@ -887,10 +901,12 @@ class ScoutIsland(Skill):
                                     chosen_dir = (ix + dx, fy, iz + dz)
                                     overhead_cells = [[ix, fy + 2, iz]]
                                     used_falling_solid = allow_fs
+                                    last_stair_dir = (dx, dz)
                                 elif step_dist == 1 and _valid_step_dir(mx, fy, mz, dx, dz, bool(pick), allow_falling_solid=allow_fs):
                                     chosen_dir = (mx + dx, fy, mz + dz)
                                     overhead_cells = [[mx, fy + 2, mz]]
                                     used_falling_solid = allow_fs
+                                    last_stair_dir = (dx, dz)
                                 break
                             if chosen_dir is not None:
                                 break
@@ -906,11 +922,11 @@ class ScoutIsland(Skill):
                 if dig_targets and pick and bare((state.st.get("held") or {}).get("name")) != pick:
                     yield rec("equip", ex.equip(pick, "hand"), item=pick)
                     st, cur = _refresh_stance(ex, state)
-                collect_stair = total_placeable(state) < 8
                 stair_dig_aborted = False
                 for dig_pos in dig_targets:
                     try:
-                        yield from nav.dig_with_recovery(ex, state, dig_pos, collect=collect_stair)
+                        # 挖脱困阶梯一律 collect=False，避免官方服每挖一块额外触发 2~5s 捡掉落物寻路
+                        yield from nav.dig_with_recovery(ex, state, dig_pos, collect=False)
                     except Replan as e:
                         code_dig, _ = failure(e)
                         if code_dig == "nothing_to_dig":
@@ -931,7 +947,7 @@ class ScoutIsland(Skill):
                             if refill not in falling_solids:
                                 break
                             try:
-                                yield from nav.dig_with_recovery(ex, state, dig_pos, collect=collect_stair)
+                                yield from nav.dig_with_recovery(ex, state, dig_pos, collect=False)
                             except Replan as e:
                                 if failure(e)[0] == "nothing_to_dig":
                                     vc and vc.invalidate(dig_pos, dimension=dim)
@@ -959,6 +975,8 @@ class ScoutIsland(Skill):
                 st, cur = _refresh_stance(ex, state)
                 if math.dist(cur, before_step_pos) < 0.35:
                     break
+                if pick and bare((st.get("held") or {}).get("name")) != pick:
+                    state.refresh_inventory(ex.client)
 
             escaped_up = float(cur[1]) > target_y + 0.5
             # 挖阶梯未成功抬升（或仅跨上了已有 1 格低台但仍远低于目标高度）时，用两列交替 step_up_1x2 连续搭块攀升（最多 5 级），
@@ -1313,7 +1331,9 @@ class ScoutIsland(Skill):
             else (lambda x: (x[3], x[0], x[1], x[4] if target_wood is not None else x[5], x[2]))
         )
         climb_cands.sort(key=lambda x: (x[0], x[1], x[2]))
-        checked, attempts, last_nav_err = [], 0, None
+        # 先去重挑出最多 16 个候选并一次性并发预取头顶两格体素，避免串行 32 次 get_block 拖慢脱困入口
+        shortlist: list[tuple[list[int], list[float]]] = []
+        checked: list[list[float]] = []
         for *_, chosen in cands + climb_cands:
             dest = [chosen[0] + 0.5, chosen[1] + 1, chosen[2] + 0.5]
             if any(math.dist(dest, old) < 3.0 for old in checked):
@@ -1321,8 +1341,18 @@ class ScoutIsland(Skill):
             if len(checked) >= 16:
                 break
             checked.append(dest)
+            shortlist.append((chosen, dest))
+        vc_head = _voxel_cache(state)
+        if shortlist:
+            _prefetch_blocks(
+                ex, vc_head,
+                [[ch[0], ch[1] + dy, ch[2]] for ch, _ in shortlist for dy in (1, 2)],
+                dim,
+            )
+        attempts, last_nav_err = 0, None
+        for chosen, dest in shortlist:
             try:
-                if any(not is_clear_space(ex.client.get_block([chosen[0], chosen[1] + dy, chosen[2]])) for dy in (1, 2)):
+                if any(not is_clear_space(_get_block(ex, vc_head, [chosen[0], chosen[1] + dy, chosen[2]], dim)) for dy in (1, 2)):
                     continue
             except ApiError as e:
                 if e.code == "not_loaded":
