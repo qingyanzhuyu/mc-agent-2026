@@ -361,6 +361,57 @@ class ScoutRecoveryTests(unittest.TestCase):
         self.assertIn("place", ops)
         self.assertGreaterEqual(state.pos[1], 64.0)
 
+    def test_official_goal_near_rng_does_not_cause_step_up_fake_success(self):
+        # 复现官方服实测 264.9s->265.9s 缺陷：GoalNear(rng=1) 在水平距 0.8 <= rng 时原地返 ok=true 导致搭块后跳不上去；
+        # 且地下洞穴 cands 仅含同层不可达石块（high_stand_ys 为空、attempts=1）时仍须立即触发多层搭路爬升而非水平来回走。
+        import math
+
+        class OfficialGoalNearWorld(ScoutFailureWorld):
+            def move_to(self, *args, **kwargs):
+                dest = list(kwargs["pos"])
+                rng = float(kwargs.get("rng", 1))
+                cur = list(self.st["pos"])
+                if tuple(dest) not in self.failures and math.hypot(dest[0] - cur[0], dest[2] - cur[2]) <= rng:
+                    self.calls.append(("move_to", {"pos": dest, "rng": rng}))
+                    return {"pos": cur}
+                return super().move_to(*args, **kwargs)
+
+        blocks = {
+            (6, 52, 0): "stone",  # 仅同层不可达石块候选（standing Y=53，high_stand_ys 为空）
+            (0, 52, 0): "stone",
+            (1, 52, 0): "stone",
+        }
+        for y in (52, 53, 54, 55):
+            for x, z in ((-1, 0), (2, 0), (0, -1), (1, -1), (0, 1), (1, 1)):
+                blocks[(x, y, z)] = "stone"
+        world = OfficialGoalNearWorld(blocks=blocks, failures={(6.5, 53, 0.5): "path_not_found"})
+        world.st["pos"] = [0.7, 53.0, 0.5]  # 距 [1.5, 54, 0.5] 水平仅 0.8 格
+        world.items["cobblestone"] = 12
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertGreaterEqual(len([s for s in steps if s["op"] == "place"]), 3)
+        self.assertGreaterEqual(state.pos[1], 56.0)
+
+    def test_existing_one_block_ledge_does_not_stop_multi_layer_step_up(self):
+        # 复现两格来回打转场景：旁边 (1, 53, 0) 已有 1 块垫脚石，Phase 1 未挖方块仅走上 Y=54 后，
+        # 不得提前终止而跳过 Phase 2，必须继续两列交替 step_up_1x2 往上搭到坑沿 Y=57。
+        blocks = {
+            (6, 52, 0): "stone",
+            (0, 52, 0): "stone",
+            (1, 52, 0): "stone",
+            (1, 53, 0): "cobblestone",  # 上一轮留下的 1 块垫脚石
+        }
+        for y in (52, 53, 54, 55, 56):
+            for x, z in ((-1, 0), (2, 0), (0, -1), (1, -1), (0, 1), (1, 1)):
+                blocks[(x, y, z)] = "stone"
+        world = ScoutFailureWorld(blocks=blocks, failures={(6.5, 53, 0.5): "path_not_found"})
+        world.st["pos"] = [0.5, 53.0, 0.5]
+        world.items["cobblestone"] = 12
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertIn("place", [s["op"] for s in steps])
+        self.assertGreaterEqual(state.pos[1], 57.0)
+
 
 if __name__ == "__main__":
     unittest.main()

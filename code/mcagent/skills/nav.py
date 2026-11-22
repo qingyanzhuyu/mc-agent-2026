@@ -240,7 +240,7 @@ def step_up_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos],
         vert = cur[1] < pos[1] + 1.0 and cur[1] + PLAYER_HEIGHT > pos[1]
         if horiz and vert and last is not None:
             top = [last[0] + 0.5, last[1] + 1, last[2] + 0.5]
-            yield rec("step_up_to", ex.move_to(pos=top, rng=1, timeout=20.0, retries=0), pos=top)
+            yield rec("step_up_to", ex.move_to(pos=top, rng=0.4, timeout=20.0, retries=0), pos=top)
         if block_name(ex, pos) in AIR:
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
