@@ -2242,6 +2242,65 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
             pass
         self.assertEqual(w.order, ["equip:stone_pickaxe", "dig:stone_pickaxe"])
 
+    def test_seg24_iron_excluded_persists_across_chunks_and_blacklists_same_vein_cluster(self) -> None:
+        # 复现 seg-24 10 分钟采铁空转：[-7, 5, 49] 超时后必须联动拉黑紧邻同矿脉 [-7, 5, 48]，
+        # 且跨区块移动后不可清空 _SESSION_EXCLUDED，避免回主矿井底部反复重试同一批死矿
+        from mcagent.client import ApiError
+        from mcagent.skills.iron import SmeltIron, _session_excluded_for, reset_iron_memo
+
+        reset_iron_memo()
+        self.addCleanup(reset_iron_memo)
+
+        class _UnreachableVeinWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(
+                    blocks={
+                        (-7, 5, 49): "iron_ore",
+                        (-7, 5, 48): "iron_ore",
+                        (3, 15, 50): "stone",
+                        (3, 16, 50): "air",
+                        (3, 17, 50): "air",
+                    },
+                    pos=[3.5, 16.0, 50.5],
+                    items={"stone_pickaxe": 1, "furnace": 1, "coal": 4},
+                )
+                self.st.update(dimension="overworld", ready=True, alive=True, health=18.0, food=18, on_ground=True)
+                self.move_targets: list[tuple[list, float]] = []
+
+            def find_blocks(self, types=None, radius=32, limit=64, **kwargs):
+                return {
+                    "blocks": [
+                        {"name": "iron_ore", "pos": [-7, 5, 49], "dist": 14.9},
+                        {"name": "iron_ore", "pos": [-7, 5, 48], "dist": 15.1},
+                    ]
+                }
+
+            def move_to(self, x=None, z=None, *, y=None, entity_id=None, rng=1, pos=None, timeout=None, **kwargs):
+                target = list(pos) if pos is not None else [x, y, z]
+                self.move_targets.append((target, float(timeout or 0.0)))
+                raise ApiError("timeout", "unreachable separate cavern")
+
+        w = _UnreachableVeinWorld()
+        ex, state = w.session()
+        skill = SmeltIron(count=3)
+        gen = skill._collect(ex, state)
+        try:
+            for _ in range(3):
+                next(gen)
+        except Exception:
+            pass
+        # 1) 远距/深层跨洞矿 move_to 超时必须压紧至 <=12.0s
+        self.assertTrue(w.move_targets)
+        self.assertLessEqual(w.move_targets[0][1], 12.0, f"expected distant/deep ore timeout <=12s, got {w.move_targets}")
+        # 2) [-7, 5, 49] 超时后同矿脉 [-7, 5, 48] 必须联动拉黑，不再二次发起 move_to
+        excl = _session_excluded_for(ex.client, state, {"dimension": "overworld", "pos": [3.5, 16.0, 50.5]})
+        self.assertIn((-7, 5, 49), excl)
+        self.assertIn((-7, 5, 48), excl)
+        # 3) 跨区块后（[-34, 61, 52]）仍保留不可达矿点黑名单
+        excl_other_chunk = _session_excluded_for(ex.client, state, {"dimension": "overworld", "pos": [-34.5, 61.0, 52.3]})
+        self.assertIn((-7, 5, 49), excl_other_chunk)
+        self.assertIn((-7, 5, 48), excl_other_chunk)
+
 
 if __name__ == "__main__":
     unittest.main()

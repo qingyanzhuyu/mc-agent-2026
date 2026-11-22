@@ -262,9 +262,10 @@ def _record_station(state: "State", kind: str, pos, dimension: str = "overworld"
 
 
 def _session_excluded_for(client: object, state: "State", status: dict) -> set[tuple[int, int, int]]:
-    cur = status.get("pos") or state.pos
+    # 按 (维度, 生命期) 共享不可达矿点黑名单，不随跨区块清空：
+    # 防止 scout_island 挪出 1 区块后 navigate_to_shaft 回到同一矿井反复重试同一批死矿浪费 10 分钟。
     deaths = tuple(state.deaths)
-    scope = (status.get("dimension"), math.floor(cur[0] / 16), math.floor(cur[2] / 16), deaths[-1:])
+    scope = (status.get("dimension"), deaths[-1:])
     entry = _SESSION_EXCLUDED.get(client)
     if entry is None or entry[0] != scope:
         fresh: set[tuple[int, int, int]] = set()
@@ -400,7 +401,9 @@ class SmeltIron(Skill):
                 cur = status.get("pos") or state.pos
                 stance = status if status.get("pos") is not None else cur
             if not can_reach_block(ex, stance, pos, reach=MINING_REACH):
-                yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=30.0), pos=pos)
+                distant_or_deep = eye_to_block_dist(stance, pos) > 14.0 or abs(pos[1] - cur[1]) > 5.0
+                move_timeout = 12.0 if distant_or_deep else 30.0
+                yield rec("move_to", _bounded_move_to(ex, pos, rng=2, timeout=move_timeout), pos=pos)
                 status = state.refresh_status(ex.client, max_age_s=0)
                 if (reach_mod is not None and hasattr(reach_mod, "settle_dry_landing")
                         and not status.get("on_ground")
@@ -790,7 +793,12 @@ class SmeltIron(Skill):
             if (best_pickaxe(state) not in STONE_OR_BETTER_PICKS
                     or not self._ore_candidates(ex, state, radius=8, excluded=excluded, max_dy=4.0)):
                 return
-        route_failures = len(excluded)
+        cur_col = (status.get("pos") or state.pos) if isinstance(status, dict) else state.pos
+        route_failures = (
+            sum(1 for p in excluded if math.hypot(p[0] - cur_col[0], p[2] - cur_col[2]) <= 32.0)
+            if isinstance(cur_col, (list, tuple)) and len(cur_col) >= 3
+            else len(excluded)
+        )
         checked_wide_shallow = False
         for _ in range(self.args["count"] + MAX_ORE_ROUTE_FAILURES + 4):
             # 同一深洞常返回多块矿。直达预算用完后，只试一次 64 格浅表露矿便切入近场阶梯探矿。
@@ -862,12 +870,31 @@ class SmeltIron(Skill):
                 excluded.add(tuple(pos))
                 err_st = state.refresh_status(ex.client, max_age_s=0)
                 err_cur = err_st.get("pos") or state.pos
-                voxel_cache_for(state).mark_unreachable(
-                    "smelt_iron",
-                    pos,
-                    dimension=str(err_st.get("dimension") or "overworld"),
-                    stance_cell=tuple(map(math.floor, err_cur)),
-                )
+                err_dim = str(err_st.get("dimension") or "overworld")
+                vc_err = voxel_cache_for(state)
+                if code in ("timeout", "move_timeout", "stalled"):
+                    # 慢速路由超时/卡停（如跨洞深矿 [-7, 5, 49]）：联动拉黑同矿脉簇（<=3.5 格）并以非站位绑定 TTL=180s 记忆，
+                    # 防止逐块重试紧邻同矿脉 [-7, 5, 48] 浪费数分钟；快失败 path_not_found / dig_skip 仍仅拉黑单块。
+                    vein_cluster = [pos] + [
+                        c for c in candidates
+                        if tuple(c) != tuple(pos) and math.dist(c, pos) <= 3.5
+                    ]
+                    for vp in vein_cluster:
+                        excluded.add(tuple(vp))
+                        vc_err.mark_unreachable(
+                            "smelt_iron",
+                            vp,
+                            dimension=err_dim,
+                            stance_cell=None,
+                            ttl_s=180.0,
+                        )
+                else:
+                    vc_err.mark_unreachable(
+                        "smelt_iron",
+                        pos,
+                        dimension=err_dim,
+                        stance_cell=tuple(map(math.floor, err_cur)),
+                    )
                 route_failures += 1
                 yield rec("ore_route_skip", pos=pos, error_code=code)
                 state.refresh_inventory(ex.client)
