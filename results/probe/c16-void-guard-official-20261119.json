@@ -1,0 +1,311 @@
+{
+  "ts": "2026-11-19 04:36:07",
+  "source": "official",
+  "base": "https://apiin.nmo.net.cn/api/v1",
+  "max_rps": 16.0,
+  "total_monitor_ticks": 12,
+  "support_populated_ticks": 12,
+  "void_risk_false_positives": 0,
+  "false_positive_rate": 0.0,
+  "tick_p50_ms": 223.2,
+  "tick_max_ms": 1046.3,
+  "moves": [
+    {
+      "i": 1,
+      "target": [
+        13039.5,
+        64.0,
+        -5894.5
+      ],
+      "ok": true,
+      "ms": 1452.6,
+      "pos": [
+        13038.5,
+        64,
+        -5894.5
+      ]
+    },
+    {
+      "i": 2,
+      "target": [
+        13039.5,
+        64.0,
+        -5888.5
+      ],
+      "ok": true,
+      "ms": 1192.9,
+      "pos": [
+        13039.3,
+        64,
+        -5889.6
+      ]
+    },
+    {
+      "i": 3,
+      "target": [
+        13033.5,
+        64.0,
+        -5888.5
+      ],
+      "ok": true,
+      "ms": 1077.1,
+      "pos": [
+        13034.6,
+        64,
+        -5888.5
+      ]
+    },
+    {
+      "i": 4,
+      "target": [
+        13029.5,
+        65.0,
+        -5892.5
+      ],
+      "ok": true,
+      "ms": 1541.6,
+      "pos": [
+        13029.5,
+        65,
+        -5892.5
+      ]
+    },
+    {
+      "i": 5,
+      "target": [
+        13033.5,
+        64.0,
+        -5894.5
+      ],
+      "ok": true,
+      "ms": 1391.5,
+      "pos": [
+        13033.5,
+        64,
+        -5894.5
+      ]
+    },
+    {
+      "i": "jump_test",
+      "ok": true
+    }
+  ],
+  "false_stops": [],
+  "samples_head": [
+    {
+      "t": 486158.013,
+      "tick_ms": 697.0,
+      "pos": [
+        13033.5,
+        64,
+        -5894.4
+      ],
+      "vel": [
+        0,
+        0,
+        0
+      ],
+      "on_ground": true,
+      "support": {
+        "pos": [
+          13033,
+          63,
+          -5895
+        ],
+        "status_pos": [
+          13033.5,
+          64,
+          -5894.4
+        ],
+        "block": {
+          "name": "grass_block",
+          "pos": [
+            13033,
+            63,
+            -5895
+          ],
+          "properties": {
+            "snowy": false
+          },
+          "diggable": true,
+          "hardness": 0.6,
+          "harvest_tool_ok": true
+        },
+        "at": 486157.658440051
+      },
+      "hazard": null
+    },
+    {
+      "t": 486159.363,
+      "tick_ms": 1046.3,
+      "pos": [
+        13033.5,
+        64,
+        -5894.4
+      ],
+      "vel": [
+        0,
+        0,
+        0
+      ],
+      "on_ground": true,
+      "support": {
+        "pos": [
+          13033,
+          63,
+          -5895
+        ],
+        "status_pos": [
+          13033.5,
+          64,
+          -5894.4
+        ],
+        "block": {
+          "name": "grass_block",
+          "pos": [
+            13033,
+            63,
+            -5895
+          ],
+          "properties": {
+            "snowy": false
+          },
+          "diggable": true,
+          "hardness": 0.6,
+          "harvest_tool_ok": true
+        },
+        "at": 486159.280910969
+      },
+      "hazard": null
+    },
+    {
+      "t": 486160.353,
+      "tick_ms": 979.9,
+      "pos": [
+        13033.5,
+        64,
+        -5894.4
+      ],
+      "vel": [
+        0,
+        0,
+        0
+      ],
+      "on_ground": true,
+      "support": {
+        "pos": [
+          13033,
+          63,
+          -5895
+        ],
+        "status_pos": [
+          13033.5,
+          64,
+          -5894.4
+        ],
+        "block": {
+          "name": "grass_block",
+          "pos": [
+            13033,
+            63,
+            -5895
+          ],
+          "properties": {
+            "snowy": false
+          },
+          "diggable": true,
+          "hardness": 0.6,
+          "harvest_tool_ok": true
+        },
+        "at": 486160.298181791
+      },
+      "hazard": null
+    },
+    {
+      "t": 486160.479,
+      "tick_ms": 106.1,
+      "pos": [
+        13033.5,
+        64,
+        -5894.4
+      ],
+      "vel": [
+        0,
+        0,
+        0
+      ],
+      "on_ground": true,
+      "support": {
+        "pos": [
+          13033,
+          63,
+          -5895
+        ],
+        "status_pos": [
+          13033.5,
+          64,
+          -5894.4
+        ],
+        "block": {
+          "name": "grass_block",
+          "pos": [
+            13033,
+            63,
+            -5895
+          ],
+          "properties": {
+            "snowy": false
+          },
+          "diggable": true,
+          "hardness": 0.6,
+          "harvest_tool_ok": true
+        },
+        "at": 486160.412587151
+      },
+      "hazard": null
+    },
+    {
+      "t": 486161.505,
+      "tick_ms": 131.2,
+      "pos": [
+        13038,
+        64,
+        -5893.7
+      ],
+      "vel": [
+        4.231,
+        0,
+        0
+      ],
+      "on_ground": true,
+      "support": {
+        "pos": [
+          13038,
+          63,
+          -5894
+        ],
+        "status_pos": [
+          13038,
+          64,
+          -5893.7
+        ],
+        "block": {
+          "name": "grass_block",
+          "pos": [
+            13038,
+            63,
+            -5894
+          ],
+          "properties": {
+            "snowy": false
+          },
+          "diggable": true,
+          "hardness": 0.6,
+          "harvest_tool_ok": true
+        },
+        "at": 486161.442779704
+      },
+      "hazard": null
+    }
+  ]
+}

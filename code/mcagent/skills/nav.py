@@ -13,7 +13,7 @@ probe 用 `for rec in ...` 收集证据。它们不进注册表，模型选不�
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Generator, Iterator, Optional, Sequence
 
 from ..client import ApiError
 from ..runtime import Fatal, Replan
@@ -22,6 +22,7 @@ from .items import (
     AIR,
     NAV_FAIL_CODES,
     PASSABLE_COVER,
+    PLACEABLE_BLOCKS,
     bare,
     best_pickaxe,
     block_name,
@@ -30,6 +31,8 @@ from .items import (
     pick_placeable,
     total_placeable,
 )
+from .sightline import eye_to_block_dist
+from .voxel_cache import voxel_cache_for
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -181,6 +184,10 @@ def _release_sneak(ex: "Executor") -> None:
         pass  # 收尾不能再抛：这里可能正处在抢占路径上
 
 
+def _invalidate_voxel(state: "State", pos: Pos) -> None:
+    voxel_cache_for(state).invalidate(pos, dimension=str((state.st or {}).get("dimension") or "overworld"))
+
+
 def breach_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos]) -> Iterator[dict]:
     """换上最好的镐，按顺序挖开 `blocks`（通常是挡路的上、下两格）。已是空气的格跳过。"""
     state.refresh_inventory(ex.client)
@@ -190,7 +197,9 @@ def breach_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos]) -> Iterato
     for pos in blocks:
         name = block_name(ex, pos)
         if name and name not in AIR:
-            yield rec("dig", ex.dig(pos), pos=pos)
+            res = ex.dig(pos)
+            _invalidate_voxel(state, pos)
+            yield rec("dig", res, pos=pos)
 
 
 def sneak_bridge(ex: "Executor", state: "State", blocks: Sequence[Pos],
@@ -209,7 +218,9 @@ def sneak_bridge(ex: "Executor", state: "State", blocks: Sequence[Pos],
                 ex.posture(sneak=True)
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
-            yield rec("place", ex.place(block, pos), item=block, pos=pos)
+            res = ex.place(block, pos)
+            _invalidate_voxel(state, pos)
+            yield rec("place", res, item=block, pos=pos)
     finally:
         _release_sneak(ex)
     yield {"op": "posture", "sneak": False}
@@ -233,7 +244,9 @@ def step_up_1x2(ex: "Executor", state: "State", blocks: Sequence[Pos],
         if block_name(ex, pos) in AIR:
             state.refresh_inventory(ex.client)
             block = pick_placeable(state, item)
-            yield rec("place", ex.place(block, pos), item=block, pos=pos)
+            res = ex.place(block, pos)
+            _invalidate_voxel(state, pos)
+            yield rec("place", res, item=block, pos=pos)
         last = list(pos)
 
 
@@ -268,6 +281,7 @@ def recover_move(
         ):
             try:
                 res = ex.dig(pos)
+                _invalidate_voxel(state, pos)
                 yield rec("dig", res, pos=pos)
             except Replan as e:
                 if _is_preemption(e):
@@ -408,6 +422,7 @@ def recover_move(
                     dig_ok = True
                     try:
                         res = ex.dig([ax, fy, az])
+                        _invalidate_voxel(state, [ax, fy, az])
                         yield rec("dig", res, pos=[ax, fy, az])
                     except Replan as e:
                         if _is_preemption(e):
@@ -501,3 +516,100 @@ def recover_move(
                     bridge_cells.append([cx, fy - 1, cz])
                 else:
                     break
+
+
+_SOLID_FLOOR: frozenset[str] = frozenset(PLACEABLE_BLOCKS) | {
+    "grass_block",
+    "coarse_dirt",
+    "deepslate",
+}
+
+
+def _supported(ex: "Executor", pos: Pos) -> bool:
+    """检查玩家脚下四个碰撞角是否均踩在实体方块上。"""
+    x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+    floor_y = math.floor(y - 0.01)
+    footprint = {
+        (math.floor(x + dx), floor_y, math.floor(z + dz))
+        for dx in (-0.35, 0.35)
+        for dz in (-0.35, 0.35)
+    }
+    try:
+        return all(
+            block_name(ex, [px, py, pz]) in _SOLID_FLOOR
+            for px, py, pz in sorted(footprint)
+        )
+    except ApiError as e:
+        if e.code in ("not_loaded", "not_ready"):
+            return False
+        raise
+
+
+def _dig_stand(ex: "Executor", cur: Pos, target: Pos) -> Optional[list[float]]:
+    """从当前格四邻寻找距离目标更近且脚下有支撑、头脚空间为空气的站位。"""
+    x, y, z = map(math.floor, cur)
+    tx, tz = math.floor(target[0]), math.floor(target[2])
+    sides = [(x + dx, z + dz) for dx, dz in _CARDINAL_DIRS]
+    sides.sort(
+        key=lambda p: eye_to_block_dist([p[0] + 0.5, float(y), p[1] + 0.5], target, sneaking=False)
+    )
+    for sx, sz in sides:
+        stand = [sx + 0.5, float(y), sz + 0.5]
+        if (sx, sz) == (tx, tz):
+            continue
+        if eye_to_block_dist(stand, target, sneaking=False) > 4.0:
+            continue
+        try:
+            if _supported(ex, stand) and all(
+                block_name(ex, [sx, y + dy, sz]) in AIR for dy in (0, 1)
+            ):
+                return stand
+        except ApiError as e:
+            if e.code not in ("not_loaded", "not_ready"):
+                raise
+    return None
+
+
+def dig_with_recovery(
+    ex: "Executor",
+    state: "State",
+    pos: Pos,
+    *,
+    collect: bool = True,
+) -> Generator[dict, None, dict]:
+    """上游 §4.2：未确认挖掉时，只在实际换到安全站位、目标仍在的情况下重挖一次。"""
+    try:
+        result = ex.dig(pos, collect=collect)
+    except Replan as e:
+        code, _ = failure(e)
+        if code != "dig_unconfirmed":
+            raise
+        yield rec("dig", pos=pos, error_code=code)
+        st = state.refresh_status(ex.client, max_age_s=0)
+        cur = st.get("pos")
+        if (
+            not cur or not st.get("ready") or not st.get("alive", True) or st.get("sneaking")
+            or st.get("on_ground") is not True or st.get("in_water") or st.get("in_lava")
+            or not _supported(ex, cur)
+        ):
+            raise
+        target_name = block_name(ex, pos)
+        if not target_name or target_name in AIR:
+            raise
+        stand = _dig_stand(ex, cur, pos)
+        if stand is None:
+            raise
+        yield rec("move_to", ex.move_to(pos=stand, rng=0.35), pos=stand)
+        after = state.refresh_status(ex.client, max_age_s=0)
+        arrived = after.get("pos")
+        if (
+            not arrived or not after.get("ready") or not after.get("alive", True)
+            or after.get("on_ground") is not True
+            or after.get("dimension") != st.get("dimension")
+            or math.dist(arrived, stand) > 0.35 or block_name(ex, pos) != target_name
+        ):
+            raise
+        result = ex.dig(pos, collect=collect)
+    _invalidate_voxel(state, pos)
+    yield rec("dig", result, pos=pos)
+    return result

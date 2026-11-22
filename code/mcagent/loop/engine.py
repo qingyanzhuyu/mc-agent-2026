@@ -8,17 +8,20 @@
 """
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..client import FATAL, ApiError, Client
-from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint
+from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint, has_equipped_armor
 from ..skills.base import Skill, failure
+from ..skills.items import bare
+from ..skills.world_memo import STRUCTURE_FINGERPRINTS, entity_landmark_tags, memo_for, structure_tags_for
 from .auditor import SoakObserver
 from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
-from .policy import CampaignPlanner
+from .policy import CampaignPlanner, PlanDecision
 
 
 @dataclass
@@ -27,8 +30,9 @@ class LoopConfig:
     max_steps: int = 0            # 0 = 不限步数（按时间或信号停止）
     max_seconds: float = 0.0      # 0 = 不限时（正式赛可设 28800 = 8h）
     max_deaths: int = 0           # 0 = 不限死亡次数（持续自愈重来）
-    idle_sleep_s: float = 1.0
-    respawn_poll_s: float = 1.0
+    stop_on_death: bool = False   # True = 检测到真实死亡时记录死亡上下文并立即干净退出
+    idle_sleep_s: float = 0.2
+    respawn_poll_s: float = 0.1
     respawn_timeout_s: float = 90.0
     enable_monitor: bool = True
     disconnect_on_exit: bool = False
@@ -41,10 +45,71 @@ class LoopConfig:
     outage_limit_s: float = 600.0      # 连续故障超过此时长才停机；0 = 永不因此停机
     continuous_observe: bool = True
     async_observe_for_llm: bool = True
+    checkpoint_path: Optional[str] = None
+    failure_cooldown_cap_s: Optional[float] = None
+    enable_roadside_scan: bool = True
+    roadside_scan_interval_s: float = 5.0
+    roadside_scan_radius: int = 48
+    roadside_scan_limit: int = 64
+    roadside_scan_move_dist: float = 8.0
 
 
 # 会话级错误：交给 `_recover_session_or_respawn` 处理，而不是按瞬时故障退避
 SESSION_CODES: frozenset[str] = frozenset({"dead", "not_connected", "wrong_server", "death_loop_cooldown"})
+
+# 沿途低频增量扫描：按维度分组的结构指纹标签与高价值机会实体白名单
+_ROADSIDE_DIM_STRUCTURES: dict[str, tuple[str, ...]] = {
+    "overworld": (
+        "village", "stronghold", "ruined_portal", "bee_nest", "trial_chambers",
+        "deep_dark", "archaeology", "powder_snow", "lush_caves",
+        "amethyst_geode", "pale_garden", "pillager_outpost",
+        "meadow", "swamp", "mangrove_swamp",
+    ),
+    "the_nether": (
+        "nether_fortress", "bastion_remnant", "ruined_portal", "dried_ghast",
+    ),
+    "the_end": (
+        "end_city",
+    ),
+}
+_ROADSIDE_OPPORTUNITY_ENTITIES: tuple[str, ...] = (
+    "wandering_trader",
+    "zombie_villager",
+    "villager",
+    "pillager",
+    "allay",
+    "breeze",
+    "axolotl",
+    "goat",
+    "tadpole",
+    "frog",
+    "armadillo",
+    "shulker",
+    "parrot",
+    "ghast",
+    "blaze",
+    "wither_skeleton",
+    "piglin_brute",
+)
+_ROADSIDE_OPPORTUNITY_ENTITY_SET: frozenset[str] = frozenset(_ROADSIDE_OPPORTUNITY_ENTITIES)
+
+
+def _roadside_structure_blocks(dimension: str) -> list[str]:
+    dim = bare(dimension).strip().lower() or "overworld"
+    if "nether" in dim:
+        bucket = "the_nether"
+    elif "end" in dim:
+        bucket = "the_end"
+    else:
+        bucket = "overworld"
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for tag in _ROADSIDE_DIM_STRUCTURES.get(bucket, ()):
+        for bname in STRUCTURE_FINGERPRINTS.get(tag, ()):
+            if bname not in seen:
+                seen.add(bname)
+                blocks.append(bname)
+    return blocks
 
 
 @dataclass
@@ -72,7 +137,7 @@ class MainLoop:
         observer: Optional[SoakObserver] = None,
         safety: Optional[Safety] = None,
         log=print,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Optional[Callable[[float], None]] = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.client = client
@@ -87,10 +152,373 @@ class MainLoop:
         self._path_failures: dict[str, int] = {}
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
-        self._sleep = sleep
+        self._custom_sleep = sleep
+        self._sleep = self._do_sleep
         self._clock = clock
         self._outage_since: Optional[float] = None
         self.transient_faults = 0
+        # 3 层同位冷却空转脱困状态机（normal -> local_retry -> relocate -> goal_abandoned）
+        self._idle_spin_count: int = 0
+        self._idle_spin_pos: Optional[tuple[float, float, float]] = None
+        self._failure_tier: int = 0
+        self._failure_tier_pos: Optional[tuple[float, float, float]] = None
+        self.failure_tier_state: str = "normal"
+        self.failure_escalations: list[str] = []
+        self._relocated_cells: set[tuple[str, int, int]] = set()
+        self._checkpoint_achieved_goals: set[str] = set()
+        self._last_roadside_scan_at: float = float(self._clock())
+        self._last_roadside_scan_pos: Optional[tuple[float, float, float]] = self._pos_tuple(self.state)
+        self._last_roadside_scan_dim: Optional[str] = (
+            str(self.state.st.get("dimension") or "overworld") if self.state.st else None
+        )
+        self._unreleased_busy_streak: int = 0
+
+    def _recover_stuck_busy_session(self) -> bool:
+        """连续多次 /stop 仍未释放服务端 busy 锁时，执行 /disconnect + 重连自愈，防整场僵死。"""
+        disconnect_fn = getattr(self.client, "disconnect", None)
+        connect_fn = getattr(self.client, "connect", None)
+        wait_fn = getattr(self.client, "wait_ready", None)
+        if not (callable(disconnect_fn) and callable(connect_fn) and callable(wait_fn)):
+            return False
+        self.log(
+            f"[loop] 连续 {self._unreleased_busy_streak} 次 /stop 未释放服务端 busy 锁，执行 /disconnect + 重连自愈..."
+        )
+        try:
+            disconnect_fn()
+        except Exception as e:
+            self.log(f"[loop] 自愈断开忽略异常: {e}")
+        try:
+            connect_fn(timeout=20)
+            st = wait_fn(timeout=60)
+            if isinstance(st, dict) and st:
+                self.state.set_status(st)
+            self.state.invalidate_inventory()
+            self.state.refresh_inventory(self.client)
+            self.state.drain(self.client)
+            self._unreleased_busy_streak = 0
+            self.log(f"[loop] busy 死锁重连自愈完成: pos={self.state.pos}")
+            return True
+        except ApiError as e:
+            if e.kind == FATAL:
+                raise
+            self.log(f"[loop] busy 死锁重连失败，交由下一拍继续恢复: {e}")
+            return False
+        except Exception as e:
+            self.log(f"[loop] busy 死锁重连异常，交由下一拍继续恢复: {e}")
+            return False
+
+    def _do_sleep(self, seconds: float) -> None:
+        if self._custom_sleep is not None:
+            self._custom_sleep(seconds)
+        else:
+            time.sleep(seconds)
+
+    @staticmethod
+    def _pos_tuple(state: State) -> Optional[tuple[float, float, float]]:
+        pos = state.st.get("pos")
+        if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+            try:
+                vals = (float(pos[0]), float(pos[1]), float(pos[2]))
+                if all(math.isfinite(v) for v in vals):
+                    return vals
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @classmethod
+    def _cell_key(cls, state: State) -> tuple[str, int, int]:
+        pos = cls._pos_tuple(state)
+        dim = str(state.st.get("dimension") or "overworld")
+        if pos is None:
+            return dim, 0, 0
+        return dim, math.floor(pos[0] / 4.0), math.floor(pos[2] / 4.0)
+
+    def _reset_failure_tier(self, pos: Optional[tuple[float, float, float]] = None) -> None:
+        self._idle_spin_count = 0
+        self._idle_spin_pos = pos
+        self._failure_tier = 0
+        self._failure_tier_pos = pos
+        self.failure_tier_state = "normal"
+
+    def _load_checkpoint_if_configured(self) -> None:
+        path = self.config.checkpoint_path
+        if not path:
+            return
+        try:
+            from ..skills.world_memo import memo_for
+            loader = getattr(memo_for(self.state), "load_checkpoint", None)
+            if callable(loader):
+                loader(path)
+        except Exception as e:
+            self.log(f"[loop] 加载检查点失败 ({path}): {e}")
+
+    def _save_checkpoint_if_configured(self) -> None:
+        path = self.config.checkpoint_path
+        if not path:
+            return
+        try:
+            from ..skills.world_memo import memo_for
+            saver = getattr(memo_for(self.state), "save_checkpoint", None)
+            if callable(saver):
+                saver(path)
+        except Exception as e:
+            self.log(f"[loop] 保存检查点失败 ({path}): {e}")
+
+    def _maybe_save_checkpoint_on_goal_progress(self, *, force: bool = False) -> None:
+        if not self.config.checkpoint_path:
+            return
+        completed_advs = set(self._server_advancements)
+        if self.observer is not None:
+            completed_advs.update(self.observer.server_advancements)
+        if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "completed_advancements"):
+            completed_advs.update(self.planner.rules.completed_advancements)
+        active = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()
+        newly_achieved = False
+        for g in active:
+            if g.id not in self._checkpoint_achieved_goals and is_goal_achieved(g, self.state, completed_advs):
+                self._checkpoint_achieved_goals.add(g.id)
+                newly_achieved = True
+        if force or newly_achieved:
+            self._save_checkpoint_if_configured()
+
+    def _record_current_biome(self) -> Optional[str]:
+        """零额外 HTTP 成本：直接从当前 `/status` 快照将脚下群系及锚点坐标写入 `WorldResourceMemo`。"""
+        if not self.state.ready or self._is_dead_now():
+            return None
+        st = self.state.st or {}
+        raw_biome = st.get("biome")
+        if not isinstance(raw_biome, str) or not raw_biome.strip():
+            return None
+        dim = str(st.get("dimension") or "overworld")
+        pos = self._pos_tuple(self.state)
+        try:
+            if memo_for(self.state).record_biome(raw_biome, pos=pos, dimension=dim):
+                return bare(raw_biome).strip().lower()
+        except Exception:
+            return None
+        return None
+
+    def _maybe_roadside_scan(self, force: bool = False) -> list[str]:
+        """技能完成边界的沿途增量扫描：满足时间间隔或位移>=8格/切维度时探测附近结构指纹与高价值机会实体。"""
+        if not self.config.enable_roadside_scan:
+            return []
+        if not self.state.ready or self._is_dead_now():
+            return []
+        now = float(self._clock())
+        dim = str(self.state.st.get("dimension") or "overworld")
+        cur_pos = self._pos_tuple(self.state)
+        if self._last_roadside_scan_pos is None and cur_pos is not None:
+            self._last_roadside_scan_pos = cur_pos
+            self._last_roadside_scan_dim = dim
+        move_dist = max(0.0, float(self.config.roadside_scan_move_dist))
+        moved_trigger = False
+        if move_dist > 0 and cur_pos is not None and self._last_roadside_scan_pos is not None:
+            if self._last_roadside_scan_dim is not None and dim != self._last_roadside_scan_dim:
+                moved_trigger = True
+            elif math.dist(cur_pos, self._last_roadside_scan_pos) >= move_dist:
+                moved_trigger = True
+        interval_s = max(0.0, float(self.config.roadside_scan_interval_s))
+        if not force and not moved_trigger and (now - self._last_roadside_scan_at) < interval_s:
+            return []
+        self._last_roadside_scan_at = now
+        self._last_roadside_scan_pos = cur_pos
+        self._last_roadside_scan_dim = dim
+
+        radius = max(1, int(self.config.roadside_scan_radius))
+        limit = max(1, int(self.config.roadside_scan_limit))
+        memo = memo_for(self.state)
+        newly_recorded: list[str] = []
+        if new_biome := self._record_current_biome():
+            newly_recorded.append(new_biome)
+
+        find_blocks = getattr(self.client, "find_blocks", None)
+        if callable(find_blocks):
+            block_types = _roadside_structure_blocks(dim)
+            if block_types:
+                resp = None
+                try:
+                    resp = find_blocks(types=block_types, radius=radius, limit=limit)
+                except ApiError as e:
+                    if e.kind == FATAL:
+                        raise
+                except Exception:
+                    resp = None
+                if isinstance(resp, dict):
+                    payload = (
+                        resp.get("result")
+                        if "blocks" not in resp and isinstance(resp.get("result"), dict)
+                        else resp
+                    )
+                    blocks = payload.get("blocks")
+                    rows: list[tuple[object, object]] = []
+                    if isinstance(blocks, list):
+                        for item in blocks:
+                            if isinstance(item, dict):
+                                rows.append((item.get("name"), item.get("pos")))
+                    elif isinstance(blocks, dict):
+                        for bname, info in blocks.items():
+                            if isinstance(info, dict):
+                                rows.append((
+                                    bname,
+                                    info.get("nearest") if info.get("nearest") is not None else info.get("pos"),
+                                ))
+                    for raw_name, raw_pos in rows:
+                        bname = bare(raw_name).strip().lower() if raw_name else ""
+                        if not bname or raw_pos is None:
+                            continue
+                        for tag in structure_tags_for((bname,)):
+                            try:
+                                if memo.record_landmark(
+                                    tag, raw_pos, dimension=dim,
+                                    meta={"block": bname, "source": "roadside_scan"},
+                                ):
+                                    newly_recorded.append(tag)
+                            except Exception:
+                                continue
+
+        get_entities = getattr(self.client, "get_entities", None)
+        if callable(get_entities):
+            resp = None
+            try:
+                resp = get_entities(radius=radius, types=list(_ROADSIDE_OPPORTUNITY_ENTITIES))
+            except ApiError as e:
+                if e.kind == FATAL:
+                    raise
+            except Exception:
+                resp = None
+            if isinstance(resp, dict):
+                payload = (
+                    resp.get("result")
+                    if "entities" not in resp and isinstance(resp.get("result"), dict)
+                    else resp
+                )
+                entities = payload.get("entities")
+                if isinstance(entities, list):
+                    for ent in entities:
+                        if not isinstance(ent, dict):
+                            continue
+                        pos = ent.get("pos")
+                        if pos is None:
+                            continue
+                        name = bare(ent.get("name")).strip().lower() if ent.get("name") else ""
+                        etype = bare(ent.get("type")).strip().lower() if ent.get("type") else ""
+                        kind = (
+                            name if name in _ROADSIDE_OPPORTUNITY_ENTITY_SET
+                            else (etype if etype in _ROADSIDE_OPPORTUNITY_ENTITY_SET else "")
+                        )
+                        if not kind:
+                            continue
+                        try:
+                            if memo.record_landmark(
+                                kind, pos, dimension=dim,
+                                meta={"entity": kind, "source": "roadside_scan"},
+                            ):
+                                newly_recorded.append(kind)
+                        except Exception:
+                            continue
+                        for mapped_tag in entity_landmark_tags(kind):
+                            if mapped_tag == kind:
+                                continue
+                            try:
+                                if memo.record_landmark(
+                                    mapped_tag, pos, dimension=dim,
+                                    meta={"entity": kind, "source": "roadside_scan"},
+                                ):
+                                    newly_recorded.append(mapped_tag)
+                            except Exception:
+                                continue
+
+        if newly_recorded:
+            self.log(f"[loop] 沿途增量扫描发现新地标: {', '.join(newly_recorded)}")
+        return newly_recorded
+
+    def _acknowledge_safety_intent(self, *, completed: bool) -> None:
+        raw = getattr(self.state, "safety_intent", None)
+        if raw is None:
+            return
+        should_clear = completed
+        if not should_clear:
+            st = self.state.snapshot()
+            kind = (
+                str(raw.get("kind") or raw.get("intent") or "").strip().lower()
+                if isinstance(raw, dict)
+                else (raw.strip().lower() if isinstance(raw, str) else "")
+            )
+            if kind in ("escape_lava", "lava") and not st.get("in_lava"):
+                should_clear = True
+            elif kind == "douse" and not st.get("on_fire") and not st.get("in_lava"):
+                should_clear = True
+            elif kind == "surface" and not st.get("in_water") and not st.get("submerged"):
+                should_clear = True
+        if should_clear:
+            setter = getattr(self.state, "set_safety_intent", None)
+            if callable(setter):
+                setter(None)
+            else:
+                self.state.safety_intent = None
+            if completed:
+                clear_hurt = getattr(self.state, "clear_recent_hurt", None)
+                if callable(clear_hurt):
+                    clear_hurt()
+
+    def _maybe_set_hurt_flee_intent(self, failed_name: str, extra: dict) -> None:
+        """非战斗技能受击中断且 18 格内有敌对生物（或刚遭远程箭矢命中）时，立即写入 flee 意图防原地/乱走被点死。"""
+        if failed_name == "emergency_escape":
+            return
+        if extra.get("cause", extra.get("interrupted_by")) != "hurt":
+            return
+        st = self.state.snapshot()
+        hostile = extra.get("nearest_hostile") or st.get("nearest_hostile")
+        hname = ""
+        hdist = 99.0
+        if isinstance(hostile, dict) and hostile:
+            try:
+                raw_d = float(hostile.get("dist", 99.0))
+                if math.isfinite(raw_d):
+                    hdist = raw_d
+            except (TypeError, ValueError):
+                hdist = 99.0
+            hname = bare(hostile.get("name") or "").strip().lower()
+        if not math.isfinite(hdist) or hdist > 18.0:
+            recent_hurt = self.state.get_recent_hurt(max_age_s=4.0) if hasattr(self.state, "get_recent_hurt") else None
+            if isinstance(recent_hurt, dict):
+                hurt_src = str(recent_hurt.get("source") or "").strip().lower()
+                src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
+                src_name = bare(src_ent.get("name") or "").strip().lower()
+                if hurt_src == "arrow" or src_name:
+                    hname = src_name or ("skeleton" if hurt_src == "arrow" else "hostile")
+                    hdist = min(hdist, 16.0)
+                else:
+                    return
+            else:
+                return
+        raw_hp = extra.get("health", st.get("health", 20.0))
+        try:
+            hp = float(raw_hp)
+        except (TypeError, ValueError):
+            hp = 20.0
+        combat_skills = {"hunt_mob", "deflect_skeleton_arrow", "shoot_mob", "fire_crossbow", "sniper_duel"}
+        if failed_name in combat_skills and hp > 12.0:
+            return
+        if has_equipped_armor(self.state) and hp > 16.0:
+            return
+        hname = hname or "hostile"
+        now = time.monotonic()
+        intent = {
+            "kind": "flee",
+            "why": f"受击应急脱险 {hname} 距离 {hdist:g}",
+            "severity": "soft",
+            "source": "hurt_interrupt",
+            "hostile": hname,
+            "dist": hdist,
+            "at": now,
+            "expires_at": now + 10.0,
+        }
+        setter = getattr(self.state, "set_safety_intent", None)
+        if callable(setter):
+            setter(intent)
+        else:
+            self.state.safety_intent = intent
 
     def _resolve_goal_spec(self, gid: str) -> Optional[GoalSpec]:
         if hasattr(self.planner, "rules") and hasattr(self.planner.rules, "ledger_map"):
@@ -144,6 +572,7 @@ class MainLoop:
             and self.config.async_observe_for_llm
             and self.state._status_booted
             and self.state._events_booted
+            and not getattr(monitor, "session_error", None)
         )
 
     # ---- 瞬时故障自愈 -------------------------------------------------
@@ -323,6 +752,21 @@ class MainLoop:
         cause = str(ld.get("cause") or "")
         death_pos = ld.get("pos")
         after_fp = _inv_fingerprint(inv) or {}
+        lost_items = {
+            k: int(v) - int(after_fp.get(k, 0))
+            for k, v in (pre_death_inv or {}).items()
+            if int(v) > int(after_fp.get(k, 0))
+        }
+        if isinstance(death_pos, (list, tuple)) and len(death_pos) >= 3:
+            try:
+                memo_for(self.state).record_death(
+                    death_pos,
+                    cause=cause,
+                    lost_items=lost_items,
+                    dimension=str(self.state.st.get("dimension") or "overworld"),
+                )
+            except Exception:
+                pass
         self.log(f"[loop] 重生就绪 ({respawn_ms:.0f}ms) pos={self.state.pos} cause={cause!r}")
 
         if self.observer is not None:
@@ -336,6 +780,70 @@ class MainLoop:
                 triggered_death_loop=triggered_death_loop,
             )
         return True
+
+    def _record_death_and_stop(
+        self,
+        pre_death_inv: dict[str, int],
+        *,
+        initial_err: Optional[ApiError] = None,
+        cause_hint: str = "",
+    ) -> None:
+        """在 `--stop-on-death` 模式下记录完整死亡上下文（不等待重生），随后交给主循环干净退出。"""
+        last_st = self.state.snapshot()
+        try:
+            st_now = self.client.status()
+            if isinstance(st_now, dict) and st_now:
+                self.state.set_status(st_now)
+                last_st = st_now
+        except Exception:
+            pass
+        try:
+            self.state.drain(self.client)
+        except Exception:
+            pass
+        self._seen_deaths_len = len(self.state.deaths)
+
+        ld = (last_st.get("last_death") or {}) if isinstance(last_st, dict) else {}
+        ev_death = self.state.deaths[-1] if self.state.deaths else {}
+        cause = str(
+            ld.get("cause")
+            or (ev_death.get("cause") if isinstance(ev_death, dict) else "")
+            or cause_hint
+            or (str(initial_err) if initial_err is not None else "")
+        )
+        death_pos = (
+            ld.get("pos")
+            or (ev_death.get("pos") if isinstance(ev_death, dict) else None)
+            or last_st.get("pos")
+            or self.state.pos
+        )
+        dim = str(last_st.get("dimension") or "overworld")
+        triggered_death_loop = bool(initial_err is not None and initial_err.code == "death_loop_cooldown")
+
+        if isinstance(death_pos, (list, tuple)) and len(death_pos) >= 3:
+            try:
+                memo_for(self.state).record_death(
+                    death_pos,
+                    cause=cause,
+                    lost_items=dict(pre_death_inv or {}),
+                    dimension=dim,
+                )
+            except Exception:
+                pass
+        self.log(
+            f"[loop] 触发 --stop-on-death：检测到真实死亡，立即记录上下文并退出 "
+            f"(pos={death_pos}, dim={dim}, hp={last_st.get('health')}, food={last_st.get('food')}, cause={cause!r})"
+        )
+        if self.observer is not None:
+            self.observer.on_death_recovered(
+                self.state,
+                respawn_ms=0.0,
+                cause=cause,
+                death_pos=death_pos,
+                before_inv_fp=pre_death_inv,
+                after_inv_fp={},
+                triggered_death_loop=triggered_death_loop,
+            )
 
     def run(self) -> RunResult:
         started_mono = time.monotonic()
@@ -366,6 +874,9 @@ class MainLoop:
                 return RunResult(0, 0, 0, 0, round(time.monotonic() - started_mono, 2),
                                  stop_reason, self.transient_faults)
             self.state.set_status(st)
+            if self._last_roadside_scan_pos is None:
+                self._last_roadside_scan_pos = self._pos_tuple(self.state)
+                self._last_roadside_scan_dim = str(self.state.st.get("dimension") or "overworld")
             try:
                 self.state.refresh_inventory(self.client)
                 self.state.drain(self.client)
@@ -375,6 +886,16 @@ class MainLoop:
                 self.state.invalidate_inventory()  # 留给第一拍的刷新补读
                 self._note_outage(e)
             self._seen_deaths_len = len(self.state.deaths)
+            self._load_checkpoint_if_configured()
+            if st.get("ready") and self._pos_tuple(self.state) is not None:
+                try:
+                    memo_for(self.state).set_spawn(
+                        self.state.st["pos"],
+                        dimension=str(self.state.st.get("dimension") or "overworld"),
+                        overwrite=False,
+                    )
+                except Exception:
+                    pass
             self.log(f"[loop] 启动完成: {self.state.summary()}")
 
             if monitor is not None:
@@ -384,8 +905,10 @@ class MainLoop:
                 if self.config.target_goal:
                     self.observer.on_progress_tick(self.state, client=self.client, force=True)
 
-            if self._sync_and_check_target_goal() and self.config.stop_on_goal:
-                stop_reason = "goal_reached"
+            if self._sync_and_check_target_goal():
+                self._maybe_save_checkpoint_on_goal_progress(force=True)
+                if self.config.stop_on_goal:
+                    stop_reason = "goal_reached"
 
             while stop_reason != "goal_reached":
                 budget = self._budget_exceeded(started_mono, steps, deaths_recovered)
@@ -405,6 +928,10 @@ class MainLoop:
                 except ApiError as e:
                     if e.code not in SESSION_CODES:
                         raise  # 只剩致命错误
+                    if self.config.stop_on_death and (e.code in ("dead", "death_loop_cooldown") or self._is_dead_now()):
+                        self._record_death_and_stop(pre_inv_fp, initial_err=e, cause_hint=str(e))
+                        stop_reason = "death_stopped"
+                        break
                     if self._recover_guarded(pre_inv_fp, initial_err=e):
                         deaths_recovered += 1
                     elif self._outage_exceeded():
@@ -419,6 +946,10 @@ class MainLoop:
                     continue
 
                 if self._is_dead_now():
+                    if self.config.stop_on_death:
+                        self._record_death_and_stop(pre_inv_fp, cause_hint="status_dead")
+                        stop_reason = "death_stopped"
+                        break
                     if self._recover_guarded(pre_inv_fp):
                         deaths_recovered += 1
                     elif self._outage_exceeded():
@@ -426,9 +957,13 @@ class MainLoop:
                         break
                     continue
 
-                if self._sync_and_check_target_goal() and self.config.stop_on_goal:
-                    stop_reason = "goal_reached"
-                    break
+                self._record_current_biome()
+
+                if self._sync_and_check_target_goal():
+                    self._maybe_save_checkpoint_on_goal_progress(force=True)
+                    if self.config.stop_on_goal:
+                        stop_reason = "goal_reached"
+                        break
 
                 decision = self.planner.select(self.state, list(self.recent_failures))
                 if decision.skill is None:
@@ -438,17 +973,111 @@ class MainLoop:
                         self.log(f"[loop] 单目标止损退轮: {decision.reason}")
                         stop_reason = "goal_stopped_out"
                         break
-                    if self.config.idle_sleep_s > 0:
-                        time.sleep(self.config.idle_sleep_s)
-                    if self.observer is not None:
-                        self.observer.on_progress_tick(self.state, client=self.client)
-                    # 若在单次零等待测试中无技能可跑，防止紧凑忙等
-                    if self.config.idle_sleep_s == 0:
-                        stop_reason = f"idle:{decision.reason}"
-                        break
-                    continue
+
+                    cur_pos = self._pos_tuple(self.state)
+                    is_cooldown_idle = (
+                        not self.state.in_safe_mode
+                        and (
+                            getattr(decision, "cooldown_blocked", False)
+                            or "冷却" in (decision.reason or "")
+                        )
+                    )
+                    if is_cooldown_idle:
+                        if (
+                            self._idle_spin_pos is not None
+                            and cur_pos is not None
+                            and math.dist(cur_pos, self._idle_spin_pos) < 2.0
+                        ):
+                            self._idle_spin_count += 1
+                        else:
+                            if (
+                                self._failure_tier_pos is not None
+                                and cur_pos is not None
+                                and math.dist(cur_pos, self._failure_tier_pos) >= 2.0
+                            ):
+                                self._reset_failure_tier(cur_pos)
+                            self._idle_spin_pos = cur_pos
+                            self._idle_spin_count = 1
+
+                        if self._idle_spin_count >= 2:
+                            # 连续 >=2 拍同位冷却空转：严禁继续长睡，直接按 3 层失败状态机升级
+                            blocked_gid = getattr(decision, "blocked_goal_id", None)
+                            if self._failure_tier == 0:
+                                self._failure_tier = 1
+                                self.failure_tier_state = "local_retry"
+                                self.failure_escalations.append("local_retry")
+                                self._failure_tier_pos = cur_pos
+                                clear_fn = getattr(self.planner, "clear_tactical_cooldowns", None)
+                                cleared = clear_fn(self.state, goal_id=blocked_gid, include_relocate=False) if callable(clear_fn) else []
+                                self.log(f"[loop] 同位冷却空转 -> Tier 1 local_retry: 清除战术冷却 {cleared}")
+                                self._idle_spin_count = 0
+                                continue
+                            if self._failure_tier == 1:
+                                self._failure_tier = 2
+                                self.failure_tier_state = "relocate"
+                                self.failure_escalations.append("relocate")
+                                self._failure_tier_pos = cur_pos
+                                cell = self._cell_key(self.state)
+                                reloc_skill = None
+                                if cell not in self._relocated_cells:
+                                    self._relocated_cells.add(cell)
+                                    make_reloc = getattr(self.planner, "make_relocate_skill", None)
+                                    reloc_skill = make_reloc(self.state) if callable(make_reloc) else None
+                                if reloc_skill is not None:
+                                    self.log(f"[loop] 同位冷却空转 -> Tier 2 relocate: 派发单次脱困/外迁 {reloc_skill}")
+                                    self._idle_spin_count = 0
+                                    decision = PlanDecision(
+                                        reloc_skill,
+                                        "rule",
+                                        f"同位冷却空转 Tier 2 外迁脱困: {decision.reason}",
+                                    )
+                                else:
+                                    self._failure_tier = 2
+                            if decision.skill is None and self._failure_tier >= 2:
+                                self._failure_tier = 3
+                                self.failure_tier_state = "goal_abandoned"
+                                self.failure_escalations.append("goal_abandoned")
+                                self._failure_tier_pos = cur_pos
+                                target_gid = blocked_gid
+                                if not target_gid:
+                                    cur_obj = getattr(self.planner, "current_objective", None)
+                                    if cur_obj is not None:
+                                        target_gid = cur_obj.goal_id
+                                if not target_gid and hasattr(self.planner, "rules"):
+                                    ranked = self.planner.rules._rank(self.state)
+                                    if ranked:
+                                        target_gid = ranked[0].step_goal.id
+                                abandon_fn = getattr(self.planner, "abandon_goal", None)
+                                abandoned = abandon_fn(target_gid) if (callable(abandon_fn) and target_gid) else False
+                                clear_fn = getattr(self.planner, "clear_tactical_cooldowns", None)
+                                if callable(clear_fn):
+                                    clear_fn(self.state, include_relocate=False)
+                                self.log(f"[loop] 同位冷却空转 -> Tier 3 goal_abandoned: target={target_gid} abandoned={abandoned}")
+                                self._idle_spin_count = 0
+                                self._failure_tier = 0
+                                if abandoned:
+                                    continue
+                                exhausted_fn = getattr(getattr(self.planner, "rules", None), "targets_exhausted", None)
+                                if callable(exhausted_fn) and exhausted_fn(self.state):
+                                    stop_reason = "goal_stopped_out"
+                                    break
+                                # 无目标可放弃（target=None）：落入下方空闲退避睡眠，禁止 0ms 紧循环空转
+                    else:
+                        self._idle_spin_count = 0
+
+                    if decision.skill is None:
+                        if self.config.idle_sleep_s > 0:
+                            self._do_sleep(self.config.idle_sleep_s)
+                        if self.observer is not None:
+                            self.observer.on_progress_tick(self.state, client=self.client)
+                        # 若在单次零等待测试中无技能可跑，防止紧凑忙等
+                        if self.config.idle_sleep_s == 0:
+                            stop_reason = f"idle:{decision.reason}"
+                            break
+                        continue
 
                 active_skill = decision.skill
+                skill_start_pos = self._pos_tuple(self.state)
                 self.log(f"[loop] -> {active_skill} ({decision.source}: {decision.reason})")
                 if self.observer is not None:
                     self.observer.on_skill_start(active_skill, decision.source, decision.reason, self.state)
@@ -465,6 +1094,12 @@ class MainLoop:
                                 self.observer.tape.end_skill_slice()
                             active_skill.abort()
                             if self.observer is not None:
+                                if self.state.st.get("sneaking") or self.state.st.get("blocking"):
+                                    try:
+                                        self.state.refresh_status(self.client, max_age_s=0)
+                                    except ApiError as refresh_err:
+                                        if refresh_err.kind == FATAL:
+                                            raise
                                 self.observer.on_skill_end(
                                     active_skill, "budget_stopped", self.state, died_or_disconnected=False
                                 )
@@ -510,6 +1145,7 @@ class MainLoop:
                         )
                         self.recent_failures.append(f"{active_skill.name}: {e}")
                         self.log(f"[loop] 技能中断 {active_skill}: {e}")
+                        real_death_from_refresh = False
                         if not is_death_err:
                             try:
                                 self.state.refresh_status(self.client, max_age_s=0)
@@ -519,8 +1155,39 @@ class MainLoop:
                                 # 会话类错误按死亡/断线恢复；网关抖动不算死亡，留给下一拍退避刷新
                                 if refresh_err.code in SESSION_CODES:
                                     is_death_err = True
+                                    real_death_from_refresh = refresh_err.code in ("dead", "death_loop_cooldown")
                                 else:
                                     self._note_outage(refresh_err)
+                        if not is_death_err and code in ("interrupted", "busy"):
+                            stop_fn = getattr(self.executor, "stop", None)
+                            if code == "busy":
+                                busy_unreleased = False
+                                if callable(stop_fn):
+                                    try:
+                                        stop_fn(raise_on_error=True)
+                                    except TypeError:
+                                        stop_fn()
+                                    except ApiError as stop_err:
+                                        if stop_err.code == "busy":
+                                            busy_unreleased = True
+                                    except Exception:
+                                        pass
+                                if busy_unreleased:
+                                    self._unreleased_busy_streak += 1
+                                    if self._unreleased_busy_streak >= 3:
+                                        self._recover_stuck_busy_session()
+                                else:
+                                    self._unreleased_busy_streak = 0
+                            else:
+                                self._unreleased_busy_streak = 0
+                                if callable(stop_fn):
+                                    stop_fn(raise_on_error=False)
+                                if code == "interrupted":
+                                    self._maybe_set_hurt_flee_intent(failed_name, extra)
+                        elif not is_death_err:
+                            self._unreleased_busy_streak = 0
+                        if failed_name == "emergency_escape" or getattr(decision, "safety_escape", False):
+                            self._acknowledge_safety_intent(completed=False)
                         environment = e if isinstance(e, EnvBlocked) and not is_death_err else None
                         if environment is not None:
                             self._path_failures.pop(active_skill.goal, None)
@@ -533,11 +1200,25 @@ class MainLoop:
                             else:
                                 streak = 0
                                 self._path_failures.pop(active_skill.goal, None)
-                            if streak >= 3:
-                                active_skill.mark_failed(cooldown_s=3 * active_skill.cooldown_s)
+                            cap = self.config.failure_cooldown_cap_s
+                            if failed_name == "emergency_escape" and code == "busy":
+                                pass
+                            elif streak >= 3:
+                                if cap is not None:
+                                    active_skill.mark_failed(cooldown_s=min(cap, active_skill.cooldown_s * 1.5))
+                                else:
+                                    active_skill.mark_failed(cooldown_s=3 * active_skill.cooldown_s)
+                            elif cap is not None:
+                                active_skill.mark_failed(cooldown_s=min(cap, active_skill.cooldown_s))
                             else:
                                 active_skill.mark_failed()
                         if self.observer is not None:
+                            if not is_death_err and (self.state.st.get("sneaking") or self.state.st.get("blocking")):
+                                try:
+                                    self.state.refresh_status(self.client, max_age_s=0)
+                                except ApiError as refresh_err:
+                                    if refresh_err.kind == FATAL:
+                                        raise
                             self.observer.on_skill_end(
                                 active_skill,
                                 "env_blocked" if environment is not None else "replan",
@@ -562,6 +1243,20 @@ class MainLoop:
                         active_skill = None
                         if is_death_err:
                             init_api_err = e if isinstance(e, ApiError) else None
+                            is_real_death = (
+                                died_during_skill
+                                or real_death_from_refresh
+                                or code in ("dead", "death_loop_cooldown")
+                                or (
+                                    code == "interrupted"
+                                    and extra.get("cause", extra.get("interrupted_by")) == "death"
+                                )
+                                or self._is_dead_now()
+                            )
+                            if self.config.stop_on_death and is_real_death:
+                                self._record_death_and_stop(pre_inv_fp, initial_err=init_api_err, cause_hint=str(e))
+                                stop_reason = "death_stopped"
+                                break
                             if self._recover_guarded(pre_inv_fp, initial_err=init_api_err):
                                 deaths_recovered += 1
                 except Fatal as e:
@@ -573,6 +1268,7 @@ class MainLoop:
                     break
 
                 if skill_done and active_skill is not None:
+                    self._unreleased_busy_streak = 0
                     skill_dt = max(0.0, time.monotonic() - skill_t0)
                     finished_skill = active_skill
                     active_skill = None
@@ -584,16 +1280,30 @@ class MainLoop:
                         if monitor is not None and self.config.async_observe_for_llm:
                             if self.state.inventory_dirty:
                                 self.state.refresh_inventory(self.client)
+                            if self.state.st.get("sneaking") or self.state.st.get("blocking"):
+                                self.state.refresh_status(self.client, max_age_s=0)
                         else:
                             # 技能已完成；这里读不到状态不应把它记成失败，留给下一拍刷新与恢复
                             self._refresh_with_backoff()
                     except ApiError as refresh_err:
                         if refresh_err.kind == FATAL:
                             raise
+                    if finished_name == "emergency_escape" or getattr(decision, "safety_escape", False):
+                        self._acknowledge_safety_intent(completed=True)
+                    end_pos = self._pos_tuple(self.state)
+                    moved_away = bool(
+                        skill_start_pos is not None
+                        and end_pos is not None
+                        and math.dist(skill_start_pos, end_pos) >= 2.0
+                    )
+                    if moved_away or finished_name not in ("scout_island", "emergency_escape"):
+                        self._reset_failure_tier(end_pos)
                     skills_ok += 1
+                    goal_specs = list(self._resolve_target_goal_specs())
+                    active_rules_goals = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()
                     force_tick = any(
                         g.skill == finished_name and g.done_advancements
-                        for g in self._resolve_target_goal_specs()
+                        for g in (*goal_specs, *active_rules_goals, *GOAL_MAP.values())
                     )
                     if self.observer is not None:
                         self.observer.on_skill_end(
@@ -621,9 +1331,13 @@ class MainLoop:
                             elapsed_s=skill_dt,
                             completed_advs=completed_advs,
                         )
-                    if self._sync_and_check_target_goal() and self.config.stop_on_goal:
+                    target_reached = self._sync_and_check_target_goal()
+                    self._maybe_save_checkpoint_on_goal_progress(force=target_reached)
+                    if target_reached and self.config.stop_on_goal:
                         stop_reason = "goal_reached"
                         goal_reached_now = True
+                    if not goal_reached_now:
+                        self._maybe_roadside_scan()
 
                 if goal_reached_now:
                     break
@@ -631,6 +1345,10 @@ class MainLoop:
         finally:
             if active_skill is not None:
                 active_skill.abort()
+            release_materials = getattr(self.planner, "release_skill_materials", None)
+            if release_materials is not None:
+                release_materials()
+            self._save_checkpoint_if_configured()
             if monitor is not None:
                 monitor.close()
             if self.observer is not None:

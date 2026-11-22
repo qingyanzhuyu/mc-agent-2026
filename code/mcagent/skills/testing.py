@@ -85,14 +85,29 @@ class GridWorld:
         self.st["pos"] = dest
         return {"pos": list(dest)}
 
-    def posture(self, sneak=None, shield=None) -> dict:
-        self.calls.append(("posture", {"sneak": sneak, "shield": shield}))
-        self.st["sneaking"] = bool(sneak)
-        return {"sneaking": bool(sneak), "blocking": bool(shield)}
+    def posture(self, sneak=None, shield=None, *, jump=None) -> dict:
+        req = {"sneak": sneak, "shield": shield}
+        if jump is not None:
+            req["jump"] = jump
+        self.calls.append(("posture", req))
+        if sneak is None and shield is None and jump is None:
+            self.st.update(sneaking=False, blocking=False, jumping=False)
+        else:
+            if sneak is not None:
+                self.st["sneaking"] = bool(sneak)
+            if shield is not None:
+                self.st["blocking"] = bool(shield)
+            if jump is not None:
+                self.st["jumping"] = bool(jump)
+        return {
+            "sneaking": bool(self.st.get("sneaking", False)),
+            "jumping": bool(self.st.get("jumping", False)),
+            "blocking": bool(self.st.get("blocking", False)),
+        }
 
     def stop(self) -> dict:
         self.calls.append(("stop", {}))
-        return {}
+        return {"stopped": True, "action": self.st.get("busy"), "released": True, "wait_ms": 0}
 
 
 class CountingExecutor(Executor):

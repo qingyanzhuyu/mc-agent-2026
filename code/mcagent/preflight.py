@@ -11,17 +11,22 @@
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
+from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ENV = os.path.join(HERE, ".env")
 DEFAULT_MATCH = os.path.join(HERE, ".env.match")
 
 OFFICIAL_HOSTS = ("apiin.nmo.net.cn", "mc-api.windywindie.top")
+CAMPUS_DIRECT_HOSTS = ("apiin.nmo.net.cn",)
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0")
 #: 群里发过的公共压测 key 前缀，正式 key 不应以它开头
 TEST_KEY_PREFIX = "sk-mRbe"
@@ -30,6 +35,15 @@ PLACEHOLDER_USERS = {"qyzy_dev", "dev_bot_1", "test", "Test_Agent", ""}
 PLACEHOLDER_PASSES = {"localdev", ""}
 
 BLOCK, WARN = "BLOCK", "WARN"
+
+_IGNORED_CMD_TOOLS = frozenset({"grep", "egrep", "fgrep", "rg", "pgrep", "pkill", "tail", "less", "cat"})
+_SHELL_WRAPPERS = frozenset({"sh", "bash", "zsh", "dash"})
+_PREFLIGHT_RE = re.compile(r"(?:^|[\s/\\])(?:mcagent\.preflight|preflight\.py)(?:\s|$)")
+_TEST_RUNNER_RE = re.compile(r"(?:^|[\s/\\])(?:unittest|pytest|py\.test)(?:\.py)?(?:\s|$)")
+_SOAK_CTL_RE = re.compile(r"(?:^|[\s/\\])soak_ctl(?:\.py)?(?:\s|$)")
+_MCAGENT_MOD_RE = re.compile(r"(?:^|\s)(?:-m\s+)?mcagent(?:\.[a-zA-Z0-9_]+)+(?:\s|$)")
+_MCAGENT_BARE_MOD_RE = re.compile(r"(?:^|\s)-m\s+mcagent(?:\s|$)")
+_MCAGENT_PATH_RE = re.compile(r"(?:^|[\s/\\])mcagent[/\\](?!\.venv\b|logs\b)[a-zA-Z0-9_./\\-]+(?:\s|$)")
 
 
 @dataclass
@@ -58,9 +72,149 @@ def _host(base: str) -> str:
     return base.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
 
 
-def check_static(env: dict[str, str], gateway_open: bool | None = None,
-                 port_probe: Callable[[str, int], bool] | None = None) -> list[Check]:
-    """静态检查。`gateway_open` 可注入，便于离线单测。"""
+def _proxy_targets_port(proxy: str, port: int = 7897) -> bool:
+    """判断代理配置是否指向指定端口（默认 7897），异常格式安全返回 False。"""
+    raw = (proxy or "").strip()
+    if not raw:
+        return False
+    if raw.isdigit():
+        return int(raw) == port
+    candidate = raw if "://" in raw else f"http://{raw}"
+    try:
+        parsed = urlsplit(candidate)
+        return parsed.port == port
+    except ValueError:
+        return False
+
+
+def _list_processes() -> list[tuple[int, str]]:
+    """列出当前运行进程 (pid, cmdline)。Linux 优先读 /proc，不可用时回退 ps。"""
+    if os.path.isdir("/proc"):
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            entries = []
+        if entries:
+            procs: list[tuple[int, str]] = []
+            for entry in entries:
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                try:
+                    with open(f"/proc/{entry}/cmdline", "rb") as f:
+                        raw = f.read()
+                except OSError:
+                    continue
+                if not raw:
+                    continue
+                cmd = " ".join(
+                    part.decode("utf-8", errors="replace")
+                    for part in raw.split(b"\x00")
+                    if part
+                ).strip()
+                if cmd:
+                    procs.append((pid, cmd))
+            return procs
+
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if res.returncode != 0:
+        return []
+    out: list[tuple[int, str]] = []
+    for line in res.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            out.append((int(parts[0]), parts[1].strip()))
+    return out
+
+
+def _is_ignored_process_cmd(cmd: str) -> bool:
+    """过滤 preflight 自身、测试运行器及查进程/看日志命令，避免误报。"""
+    stripped = (cmd or "").strip()
+    if not stripped:
+        return True
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        tokens = stripped.split()
+    if not tokens:
+        return True
+
+    exe = os.path.basename(tokens[0]).lower()
+    if exe in _IGNORED_CMD_TOOLS:
+        return True
+    if exe in _SHELL_WRAPPERS:
+        for i, tok in enumerate(tokens[1:-1], start=1):
+            if tok == "-c":
+                sub_tokens = tokens[i + 1].strip().split()
+                if sub_tokens and os.path.basename(sub_tokens[0]).lower() in _IGNORED_CMD_TOOLS:
+                    return True
+                break
+
+    if _PREFLIGHT_RE.search(stripped):
+        return True
+    if _TEST_RUNNER_RE.search(stripped):
+        return True
+    return False
+
+
+def _is_residual_target_cmd(cmd: str) -> bool:
+    return bool(
+        _SOAK_CTL_RE.search(cmd)
+        or _MCAGENT_MOD_RE.search(cmd)
+        or _MCAGENT_BARE_MOD_RE.search(cmd)
+        or _MCAGENT_PATH_RE.search(cmd)
+    )
+
+
+def _find_residual_processes(
+    processes: Sequence[tuple[int, str]],
+    self_pid: int | None = None,
+    self_ppid: int | None = None,
+) -> list[tuple[int, str]]:
+    cur_pid = os.getpid() if self_pid is None else self_pid
+    cur_ppid = os.getppid() if self_ppid is None else self_ppid
+    residuals: list[tuple[int, str]] = []
+    for pid, cmd in processes:
+        if pid <= 0 or pid in (cur_pid, cur_ppid):
+            continue
+        if _is_ignored_process_cmd(cmd):
+            continue
+        if _is_residual_target_cmd(cmd):
+            residuals.append((pid, cmd))
+    return residuals
+
+
+def _summarize_cmd(cmd: str, max_len: int = 72) -> str:
+    compact_tokens: list[str] = []
+    for idx, tok in enumerate(cmd.split()):
+        if idx <= 2 and not tok.startswith("-") and ("/" in tok or "\\" in tok):
+            base = tok.replace("\\", "/").rsplit("/", 1)[-1]
+            compact_tokens.append(base or tok)
+        else:
+            compact_tokens.append(tok)
+    compact = " ".join(compact_tokens)
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3] + "..."
+
+
+def check_static(
+    env: dict[str, str],
+    gateway_open: bool | None = None,
+    port_probe: Callable[[str, int], bool] | None = None,
+    running_processes: Sequence[tuple[int, str]] | None = None,
+    process_lister: Callable[[], list[tuple[int, str]]] | None = None,
+) -> list[Check]:
+    """静态检查。`gateway_open`、`port_probe` 与进程列表可注入，便于离线单测。"""
     out: list[Check] = []
     base = env.get("MC_API_BASE", "")
     host = _host(base) if base else ""
@@ -75,6 +229,28 @@ def check_static(env: dict[str, str], gateway_open: bool | None = None,
         out.append(Check(
             "端点是官方入口", host in OFFICIAL_HOSTS,
             f"host={host or '(空)'}" + ("" if host in OFFICIAL_HOSTS else "  ← 不认识的域名，确认后再用"),
+            level=WARN))
+
+    mc_proxy = (env.get("MC_PROXY", "") or "").strip()
+    if host not in CAMPUS_DIRECT_HOSTS:
+        out.append(Check(
+            "校园网直连未挂 7897 代理", True,
+            f"host={host or '(空)'}（非校园网直连入口，不拦截 MC_PROXY）",
+            level=BLOCK))
+    elif not mc_proxy:
+        out.append(Check(
+            "校园网直连未挂 7897 代理", True,
+            "MC_PROXY=(空)（校园网直连）",
+            level=BLOCK))
+    elif _proxy_targets_port(mc_proxy, 7897):
+        out.append(Check(
+            "校园网直连未挂 7897 代理", False,
+            f"MC_PROXY={mc_proxy}  ← 校园网入口 {host} 直连实测仅 ~4ms，挂本地 7897 代理会导致不可达或高延迟，需清空 MC_PROXY",
+            level=BLOCK))
+    else:
+        out.append(Check(
+            "校园网直连未挂 7897 代理", False,
+            f"MC_PROXY={mc_proxy}  ← 校园网直连建议清空 MC_PROXY，避免代理绕行",
             level=WARN))
 
     user = env.get("MC_USER", "")
@@ -128,6 +304,27 @@ def check_static(env: dict[str, str], gateway_open: bool | None = None,
     out.append(Check(
         "本地联调网关已停", not gateway_open,
         "127.0.0.1:8787 " + ("仍在监听 ← 先停掉再开赛" if gateway_open else "已关闭")))
+
+    # 残留后台进程检查：避免 soak_ctl / mcagent 占号或吃掉 2 路 LLM 并发
+    if running_processes is None:
+        procs = process_lister() if process_lister is not None else _list_processes()
+    else:
+        procs = list(running_processes)
+    residuals = _find_residual_processes(procs)
+    if residuals:
+        pids_str = " ".join(str(pid) for pid, _ in residuals)
+        preview = "; ".join(f"pid={pid} ({_summarize_cmd(cmd)})" for pid, cmd in residuals[:3])
+        if len(residuals) > 3:
+            preview += f" 等共 {len(residuals)} 个进程"
+        out.append(Check(
+            "无残留 soak / mcagent 进程", False,
+            f"发现残留进程：{preview}  ← 先清理再开赛：kill {pids_str}（或 pkill -f 'soak_ctl|mcagent\\.loop'）",
+            level=BLOCK))
+    else:
+        out.append(Check(
+            "无残留 soak / mcagent 进程", True,
+            "未发现残留 soak_ctl / mcagent 后台进程",
+            level=BLOCK))
 
     return out
 

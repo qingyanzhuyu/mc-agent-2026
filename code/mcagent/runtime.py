@@ -64,16 +64,19 @@ class Fatal(Exception):
 @dataclass(frozen=True)
 class RuntimeConfig:
     # 临时工程值，必须用官方 C1/寻路证据标定；不代表已验证的生存阈值。
-    poll_safe_s: float = 4.0
-    poll_risk_s: float = 1.0
-    observer_min_interval_s: float = 0.25
-    status_ttl_s: float = 1.0
+    poll_safe_s: float = 0.8
+    poll_risk_s: float = 0.2
+    observer_min_interval_s: float = 0.05
+    status_ttl_s: float = 0.2
     stop_cooldown_s: float = 10.0
     hp_crit: float = 8.0
     hp_risk: float = 14.0
     oxygen_warn: float = 6.0
     hostile_risk_dist: float = 16.0
     hostile_flee_dist: float = 6.0
+    creeper_urgent_dist: float = 5.0
+    food_warn: float = 6.0
+    food_crit: float = 2.0
     night_start: float = 13000.0
     night_end: float = 23000.0
     support_ttl_s: float = 5.0
@@ -96,6 +99,8 @@ class RuntimeConfig:
             raise ValueError("MC_OXYGEN_WARN 必须使用 1.21 的 20 格氧气刻度")
         if values["poll_risk_s"] > values["poll_safe_s"] or values["hp_crit"] > values["hp_risk"]:
             raise ValueError("风险轮询不能比安全轮询慢，危急血量不能高于预警血量")
+        if values["food_crit"] > values["food_warn"]:
+            raise ValueError("危急饱食度不能高于预警饱食度")
         if values["safe_cooldown_s"] < 65:
             raise ValueError("死亡循环冷却不能低于 65 秒")
         return cls(**values)
@@ -128,6 +133,7 @@ class State:
         self._inventory_generation = 0
         self._status_generation = 0
         self.safety_intent: Optional[dict] = None
+        self.active_escape_intent: Optional[str] = None
         self.risk_context = {"near_water": False, "near_void": False, "void_guard": False}
         self.support: dict = {}
         self.st: dict = {}
@@ -141,6 +147,9 @@ class State:
         self._seen_death_t_ms: set[int] = set()
         self._seen_death_seqs: set[int] = set()
         self._unlinked_alive_death_mono: Optional[float] = None
+        self._totem_guard: Optional[dict[str, Any]] = None
+        self.last_hurt_at: float = 0.0
+        self.last_hurt_info: dict[str, Any] = {}
 
     @_locked
     def _record_death(
@@ -238,6 +247,10 @@ class State:
                 continue
             if key in result:
                 self.st = {**self.st, key: copy.deepcopy(result[key])}
+                if key == "pos":
+                    # 速度属于上一次 /status 的物理 tick，与新动作返回的坐标不能混用。
+                    self.st.pop("speed", None)
+                    self.st.pop("velocity", None)
 
     def refresh_status(self, client: Client, max_age_s: Optional[float] = None) -> dict:
         ttl = self.config.status_ttl_s if max_age_s is None else max_age_s
@@ -293,6 +306,27 @@ class State:
     def set_safety_intent(self, hazard: Optional[dict]) -> None:
         self.safety_intent = copy.deepcopy(hazard)
 
+    @_locked
+    def set_active_escape(self, intent: Optional[str]) -> None:
+        self.active_escape_intent = intent
+
+    @_locked
+    def get_active_escape(self) -> Optional[str]:
+        return self.active_escape_intent
+
+    @_locked
+    def clear_recent_hurt(self) -> None:
+        self.last_hurt_at = 0.0
+        self.last_hurt_info = {}
+
+    @_locked
+    def get_recent_hurt(self, max_age_s: float = 4.0) -> Optional[dict[str, Any]]:
+        if self.last_hurt_at <= 0.0 or not self.last_hurt_info:
+            return None
+        if (time.monotonic() - self.last_hurt_at) > max_age_s:
+            return None
+        return copy.deepcopy(self.last_hurt_info)
+
     def drain(self, client: Client, limit: int = 200) -> list[dict]:
         """首次启动先追平历史积压（防数小时前旧 death 误计为实时死亡），运行期每拍读一页防挤占急停额度。"""
         with self._event_fetch:
@@ -346,6 +380,9 @@ class State:
                     self.invalidate_inventory()
                 if etype == "death":
                     self.invalidate_inventory()
+                    self.last_hurt_at = 0.0
+                    self.last_hurt_info = {}
+                    self.safety_intent = None
                     if was_booted:
                         self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
                     elif ev_t_ms is not None and ref_t_ms is not None:
@@ -358,6 +395,19 @@ class State:
                             self._seen_death_t_ms.add(ev_t_ms)
                     else:
                         self._record_death(mono_ts=now_mono, server_t_ms=ev_t_ms, seq=seq)
+                elif etype == "spawn":
+                    self.last_hurt_at = 0.0
+                    self.last_hurt_info = {}
+                    self.safety_intent = None
+                elif etype == "hurt" and was_booted:
+                    self.last_hurt_at = now_mono
+                    self.last_hurt_info = {
+                        "source": ev.get("source"),
+                        "source_entity": copy.deepcopy(ev.get("source_entity")),
+                        "likely_attacker": copy.deepcopy(ev.get("likely_attacker")),
+                        "damage": ev.get("damage"),
+                        "health": ev.get("health"),
+                    }
                 elif etype == "death_loop":
                     self.safe_mode_until = max(self.safe_mode_until, now_mono + self.SAFE_COOLDOWN_S)
         return out
@@ -416,6 +466,18 @@ class State:
         now = time.monotonic()
         return sum(1 for t in self.deaths if 0 <= now - t <= window_s)
 
+    @_locked
+    def last_hurt_source(self) -> Optional[str]:
+        for event in reversed(self.events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") in ("spawn", "death"):
+                break
+            if event.get("type") == "hurt":
+                source = event.get("source")
+                return source if isinstance(source, str) and source else None
+        return None
+
     def summary(self) -> str:
         st = self.st
         return (
@@ -424,8 +486,503 @@ class State:
             f"nearest_hostile={st.get('nearest_hostile')}"
         )
 
+    @_locked
+    def is_totem_trigger_armed(self) -> bool:
+        """返回受控图腾触发守卫是否处于已布防、未失效且未超时状态。"""
+        guard = self._totem_guard
+        if not (isinstance(guard, dict) and guard.get("active") and not guard.get("consumed")):
+            return False
+        expires_at = guard.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.monotonic() > expires_at:
+            return False
+        return True
+
+    @_locked
+    def consume_totem_trigger_suppression(self) -> bool:
+        """锁内二次核验条件并在受控坠落窗口内支持多拍抑制（直到落地/消耗/超时/撤防）。"""
+        guard = self._totem_guard
+        if not (isinstance(guard, dict) and guard.get("active") and not guard.get("consumed")):
+            return False
+        expires_at = guard.get("expires_at")
+        if isinstance(expires_at, (int, float)) and time.monotonic() > expires_at:
+            guard["active"] = False
+            return False
+        st = self.st or {}
+        inv = self.inventory or {}
+        if self.in_safe_mode or st.get("in_lava") or st.get("submerged") or not st.get("alive", True):
+            return False
+        if st.get("on_ground") is False:
+            guard["saw_airborne"] = True
+        if guard.get("saw_airborne") and st.get("on_ground") is True:
+            guard["consumed"] = True
+            guard["active"] = False
+            return False
+        if not _has_offhand_totem(inv, st):
+            guard["consumed"] = True
+            guard["active"] = False
+            return False
+        if guard.get("allow_armored"):
+            armor_ok, _, _, _, _ = assess_totem_armor(inv, st)
+            if not armor_ok:
+                return False
+        elif not _is_armor_stripped(inv, st):
+            return False
+        guard["suppression_count"] = int(guard.get("suppression_count", 0)) + 1
+        return True
+
+    def controlled_totem_trigger(
+        self,
+        client: Any,
+        *,
+        drop_height: int = 25,
+        landing_col: Any = None,
+        min_drop: int = 23,
+        max_duration_s: float = 3.5,
+        allow_armored: bool = False,
+    ):
+        """受控图腾触发（Postmortal）坠落全过程安全抑制上下文管理器。"""
+        return controlled_totem_trigger(
+            self,
+            client,
+            drop_height=drop_height,
+            landing_col=landing_col,
+            min_drop=min_drop,
+            max_duration_s=max_duration_s,
+            allow_armored=allow_armored,
+        )
+
+
+# ---------------------------------------------------------------- 受控图腾触发守卫
+_TOTEM_UNSAFE_LANDING_BLOCKS: frozenset[str] = frozenset({
+    "lava", "flowing_lava", "water", "flowing_water", "bubble_column",
+    "fire", "soul_fire", "powder_snow", "magma_block", "cobweb",
+    "slime_block", "hay_block", "sweet_berry_bush", "honey_block",
+})
+_TOTEM_PASSABLE_BLOCKS: frozenset[str] = frozenset({
+    "short_grass", "tall_grass", "fern", "large_fern",
+    "short_dry_grass", "tall_dry_grass", "dead_bush",
+    "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet",
+    "oxeye_daisy", "cornflower", "lily_of_the_valley",
+})
+_TOTEM_AIR_BLOCKS: frozenset[str] = frozenset({"air", "cave_air", "void_air"})
+_TOTEM_ARMOR_SLOTS: tuple[str, ...] = ("head", "chest", "legs", "feet")
+
+
+def _is_unsafe_totem_landing_block(bname: str) -> bool:
+    return bname in _TOTEM_UNSAFE_LANDING_BLOCKS or bname == "bed" or bname.endswith("_bed")
+
+
+def _is_totem_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    name = str(item.get("name", "")).removeprefix("minecraft:")
+    if name != "totem_of_undying":
+        return False
+    raw_count = item.get("count", 1)
+    if raw_count is None or isinstance(raw_count, bool):
+        return False
+    try:
+        return int(raw_count) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_offhand_totem(inv: Any, st: Any) -> bool:
+    inv_off = inv.get("offhand") if isinstance(inv, dict) else None
+    st_off = st.get("offhand") if isinstance(st, dict) else None
+    if isinstance(inv_off, dict) and inv_off and not _is_totem_item(inv_off):
+        return False
+    if isinstance(st_off, dict) and st_off and not _is_totem_item(st_off):
+        return False
+    return _is_totem_item(inv_off) or _is_totem_item(st_off)
+
+
+def _is_armor_stripped(inv: Any, st: Any) -> bool:
+    armor = inv.get("armor") if isinstance(inv, dict) else None
+    if isinstance(armor, dict):
+        for slot in (*_TOTEM_ARMOR_SLOTS, "torso"):
+            piece = armor.get(slot)
+            if isinstance(piece, dict):
+                if piece and (piece.get("name") or int(piece.get("count", 0) or 0) > 0):
+                    return False
+            elif piece:
+                return False
+    elif armor:
+        return False
+    raw_ap = st.get("armor_points", 0) if isinstance(st, dict) else 0
+    if isinstance(raw_ap, bool):
+        return False
+    try:
+        return float(raw_ap or 0) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _iter_piece_enchants(piece: dict[str, Any]) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    sources: list[Any] = [piece]
+    for key in ("components", "nbt", "metadata", "meta"):
+        sub = piece.get(key)
+        if isinstance(sub, dict):
+            sources.append(sub)
+    for src in sources:
+        ench = src.get("enchantments")
+        if isinstance(ench, dict):
+            for k, v in ench.items():
+                if isinstance(v, int) and not isinstance(v, bool):
+                    out.append((str(k).removeprefix("minecraft:").strip().lower(), v))
+        elif isinstance(ench, (list, tuple)):
+            for row in ench:
+                if not isinstance(row, dict):
+                    continue
+                ename = str(row.get("name") or row.get("id") or "").removeprefix("minecraft:").strip().lower()
+                lvl = row.get("level") if row.get("level") is not None else row.get("lvl", 1)
+                if ename and isinstance(lvl, int) and not isinstance(lvl, bool):
+                    out.append((ename, lvl))
+    return out
+
+
+def assess_totem_armor(inv: Any, st: Any) -> tuple[bool, str, int, int, bool]:
+    """评估当前护甲附魔与减伤情况：返回 (可否执行, 拒绝原因, 所需坠落高度, min_drop, 是否带甲)。"""
+    armor = inv.get("armor") if isinstance(inv, dict) else None
+    occupied = 0
+    prot_epf = 0
+    seen_slots: set[str] = set()
+    if isinstance(armor, dict):
+        for slot in (*_TOTEM_ARMOR_SLOTS, "torso"):
+            norm_slot = "chest" if slot == "torso" else slot
+            if norm_slot in seen_slots:
+                continue
+            piece = armor.get(slot)
+            if not isinstance(piece, dict) or not piece:
+                continue
+            if not (piece.get("name") or int(piece.get("count", 0) or 0) > 0):
+                continue
+            seen_slots.add(norm_slot)
+            occupied += 1
+            for ename, lvl in _iter_piece_enchants(piece):
+                if ename == "feather_falling" and lvl >= 1:
+                    return (
+                        False,
+                        "totem_feather_falling_armor_cannot_unequip: 穿戴摔落保护靴子且无脱甲接口，禁止受控坠落",
+                        0,
+                        0,
+                        False,
+                    )
+                if ename == "protection" and lvl >= 1:
+                    prot_epf += lvl
+
+    raw_ap = st.get("armor_points", 0) if isinstance(st, dict) else 0
+    if isinstance(raw_ap, bool):
+        return False, "护甲值 armor_points 格式无效，禁止受控坠落", 0, 0, False
+    try:
+        armor_points = float(raw_ap or 0)
+    except (TypeError, ValueError):
+        return False, "护甲值 armor_points 解析失败，禁止受控坠落", 0, 0, False
+
+    if occupied == 0 and armor_points == 0.0:
+        return True, "ok", 25, 23, False
+
+    if prot_epf >= 12:
+        return (
+            False,
+            f"totem_high_protection_armor_cannot_unequip: 护甲保护总等级过高(prot_epf={prot_epf})且无脱甲接口，禁止受控坠落",
+            0,
+            0,
+            False,
+        )
+
+    reduction = min(0.80, 0.04 * prot_epf)
+    needed_height = math.ceil(3.0 + 24.0 / (1.0 - reduction))
+    needed_height = max(needed_height, 28) if prot_epf == 0 else max(needed_height + 2, 30)
+    return True, "ok_armored", needed_height, needed_height - 2, True
+
+
+def validate_controlled_totem_conditions(
+    state: State,
+    client: Any,
+    *,
+    drop_height: int = 25,
+    landing_col: Any = None,
+    min_drop: int = 23,
+    allow_armored: bool = False,
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    """严格校验受控图腾触发（Postmortal）的全部安全前置条件与落点列连续净空。"""
+    if isinstance(drop_height, bool) or not isinstance(drop_height, int) or drop_height < 1:
+        return False, "drop_height 必须为正整数", None
+    if isinstance(min_drop, bool) or not isinstance(min_drop, int) or min_drop < 1:
+        return False, "min_drop 必须为正整数", None
+
+    with state._lock:
+        st = state.snapshot()
+        inv = copy.deepcopy(state.inventory)
+        inv_dirty = bool(state.inventory_dirty)
+        in_safe_mode = state.in_safe_mode
+
+    # (a) 存活 & 就绪 & 不在 safe_mode & 不在岩浆/水/溺水/着火中
+    if not isinstance(st, dict) or not st:
+        return False, "缺少 /status 状态快照，无法校验受控图腾触发条件", None
+    if not st.get("alive", True):
+        return False, "角色当前未存活，禁止受控图腾触发", None
+    if not st.get("ready"):
+        return False, "角色当前未就绪(ready=False)，禁止受控图腾触发", None
+    if in_safe_mode:
+        return False, "当前处于死亡循环避险冷却(safe_mode)，禁止受控图腾触发", None
+    if st.get("in_lava"):
+        return False, "角色当前处于岩浆中，禁止受控图腾触发", None
+    if st.get("in_water") or st.get("submerged"):
+        return False, "角色当前处于水中/溺水状态，禁止受控图腾触发", None
+    if st.get("on_fire"):
+        return False, "角色当前处于着火状态，禁止受控图腾触发", None
+
+    # (b) 背包快照新鲜且副手确认持有 totem_of_undying
+    if inv_dirty:
+        return False, "背包快照未刷新(inventory_dirty=True)，无法确认副手图腾与护甲状态", None
+    if not _has_offhand_totem(inv, st):
+        return False, "副手未确认持有不死图腾(totem_of_undying)", None
+
+    # (c) 无护甲或满足无摔落保护/低减伤且抬高落差要求
+    if allow_armored:
+        armor_ok, armor_reason, req_height, req_min_drop, _ = assess_totem_armor(inv, st)
+        if not armor_ok:
+            return False, armor_reason, None
+        if drop_height < req_height or min_drop < req_min_drop:
+            return False, f"穿戴护甲时坠落高度不足（需 drop_height>={req_height}, min_drop>={req_min_drop}）", None
+    elif not _is_armor_stripped(inv, st):
+        return False, "角色仍穿戴护甲或 armor_points 不为 0，必须先脱甲或按护甲减伤抬高落差再触发图腾", None
+
+    # (d) 落点列向下连续至少 min_drop 格空气/非致命阻挡后落到安全实心方块
+    pos = st.get("pos")
+    if (
+        not isinstance(pos, (list, tuple))
+        or len(pos) < 3
+        or any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+            for v in pos[:3]
+        )
+    ):
+        return False, "缺少有效玩家坐标 pos，无法校验安全落点", None
+
+    get_block = getattr(client, "get_block", None)
+    if not callable(get_block):
+        return False, "缺少 client.get_block，无法校验安全落点", None
+
+    fx, fy, fz = math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2])
+    if landing_col is not None:
+        if (
+            not isinstance(landing_col, (list, tuple))
+            or len(landing_col) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in landing_col)
+        ):
+            return False, "landing_col 必须为有效的 (x, z) 坐标", None
+        lx, lz = math.floor(landing_col[0]), math.floor(landing_col[1])
+    else:
+        lx, lz = fx, fz
+
+    supports_use_cache = _accepts_use_cache(get_block)
+
+    def _read_bname(probe: list[int]) -> str:
+        blk = get_block(probe, use_cache=False) if supports_use_cache else get_block(probe)
+        raw = blk.get("name") if isinstance(blk, dict) else None
+        return str(raw).removeprefix("minecraft:") if isinstance(raw, str) else ""
+
+    if (lx, lz) != (fx, fz):
+        for head_dy in (0, 1):
+            try:
+                head_name = _read_bname([lx, fy + head_dy, lz])
+            except ApiError as e:
+                return False, f"查询落点列起步空间失败 ({e.code}): {e.message}", None
+            if head_name and head_name not in _TOTEM_AIR_BLOCKS and head_name not in _TOTEM_PASSABLE_BLOCKS:
+                return False, f"落点列 ({lx}, {lz}) 起步空间受阻 ({head_name})", None
+
+    max_probe = max(drop_height, min_drop) + 2
+    for dy in range(1, max_probe + 1):
+        probe_pos = [lx, fy - dy, lz]
+        try:
+            bname = _read_bname(probe_pos)
+        except ApiError as e:
+            return False, f"查询落点列方块失败 ({e.code}): {e.message}", None
+        if not bname or bname in _TOTEM_AIR_BLOCKS or bname in _TOTEM_PASSABLE_BLOCKS:
+            continue
+        if _is_unsafe_totem_landing_block(bname):
+            return False, f"落点列 ({lx}, {lz}) 存在岩浆/水/缓冲/床等危险方块 ({bname})", None
+        drop_blocks = dy - 1
+        if drop_blocks < min_drop:
+            return False, f"落点列 ({lx}, {lz}) 坠落高度不足（仅 {drop_blocks} 格 < {min_drop} 格即遇 {bname}）", None
+        return True, "ok", {
+            "landing_pos": probe_pos,
+            "landing_block": bname,
+            "drop_blocks": drop_blocks,
+            "landing_col": [lx, lz],
+        }
+
+    return False, f"落点列 ({lx}, {lz}) 下方 {max(drop_height, min_drop)} 格内无实心安全落点（疑似虚空）", None
+
+
+@contextlib.contextmanager
+def controlled_totem_trigger(
+    state: State,
+    client: Any,
+    *,
+    drop_height: int = 25,
+    landing_col: Any = None,
+    min_drop: int = 23,
+    max_duration_s: float = 3.5,
+    allow_armored: bool = False,
+):
+    """受控图腾触发守卫：严格核验前置条件后在持续窗口内布防，退出必恢复。"""
+    if isinstance(max_duration_s, bool) or not isinstance(max_duration_s, (int, float)) or not math.isfinite(max_duration_s) or max_duration_s <= 0:
+        raise Replan("受控图腾触发守卫拒绝放行: max_duration_s 必须为正有限数")
+    ok, reason, meta = validate_controlled_totem_conditions(
+        state,
+        client,
+        drop_height=drop_height,
+        landing_col=landing_col,
+        min_drop=min_drop,
+        allow_armored=allow_armored,
+    )
+    if not ok:
+        raise Replan(f"受控图腾触发守卫拒绝放行: {reason}")
+    now = time.monotonic()
+    guard: dict[str, Any] = {
+        "active": True,
+        "consumed": False,
+        "allow_armored": bool(allow_armored),
+        "saw_airborne": False,
+        "suppression_count": 0,
+        "max_duration_s": float(max_duration_s),
+        **(meta or {}),
+        "armed_at": now,
+        "expires_at": now + float(max_duration_s),
+    }
+    with state._lock:
+        state._totem_guard = guard
+    try:
+        yield meta
+    finally:
+        with state._lock:
+            state._totem_guard = None
+
 
 # ---------------------------------------------------------------- 安全闸
+_EDIBLE_FOODS: frozenset[str] = frozenset({
+    "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod",
+    "cooked_salmon", "cooked_rabbit", "bread", "baked_potato", "golden_carrot",
+    "golden_apple", "enchanted_golden_apple", "pumpkin_pie", "apple", "carrot",
+    "melon_slice", "sweet_berries", "glow_berries", "beef", "porkchop", "mutton",
+    "chicken", "rabbit", "potato", "beetroot", "dried_kelp", "cookie",
+    "mushroom_stew", "beetroot_soup", "rabbit_stew",
+})
+
+
+def _has_edible_food(s: State) -> bool:
+    return any(s.count(food) >= 1 for food in _EDIBLE_FOODS)
+
+
+_ARMOR_SLOTS: frozenset[str] = frozenset({
+    "head", "chest", "torso", "legs", "feet",
+    "helmet", "chestplate", "leggings", "boots",
+})
+
+
+def _is_equipped_armor_piece(piece: Any) -> bool:
+    """判断单个槽位条目是否为有效已穿戴护甲件。"""
+    if isinstance(piece, str):
+        name = piece.removeprefix("minecraft:").strip().lower()
+        return bool(name) and name not in ("air", "none")
+    if isinstance(piece, dict):
+        name = str(piece.get("name") or "").removeprefix("minecraft:").strip().lower()
+        if not name or name in ("air", "none"):
+            return False
+        raw_count = piece.get("count", 1)
+        if raw_count is None:
+            return True
+        if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float)) or not math.isfinite(raw_count):
+            return False
+        return float(raw_count) > 0
+    return False
+
+
+def _has_armor_in_container(container: Any, *, filter_slots: bool = False, allow_numeric: bool = False) -> bool:
+    if allow_numeric and isinstance(container, (int, float)) and not isinstance(container, bool):
+        return math.isfinite(container) and float(container) > 0
+    if isinstance(container, dict):
+        for slot, piece in container.items():
+            if filter_slots and str(slot).strip().lower() not in _ARMOR_SLOTS:
+                continue
+            if _is_equipped_armor_piece(piece):
+                return True
+        return False
+    if isinstance(container, (list, tuple)) and not filter_slots:
+        return any(_is_equipped_armor_piece(piece) for piece in container)
+    return False
+
+
+def has_equipped_armor(state: State) -> bool:
+    """判断角色当前是否穿戴了任意部位护甲（背包未穿戴不计入）。"""
+    st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
+    if not isinstance(st, dict):
+        st = {}
+    inv = getattr(state, "inventory", None) or {}
+    if not isinstance(inv, dict):
+        inv = {}
+
+    armor_points = st.get("armor_points")
+    if (
+        isinstance(armor_points, (int, float))
+        and not isinstance(armor_points, bool)
+        and math.isfinite(armor_points)
+        and armor_points > 0
+    ):
+        return True
+    if _has_armor_in_container(st.get("armor"), allow_numeric=True):
+        return True
+    if _has_armor_in_container(st.get("equipment"), filter_slots=True):
+        return True
+    if _has_armor_in_container(inv.get("armor"), allow_numeric=False):
+        return True
+    if _has_armor_in_container(inv.get("equipment"), filter_slots=True):
+        return True
+    return False
+
+
+def effective_hostile_flee_dist(state: State, hostile_name: str = "") -> float:
+    """无甲或低血量时扩大非苦力怕敌怪预警逃跑半径（骷髅 10m、其余 9m）。"""
+    cfg = getattr(state, "config", None)
+    raw_base = getattr(cfg, "hostile_flee_dist", 6.0)
+    base = (
+        float(raw_base)
+        if isinstance(raw_base, (int, float)) and not isinstance(raw_base, bool) and math.isfinite(raw_base) and raw_base > 0
+        else 6.0
+    )
+    raw_hp_risk = getattr(cfg, "hp_risk", 14.0)
+    hp_risk = (
+        float(raw_hp_risk)
+        if isinstance(raw_hp_risk, (int, float)) and not isinstance(raw_hp_risk, bool) and math.isfinite(raw_hp_risk) and raw_hp_risk > 0
+        else 14.0
+    )
+
+    st = state.snapshot() if hasattr(state, "snapshot") else (getattr(state, "st", None) or {})
+    if not isinstance(st, dict):
+        st = {}
+    raw_hp = st.get("health", 20)
+    if isinstance(raw_hp, (int, float)) and not isinstance(raw_hp, bool) and math.isfinite(raw_hp):
+        hp = float(raw_hp)
+    else:
+        hp = 20.0
+
+    if (not has_equipped_armor(state)) or hp < hp_risk:
+        norm = str(hostile_name or "").removeprefix("minecraft:").strip().lower()
+        ranged_names = ("skeleton", "stray", "bogged", "pillager", "parched")
+        hp_crit = float(getattr(cfg, "hp_crit", 6.0) or 6.0)
+        if not has_equipped_armor(state) and hp <= hp_crit and norm in ranged_names:
+            return max(base, 14.0)
+        if norm in ranged_names:
+            return max(base, 10.0)
+        return max(base, 9.0)
+    return base
+
+
 class Safety:
     """纯判断：urgent 抢占，soft 留给执行层在动作边界切换技能。"""
 
@@ -443,7 +1000,7 @@ class Safety:
         def add(kind: str, why: str, severity: str = "urgent", **extra: Any) -> None:
             out.append({"kind": kind, "why": why, "severity": severity, **extra})
 
-        # 致命物理险情（岩浆/缺氧/失重坠落）必须排在 safe_mode 之前，避免 65s 避险锁存遮蔽当前逃生意图
+        # 致命物理险情（岩浆/缺氧/失重坠落/近身苦力怕）必须排在 safe_mode 之前，避免 65s 避险锁存遮蔽当前逃生意图
         if st.get("in_lava"):
             add("escape_lava", "在岩浆里")
         oxygen = st.get("oxygen")
@@ -456,24 +1013,127 @@ class Safety:
             and support.get("status_pos") == st.get("pos")
         ):
             add("void_risk", support["risk"])
+        raw_hostile = st.get("nearest_hostile")
+        hostile = raw_hostile if isinstance(raw_hostile, dict) else {}
+        hostile_name = (
+            str(hostile.get("name", "")).removeprefix("minecraft:").strip().lower()
+            if hostile
+            else ""
+        )
+        raw_dist = hostile.get("dist", 99.0) if hostile else 99.0
+        if isinstance(raw_dist, (int, float)) and not isinstance(raw_dist, bool) and math.isfinite(raw_dist):
+            hostile_dist = float(raw_dist)
+        else:
+            hostile_dist = 99.0
+        offhand_name = (
+            str((st.get("offhand") or {}).get("name") or "").removeprefix("minecraft:").strip().lower()
+            if isinstance(st.get("offhand"), dict)
+            else ""
+        )
+        has_shield_def = offhand_name == "shield" or (hasattr(s, "count") and s.count("shield") >= 1)
+        pos_now = st.get("pos")
+        in_underground_cave = (
+            isinstance(pos_now, (list, tuple))
+            and len(pos_now) >= 3
+            and isinstance(pos_now[1], (int, float))
+            and not isinstance(pos_now[1], bool)
+            and float(pos_now[1]) < 56.0
+        )
+        # 困难模式无甲无盾身处地下矿洞（Y<56，地形狭窄易卡墙）时，苦力怕 4.5m 贴爆即满血秒杀（20->0）：
+        # 将地下无甲无盾 urgent 抢占半径由 5.0m 扩至 7.5m，避免长距 move_to 走进深坑逼近至 4.5m 才急停。
+        creeper_urgent_thresh = (
+            max(float(self.config.creeper_urgent_dist), 7.5)
+            if (in_underground_cave and not has_equipped_armor(s) and not has_shield_def)
+            else float(self.config.creeper_urgent_dist)
+        )
+        creeper_urgent = hostile_name == "creeper" and hostile_dist < creeper_urgent_thresh
+        if creeper_urgent:
+            add(
+                "flee",
+                f"近身苦力怕 距离 {hostile.get('dist')}",
+                "urgent",
+                hostile="creeper",
+                dist=hostile.get("dist"),
+                creeper=True,
+            )
+        close_hostile_threshold = max(6.0, float(self.config.hostile_flee_dist))
+        close_non_creeper = (not creeper_urgent) and bool(hostile) and hostile_dist < close_hostile_threshold
+        emitted_flee = bool(creeper_urgent)
         if s.in_safe_mode:
+            suppress_safe_mode_urgent = bool(s.get_active_escape()) or close_non_creeper
+            if close_non_creeper:
+                add(
+                    "flee",
+                    f"{hostile.get('name')} 距离 {hostile.get('dist')}",
+                    "soft",
+                    hostile=hostile.get("name"),
+                    dist=hostile.get("dist"),
+                )
+                emitted_flee = True
             add(
                 "safe_mode",
                 f"接近死亡循环，锁存避险剩 {s.safe_mode_remaining:.0f}s",
+                "soft" if suppress_safe_mode_urgent else "urgent",
                 remaining_s=round(s.safe_mode_remaining, 1),
             )
         hp = float(st.get("health", 20))
         if hp <= self.config.hp_crit:
             add("heal", f"血量 {hp}", "soft")
-        hostile = st.get("nearest_hostile") or {}
-        if hostile and float(hostile.get("dist", 99)) < self.config.hostile_flee_dist:
+        raw_food = st.get("food")
+        if isinstance(raw_food, (int, float)) and not isinstance(raw_food, bool):
+            food = float(raw_food)
+            if food <= self.config.food_warn:
+                can_eat = _has_edible_food(s)
+                sev = "urgent" if (food <= self.config.food_crit and can_eat) else "soft"
+                add("eat", f"低饱食度 {food:g}", sev, food=food, has_food=can_eat)
+        flee_threshold = effective_hostile_flee_dist(s, hostile_name)
+        if not emitted_flee and hostile and hostile_dist < flee_threshold:
+            ranged_urgent_names = ("skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast")
+            lethal_proximity_urgent = (
+                not s.get_active_escape()
+                and not has_equipped_armor(s)
+                and hp <= self.config.hp_crit
+                and (
+                    hostile_dist <= 4.5
+                    or (hostile_name in ranged_urgent_names and hostile_dist <= 8.0)
+                )
+            )
             add(
                 "flee",
                 f"{hostile.get('name')} 距离 {hostile.get('dist')}",
-                "soft",
+                "urgent" if lethal_proximity_urgent else "soft",
                 hostile=hostile.get("name"),
                 dist=hostile.get("dist"),
             )
+            emitted_flee = True
+        recent_hurt = s.get_recent_hurt(max_age_s=4.0) if hasattr(s, "get_recent_hurt") else None
+        if isinstance(recent_hurt, dict):
+            hurt_src = str(recent_hurt.get("source") or "").strip().lower()
+            src_ent = recent_hurt.get("source_entity") if isinstance(recent_hurt.get("source_entity"), dict) else {}
+            att_ent = recent_hurt.get("likely_attacker") if isinstance(recent_hurt.get("likely_attacker"), dict) else {}
+            src_name = str(src_ent.get("name") or att_ent.get("name") or "").removeprefix("minecraft:").strip().lower()
+            is_arrow_or_ranged = hurt_src in ("arrow", "trident") or src_name in (
+                "skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast", "drowned",
+            )
+            is_mob_attack = hurt_src in ("mob_attack", "mob_projectile", "indirect_magic") or bool(src_name)
+            if (is_arrow_or_ranged or is_mob_attack) and (not has_equipped_armor(s) or hp < self.config.hp_risk):
+                sev = "urgent" if (hp <= self.config.hp_crit and not s.get_active_escape()) else "soft"
+                if not emitted_flee:
+                    add(
+                        "flee",
+                        f"受击应急脱险 {src_name or hurt_src or 'hostile'}",
+                        sev,
+                        hostile=src_name or hostile_name or "hostile",
+                        dist=hostile_dist if hostile else 16.0,
+                        hurt_triggered=True,
+                    )
+                    emitted_flee = True
+                elif sev == "urgent":
+                    for item in out:
+                        if item.get("kind") == "flee":
+                            item["severity"] = "urgent"
+                            item["hurt_triggered"] = True
+                            break
         if st.get("on_fire") and not st.get("in_water"):
             add("douse", "着火", "soft")
         return out
@@ -566,7 +1226,7 @@ class Executor:
         before_fp: Optional[dict[str, int]],
         verify_done: Optional[Callable[[dict[str, int], dict[str, int]], bool]],
         busy_polls: int = 3,
-        busy_interval_s: float = 0.4,
+        busy_interval_s: float = 0.1,
     ) -> tuple[str, Optional[dict]]:
         """网络超时/断流后核实服务端状态：先等 busy 结束，再比对背包确认副作用是否已发生。"""
         still_busy = False
@@ -700,6 +1360,12 @@ class Executor:
                         self.state.patch_action(result, action=name)
                     return result
                 except ApiError as e:
+                    if (
+                        name == "craft"
+                        and e.code == "bad_args"
+                        and any(tok in e.message.lower() for tok in ("updateslot", "did not fire within timeout"))
+                    ):
+                        e = ApiError("window_timeout", e.message, e.extra)
                     attempt_elapsed = time.monotonic() - attempt_started
                     self.n_errors += 1
                     self._record({
@@ -737,7 +1403,7 @@ class Executor:
 
                     retryable = e.kind == RETRY and not (
                         e.code == "timeout" and attempt_elapsed >= _NO_RETRY_TIMEOUT_ELAPSED_S
-                    )
+                    ) and not (e.code == "window_timeout" and name in NON_IDEMPOTENT_ACTIONS)
                     if retryable and attempt <= retries:
                         try:
                             wait_s = self._recover_session_if_needed(e, backoff, attempt)
@@ -890,7 +1556,9 @@ class Executor:
 
     def stop(self, *, raise_on_error: bool = False) -> None:
         try:
-            self.client.stop()
+            res = self.client.stop()
+            if isinstance(res, dict) and res.get("released") is False:
+                raise ApiError("busy", "/stop 等待后动作仍未退出", res)
         except Exception as e:
             self.log(f"  [stop] 失败: {e}")
             if raise_on_error:
@@ -915,6 +1583,31 @@ def _accepts_use_cache(fn: Any) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
+def _same_escape_kind(active_escape: Optional[str], hazard_kind: str) -> bool:
+    """避免后台 SafetyMonitor 重复 /stop 打断正在执行的同类紧急脱险（如 flee 被 flee 抢占）。"""
+    if not active_escape or not active_escape.strip():
+        return False
+    a = active_escape.strip().lower()
+    h = hazard_kind.strip().lower()
+    if h == "safe_mode":
+        return True
+    if a == h:
+        return True
+    douse_group = {"douse", "escape_lava"}
+    surface_group = {"surface", "escape_water"}
+    flee_group = {"flee", "void_risk"}
+    return (
+        (a in douse_group and h in douse_group)
+        or (a in surface_group and h in surface_group)
+        or (a in flee_group and h in flee_group)
+    )
+
+
+_VOID_NON_SOLID: frozenset[str] = frozenset({
+    "air", "cave_air", "void_air", "lava", "flowing_lava",
+})
+
+
 class SafetyMonitor:
     """唯一定时 status/events 读取者；持续危险一次抢占，软危险只发布意图。"""
 
@@ -936,6 +1629,9 @@ class SafetyMonitor:
         self._active: set[str] = set()
         self._triggered: dict[str, float] = {}
         self._last_y: Optional[float] = None
+        self.session_error: Optional[str] = None
+        self._last_err_msg: str = ""
+        self._err_repeat: int = 0
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -945,11 +1641,18 @@ class SafetyMonitor:
         rc = self.state.get_risk_context()
         hostile = st.get("nearest_hostile") or {}
         tod = float(st.get("time_of_day", 0)) % 24000
+        raw_food = st.get("food")
+        low_food = (
+            isinstance(raw_food, (int, float))
+            and not isinstance(raw_food, bool)
+            and float(raw_food) <= cfg.food_warn
+        )
         return bool(
             not st
             or cfg.night_start <= tod <= cfg.night_end
             or "nether" in st.get("dimension", "")
             or float(st.get("health", 20)) < cfg.hp_risk
+            or low_food
             or float(hostile.get("dist", 999)) <= cfg.hostile_risk_dist
             or st.get("in_water")
             or st.get("submerged")
@@ -996,10 +1699,20 @@ class SafetyMonitor:
             return
         y = float(pos[1])
         prev_y = self._last_y
-        falling = prev_y is not None and prev_y - y >= self.config.void_fall_delta
-        ascending = prev_y is not None and y - prev_y > 0.05
-        self._last_y = y
         on_ground = st.get("on_ground")
+        velocity = st.get("velocity")
+        if isinstance(velocity, (list, tuple)) and len(velocity) == 3 and all(
+            isinstance(component, (float, int)) and not isinstance(component, bool) and math.isfinite(component)
+            for component in velocity
+        ):
+            # 落地所在 tick 仍可能有负的垂直位移。
+            falling = on_ground is not True and velocity[1] < 0
+            ascending = velocity[1] > 0
+        else:
+            # 旧版本与传送后的空值仍可用相邻位置样本判断。
+            falling = prev_y is not None and prev_y - y >= self.config.void_fall_delta
+            ascending = prev_y is not None and y - prev_y > 0.05
+        self._last_y = y
         # 潜行且仍在地面上（如搭桥探边准备放下一块）受原版潜行防坠保护，不把待放空气格误判为坠落
         if on_ground is True and st.get("sneaking") and not falling:
             self.state.set_support({
@@ -1023,8 +1736,8 @@ class SafetyMonitor:
             block = self._get_block_uncached(under)
             evidence["block"] = block
             name = str(block.get("name", "")).removeprefix("minecraft:")
-            if name in ("air", "cave_air", "void_air"):
-                if guard:
+            if guard:
+                if name in ("air", "cave_air", "void_air"):
                     # 玩家水平碰撞箱 0.6×0.6（半宽 0.3，叠加上 /status 一位小数四舍五入容差 0.05 → ±0.35）：
                     # 非潜行走过单格桥/窄边且服务端物理判定 on_ground=True 时，中心点可能落在相邻空气格，
                     # 需核对碰撞箱四角是否存在实心承重块，避免把正常贴边行走误判为悬空并误发 /stop。
@@ -1040,7 +1753,7 @@ class SafetyMonitor:
                             cb = self._get_block_uncached(cpos)
                             cname = str(cb.get("name", "")).removeprefix("minecraft:")
                             aabb_checked.append({"pos": cpos, "name": cname})
-                            if cname and cname not in ("air", "cave_air", "void_air", "lava"):
+                            if cname and cname not in _VOID_NON_SOLID:
                                 has_aabb_support = True
                                 evidence["aabb_support"] = {"pos": cpos, "name": cname}
                                 break
@@ -1048,23 +1761,33 @@ class SafetyMonitor:
                             evidence["aabb_checked"] = aabb_checked
                     if not has_aabb_support:
                         evidence["risk"] = "脚下空气：疑似无支撑/坠落，尚不能证明是虚空"
-                elif falling:
-                    # 普通地形下落时再往下探 2 格，区分正常下 1~2 格台阶与真悬空/深坑
+                elif not name:
+                    evidence["risk"] = "高风险路径脚下方块未知"
+            else:
+                near_world_bottom = y <= -60.0
+                if name == "void_air":
+                    evidence["risk"] = "脚下虚空空气(void_air)：疑似坠入虚空"
+                elif near_world_bottom and name in ("air", "cave_air", "") and not ascending:
+                    evidence["risk"] = "接近世界底部(y<=-60)且脚下无实心支撑：疑似坠入虚空"
+                elif name in ("air", "cave_air") and falling:
+                    # 普通地形下落时再往下探 3 格，区分正常下 1~3 格零摔伤台阶/山坡与真悬空/深坑（>=4 格）
                     has_near_ground = False
                     below_checked = []
-                    for dy in (1, 2):
+                    for dy in (1, 2, 3):
                         bpos = [under[0], under[1] - dy, under[2]]
                         b = self._get_block_uncached(bpos)
                         bname = str(b.get("name", "")).removeprefix("minecraft:")
                         below_checked.append({"pos": bpos, "name": bname})
-                        if bname and bname not in ("air", "cave_air", "void_air", "lava"):
+                        if bname in ("lava", "flowing_lava"):
+                            break
+                        if bname and bname not in _VOID_NON_SOLID:
                             has_near_ground = True
                             break
                     evidence["below_checked"] = below_checked
                     if not has_near_ground:
                         evidence["risk"] = "脚下连续空气且正在下落：疑似坠落/深坑"
-            elif not name and guard:
-                evidence["risk"] = "高风险路径脚下方块未知"
+                elif not name and falling:
+                    evidence["risk"] = "脚下方块未知且正在下落：疑似虚空边缘"
         except ApiError as e:
             evidence["error"] = e.code
             if guard:
@@ -1089,10 +1812,35 @@ class SafetyMonitor:
     def _dispatch(self, reconcile: bool = True) -> Optional[dict]:
         hazards = self.safety.hazards(self.state)
         for hazard in hazards:
-            if hazard["kind"] == "heal" and self.executor.active_action in ("attack", "shoot"):
+            if (
+                hazard["kind"] == "heal"
+                and self.executor.active_action in ("attack", "shoot")
+                and not (getattr(self.state, "foraging_passive", False) and not _has_edible_food(self.state))
+            ):
                 hazard["severity"] = "urgent"
-        self.state.set_safety_intent(hazards[0] if hazards else None)
-        urgent = [h for h in hazards if h["severity"] == "urgent"]
+            elif (
+                hazard["kind"] == "eat"
+                and hazard.get("has_food")
+                and self.executor.active_action in ("attack", "shoot")
+            ):
+                hazard["severity"] = "urgent"
+        if hazards:
+            self.state.set_safety_intent(hazards[0])
+        else:
+            cur_intent = getattr(self.state, "safety_intent", None)
+            keep_event_intent = (
+                isinstance(cur_intent, dict)
+                and cur_intent.get("source") == "hurt_interrupt"
+                and isinstance(cur_intent.get("expires_at"), (int, float))
+                and time.monotonic() < float(cur_intent["expires_at"])
+            )
+            if not keep_event_intent:
+                self.state.set_safety_intent(None)
+        active_escape = self.state.get_active_escape()
+        urgent = [
+            h for h in hazards
+            if h["severity"] == "urgent" and not _same_escape_kind(active_escape, h["kind"])
+        ]
         keys = {h["kind"] for h in urgent}
         # 持续存在的危险不重新触发；解除后也要过冷静期，防止阈值抖动。
         if reconcile:
@@ -1101,6 +1849,12 @@ class SafetyMonitor:
         fresh = [h for h in urgent if h["kind"] not in self._active
                  and now - self._triggered.get(h["kind"], float("-inf")) >= self.config.stop_cooldown_s]
         if fresh:
+            if (
+                all(h["kind"] in ("void_risk", "heal") for h in fresh)
+                and self.state.is_totem_trigger_armed()
+                and self.state.consume_totem_trigger_suppression()
+            ):
+                return hazards[0] if hazards else None
             hazard = fresh[0]
             reason = "; ".join(f"{h['kind']}: {h.get('why', '')}" for h in fresh)
             def after_stop(ex):
@@ -1116,6 +1870,7 @@ class SafetyMonitor:
     def _loop(self) -> None:
         while not self._stop_ev.is_set():
             started = time.monotonic()
+            session_backoff = 0.0
             try:
                 bg_obs = getattr(self.client, "background_observation", None)
                 ctx = bg_obs() if callable(bg_obs) else None
@@ -1123,8 +1878,23 @@ class SafetyMonitor:
                     ctx = contextlib.nullcontext()
                 with ctx:
                     self.tick()
+                self.session_error = None
+                self._last_err_msg = ""
+                self._err_repeat = 0
             except Exception as e:
-                self.executor.log(f"  [monitor] 轮询异常: {e}")
+                code = e.code if isinstance(e, ApiError) else ""
+                if code in ("not_connected", "death_loop_cooldown", "wrong_server"):
+                    self.session_error = code
+                    session_backoff = 3.0
+                msg = str(e)
+                if msg == self._last_err_msg:
+                    self._err_repeat += 1
+                    if self._err_repeat % 10 == 0:
+                        self.executor.log(f"  [monitor] 轮询异常（重复×{self._err_repeat}）: {msg}")
+                else:
+                    self._last_err_msg = msg
+                    self._err_repeat = 1
+                    self.executor.log(f"  [monitor] 轮询异常: {msg}")
             if self.continuous:
                 if self.interval_s is not None:
                     wait_s = max(0.0, float(self.interval_s) - (time.monotonic() - started))
@@ -1133,6 +1903,8 @@ class SafetyMonitor:
             else:
                 # 从轮询开始计时，慢 RTT 时不堆积补发。
                 wait_s = max(0.01, self.next_interval() - (time.monotonic() - started))
+            if session_backoff > 0.0:
+                wait_s = max(wait_s, session_backoff)
             self._stop_ev.wait(wait_s)
 
     def start(self) -> None:

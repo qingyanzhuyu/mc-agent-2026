@@ -1,0 +1,254 @@
+{
+  "probe": "T4-P4",
+  "item": "B13",
+  "target": "local-target",
+  "scope_note": "local-target (non-official sandbox/bridge); strictly separated from official competition time budget",
+  "api_base": "http://127.0.0.1:8788/api/v1",
+  "mc_version": "1.21.11",
+  "timestamp": "2026-11-19T17:29:18Z",
+  "steps": {
+    "setup_state": {
+      "pos": [
+        198.5,
+        90,
+        200.5
+      ],
+      "dimension": "overworld",
+      "stick_before": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          100,
+          100
+        ]
+      },
+      "saddle_before": {
+        "name": "saddle",
+        "count": 1,
+        "slot": 36
+      },
+      "striders_found": [
+        {
+          "id": 1045,
+          "type": "animal",
+          "name": "strider",
+          "pos": [
+            201.5,
+            89.5,
+            200.5
+          ],
+          "dist": 3
+        }
+      ]
+    },
+    "saddle_interact": {
+      "ok": true,
+      "elapsed_ms": 264.1,
+      "result": {
+        "entity": {
+          "id": 1045,
+          "name": "strider"
+        },
+        "in_vehicle": null,
+        "vehicle_changed": false,
+        "used": {
+          "saddle": 1
+        },
+        "gained": {}
+      }
+    },
+    "mount_interact": {
+      "response": {
+        "ok": true,
+        "elapsed_ms": 204.0,
+        "result": {
+          "entity": {
+            "id": 1045,
+            "name": "strider"
+          },
+          "in_vehicle": {
+            "id": 1045,
+            "name": "strider"
+          },
+          "vehicle_changed": true,
+          "used": {},
+          "gained": {}
+        }
+      },
+      "in_vehicle": {
+        "id": 1045,
+        "name": "strider"
+      },
+      "pos": [
+        201.5,
+        90.6,
+        200.5
+      ]
+    },
+    "equip_stick": {
+      "response": {
+        "ok": true,
+        "elapsed_ms": 63.3,
+        "result": {
+          "held": {
+            "name": "warped_fungus_on_a_stick",
+            "count": 1,
+            "slot": 37,
+            "durability": [
+              100,
+              100
+            ]
+          }
+        }
+      },
+      "stick_pre": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          100,
+          100
+        ]
+      },
+      "adv_pre_ride_strider": []
+    },
+    "move_to_steer": {
+      "pos_before": [
+        201.5,
+        90.6,
+        200.5
+      ],
+      "pos_after": [
+        201.5,
+        90.6,
+        200.5
+      ],
+      "in_vehicle_after": {
+        "id": 1045,
+        "name": "strider"
+      },
+      "response": {
+        "ok": false,
+        "elapsed_ms": 8068.6,
+        "error": {
+          "code": "stalled",
+          "message": "stalled (Stuck for 8s without movement progress) {'pos': [201.5, 90.6, 200.5]}",
+          "extra": {
+            "pos": [
+              201.5,
+              90.6,
+              200.5
+            ]
+          }
+        }
+      },
+      "stick_before": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          100,
+          100
+        ]
+      },
+      "stick_after": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          100,
+          100
+        ]
+      },
+      "durability_delta": 0,
+      "strider_advancements_completed": []
+    },
+    "use_item_boost": {
+      "pos_before": [
+        201.5,
+        90.6,
+        200.5
+      ],
+      "pos_after": [
+        201.5,
+        90.6,
+        200.5
+      ],
+      "in_vehicle_after": {
+        "id": 1045,
+        "name": "strider"
+      },
+      "response": {
+        "ok": true,
+        "elapsed_ms": 364.9,
+        "result": {
+          "used": "warped_fungus_on_a_stick",
+          "thrown": true,
+          "pos": [
+            201.5,
+            90.6,
+            200.5
+          ]
+        }
+      },
+      "stick_before": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          100,
+          100
+        ]
+      },
+      "stick_after": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          99,
+          100
+        ]
+      },
+      "durability_delta": 1,
+      "strider_advancements_completed": [
+        {
+          "id": "minecraft:nether/ride_strider",
+          "parent_id": "minecraft:nether/root",
+          "title": "advancements.nether.ride_strider.title",
+          "frame": "task",
+          "status": "completed",
+          "completed_at": 1795109371690,
+          "progress": [
+            1,
+            1
+          ]
+        }
+      ]
+    }
+  },
+  "rcon_setup": {
+    "forceload add 184 184 216 216": "Marked 9 chunks in minecraft:overworld from [11, 11] to [13, 13] to be force loaded",
+    "fill 194 88 194 218 96 206 minecraft:air": "No blocks were filled",
+    "fill 194 88 194 218 89 206 minecraft:obsidian": "Successfully filled 650 block(s)",
+    "fill 200 89 197 214 89 203 minecraft:lava": "Successfully filled 105 block(s)",
+    "kill @e[type=minecraft:strider,x=200,y=90,z=200,distance=..32]": "No entity was found",
+    "clear <local_test_bot>": "No items were found on player <local_test_bot>",
+    "gamemode survival <local_test_bot>": "",
+    "effect clear <local_test_bot>": "Target has no effects to remove",
+    "effect give <local_test_bot> minecraft:fire_resistance 300 0 true": "Applied effect Fire Resistance to <local_test_bot>",
+    "effect give <local_test_bot> minecraft:resistance 300 4 true": "Applied effect Resistance to <local_test_bot>",
+    "advancement revoke <local_test_bot> only minecraft:nether/ride_strider": "Couldn't revoke advancement [This Boat Has Legs] from <local_test_bot> as they don't have it",
+    "advancement revoke <local_test_bot> only minecraft:nether/ride_strider_in_overworld_lava": "Couldn't revoke advancement [Feels Like Home] from <local_test_bot> as they don't have it",
+    "tp <local_test_bot> 198.5 90 200.5": "Teleported <local_test_bot> to 198.500000, 90.000000, 200.500000",
+    "give <local_test_bot> minecraft:saddle 1": "Gave 1 [Saddle] to <local_test_bot>",
+    "give <local_test_bot> minecraft:warped_fungus_on_a_stick 1": "Gave 1 [Warped Fungus on a Stick] to <local_test_bot>",
+    "summon minecraft:strider 201.5 90 200.5 {PersistenceRequired:1b}": "Summoned new Strider"
+  },
+  "verdict": {
+    "local_bridge_move_to_durability_delta": 0,
+    "local_bridge_use_item_durability_delta": 1,
+    "ride_strider_advancement_triggered": true,
+    "bridge_vs_spec_notes": "local-api-bridge /use_item falls through to bot.activateItem() for unlisted items, whereas official API v1.3.11 §4.5 states unlisted items return cannot_use; local-api-bridge /move_to does NOT implement §4.1 vehicle steering (uses generic pathfinder)."
+  }
+}

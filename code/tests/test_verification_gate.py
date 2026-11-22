@@ -11,6 +11,10 @@ from mcagent.loop.starter_skills import GatherWood, ScoutIsland
 from mcagent.runtime import State
 
 
+class OfflineGatherWood(GatherWood):
+    verified = "offline"
+
+
 class LiveGatherWood(GatherWood):
     verified = "live"
 
@@ -27,16 +31,16 @@ class VerificationGateTests(unittest.TestCase):
         self.goal = GOAL_MAP["prep_wood"]
 
     def test_rule_queue_skips_offline_goal_and_uses_live_fallback(self):
-        registry = {"gather_wood": GatherWood, "scout_island": LiveScoutIsland}
+        registry = {"gather_wood": OfflineGatherWood, "scout_island": LiveScoutIsland}
         local = RulePlanner(registry=registry, ledger=(self.goal,))
-        self.assertIsInstance(local.choose(self.state).skill, GatherWood)
+        self.assertIsInstance(local.choose(self.state).skill, OfflineGatherWood)
 
         strict = RulePlanner(registry=registry, ledger=(self.goal,), min_verified="live")
         self.assertIsInstance(strict.choose(self.state).skill, LiveScoutIsland)
 
     def test_explicit_goal_respects_floor_even_when_candidate_is_forced(self):
         candidate = replace(self.goal, stage="candidate")
-        registry = {"gather_wood": GatherWood, "scout_island": ScoutIsland}
+        registry = {"gather_wood": OfflineGatherWood, "scout_island": ScoutIsland}
         strict = CampaignPlanner(
             target_goal=candidate.id, ledger=(candidate,), registry=registry, min_verified="live",
         )
@@ -44,8 +48,8 @@ class VerificationGateTests(unittest.TestCase):
 
     def test_explicit_skill_uses_same_verification_floor(self):
         for cls, floor, allowed in (
-            (GatherWood, "offline", True),
-            (GatherWood, "live", False),
+            (OfflineGatherWood, "offline", True),
+            (OfflineGatherWood, "live", False),
             (LiveGatherWood, "live", True),
         ):
             with self.subTest(skill=cls.__name__, floor=floor):
@@ -75,7 +79,7 @@ class VerificationGateTests(unittest.TestCase):
         model.ask_json.side_effect = choose_offline
         planner = CampaignPlanner(
             use_llm=True, llm=model, ledger=(self.goal,), min_verified="live",
-            registry={"gather_wood": GatherWood, "scout_island": LiveScoutIsland},
+            registry={"gather_wood": OfflineGatherWood, "scout_island": LiveScoutIsland},
         )
         decision = planner.select(self.state, [])
         self.assertEqual(decision.source, "llm_fallback_rule")
@@ -87,7 +91,7 @@ class VerificationGateTests(unittest.TestCase):
                 cfg = Config(base=f"https://{hostname}/api/v1", username="fixture", password="fixture")
                 with patch.object(Config, "load", return_value=cfg), patch.object(loop_main, "Client") as client, \
                         redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                    code = loop_main.main(["--live", "--local-target", "--mode", "focus", "--skill", "gather_wood"])
+                    code = loop_main.main(["--live", "--local-target", "--mode", "focus", "--skill", "scout_island"])
 
                 self.assertEqual(code, 2)
                 self.assertIn("需要 verified=live", err.getvalue())

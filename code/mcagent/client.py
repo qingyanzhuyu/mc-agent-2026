@@ -17,13 +17,17 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 DEFAULT_BASE = "https://mc-api.windywindie.top/api/v1"
-MAX_RPS_CAP: float = 16.0
+MAX_RPS_CAP: float = 100_000.0
+_FAST_PATH_MIN_RPS: float = 10_000.0
+_FAST_PATH_MAX_SPACING: float = 0.0001
 
 # §3.1 / §4.11: 姿态请求与响应使用不同的字段名。
 _POSTURE_FIELDS = {"sneak": "sneaking", "shield": "blocking", "jump": "jumping"}
@@ -38,6 +42,7 @@ CODE_CLASS: dict[str, str] = {
     # 瞬时/会话可恢复：由客户端或执行器按协议退避恢复后重试
     "busy": RETRY,
     "timeout": RETRY,
+    "window_timeout": RETRY,
     "not_loaded": RETRY,
     "rate_limited": RETRY,
     "not_ready": RETRY,
@@ -171,13 +176,13 @@ class Config:
         self.proxy = proxy
         self.token_file = token_file
 
-        raw_rps = os.environ.get("MC_MAX_RPS", "16") if max_rps is None else max_rps
-        rps_err = "MC_MAX_RPS 必须在 (0, 16]，16 是客户端硬上限"
+        raw_rps = os.environ.get("MC_MAX_RPS", "100000") if max_rps is None else max_rps
+        rps_err = "MC_MAX_RPS 必须在 (0, 100000]，100000 是客户端硬上限"
         self.max_rps = _parse_finite_float(raw_rps, rps_err)
         if not 0 < self.max_rps <= MAX_RPS_CAP:
             raise ValueError(rps_err)
 
-        raw_ttl = os.environ.get("MC_BLOCK_CACHE_TTL_S", "1.5") if block_cache_ttl_s is None else block_cache_ttl_s
+        raw_ttl = os.environ.get("MC_BLOCK_CACHE_TTL_S", "0.3") if block_cache_ttl_s is None else block_cache_ttl_s
         ttl_err = "MC_BLOCK_CACHE_TTL_S 必须为有限非负数"
         self.block_cache_ttl_s = _parse_finite_float(raw_ttl, ttl_err)
         if self.block_cache_ttl_s < 0:
@@ -225,10 +230,12 @@ def _parse_iso(s: Optional[str]) -> Optional[float]:
 
 # ---------------------------------------------------------------- 客户端
 class RequestLimiter:
-    """所有请求共用的无突发限速；等待者不持锁睡眠，/stop > 普通 > 后台观察。"""
+    """所有请求共用的限速器；高频(>=10000 RPS)走零睡眠快路径，低频保留 /stop > 普通 > 后台观察三级排队。"""
 
     def __init__(self, rate: float):
-        self.spacing = 1.0 / rate
+        self.rate = float(rate)
+        self.spacing = 1.0 / self.rate
+        self._fast_path = self.rate >= _FAST_PATH_MIN_RPS or self.spacing <= _FAST_PATH_MAX_SPACING
         self._next = 0.0
         self._cond = threading.Condition()
         self._urgent = 0
@@ -236,6 +243,15 @@ class RequestLimiter:
 
     def acquire(self, urgent: bool = False, *, background: bool = False) -> None:
         is_urgent = bool(urgent)
+        if self._fast_path:
+            if is_urgent:
+                return
+            if self._urgent == 0:
+                return
+            with self._cond:
+                while self._urgent > 0:
+                    self._cond.wait(0.001)
+            return
         is_normal = not is_urgent and not bool(background)
         with self._cond:
             if is_urgent:
@@ -269,6 +285,9 @@ class Client:
         self.session = requests.Session()
         # 关键：不读环境/注册表里的代理
         self.session.trust_env = False
+        adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         if cfg.proxy:
             self.session.proxies = {"http": cfg.proxy, "https": cfg.proxy}
         self.token: Optional[str] = None
@@ -684,6 +703,70 @@ class Client:
                             self._block_cache.pop(k, None)
                     self._block_cache[key] = (now + ttl, copy.deepcopy(res))
         return copy.deepcopy(res) if isinstance(res, dict) else res
+
+    def get_blocks_batch(
+        self,
+        positions,
+        *,
+        max_workers: int = 8,
+        use_cache: bool = True,
+    ) -> dict[tuple[int, int, int], dict]:
+        """并发只读批量查块（有界线程池 + 短时缓存命中 + 单格异常隔离，不触碰 Executor 动作锁）。"""
+        keys: list[tuple[int, int, int]] = []
+        seen: set[tuple[int, int, int]] = set()
+        for pos in positions:
+            key = self._block_cache_key(pos)
+            if key is not None and key not in seen:
+                seen.add(key)
+                keys.append(key)
+        if not keys:
+            return {}
+
+        out: dict[tuple[int, int, int], dict] = {}
+        missing: list[tuple[int, int, int]] = []
+        ttl = getattr(self.cfg, "block_cache_ttl_s", 0.0)
+        if use_cache and ttl > 0:
+            now = time.monotonic()
+            with self._block_cache_lock:
+                for key in keys:
+                    entry = self._block_cache.get(key)
+                    if entry is not None:
+                        expires_at, cached = entry
+                        if now < expires_at:
+                            out[key] = copy.deepcopy(cached)
+                            continue
+                        self._block_cache.pop(key, None)
+                    missing.append(key)
+        else:
+            missing = keys
+
+        if not missing:
+            return out
+
+        is_bg = self._is_background_thread()
+
+        def _fetch_one(cell: tuple[int, int, int]) -> tuple[tuple[int, int, int], dict]:
+            try:
+                if is_bg:
+                    with self.background_observation():
+                        res = self.get_block(list(cell), use_cache=use_cache)
+                else:
+                    res = self.get_block(list(cell), use_cache=use_cache)
+                return cell, (res if isinstance(res, dict) else {})
+            except Exception:
+                return cell, {}
+
+        workers = max(1, min(int(max_workers or 1), len(missing), 16))
+        if workers <= 1 or len(missing) == 1:
+            for cell in missing:
+                k, val = _fetch_one(cell)
+                out[k] = val
+            return out
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for k, val in pool.map(_fetch_one, missing):
+                out[k] = val
+        return out
 
     def get_entities(self, radius=32, types=None) -> dict:
         body: dict = {"radius": radius}

@@ -1,0 +1,200 @@
+{
+  "probe": "T4-P1",
+  "item": "B19",
+  "target": "local-target",
+  "scope_note": "local-target (non-official sandbox/bridge); strictly separated from official competition time budget",
+  "api_base": "http://127.0.0.1:8788/api/v1",
+  "mc_version": "1.21.11",
+  "timestamp": "2026-11-19T17:30:07Z",
+  "cases": {
+    "attack_max_hits_1": {
+      "setup": {
+        "forceload add 232 192 248 208": "Marked 4 chunks in minecraft:overworld from [14, 12] to [15, 13] to be force loaded",
+        "fill 236 89 196 244 94 204 minecraft:air": "No blocks were filled",
+        "fill 236 89 196 244 89 204 minecraft:stone": "Successfully filled 81 block(s)",
+        "fill 238 90 199 242 92 199 minecraft:stone": "Successfully filled 15 block(s)",
+        "kill @e[type=minecraft:item_frame,x=240,y=90,z=200,distance=..16]": "No entity was found",
+        "kill @e[type=minecraft:item,x=240,y=90,z=200,distance=..16]": "No entity was found",
+        "clear <local_test_bot>": "No items were found on player <local_test_bot>",
+        "gamemode survival <local_test_bot>": "",
+        "tp <local_test_bot> 240.5 90 201.8 180 0": "Teleported <local_test_bot> to 240.500000, 90.000000, 201.800000",
+        "summon minecraft:item_frame 240 91 200 {Facing:3b,Item:{id:\"minecraft:elytra\",count:1}}": "Summoned new Item Frame"
+      },
+      "frames_before": [
+        {
+          "id": 1411,
+          "type": "other",
+          "name": "item_frame",
+          "pos": [
+            240,
+            91,
+            200
+          ],
+          "dist": 2.1
+        }
+      ],
+      "attack_response": {
+        "ok": true,
+        "elapsed_ms": 64.1,
+        "result": {
+          "killed": false,
+          "hits": 1,
+          "ms": 1,
+          "inventory": {}
+        }
+      },
+      "entities_after_hit": [
+        {
+          "id": 1411,
+          "name": "item_frame",
+          "pos": [
+            240,
+            91,
+            200
+          ]
+        }
+      ],
+      "inv_immediately": {
+        "name": "elytra",
+        "count": 1,
+        "slot": 36,
+        "durability": [
+          432,
+          432
+        ]
+      },
+      "inv_after_collect": {
+        "name": "elytra",
+        "count": 1,
+        "slot": 36,
+        "durability": [
+          432,
+          432
+        ]
+      },
+      "frames_remaining": [
+        {
+          "id": 1411,
+          "type": "other",
+          "name": "item_frame",
+          "pos": [
+            240,
+            91,
+            200
+          ],
+          "dist": 2.1
+        }
+      ]
+    },
+    "control_hit_true": {
+      "setup": {
+        "forceload add 232 192 248 208": "No chunks were marked for force loading",
+        "fill 236 89 196 244 94 204 minecraft:air": "Successfully filled 96 block(s)",
+        "fill 236 89 196 244 89 204 minecraft:stone": "Successfully filled 81 block(s)",
+        "fill 238 90 199 242 92 199 minecraft:stone": "Successfully filled 15 block(s)",
+        "kill @e[type=minecraft:item_frame,x=240,y=90,z=200,distance=..16]": "Killed Item Frame",
+        "kill @e[type=minecraft:item,x=240,y=90,z=200,distance=..16]": "No entity was found",
+        "clear <local_test_bot>": "Removed 1 item(s) from player <local_test_bot>",
+        "gamemode survival <local_test_bot>": "",
+        "tp <local_test_bot> 240.5 90 201.8 180 0": "Teleported <local_test_bot> to 240.500000, 90.000000, 201.800000",
+        "summon minecraft:item_frame 240 91 200 {Facing:3b,Item:{id:\"minecraft:elytra\",count:1}}": "Summoned new Item Frame"
+      },
+      "frames_before": [
+        {
+          "id": 1681,
+          "type": "other",
+          "name": "item_frame",
+          "pos": [
+            240,
+            91,
+            200
+          ],
+          "dist": 2.1
+        }
+      ],
+      "look_response": {
+        "ok": true,
+        "elapsed_ms": 61.6,
+        "result": {
+          "yaw": 0.26965336943310714,
+          "pitch": -0.31939525311494243
+        }
+      },
+      "control_hit_response": {
+        "ok": true,
+        "elapsed_ms": 56.1,
+        "result": {
+          "ms": 51,
+          "pos": [
+            240.5,
+            90,
+            201.8
+          ],
+          "moved": 0,
+          "on_ground": true,
+          "in_water": false,
+          "yaw": 0.26965336943310714,
+          "pitch": -0.31939525311494243,
+          "hits": [
+            {
+              "t_ms": 0,
+              "entity": {
+                "id": 1681,
+                "name": "item_frame",
+                "dist": 1.7
+              }
+            }
+          ],
+          "hit_interval_ms": 250,
+          "held": null
+        }
+      },
+      "entities_after_hit": [
+        {
+          "id": 1681,
+          "name": "item_frame",
+          "pos": [
+            240,
+            91,
+            200
+          ]
+        }
+      ],
+      "inv_immediately": {
+        "name": "elytra",
+        "count": 1,
+        "slot": 36,
+        "durability": [
+          432,
+          432
+        ]
+      },
+      "inv_after_collect": {
+        "name": "elytra",
+        "count": 1,
+        "slot": 36,
+        "durability": [
+          432,
+          432
+        ]
+      },
+      "frames_remaining": [
+        {
+          "id": 1681,
+          "type": "other",
+          "name": "item_frame",
+          "pos": [
+            240,
+            91,
+            200
+          ],
+          "dist": 2.1
+        }
+      ]
+    }
+  },
+  "verdict": {
+    "attack_popped_and_picked_elytra": true,
+    "control_hit_popped_and_picked_elytra": true
+  }
+}

@@ -1,6 +1,6 @@
 # 南大 AI Agent for Minecraft 开发大赛 · Harness 赛道备赛仓库
 
-> 状态：**备赛中（D0+，底层容错与离线故障注入单测已就位）** · 更新 2026-11-12
+> 状态：**架构收拢分支 `feat/arch-converge-v2-agy`（待合入 `main`；4 项核心技能 `verified: live` + 75 项技能 `verified: offline` / 含阶段二 37 项与阶段三 18 项 T4 精选技能，另附 `local-target` 冒烟）** · 更新 2026-11-19
 > 初赛：**11/22（日）10:00–18:00，8 小时，每人一座虚空岛（v2 草案）** · 决赛：12/6
 > 出线：初赛取 8 队 · 报名截止：**11/18**
 
@@ -12,8 +12,8 @@
 ## 三十秒版本
 
 - 赛道：自建 harness 控制一个 Minecraft bot 自主生存 8 小时，按原版 advancement 计分（60）+ 工程评审（40）。
-- 模型：公告写"统一 DeepSeek V4.1 Flash"，群里已改口为 **qwen3.6-35b-a3b 无限额度**，d4.1f 额度有限，正式用哪个**还未定**（代码层统一按环境变量配置化，见 J13）。
-- 接口：`https://mc-api.windywindie.top/api/v1`，以上游 [v1.3.11 规范](docs/99-原始记录/api-spec-v1.3.11.md)为协议参考。比赛服实际部署版本见 [待确认 B18](docs/04-待确认.md)。
+- 模型：公告写"统一 DeepSeek V4.1 Flash"，群里已改口为 **qwen3.6-35b-a3b 无限额度**，d4.1f 额度有限，正式用哪个**还未定**（代码层统一配置为 `LLM_MODEL=default` 并通过环境变量切换，见 J13；2026-11-19 官方 AIA 实测返回 `qwen3.6-35b-a3b`）。
+- 接口：官方双端点——校园网直连入口 `https://apiin.nmo.net.cn/api/v1`（2026-11-19 官方校园网实测 `T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`）与公网备用入口 `https://mc-api.windywindie.top/api/v1`（2026-11-19 无鉴权探活 `816–973 ms`，返 `401 unauthorized`）；以上游 [v1.3.11 规范](docs/99-原始记录/api-spec-v1.3.11.md)为协议参考，已关闭 [B18/C1](docs/04-待确认.md) 官方标定项。
 
 ## 我们目前最重要的五条判断
 
@@ -34,33 +34,41 @@ AGENTS.md            多 agent 协作硬规则（文件所有权 / 协作禁令�
 skill/SKILL.md       仓库使用手册（定位 / 任务路由 / 五个坑 / DoD）—— 同上，先读这个
 skill/live-experiment/SKILL.md  真机实验流程（同步 → 起网关 → smoke → probe）
 pyproject.toml       Python 依赖声明（配合 uv.lock 锁定可复现测试环境）
+report.md            40 分工程评审技术报告正文（整合 J1–J20、架构、官方基线与迭代案例）
+report.pdf           由 report.md 导出的可提交工程技术报告 PDF
+demo.md              11/22 线下交流日与阶段模拟展示七步脚本（含断网兜底回放命令）
+results/             脱敏官方实测证据、2h 长跑曲线、离线 --replay 异常包与阶段二 local-target 冒烟记录
 docs/
   00-赛事事实.md      客观条款（公告 + 细则 + 群聊补充），带来源
   01-关键判断.md      J1–J20，每条可被证伪
   02-接口与架构.md    API 能力地图 + 三层架构 + 四条工程红线
-  03-策略推论.md      旧计分公式下的推论（前三节已作废）+ 靶场数据 ≠ 比赛预算
+  03-策略推论.md      旧计分公式下的推论（前三节已作废）+ §六 官方校园网基线与长跑曲线（靶场数据 ≠ 比赛预算）
   04-待确认.md        checkbox 清单，认领制
-  05-分工与契约.md    角色表 / 账号表（登录前占位）/ 模块冻结面
+  05-分工与契约.md    角色表 / 账号表（已脱敏占位）/ 模块冻结面
   06-工作日志.md      每次改动追加一条（含为什么、验证到哪一步）
-  07-评审材料.md      40 分评审怎么攒：评分项 → 证据 → 现状
+  07-评审材料.md      40 分评审怎么攒：评分项 → 证据 → 现状（含五部分材料包映射）
   08-计分建模与推进顺序.md  v2 草案计分表：分池、分档、不计分项
   09-进度树与判据表.md  125 项进度树 + 官方判据 + capability 归并（脚本生成）
   10-推进批次.md      99 个计分项聚成 22 批（按共享前置）+ 岛体检结构指纹表
   11-任务性价比分层.md  99 项分四层：底仓 / 有就做 / 长链带止损 / 放弃
   13-得分目标脚本与子目标规划.md  99 项拆成子目标与公共脚本 + 新旧技能对照 + 岛体检 + 成本与时间线
+  14-T4精选扩展与子目标规划.md    Stage 3 1.21.11×API 交叉审计、Wave A–D 18 项 T4 精选扩展与 10 项共享 T4_PREP 子图
   99-原始记录/        v1/v2/v3 原始分析 + 官方接口规范原文
 plan/
   11-12到11-22执行计划.md
+  赛前切换清单.md    T-7 / T-1 / T-0 与 11/22 线下交流日切换清单
 code/
   mcagent/
-    client.py        HTTP 客户端（401 单点刷新 + .token.json 复用 + 姿态合并，冻结面）
-    runtime.py       State / Safety / SafetyMonitor / Executor（可抢占锁 + 非幂等判重，冻结面）
-    smoke.py probe.py 冒烟与基线测量
-    planner/         决策层：Decision 契约 + 强类型反射校验器（无策略实现）
-    skills/          执行层：Skill 基类 + 空注册表（无具体技能）
-  tests/             14 项离线故障注入与多线程抢占单测（verified: offline）
+    client.py        HTTP 客户端（401 单点刷新 + .token.json 复用 + 16 RPS 分级限速 + get_block 缓存 + 姿态合并，冻结面）
+    runtime.py       State / Safety / 连续异步 SafetyMonitor / Executor（可抢占锁 + 非幂等判重 + 有界 move_to 超时禁重试 + v1.3.11 精选恢复，冻结面）
+    preflight.py     赛前切换自检（12 项静态门禁：官方端点 / 凭据 / 2 路并发闸门 / 8787 网关 / 残留 soak_ctl·mcagent 进程 / apiin 误配 7897 代理拦截）
+    smoke.py probe.py 冒烟与基线测量（含 --api-capabilities / --pathfinding）
+    planner/         决策层：objective.py（目标级战略校验）、skill_choice.py、decision.py、llm.py（2 路 BoundedSemaphore 并发闸门）、scheduler.py
+    skills/          执行层：L2 原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（21 类指纹 + 原子 JSON 检查点）、79 个注册 L3 技能（4 项 verified="live" + 75 项 verified="offline"，含 emergency_escape 及阶段三 18 项 T4 技能）
+    loop/            主循环与策略：engine.py（同格冷却自旋三级升级 + 30s 沿路增量扫描）、goals.py（104 项 GoalSpec 台账：89 计分项 / 2,730 分上限 [80.6%]，6 graduated / 1 candidate / 97 draft）、subgoals.py（10 项活谓词 + 10 类工作站）、strategy.py & strategy_async.py（--strategy llm）、context.py、auditor.py、tape.py
+  tests/             离线故障注入、架构契约与集成回归单测：1,421 项 Python unittest（verified: offline）
 tools/
-  local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，与比赛代码零耦合）
+  local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，含 11 项 Node 网关契约单测，与比赛代码零耦合）
 ```
 
 ## 怎么参与
@@ -69,19 +77,23 @@ tools/
 1. **认领问题**：打开 [docs/04-待确认.md](docs/04-待确认.md)，把 `[ ]` 改成 `[x] @你的名字`，然后去问 / 去试。
 2. **改事实**：`docs/00` 是我们的共识底座，改动必须附来源（链接、截图、会议纪要）。
 3. **提判断**：新判断写进 `docs/01`，编号顺延，**必须写"什么情况会推翻它"**——写不出就别写。
-4. **改代码**：先读 [code/mcagent/README.md](code/mcagent/README.md) 的三条约束，跑通 `cd code && uv run python -m unittest discover -s tests && uv run python -m mcagent.smoke --dry`。
+4. **改代码**：先读 [code/mcagent/README.md](code/mcagent/README.md) 的三条约束，跑通 `cd code && uv run python -m unittest discover -s tests && uv run python -m mcagent.smoke --dry && uv run python -m mcagent.preflight`。
 5. **别提交密钥**：`.env`、`.token.json`、`sk-...`、皮肤站密码，一律不进仓库。
 
 ## 当前进度
 
-- [x] 抓全公告 + 初赛细则（公开页，无需登录）
-- [x] 读完接口规范 v1.3.1，探通端点（未授权 401，RTT ≈ 0.6s）
-- [x] 底层容错闭环（401 单点重登与 Token 持久化、死亡去重与 65s 避险锁存、非幂等超时判重、`emergency()` 紧急抢占）+ **14 项离线故障注入单测全绿**
-- [ ] **登录 + `ready=True`**（等皮肤站账号，D0 阻塞项）
-- [ ] 基线测量（`T_status` / `T_move20` / `T_dig1`）
-- [ ] 计分表 / 参考实现 / 官方口径（都在等主办方）
+- [x] 抓全公告 + 初赛细则 + 计分/判据表整理（`docs/00`、`docs/08`–`docs/13`）
+- [x] 读完接口规范 v1.3.1–v1.3.11，探通官方双端点无鉴权（2026-11-19 实测：校园网 `apiin.nmo.net.cn` 长连接 RTT `4.0–4.3 ms`，公网 `mc-api.windywindie.top` `816–973 ms`，均返 `401 unauthorized`）
+- [x] 底层容错与运行时加固（401 单点重登与 Token 持久化、16 RPS 三级限速、连续异步 `SafetyMonitor`、死亡去重与 65s 避险锁存、非幂等超时判重、有界 `move_to` 超时禁重试、`emergency()` 紧急抢占、移植 `v1.3.11` 精选恢复 4 项）
+- [x] 架构收拢至 `feat/arch-converge-v2-agy` 并合入 Stage 3（Wave A–D，**79 个注册 L3 技能**：`4` 项 `verified="live"` + `75` 项 `verified="offline"`；**104 项 `GoalSpec` 台账**：`89` 计分项 / `2,730` 分上限 [80.6%]，`6 graduated / 1 candidate / 97 draft`；10 项活谓词、21 类世界指纹、受控图腾单次安全钩子、共享子图 DAG 边际 ROI、被动机会根目标门控、30s 节流沿路扫描与 `furnace_lease` 异步租约）+ **1,421 项 Python `unittest` + 11 项 Node 网关契约单测全绿**
+- [x] 本地靶场 `local-target` 冷启动、阶段二与阶段三技能冒烟复测（2 轮 240s 冷启动验证闭环，第 2 轮 `<local_test_bot>` 0 死亡拿 10 分；阶段二 `survey_island`/`discover_structure`/`trade_villager`/`furnace_lease` 冒烟通过；阶段三 Step 0 `T4-P1..P4` 标定及 18 项空包 `blocked` 18/18 拦截 + Vanilla 1.21.11 实跑 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 解锁真实进度；**均不进入正式比赛时间预算表**）
+- [x] **官方正式皮肤站账号登录 + `ready=True`**（校园网 `apiin.nmo.net.cn` `preflight --apply --live` 15/15 全绿、`smoke` `0.5s` 登录进服就绪，Token TTL 24h）
+- [x] **官方校园网基线 `probe` + 能力标定 + AIA 实测**（`T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`、`MC_MAX_RPS` 4/8/12/16 零限流、C16 虚空保护误报 `0/12`、官方 AIA `qwen3.6-35b-a3b` 快路径 `4/4` `p50=1652.7 ms`，已关闭 `docs/04` B18/C1 等 10 项待确认项，数据归档 `results/probe/`）
+- [x] **官方真机故障演练 3/3 PASS**（断线重连 `63.11s`、`safe_mode` `65.2s` 冷却自愈、3 线程并发 401 单飞刷新 `login_calls=1`，归档 `results/probe/fault-drills-official-20261119.json`）
+- [x] **官方 2 小时长跑取证 + 根因修复 + 评审五部分材料冻结**（`official-soak-20261119` 有效 `6303.9s` **0 死亡 0 崩溃**、`emergency_escape` 6/6，前 `124.7s` 拿下 5 项起步目标；4 项零缺陷技能升格 `verified="live"`；暴露的 4 环死锁与 Token 烧爆已在 `c03c26e` 闭环修复；`INC-005` 可 100% 离线 `--replay`；`report.md`、`report.pdf`、`demo.md`、`results/` 已脱敏汇编就绪）
+- [ ] **阶段二/三技能真机晋级 + 合入 `main` + 赛前收尾**（阶段二/三及未实测技能共 **75 项仍保持 `verified="offline"`**、台账 97 项仍为 `draft`，`feat/arch-converge-v2-agy` **尚待最终合入 `main`**；另待 11/22 演示备用录屏、跟进官方提交入口 `docs/04` A3 与 `docs/05` 角色表人类签字）
 
 ## 已知的两个坑
 
-1. **本机注册表挂了死代理 `127.0.0.1:7897`**，`requests` 默认会读它 → 报 `ProxyError`，看着像断网。代码里必须 `trust_env=False`。
-2. **LLM 端点和 MC 端点的网络路径不同**：`api.nju-aia.com` 走代理 219ms / 直连 1520ms；`mc-api` 直连 666ms，绕代理没收益。别一刀切开/关 VPN。
+1. **本机注册表挂了死代理 `127.0.0.1:7897`**，`requests` 默认会读它 → 报 `ProxyError`，看着像断网。代码里必须保持 `trust_env=False`。
+2. **校园网直连端点与 LLM 端点的网络路径不同**：校园网 MC 入口 `apiin.nmo.net.cn` 直连长连接 RTT 实测 `4.0–4.3 ms`（公网备用 `mc-api.windywindie.top` 约 `816–973 ms`），**严禁给 `apiin.nmo.net.cn` 误配 `7897` 代理**（`code/mcagent/preflight.py` 已内置拦截）；而 `api.nju-aia.com` 走代理与直连表现不同（见 `planner/llm.py` 双线路降级）。别一刀切开/关 VPN。

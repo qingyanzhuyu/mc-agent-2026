@@ -11,13 +11,18 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Collection, Mapping, Optional
+from typing import Any, Collection, Mapping, Optional, Sequence
 
-from ..runtime import State
+from ..runtime import State, has_equipped_armor
 from ..skills import REGISTRY, bind_args
+from ..skills.furnace_lease import lease_book_for
 from ..skills.items import STONE_OR_BETTER_PICKS, best_pickaxe
+from ..skills.survival_food import cooked_food_count, inventory_food_restore
+from ..skills.world_memo import memo_for
+from . import subgoals
 from .starter_skills import (
     can_afford_gear,
     has_known_table,
@@ -29,7 +34,7 @@ from .starter_skills import (
 GOAL_STAGES: tuple[str, ...] = ("draft", "candidate", "graduated", "live")
 DEFAULT_CAMPAIGN_STAGES: tuple[str, ...] = ("candidate", "graduated", "live")
 OFFICIAL_CAMPAIGN_STAGES: tuple[str, ...] = ("graduated", "live")
-GOAL_TIERS: tuple[str, ...] = ("T0_PREP", "T1", "T2", "T3")
+GOAL_TIERS: tuple[str, ...] = ("T0_PREP", "T1", "T2", "T3", "T4_PREP", "T4")
 
 IRON_OR_BETTER_PICKS: frozenset[str] = frozenset({
     "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe",
@@ -45,7 +50,7 @@ class GoalSpec:
 
     id: str
     title: str
-    tier: str                                  # "T0_PREP" | "T1" | "T2" | "T3"
+    tier: str                                  # "T0_PREP" | "T1" | "T2" | "T3" | "T4_PREP" | "T4"
     score: int                                 # RULES v2 分值（前置准备项允许为 0）
     skill: str                                 # 达成该目标的主技能名
     skill_args: tuple[tuple[str, Any], ...] = ()
@@ -62,6 +67,9 @@ class GoalSpec:
     stage: str = "draft"                       # "draft" | "candidate" | "graduated" | "live"
     editable_files: tuple[str, ...] = ()       # GOAL_MISS 自动修复时允许改动的收窄白名单
     held_items: tuple[str, ...] = ()            # 下游所需实物，未指定时沿用 done_items
+    gather_when_blocked: bool = False          # 允许主技能先观察复用场景，无法启动时再尝试补料
+    done_predicates: tuple[str, ...] = ()      # 子目标/世界记忆复合达成谓词表达式
+    requires_landmarks: tuple[str, ...] = ()   # 静默地标/群系先验门控（支持 "a|b" OR 表达式）
 
     @property
     def args_dict(self) -> dict[str, Any]:
@@ -78,6 +86,8 @@ class GoalPlanStep:
     path_score: int                            # 整条未完成链路合计可解锁分值
     path_cost: float                           # 整条未完成链路预计/实测耗时成本（秒）
     roi: float                                 # path_score / path_cost
+    shared_dependents: int = 1                 # 共享 step_goal 的可执行计分目标数
+    marginal_roi: Optional[float] = None       # 共享子图分摊后的边际性价比（无共享时等于 roi）
 
 
 # ============================================================================
@@ -90,6 +100,64 @@ _STARTER_EDITABLE: tuple[str, ...] = (
     "code/mcagent/loop/starter_skills.py",
     "code/tests/test_loop_soak.py",
 )
+
+_COMBAT_EDITABLE = ("code/mcagent/skills/combat.py", "code/mcagent/skills/combat_materials.py",
+                    "code/mcagent/skills/combat_scene.py", "code/tests/test_combat.py")
+_T2_OVERWORLD_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t2_overworld.py",
+    "code/tests/test_stage2_overworld.py",
+)
+_END_RUSH_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/end_rush.py",
+    "code/tests/test_stage2_end_rush.py",
+)
+_T2_TRIALS_ORIENTED_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t2_trials_oriented.py",
+    "code/tests/test_stage2_trials_oriented.py",
+)
+_T3_BIOMES_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t3_biomes.py",
+    "code/tests/test_stage2_t3_biomes.py",
+)
+_T4_QUICK_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_quick_exploits.py",
+    "code/tests/test_stage3_base_and_wave_a.py",
+)
+_T4_END_FROGS_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_end_and_frogs.py",
+    "code/tests/test_stage3_base_and_wave_a.py",
+)
+_T4_ARBALISTIC_HEIGHT_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_arbalistic_and_height.py",
+    "code/tests/test_stage3_wave_b.py",
+)
+_T4_NETHER_ENDGAME_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_nether_endgame.py",
+    "code/tests/test_stage3_wave_b.py",
+)
+_T4_OMINOUS_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_ominous_combat.py",
+    "code/tests/test_stage3_wave_c.py",
+)
+_T4_STRIDER_TRIDENT_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/t4_strider_and_trident.py",
+    "code/tests/test_stage3_wave_d.py",
+)
+_ARCHAEOLOGY_SNIFFER_EDITABLE: tuple[str, ...] = (
+    "code/mcagent/skills/archaeology_sniffer.py",
+    "code/tests/test_archaeology_sniffer.py",
+)
+_FISHING_STOCK = ("string>=2", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2)))
+_ARROW_STOCK = ("arrow|spectral_arrow|tipped_arrow>=1", "hunt_mob",
+                (("target", "skeleton"), ("drop", "arrow"), ("count", 1)))
+
+
+def _stick_fallbacks(count: int):
+    return (
+        (f"@stick_stock:{count}>=1", "gather_wood", (("count", 2),)),
+        (f"stick>={count}", "craft_gear", (("item", "stick"),)),
+    )
+
 
 GOALS: tuple[GoalSpec, ...] = (
     # ---- 批次 0：起步木石与冶炼底座（已集成并离线+联调验证，stage="graduated"） ----
@@ -194,6 +262,7 @@ GOALS: tuple[GoalSpec, ...] = (
         prereq_goals=("upgrade_tools", "prep_stone_sword"),
         prereq_items=("@gear_ready:furnace>=1",),
         done_items=("furnace>=1",),
+        held_items=("@furnace_ready>=1",),
         must_hold_for_children=True,
         gather_fallbacks=(
             ("cobblestone|cobbled_deepslate>=8", "mine_stone", (("count", 8),)),
@@ -212,7 +281,7 @@ GOALS: tuple[GoalSpec, ...] = (
         tier="T1",
         score=5,
         skill="smelt_iron",
-        skill_args=(("count", 3),),
+        skill_args=(("count", 6),),
         prereq_goals=("upgrade_tools", "prep_furnace"),
         done_advancements=("minecraft:story/smelt_iron",),
         done_items=("iron_ingot>=1",),
@@ -220,7 +289,7 @@ GOALS: tuple[GoalSpec, ...] = (
         budget_s=210.0,
         max_fails_per_ep=4,
         est_cost_s=60.0,
-        stage="draft",
+        stage="candidate",
         editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
@@ -231,19 +300,20 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="craft_iron_gear",
         skill_args=(("item", "iron_pickaxe"),),
         prereq_goals=("smelt_iron",),
-        prereq_items=("iron_ingot>=3",),
+        prereq_items=("iron_ingot>=3", "stick>=2"),
         done_advancements=("minecraft:story/iron_tools",),
-        done_items=("@iron_plus_pickaxe>=1",),
+        done_items=("iron_pickaxe>=1",),
         must_hold_for_children=True,
+        held_items=("@iron_plus_pickaxe>=1",),
         gather_fallbacks=(
-            ("iron_ingot>=3", "smelt_iron", (("count", 3),)),
-            ("stick>=2", "gather_wood", (("count", 2),)),
+            ("iron_ingot>=3", "smelt_iron", (("count", 6),)),
+            *_stick_fallbacks(2),
         ),
         budget_s=150.0,
         max_fails_per_ep=3,
         est_cost_s=30.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
+        editable_files=("code/mcagent/skills/iron_gear.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
         id="obtain_armor",
@@ -257,13 +327,13 @@ GOALS: tuple[GoalSpec, ...] = (
         done_advancements=("minecraft:story/obtain_armor",),
         done_items=("iron_helmet|iron_chestplate|iron_leggings|iron_boots>=1",),
         gather_fallbacks=(
-            ("iron_ingot>=4", "smelt_iron", (("count", 4),)),
+            ("iron_ingot>=4", "smelt_iron", (("count", 6),)),
         ),
         budget_s=150.0,
         max_fails_per_ep=3,
         est_cost_s=35.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
+        editable_files=("code/mcagent/skills/iron_gear.py", "code/tests/test_iron.py"),
     ),
     GoalSpec(
         id="lava_bucket",
@@ -272,17 +342,19 @@ GOALS: tuple[GoalSpec, ...] = (
         score=15,
         skill="fill_lava_bucket",
         prereq_goals=("smelt_iron",),
+        prereq_items=("bucket>=1",),
         done_advancements=("minecraft:story/lava_bucket",),
         done_items=("lava_bucket>=1",),
         gather_fallbacks=(
-            ("bucket|iron_ingot>=3", "smelt_iron", (("count", 3),)),
+            ("bucket|iron_ingot>=3", "smelt_iron", (("count", 6),)),
+            ("bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=210.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=50.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/iron.py", "code/tests/test_iron.py"),
+        editable_files=("code/mcagent/skills/iron_lava.py", "code/tests/test_iron.py"),
     ),
 
     # ---- 批次 2：顺手生存项（床、种地、繁殖） ----
@@ -294,12 +366,17 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="sleep_in_bed",
         prereq_goals=("prep_wood",),
         done_advancements=("minecraft:adventure/sleep_in_bed",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            ("@wood_equiv>=3", "gather_wood", (("count", 2),)),
+        ),
         budget_s=150.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=45.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_camp.py",
+                        "code/tests/test_survival.py"),
     ),
     GoalSpec(
         id="plant_seed",
@@ -314,7 +391,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=30.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_farm.py",
+                        "code/tests/test_survival.py"),
     ),
     GoalSpec(
         id="breed_an_animal",
@@ -329,7 +407,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=55.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_farm.py",
+                        "code/tests/test_survival.py"),
     ),
 
     # ---- 批次 3：战斗、盾牌与线系（合计 55 分） ----
@@ -346,7 +425,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=40.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="deflect_arrow",
@@ -361,7 +440,7 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=55.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="shoot_arrow",
@@ -371,12 +450,18 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="shoot_mob",
         prereq_goals=("kill_a_mob",),
         done_advancements=("minecraft:adventure/shoot_arrow",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            _ARROW_STOCK,
+            ("string>=5", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 5))),
+            *_stick_fallbacks(3),
+        ),
         budget_s=150.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=45.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="ol_betsy",
@@ -386,12 +471,18 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="fire_crossbow",
         prereq_goals=("smelt_iron", "kill_a_mob"),
         done_advancements=("minecraft:adventure/ol_betsy",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            ("arrow|spectral_arrow|tipped_arrow|firework_rocket>=1", _ARROW_STOCK[1], _ARROW_STOCK[2]),
+            ("string>=4", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 4))),
+            *_stick_fallbacks(4),
+        ),
         budget_s=150.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=50.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/combat.py", "code/tests/test_combat.py"),
+        editable_files=_COMBAT_EDITABLE,
     ),
     GoalSpec(
         id="fishy_business",
@@ -401,12 +492,18 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="catch_fish",
         prereq_goals=("kill_a_mob",),
         done_advancements=("minecraft:husbandry/fishy_business",),
+        gather_when_blocked=True,
+        gather_fallbacks=(
+            _FISHING_STOCK,
+            *_stick_fallbacks(3),
+        ),
         budget_s=240.0,
         max_fails_per_ep=2,
         stop_loss=True,
         est_cost_s=95.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/survival.py", "code/tests/test_survival.py"),
+        editable_files=("code/mcagent/skills/survival.py", "code/mcagent/skills/survival_fish.py",
+                        "code/tests/test_survival.py"),
     ),
 
     # ---- 批次 4：钻石层高分核心与下界门（shiny_gear 4 钻 60 分，性价比全表第一） ----
@@ -426,7 +523,8 @@ GOALS: tuple[GoalSpec, ...] = (
         stop_loss=True,
         est_cost_s=150.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/diamond.py", "code/tests/test_diamond.py"),
+        editable_files=("code/mcagent/skills/diamond.py", "code/mcagent/skills/diamond_site.py",
+                        "code/tests/test_diamond.py"),
     ),
     GoalSpec(
         id="shiny_gear",
@@ -436,9 +534,9 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="craft_diamond_gear",
         skill_args=(("item", "diamond_boots"),),
         prereq_goals=("mine_diamond",),
-        prereq_items=("diamond>=4",),
         done_advancements=("minecraft:story/shiny_gear",),
         done_items=("diamond_helmet|diamond_chestplate|diamond_leggings|diamond_boots>=1",),
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("diamond>=4", "mine_diamond", (("count", 4),)),
         ),
@@ -446,7 +544,8 @@ GOALS: tuple[GoalSpec, ...] = (
         max_fails_per_ep=3,
         est_cost_s=25.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/diamond.py", "code/tests/test_diamond.py"),
+        editable_files=("code/mcagent/skills/diamond.py", "code/mcagent/skills/diamond_site.py",
+                        "code/tests/test_diamond.py"),
     ),
     GoalSpec(
         id="prep_diamond_pickaxe",
@@ -456,17 +555,19 @@ GOALS: tuple[GoalSpec, ...] = (
         skill="craft_diamond_gear",
         skill_args=(("item", "diamond_pickaxe"),),
         prereq_goals=("mine_diamond",),
-        prereq_items=("diamond>=3",),
         done_items=("@diamond_plus_pickaxe>=1",),
         must_hold_for_children=True,
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("diamond>=3", "mine_diamond", (("count", 3),)),
+            *_stick_fallbacks(2),
         ),
         budget_s=120.0,
         max_fails_per_ep=3,
         est_cost_s=25.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/diamond.py", "code/tests/test_diamond.py"),
+        editable_files=("code/mcagent/skills/diamond.py", "code/mcagent/skills/diamond_site.py",
+                        "code/tests/test_diamond.py"),
     ),
     GoalSpec(
         id="form_obsidian",
@@ -474,22 +575,22 @@ GOALS: tuple[GoalSpec, ...] = (
         tier="T1",
         score=15,
         skill="mine_obsidian",
-        skill_args=(("count", 10),),
-        # 黑曜石只能用钻石镐采；倒水造黑曜石还要一只桶（mine_obsidian 自己去舀水）
+        skill_args=(("count", 1),),
         prereq_goals=("prep_diamond_pickaxe",),
-        prereq_items=("@diamond_plus_pickaxe>=1", "bucket|water_bucket|lava_bucket>=1"),
         done_advancements=("minecraft:story/form_obsidian",),
         done_items=("obsidian>=1",),
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("@diamond_plus_pickaxe>=1", "craft_diamond_gear", (("item", "diamond_pickaxe"),)),
-            ("bucket|water_bucket|lava_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
+            ("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=240.0,
         max_fails_per_ep=3,
         stop_loss=True,
         est_cost_s=85.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/nether.py", "code/tests/test_nether.py"),
+        editable_files=("code/mcagent/skills/nether.py", "code/mcagent/skills/nether_mining.py",
+                        "code/mcagent/skills/nether_site.py", "code/tests/test_nether.py"),
     ),
     GoalSpec(
         id="enter_the_nether",
@@ -498,22 +599,1521 @@ GOALS: tuple[GoalSpec, ...] = (
         score=30,
         skill="build_and_enter_portal",
         prereq_goals=("form_obsidian", "smelt_iron"),
-        # 去掉四角的最小门框 10 块黑曜石 + 打火石（1 铁锭 + 1 燧石，燧石来自挖沙砾）
-        prereq_items=("obsidian>=10", "flint_and_steel>=1"),
         done_advancements=("minecraft:story/enter_the_nether",),
+        gather_when_blocked=True,
         gather_fallbacks=(
             ("obsidian>=10", "mine_obsidian", (("count", 10),)),
-            ("flint_and_steel>=1", "craft_flint_and_steel", ()),
+            ("flint|flint_and_steel>=1", "build_and_enter_portal", (("prepare_flint", True),)),
+            ("iron_ingot|flint_and_steel>=1", "smelt_iron", (("count", 1),)),
+            ("flint_and_steel>=1", "craft_iron_gear", (("item", "flint_and_steel"),)),
         ),
         budget_s=240.0,
         max_fails_per_ep=2,
         stop_loss=True,
         est_cost_s=95.0,
         stage="draft",
-        editable_files=("code/mcagent/skills/nether.py", "code/tests/test_nether.py"),
+        editable_files=("code/mcagent/skills/nether.py", "code/mcagent/skills/nether_portal.py",
+                        "code/mcagent/skills/nether_mining.py", "code/mcagent/skills/nether_site.py",
+                        "code/tests/test_nether.py"),
+    ),
+    GoalSpec(
+        id="enchant_item",
+        title="附魔师（附魔一件物品）",
+        tier="T1",
+        score=30,
+        skill="enchant_item",
+        prereq_goals=("prep_wood",),
+        prereq_items=("lapis_lazuli>=1",),
+        done_advancements=("minecraft:story/enchant_item",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=("code/mcagent/skills/enchant.py", "code/tests/test_enchant.py"),
+    ),
+    GoalSpec(
+        id="use_lodestone",
+        title="天涯共此石（指南针绑定磁石）",
+        tier="T1",
+        score=15,
+        skill="attune_lodestone",
+        prereq_goals=("prep_wood",),
+        prereq_items=("compass>=1",),
+        done_advancements=("minecraft:adventure/use_lodestone",),
+        gather_fallbacks=(("compass>=1", "craft_iron_gear", (("item", "compass"),)),),
+        budget_s=320.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=("code/mcagent/skills/lodestone.py", "code/tests/test_lodestone.py"),
+    ),
+    GoalSpec(
+        id="bullseye",
+        title="正中靶心（远距离命中标靶中心）",
+        tier="T1",
+        score=15,
+        skill="hit_bullseye",
+        prereq_goals=("shoot_arrow",),
+        done_advancements=("minecraft:adventure/bullseye",),
+        gather_when_blocked=True,
+        gather_fallbacks=(_ARROW_STOCK,),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=135.0,
+        stage="draft",
+        editable_files=("code/mcagent/skills/target.py", "code/tests/test_target.py"),
+    ),
+
+    # ---- Stage 2 Batch 1：结构与群系勘探（5 goals / 165 pts） ----
+    GoalSpec(
+        id="follow_ender_eye",
+        title="隔墙有眼（投掷末影之眼定位要塞）",
+        tier="T2",
+        score=60,
+        skill="discover_structure",
+        skill_args=(("structure", "stronghold"),),
+        done_advancements=("minecraft:story/follow_ender_eye",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=320.0,
+        stage="draft",
+        requires_landmarks=("stronghold",),
+    ),
+    GoalSpec(
+        id="find_fortress",
+        title="阴森堡垒（定位并进入下界要塞）",
+        tier="T2",
+        score=30,
+        skill="discover_structure",
+        skill_args=(("structure", "nether_fortress"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/find_fortress",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="find_bastion",
+        title="光辉岁月（定位并进入猪灵堡垒）",
+        tier="T2",
+        score=30,
+        skill="discover_structure",
+        skill_args=(("structure", "bastion_remnant"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/find_bastion",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="minecraft_trials_edition",
+        title="我的世界：试炼版（定位并踏入试炼密室）",
+        tier="T2",
+        score=15,
+        skill="discover_structure",
+        skill_args=(("structure", "trial_chambers"),),
+        done_advancements=("minecraft:adventure/minecraft_trials_edition",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        requires_landmarks=("trial_chambers",),
+    ),
+    GoalSpec(
+        id="explore_nether",
+        title="热门旅游景点（探索全部下界群系）",
+        tier="T3",
+        score=30,
+        skill="discover_structure",
+        skill_args=(("structure", "nether_biomes"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/explore_nether",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=300.0,
+        stage="draft",
+    ),
+
+    # ---- Stage 2 Batch 2A：工作站、锻造与炼药线（5 goals / 180 pts） ----
+    GoalSpec(
+        id="trade",
+        title="这交易划算吗（与村民完成交易）",
+        tier="T2",
+        score=15,
+        skill="trade_villager",
+        done_advancements=("minecraft:adventure/trade",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=150.0,
+        stage="draft",
+        requires_landmarks=("village",),
+    ),
+    GoalSpec(
+        id="trim_with_any_armor_pattern",
+        title="锻造新风尚（为盔甲锻造纹饰）",
+        tier="T2",
+        score=30,
+        skill="trim_armor",
+        done_advancements=("minecraft:adventure/trim_with_any_armor_pattern",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=210.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="obtain_netherite_hoe",
+        title="终极奉献（锻造下界合金锄）",
+        tier="T3",
+        score=60,
+        skill="smith_netherite_hoe",
+        prereq_goals=("obtain_ancient_debris", "loot_bastion"),
+        done_advancements=("minecraft:husbandry/obtain_netherite_hoe",),
+        done_items=("netherite_hoe>=1",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=240.0,
+        stage="draft",
+        requires_landmarks=("bastion_remnant",),
+    ),
+    GoalSpec(
+        id="brew_potion",
+        title="本地酿造厂（酿造一瓶药水）",
+        tier="T2",
+        score=15,
+        skill="brew_potion",
+        skill_args=(("recipe", "mundane"),),
+        prereq_goals=("obtain_blaze_rod",),
+        done_advancements=("minecraft:nether/brew_potion",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=150.0,
+        stage="draft",
+        requires_landmarks=("nether_fortress",),
+    ),
+    GoalSpec(
+        id="cure_zombie_villager",
+        title="僵尸科医生（弱化并治愈僵尸村民）",
+        tier="T3",
+        score=60,
+        skill="cure_zombie_villager",
+        prereq_goals=("brew_potion",),
+        done_advancements=("minecraft:story/cure_zombie_villager",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=320.0,
+        stage="draft",
+        requires_landmarks=("village",),
+    ),
+
+    # ---- Stage 2 Batch 2B：下界核心线（7 goals / 230 pts） ----
+    GoalSpec(
+        id="obtain_ancient_debris",
+        title="深藏在地下（挖掘远古残骸）",
+        tier="T2",
+        score=60,
+        skill="mine_ancient_debris",
+        prereq_goals=("enter_the_nether", "prep_diamond_pickaxe"),
+        done_advancements=("minecraft:nether/obtain_ancient_debris",),
+        done_items=("ancient_debris>=1",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="obtain_blaze_rod",
+        title="与火共舞（击杀烈焰人获取烈焰棒）",
+        tier="T2",
+        score=30,
+        skill="hunt_blaze",
+        prereq_goals=("find_fortress",),
+        done_advancements=("minecraft:nether/obtain_blaze_rod",),
+        done_items=("blaze_rod>=1",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        requires_landmarks=("nether_fortress",),
+    ),
+    GoalSpec(
+        id="loot_bastion",
+        title="战利品（掠夺猪灵堡垒宝箱）",
+        tier="T2",
+        score=30,
+        skill="loot_bastion",
+        prereq_goals=("find_bastion",),
+        done_advancements=("minecraft:nether/loot_bastion",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        requires_landmarks=("bastion_remnant",),
+    ),
+    GoalSpec(
+        id="charge_respawn_anchor",
+        title="锚已就绪（充能重生锚）",
+        tier="T2",
+        score=30,
+        skill="charge_respawn_anchor",
+        prereq_goals=("obtain_crying_obsidian",),
+        done_advancements=("minecraft:nether/charge_respawn_anchor",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="obtain_crying_obsidian",
+        title="谁在切洋葱（交易或获取哭泣的黑曜石）",
+        tier="T2",
+        score=15,
+        skill="distract_piglin",
+        skill_args=(("mode", "barter_crying_obsidian"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/obtain_crying_obsidian",),
+        done_items=("crying_obsidian>=1",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="distract_piglin",
+        title="噢，闪亮亮（投掷金锭吸引猪灵）",
+        tier="T2",
+        score=5,
+        skill="distract_piglin",
+        skill_args=(("mode", "distract"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/distract_piglin",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+    ),
+    GoalSpec(
+        id="get_wither_skull",
+        title="怪异的头颅（击杀凋灵骷髅获取头颅）",
+        tier="T3",
+        score=60,
+        skill="hunt_wither_skull",
+        prereq_goals=("find_fortress",),
+        done_advancements=("minecraft:nether/get_wither_skull",),
+        done_items=("wither_skeleton_skull>=1",),
+        budget_s=540.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=360.0,
+        stage="draft",
+        requires_landmarks=("nether_fortress",),
+    ),
+
+    # ---- Stage 2 Batch 2C：主世界 T2 顺手高分项（14 goals / 260 pts） ----
+    GoalSpec(
+        id="summon_iron_golem",
+        title="招募援助（建造铁傀儡）",
+        tier="T2",
+        score=30,
+        skill="summon_iron_golem",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:adventure/summon_iron_golem",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+    ),
+    GoalSpec(
+        id="sniper_duel",
+        title="狙击手的对决（远距射杀骷髅）",
+        tier="T2",
+        score=30,
+        skill="sniper_duel",
+        prereq_goals=("shoot_arrow",),
+        done_advancements=("minecraft:adventure/sniper_duel",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+    ),
+    GoalSpec(
+        id="make_sign_glow",
+        title="发光发热（用荧光墨囊点亮告示牌）",
+        tier="T2",
+        score=30,
+        skill="make_sign_glow",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:husbandry/make_a_sign_glow",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+    ),
+    GoalSpec(
+        id="axolotl_in_a_bucket",
+        title="最萌捕手（用水桶捕获美西螈）",
+        tier="T2",
+        score=30,
+        skill="catch_aquatic_mob",
+        skill_args=(("target", "axolotl"),),
+        prereq_goals=("smelt_iron",),
+        prereq_items=("bucket|water_bucket>=1",),
+        done_advancements=("minecraft:husbandry/axolotl_in_a_bucket",),
+        gather_fallbacks=(
+            ("bucket|water_bucket|iron_ingot>=3", "smelt_iron", (("count", 3),)),
+            ("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
+        ),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("lush_caves",),
+    ),
+    GoalSpec(
+        id="tactical_fishing",
+        title="战术性钓鱼（用水桶捞起鱼）",
+        tier="T2",
+        score=15,
+        skill="catch_aquatic_mob",
+        skill_args=(("target", "fish"),),
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:husbandry/tactical_fishing",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+    ),
+    GoalSpec(
+        id="tame_an_animal",
+        title="永恒的伙伴（驯服一只动物）",
+        tier="T2",
+        score=15,
+        skill="tame_animal",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:husbandry/tame_an_animal",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+    ),
+    GoalSpec(
+        id="safely_harvest_honey",
+        title="与蜂共舞（篝火下安全采蜜）",
+        tier="T2",
+        score=15,
+        skill="harvest_honey_wax",
+        skill_args=(("mode", "honey"),),
+        prereq_goals=("prep_wood",),
+        prereq_items=("glass_bottle|glass>=1", "campfire|soul_campfire|coal|charcoal>=1"),
+        done_advancements=("minecraft:husbandry/safely_harvest_honey",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("bee_nest",),
+    ),
+    GoalSpec(
+        id="wax_on",
+        title="涂蜡（给铜块涂蜜脾）",
+        tier="T2",
+        score=15,
+        skill="harvest_honey_wax",
+        skill_args=(("mode", "wax_on"),),
+        prereq_goals=("prep_wood",),
+        prereq_items=("honeycomb|shears>=1",),
+        done_advancements=("minecraft:husbandry/wax_on",),
+        gather_fallbacks=(
+            ("honeycomb|shears|iron_ingot>=2", "smelt_iron", (("count", 2),)),
+            ("honeycomb|shears>=1", "craft_iron_gear", (("item", "shears"),)),
+        ),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("bee_nest",),
+    ),
+    GoalSpec(
+        id="wax_off",
+        title="脱蜡（用斧给涂蜡铜块脱蜡）",
+        tier="T2",
+        score=5,
+        skill="harvest_honey_wax",
+        skill_args=(("mode", "wax_off"),),
+        prereq_goals=("wax_on",),
+        prereq_items=(
+            "wooden_axe|stone_axe|copper_axe|iron_axe|golden_axe|diamond_axe|netherite_axe|"
+            "oak_log|birch_log|spruce_log|jungle_log|acacia_log|dark_oak_log|cherry_log|mangrove_log|pale_oak_log|"
+            "oak_planks|birch_planks|spruce_planks|jungle_planks|acacia_planks|dark_oak_planks|cherry_planks|mangrove_planks|pale_oak_planks>=1",
+        ),
+        done_advancements=("minecraft:husbandry/wax_off",),
+        gather_fallbacks=(
+            (
+                "wooden_axe|stone_axe|copper_axe|iron_axe|golden_axe|diamond_axe|netherite_axe|"
+                "oak_log|birch_log|spruce_log|jungle_log|acacia_log|dark_oak_log|cherry_log|mangrove_log|pale_oak_log|"
+                "oak_planks|birch_planks|spruce_planks|jungle_planks|acacia_planks|dark_oak_planks|cherry_planks|mangrove_planks|pale_oak_planks>=1",
+                "gather_wood",
+                (("count", 2),),
+            ),
+        ),
+        budget_s=180.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=100.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("bee_nest",),
+    ),
+    GoalSpec(
+        id="avoid_vibration",
+        title="潜行避声（潜行靠近幽匿感测体）",
+        tier="T2",
+        score=15,
+        skill="biome_quick_action",
+        skill_args=(("action", "avoid_vibration"),),
+        done_advancements=("minecraft:adventure/avoid_vibration",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("deep_dark",),
+    ),
+    GoalSpec(
+        id="brush_armadillo",
+        title="轻刷犰狳（用刷子刷取犰狳鳞甲）",
+        tier="T2",
+        score=15,
+        skill="biome_quick_action",
+        skill_args=(("action", "brush_armadillo"),),
+        prereq_items=("brush|feather>=1", "brush|copper_ingot>=1"),
+        done_advancements=("minecraft:adventure/brush_armadillo",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("savanna|badlands",),
+    ),
+    GoalSpec(
+        id="walk_on_powder_snow_with_leather_boots",
+        title="轻功雪上漂（穿皮革靴踩细雪）",
+        tier="T2",
+        score=15,
+        skill="biome_quick_action",
+        skill_args=(("action", "powder_snow"),),
+        prereq_items=("leather_boots|leather>=1",),
+        done_advancements=("minecraft:adventure/walk_on_powder_snow_with_leather_boots",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("powder_snow",),
+    ),
+    GoalSpec(
+        id="place_dried_ghast_in_water",
+        title="干涸恶魂入水（放置干涸恶魂块并浸水）",
+        tier="T2",
+        score=15,
+        skill="biome_quick_action",
+        skill_args=(("action", "dried_ghast"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:husbandry/place_dried_ghast_in_water",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("dried_ghast|soul_sand_valley",),
+    ),
+    GoalSpec(
+        id="whos_the_pillager_now",
+        title="现在谁才是掠夺者（用弩击杀掠夺者）",
+        tier="T2",
+        score=15,
+        skill="biome_quick_action",
+        skill_args=(("action", "crossbow_pillager"),),
+        prereq_goals=("ol_betsy",),
+        prereq_items=("crossbow|string>=1", "crossbow|iron_ingot>=1", "arrow|spectral_arrow|tipped_arrow>=2"),
+        done_advancements=("minecraft:adventure/whos_the_pillager_now",),
+        gather_fallbacks=(
+            ("arrow|spectral_arrow|tipped_arrow>=2", "hunt_mob", (("target", "skeleton"), ("drop", "arrow"), ("count", 2))),
+            ("crossbow|string>=1", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2))),
+            ("crossbow|iron_ingot>=1", "smelt_iron", (("count", 2),)),
+        ),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T2_OVERWORLD_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
+    ),
+
+    # ---- Stage 2 Batch 2D：末地冲刺线（4 goals / 210 pts） ----
+    GoalSpec(
+        id="enter_the_end",
+        title="结束了？（填补末地传送门框并进入末地）",
+        tier="T2",
+        score=60,
+        skill="enter_the_end",
+        prereq_goals=("follow_ender_eye",),
+        done_advancements=("minecraft:story/enter_the_end",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=280.0,
+        stage="draft",
+        editable_files=_END_RUSH_EDITABLE,
+    ),
+    GoalSpec(
+        id="enter_end_gateway",
+        title="远程折跃（向末地折跃门投掷末影珍珠前往外岛）",
+        tier="T2",
+        score=30,
+        skill="enter_end_gateway",
+        prereq_goals=("enter_the_end",),
+        done_advancements=("minecraft:end/enter_end_gateway",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_END_RUSH_EDITABLE,
+    ),
+    GoalSpec(
+        id="find_end_city",
+        title="在游戏尽头的城市（跨岛探索并抵达末地城）",
+        tier="T3",
+        score=60,
+        skill="find_end_city",
+        prereq_goals=("enter_end_gateway",),
+        done_advancements=("minecraft:end/find_end_city",),
+        budget_s=540.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=320.0,
+        stage="draft",
+        editable_files=_END_RUSH_EDITABLE,
+    ),
+    GoalSpec(
+        id="levitate",
+        title="这上面的风景不错（在末地城借潜影贝漂浮抬升 50 格）",
+        tier="T3",
+        score=60,
+        skill="levitate_fifty",
+        prereq_goals=("find_end_city",),
+        done_advancements=("minecraft:end/levitate",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=280.0,
+        stage="draft",
+        editable_files=_END_RUSH_EDITABLE,
+    ),
+
+    # ---- Stage 2 Batch 2E：试炼密室与朝向放置线（5 goals / 120 pts） ----
+    GoalSpec(
+        id="under_lock_and_key",
+        title="上锁的宝库（用试炼钥匙开启宝库）",
+        tier="T2",
+        score=30,
+        skill="unlock_trial_vault",
+        prereq_goals=("minecraft_trials_edition",),
+        prereq_items=("trial_key|ominous_trial_key|netherite_sword|diamond_sword|iron_sword|stone_sword|netherite_axe|diamond_axe|iron_axe|stone_axe|mace>=1",),
+        done_advancements=("minecraft:adventure/under_lock_and_key",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("trial_chambers",),
+    ),
+    GoalSpec(
+        id="who_needs_rockets",
+        title="谁还需要火箭？（向脚下发射风弹弹跳 7 格以上）",
+        tier="T2",
+        score=30,
+        skill="wind_charge_bounce",
+        prereq_goals=("minecraft_trials_edition",),
+        prereq_items=("wind_charge|breeze_rod|netherite_sword|diamond_sword|iron_sword|stone_sword|netherite_axe|diamond_axe|iron_axe|stone_axe|mace>=1",),
+        done_advancements=("minecraft:adventure/who_needs_rockets",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("trial_chambers",),
+    ),
+    GoalSpec(
+        id="lighten_up",
+        title="点亮它（点亮氧化铜灯并刮除氧化层）",
+        tier="T2",
+        score=15,
+        skill="scrape_lit_copper_bulb",
+        prereq_goals=("minecraft_trials_edition",),
+        prereq_items=("netherite_axe|diamond_axe|iron_axe|copper_axe|stone_axe|golden_axe|wooden_axe>=1",),
+        done_advancements=("minecraft:adventure/lighten_up",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=150.0,
+        stage="draft",
+        editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("trial_chambers",),
+    ),
+    GoalSpec(
+        id="read_power_of_chiseled_bookshelf",
+        title="知识的力量（比较器读取雕纹书架红石信号）",
+        tier="T2",
+        score=15,
+        skill="read_chiseled_bookshelf",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:adventure/read_power_of_chiseled_bookshelf",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+    ),
+    GoalSpec(
+        id="heart_transplanter",
+        title="换心术（在苍白橡木原木间对齐放置嘎枝之心）",
+        tier="T2",
+        score=30,
+        skill="transplant_creaking_heart",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:adventure/heart_transplanter",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T2_TRIALS_ORIENTED_EDITABLE,
+        requires_landmarks=("pale_garden",),
+    ),
+
+    # ---- Stage 2 Batch 2F：群系与生态专项 T3 线（10 goals / 270 pts） ----
+    GoalSpec(
+        id="kill_mob_near_sculk_catalyst",
+        title="它蔓延了（在幽匿催发体旁击杀生物）",
+        tier="T3",
+        score=30,
+        skill="kill_near_sculk_catalyst",
+        prereq_goals=("kill_a_mob",),
+        done_advancements=("minecraft:adventure/kill_mob_near_sculk_catalyst",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("deep_dark",),
+    ),
+    GoalSpec(
+        id="kill_axolotl_target",
+        title="友谊的治愈力量！（协助美西螈击杀猎物）",
+        tier="T3",
+        score=30,
+        skill="assist_axolotl_hunt",
+        prereq_goals=("kill_a_mob",),
+        done_advancements=("minecraft:husbandry/kill_axolotl_target",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("lush_caves",),
+    ),
+    GoalSpec(
+        id="remove_wolf_armor",
+        title="剪断关系（用剪刀卸下狼铠）",
+        tier="T3",
+        score=30,
+        skill="manage_wolf_armor",
+        skill_args=(("mode", "remove"),),
+        prereq_goals=("tame_an_animal", "brush_armadillo"),
+        done_advancements=("minecraft:husbandry/remove_wolf_armor",),
+        gather_when_blocked=True,
+        gather_fallbacks=(("shears>=1", "craft_iron_gear", (("item", "shears"),)),),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("savanna|badlands",),
+    ),
+    GoalSpec(
+        id="repair_wolf_armor",
+        title="完好如初（用犰狳鳞甲修复狼铠）",
+        tier="T3",
+        score=30,
+        skill="manage_wolf_armor",
+        skill_args=(("mode", "repair"),),
+        prereq_goals=("tame_an_animal", "brush_armadillo"),
+        prereq_items=("armadillo_scute>=1",),
+        done_advancements=("minecraft:husbandry/repair_wolf_armor",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("savanna|badlands",),
+    ),
+    GoalSpec(
+        id="allay_deliver_item_to_player",
+        title="找到一个好朋友（让悦灵递送物品）",
+        tier="T3",
+        score=30,
+        skill="allay_deliver_item",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:husbandry/allay_deliver_item_to_player",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=240.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
+    ),
+    GoalSpec(
+        id="ride_a_boat_with_a_goat",
+        title="羊帆起航！（与山羊同乘一艘船）",
+        tier="T3",
+        score=30,
+        skill="boat_with_goat",
+        prereq_goals=("prep_wood",),
+        done_advancements=("minecraft:husbandry/ride_a_boat_with_a_goat",),
+        gather_when_blocked=True,
+        gather_fallbacks=(("@wood_equiv>=5", "gather_wood", (("count", 2),)),),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=240.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("jagged_peaks|frozen_peaks|snowy_slopes|meadow",),
+    ),
+    GoalSpec(
+        id="silk_touch_nest",
+        title="举巢搬迁（用精准采集挖下蜂巢）",
+        tier="T3",
+        score=30,
+        skill="silk_touch_bee_nest",
+        prereq_goals=("enchant_item",),  # enchant_item 不保证附魔出 silk_touch，由 SilkTouchBeeNest.blocked() 强拦截
+        done_advancements=("minecraft:husbandry/silk_touch_nest",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("bee_nest",),
+    ),
+    GoalSpec(
+        id="tadpole_in_a_bucket",
+        title="呱呱坠桶（用水桶捞起蝌蚪）",
+        tier="T3",
+        score=30,
+        skill="catch_tadpole",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:husbandry/tadpole_in_a_bucket",),
+        gather_when_blocked=True,
+        gather_fallbacks=(("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("swamp|mangrove_swamp",),
+    ),
+    GoalSpec(
+        id="spyglass_at_ghast",
+        title="那是气球吗？（用望远镜观察恶魂）",
+        tier="T3",
+        score=15,
+        skill="spyglass_observe",
+        skill_args=(("target", "ghast"),),
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:adventure/spyglass_at_ghast",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+    ),
+    GoalSpec(
+        id="spyglass_at_parrot",
+        title="那是鸟吗？（用望远镜观察鹦鹉）",
+        tier="T3",
+        score=15,
+        skill="spyglass_observe",
+        skill_args=(("target", "parrot"),),
+        prereq_goals=("prep_wood",),
+        prereq_items=("spyglass|amethyst_shard>=1",),
+        done_advancements=("minecraft:adventure/spyglass_at_parrot",),
+        budget_s=300.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T3_BIOMES_EDITABLE,
+        requires_landmarks=("jungle",),
+    ),
+
+    # ---- Stage 3 (Wave A, T4_PREP + T4)：高分收口与巧取（2 项准备 + 7 项计分，全部 stage="draft"） ----
+    GoalSpec(
+        id="prep_ominous_bottle",
+        title="预备不祥之瓶（清剿掠夺者前哨站队长）",
+        tier="T4_PREP",
+        score=0,
+        skill="sweep_outpost_captain",
+        prereq_goals=("smelt_iron",),
+        done_items=("ominous_bottle>=1",),
+        must_hold_for_children=True,
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("pillager_outpost|trial_chambers",),
+    ),
+    GoalSpec(
+        id="prep_two_cakes",
+        title="预备蛋糕与音符盒（为悦灵生日做准备）",
+        tier="T4_PREP",
+        score=0,
+        skill="allay_cake_birthday",
+        skill_args=(("prep_only", True),),
+        prereq_goals=("trade",),
+        done_items=("cake>=2", "note_block>=1"),
+        must_hold_for_children=True,
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=130.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("village",),
+    ),
+    GoalSpec(
+        id="crafters_crafting_crafters",
+        title="合成器合成合成器",
+        tier="T4",
+        score=15,
+        skill="crafter_chain",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:adventure/crafters_crafting_crafters",),
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+    ),
+    GoalSpec(
+        id="craft_decorated_pot_using_only_sherds",
+        title="慎重修复（仅用陶片合成饰纹陶罐）",
+        tier="T4",
+        score=30,
+        skill="decorated_pot_sherds",
+        prereq_goals=("minecraft_trials_edition",),
+        done_advancements=("minecraft:adventure/craft_decorated_pot_using_only_sherds",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("trial_chambers|archaeology",),
+    ),
+    GoalSpec(
+        id="play_jukebox_in_meadows",
+        title="草甸之声（在草甸演奏唱片机）",
+        tier="T4",
+        score=30,
+        skill="jukebox_meadow",
+        prereq_goals=("minecraft_trials_edition", "mine_diamond"),
+        # 机会门控：音乐唱片无确定性合成路径（依赖试炼宝库/箱子/骷髅射杀苦力怕掉落），
+        # 前置达成后若仍无任意 music_disc_*，由 prereq_items 机会门控静默跳过，避免反复触发 blocked() 空转。
+        prereq_items=("@music_disc>=1",),
+        done_advancements=("minecraft:adventure/play_jukebox_in_meadows",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("meadow",),
+    ),
+    GoalSpec(
+        id="voluntary_exile",
+        title="自我放逐（击杀袭击队长）",
+        tier="T4",
+        score=30,
+        skill="sweep_outpost_captain",
+        prereq_goals=("smelt_iron",),
+        done_advancements=("minecraft:adventure/voluntary_exile",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
+    ),
+    GoalSpec(
+        id="allay_deliver_cake_to_note_block",
+        title="生日快乐歌（让悦灵向音符盒递送蛋糕）",
+        tier="T4",
+        score=30,
+        skill="allay_cake_birthday",
+        prereq_goals=("allay_deliver_item_to_player", "prep_two_cakes"),
+        done_advancements=("minecraft:husbandry/allay_deliver_cake_to_note_block",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=190.0,
+        stage="draft",
+        editable_files=_T4_QUICK_EDITABLE,
+        requires_landmarks=("pillager_outpost",),
+    ),
+    GoalSpec(
+        id="elytra",
+        title="天空即为极限（在末地船获取鞘翅）",
+        tier="T4",
+        score=60,
+        skill="loot_end_ship_elytra",
+        prereq_goals=("find_end_city",),
+        done_advancements=("minecraft:end/elytra",),
+        done_items=("elytra>=1",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T4_END_FROGS_EDITABLE,
+    ),
+    GoalSpec(
+        id="leash_all_frog_variants",
+        title="用拴绳牵引所有青蛙变种",
+        tier="T4",
+        score=60,
+        skill="leash_frog_variants",
+        prereq_goals=("tadpole_in_a_bucket", "enter_the_end"),
+        done_advancements=("minecraft:husbandry/leash_all_frog_variants",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=300.0,
+        stage="draft",
+        editable_files=_T4_END_FROGS_EDITABLE,
+        # 仅门控产蝌蚪所需的 swamp|mangrove_swamp；冷群系可由主世界冷群系或 enter_the_end 末地兜底，
+        # 暖群系可由主世界暖群系或 enter_the_nether 下界兜底，不硬门控主世界冷/暖群系以免屏蔽跨维孵化路线。
+        requires_landmarks=("swamp|mangrove_swamp",),
+    ),
+    GoalSpec(
+        id="froglights",
+        title="聚光灯下（集齐三种蛙明灯入包）",
+        tier="T4",
+        score=60,
+        skill="collect_froglights",
+        prereq_goals=("leash_all_frog_variants", "enter_the_nether"),
+        done_advancements=("minecraft:husbandry/froglights",),
+        done_items=("ochre_froglight>=1", "verdant_froglight>=1", "pearlescent_froglight>=1"),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=300.0,
+        stage="draft",
+        editable_files=_T4_END_FROGS_EDITABLE,
+        requires_landmarks=("basalt_deltas|bastion_remnant",),
+    ),
+
+    # ---- Stage 3 (Wave B, T4_PREP + T4)：高空贸易、劲弩手与下界终局（7 项准备 + 5 项计分，全部 stage="draft"） ----
+    GoalSpec(
+        id="prep_high_altitude_portal",
+        title="预备建筑高度上限门户（高空传送门与村民位）",
+        tier="T4_PREP",
+        score=0,
+        skill="trade_world_height",
+        skill_args=(("prep_only", True),),
+        prereq_goals=("trade", "enter_the_nether"),
+        done_predicates=("landmark_reachable:high_altitude_portal",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+        requires_landmarks=("village",),
+    ),
+    GoalSpec(
+        id="prep_piercing_iv_crossbow",
+        title="预备穿透 IV 弩（为劲弩手一箭五雕做准备）",
+        tier="T4_PREP",
+        score=0,
+        skill="arbalistic_trench_shot",
+        skill_args=(("prep_only", True), ("prep_mode", "crossbow")),
+        prereq_goals=("trade", "enchant_item", "ol_betsy"),
+        done_predicates=("enchantment_ready:crossbow:piercing>=4",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=210.0,
+        stage="draft",
+        editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+    ),
+    GoalSpec(
+        id="prep_five_unique_mobs_pack",
+        title="预备五种独立低血生物桶包（为劲弩手堑壕一击做准备）",
+        tier="T4_PREP",
+        score=0,
+        skill="arbalistic_trench_shot",
+        skill_args=(("prep_only", True), ("prep_mode", "mobs")),
+        prereq_goals=("tactical_fishing", "tadpole_in_a_bucket"),
+        done_predicates=("mob_collection_ready>=5",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+    ),
+    GoalSpec(
+        id="prep_looting_sword",
+        title="预备抢夺附魔剑（提升凋灵骷髅头颅掉率）",
+        tier="T4_PREP",
+        score=0,
+        skill="summon_and_trap_wither",
+        skill_args=(("mode", "prep_looting"),),
+        prereq_goals=("trade", "enchant_item"),
+        done_predicates=("enchantment_ready:sword:looting>=3",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=200.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+    ),
+    GoalSpec(
+        id="prep_wither_3_skulls",
+        title="预备 3 颗凋灵骷髅头颅（召唤凋灵前置）",
+        tier="T4_PREP",
+        score=0,
+        skill="summon_and_trap_wither",
+        skill_args=(("mode", "prep_skulls"),),
+        prereq_goals=("find_fortress", "get_wither_skull", "prep_looting_sword"),
+        done_items=("wither_skeleton_skull>=3",),
+        must_hold_for_children=True,
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=300.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+        requires_landmarks=("nether_fortress",),
+    ),
+    GoalSpec(
+        id="prep_nether_star",
+        title="预备下界之星（下界基岩顶卡死并击杀凋灵）",
+        tier="T4_PREP",
+        score=0,
+        skill="summon_and_trap_wither",
+        skill_args=(("mode", "nether_roof_trap"),),
+        prereq_goals=("summon_wither",),
+        done_items=("nether_star>=1",),
+        must_hold_for_children=True,
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+    ),
+    GoalSpec(
+        id="prep_netherite_upgrade_set",
+        title="预备全套下界合金升级模板与下界合金锭（各 4 份）",
+        tier="T4_PREP",
+        score=0,
+        skill="craft_netherite_armor_set",
+        skill_args=(("prep_only", True),),
+        prereq_goals=("obtain_ancient_debris", "loot_bastion", "trade"),
+        done_items=("netherite_upgrade_smithing_template>=4", "netherite_ingot>=4"),
+        must_hold_for_children=True,
+        budget_s=540.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=340.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+        requires_landmarks=("bastion_remnant",),
+    ),
+    GoalSpec(
+        id="trade_at_world_height",
+        title="星际贸易（在建筑高度上限与村民交易）",
+        tier="T4",
+        score=60,
+        skill="trade_world_height",
+        prereq_goals=("prep_high_altitude_portal",),
+        done_advancements=("minecraft:adventure/trade_at_world_height",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+        requires_landmarks=("village",),
+    ),
+    GoalSpec(
+        id="arbalistic",
+        title="劲弩手（单发弩箭穿透击杀五种不同生物）",
+        tier="T4",
+        score=100,
+        skill="arbalistic_trench_shot",
+        prereq_goals=("prep_piercing_iv_crossbow", "prep_five_unique_mobs_pack"),
+        done_advancements=("minecraft:adventure/arbalistic",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=150.0,
+        stage="draft",
+        editable_files=_T4_ARBALISTIC_HEIGHT_EDITABLE,
+    ),
+    GoalSpec(
+        id="netherite_armor",
+        title="残骸裹身（合成并装备全套下界合金盔甲）",
+        tier="T4",
+        score=100,
+        skill="craft_netherite_armor_set",
+        prereq_goals=("prep_netherite_upgrade_set",),
+        done_advancements=("minecraft:nether/netherite_armor",),
+        done_items=(
+            "netherite_helmet>=1",
+            "netherite_chestplate>=1",
+            "netherite_leggings>=1",
+            "netherite_boots>=1",
+        ),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+        requires_landmarks=("bastion_remnant",),
+    ),
+    GoalSpec(
+        id="summon_wither",
+        title="凋零山庄（召唤凋灵）",
+        tier="T4",
+        score=100,
+        skill="summon_and_trap_wither",
+        skill_args=(("mode", "summon_only"),),
+        prereq_goals=("prep_wither_3_skulls",),
+        done_advancements=("minecraft:nether/summon_wither",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+    ),
+    GoalSpec(
+        id="create_beacon",
+        title="带信标回家（放置并激活信标）",
+        tier="T4",
+        score=60,
+        skill="activate_beacon",
+        prereq_goals=("prep_nether_star",),
+        done_advancements=("minecraft:nether/create_beacon",),
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=90.0,
+        stage="draft",
+        editable_files=_T4_NETHER_ENDGAME_EDITABLE,
+    ),
+
+    # ---- Stage 3 (Wave C, T4_PREP + T4)：不祥宝库、微型村袭击与不死图腾（1 项准备 + 3 项计分，全部 stage="draft"） ----
+    GoalSpec(
+        id="prep_micro_village_bunker",
+        title="预备微型隔离村碉堡（密封村民、床、钟与4格射击塔）",
+        tier="T4_PREP",
+        score=0,
+        skill="win_micro_village_raid",
+        skill_args=(("prep_only", True),),
+        prereq_goals=("trade",),
+        done_predicates=("landmark_reachable:micro_village_bunker",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=160.0,
+        stage="draft",
+        editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("village",),
+    ),
+    GoalSpec(
+        id="revaulting",
+        title="宝库寻宝（开启不祥试炼宝库）",
+        tier="T4",
+        score=60,
+        skill="unlock_ominous_vault",
+        prereq_goals=("prep_ominous_bottle", "minecraft_trials_edition"),
+        done_advancements=("minecraft:adventure/revaulting",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=240.0,
+        stage="draft",
+        editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("trial_chambers",),
+    ),
+    GoalSpec(
+        id="hero_of_the_village",
+        title="村庄英雄（赢得微型村袭击并亲手补刀）",
+        tier="T4",
+        score=60,
+        skill="win_micro_village_raid",
+        prereq_goals=("prep_ominous_bottle", "prep_micro_village_bunker"),
+        done_advancements=("minecraft:adventure/hero_of_the_village",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=280.0,
+        stage="draft",
+        editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("village",),
+    ),
+    GoalSpec(
+        id="totem_of_undying",
+        title="超越生死（受控触发不死图腾）",
+        tier="T4",
+        score=60,
+        skill="trigger_totem_safely",
+        prereq_goals=("hero_of_the_village",),
+        done_advancements=("minecraft:adventure/totem_of_undying",),
+        budget_s=300.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=140.0,
+        stage="draft",
+        editable_files=_T4_OMINOUS_EDITABLE,
+        requires_landmarks=("village",),
+    ),
+
+    # ---- Stage 3 (Wave D, T4)：炽足兽跨维度骑行与三叉戟机会投掷（3 项计分，+150 分，全部 stage="draft"） ----
+    GoalSpec(
+        id="ride_strider",
+        title="这船真长腿（骑乘炽足兽并用诡异菌钓竿加速）",
+        tier="T4",
+        score=30,
+        skill="ride_strider_boost",
+        prereq_goals=("enter_the_nether",),
+        done_advancements=("minecraft:nether/ride_strider",),
+        budget_s=240.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=120.0,
+        stage="draft",
+        editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
+    ),
+    GoalSpec(
+        id="ride_strider_in_overworld_lava",
+        title="感觉像在家一样（在主世界岩浆骑炽足兽直线 50 格）",
+        tier="T4",
+        score=60,
+        skill="ride_strider_overworld",
+        prereq_goals=("ride_strider",),
+        done_advancements=("minecraft:nether/ride_strider_in_overworld_lava",),
+        budget_s=480.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
+    ),
+    GoalSpec(
+        id="throw_trident",
+        title="抖包袱（被动机会持有三叉戟时投掷命中）",
+        tier="T4",
+        score=60,
+        skill="throw_opportunistic_trident",
+        prereq_goals=(),  # 被动机会钩子：持有三叉戟（试炼宝库/溺尸掉落）即解锁，无三叉戟时由 prereq_items 与 skill.blocked() 双重拦截
+        prereq_items=("trident>=1",),
+        done_advancements=("minecraft:adventure/throw_trident",),
+        budget_s=120.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=30.0,
+        stage="draft",
+        editable_files=_T4_STRIDER_TRIDENT_EDITABLE,
+    ),
+
+    # ---- 生态与考古线（4 项计分，+135 分，全部 stage="draft"） ----
+    GoalSpec(
+        id="salvage_sherd",
+        title="探古寻源（考古结构刷可疑沙/沙砾出陶片）",
+        tier="T2",
+        score=15,
+        skill="brush_archaeology",
+        skill_args=(("target", "sherd"),),
+        done_advancements=("minecraft:adventure/salvage_sherd",),
+        budget_s=240.0,
+        max_fails_per_ep=3,
+        stop_loss=True,
+        est_cost_s=110.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("archaeology|warm_ocean_ruins",),
+    ),
+    GoalSpec(
+        id="obtain_sniffer_egg",
+        title="嗅探之谜（暖水海底废墟刷可疑沙子获得嗅探兽蛋）",
+        tier="T3",
+        score=30,
+        skill="brush_archaeology",
+        skill_args=(("target", "sniffer_egg"),),
+        done_advancements=("minecraft:husbandry/obtain_sniffer_egg",),
+        done_items=("sniffer_egg>=1",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=180.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("warm_ocean_ruins|warm_ocean|archaeology",),
+    ),
+    GoalSpec(
+        id="plant_any_sniffer_seed",
+        title="昔日重现（种植火把花种子或瓶子草荚果）",
+        tier="T3",
+        score=30,
+        skill="hatch_and_raise_sniffer",
+        skill_args=(("mode", "plant_seed"),),
+        prereq_goals=("obtain_sniffer_egg",),
+        done_advancements=("minecraft:husbandry/plant_any_sniffer_seed",),
+        budget_s=360.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=220.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("warm_ocean_ruins|warm_ocean|archaeology",),
+    ),
+    GoalSpec(
+        id="feed_snifflet",
+        title="小小嗅探兽（用火把花种子喂食幼年嗅探兽）",
+        tier="T4",
+        score=60,
+        skill="hatch_and_raise_sniffer",
+        skill_args=(("mode", "feed_snifflet"),),
+        prereq_goals=("obtain_sniffer_egg",),
+        done_advancements=("minecraft:husbandry/feed_snifflet",),
+        budget_s=420.0,
+        max_fails_per_ep=2,
+        stop_loss=True,
+        est_cost_s=260.0,
+        stage="draft",
+        editable_files=_ARCHAEOLOGY_SNIFFER_EDITABLE,
+        requires_landmarks=("warm_ocean_ruins|warm_ocean|archaeology",),
     ),
 )
 
+_NETHER_END_ADV_PREFIXES: tuple[str, ...] = (
+    "minecraft:nether/",
+    "minecraft:end/",
+    "minecraft:story/enter_the_nether",
+    "minecraft:story/enter_the_end",
+)
+_NETHER_END_EXTRA_IDS: frozenset[str] = frozenset({
+    "enter_the_nether",
+    "enter_the_end",
+    "enter_end_gateway",
+    "find_end_city",
+    "levitate",
+    "elytra",
+    "place_dried_ghast_in_water",
+    "spyglass_at_ghast",
+    "prep_wither_3_skulls",
+    "prep_nether_star",
+    "prep_netherite_upgrade_set",
+    "netherite_armor",
+    "obtain_netherite_hoe",
+    "froglights",
+})
+
+
+def _is_nether_or_end_goal(goal: GoalSpec) -> bool:
+    return goal.id in _NETHER_END_EXTRA_IDS or any(
+        adv.startswith(_NETHER_END_ADV_PREFIXES) for adv in goal.done_advancements
+    )
+
+
+def _tighten_nether_end_stop_loss(goals: tuple[GoalSpec, ...]) -> tuple[GoalSpec, ...]:
+    """兑现 docs/11 §八（A13 已确认 keepInventory=false）：下界与末地高风险目标止损预算收紧一半。"""
+    out: list[GoalSpec] = []
+    for g in goals:
+        if not _is_nether_or_end_goal(g):
+            out.append(g)
+            continue
+        floor_s = 180.0 if g.tier in {"T2", "T3"} else 120.0
+        tightened_budget = max(floor_s, round(g.budget_s * 0.5, 1))
+        tightened_fails = min(g.max_fails_per_ep, 2) if g.max_fails_per_ep > 0 else 2
+        out.append(replace(g, budget_s=tightened_budget, max_fails_per_ep=tightened_fails, stop_loss=True))
+    return tuple(out)
+
+
+GOALS = _tighten_nether_end_stop_loss(GOALS)
+NETHER_END_HIGH_RISK_GOALS: frozenset[str] = frozenset(g.id for g in GOALS if _is_nether_or_end_goal(g))
 GOAL_MAP: dict[str, GoalSpec] = {g.id: g for g in GOALS}
 
 
@@ -533,6 +2133,18 @@ def eval_item_expr(state: State, expr: str) -> tuple[bool, int, int, str]:
         need = 1
 
     assume_no_tbl = not has_known_table(state.pos)
+    if assume_no_tbl:
+        st_pos_tbl = state.st.get("pos") if isinstance(state.st, Mapping) else None
+        if isinstance(st_pos_tbl, (list, tuple)) and len(st_pos_tbl) >= 3:
+            dim_tbl = str((state.st.get("dimension") if isinstance(state.st, Mapping) else None) or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+            cur3_tbl = (float(st_pos_tbl[0]), float(st_pos_tbl[1]), float(st_pos_tbl[2]))
+            m_tbl = memo_for(state)
+            if any(
+                math.dist(cur3_tbl, (p[0] + 0.5, p[1] + 0.5, p[2] + 0.5)) <= 24.0
+                and not m_tbl.is_blocked(p, dimension=dim_tbl, category="station")
+                for p in m_tbl.stations("crafting_table", dimension=dim_tbl)
+            ):
+                assume_no_tbl = False
 
     if lhs == "@logs":
         cur = total_logs(state)
@@ -565,10 +2177,48 @@ def eval_item_expr(state: State, expr: str) -> tuple[bool, int, int, str]:
         )
         cur = 1 if ready else 0
         label = "木镐所需原木/木板"
+    elif lhs.startswith("@stick_stock:"):
+        target = int(lhs.split(":", 1)[1])
+        cur = int(state.count("stick") >= target or can_afford_gear(state, "stick"))
+        label = f"已持 {target} 木棍或可继续制作"
+    elif lhs == "@furnace_ready":
+        ready = state.count("furnace") >= 1 or state.count("blast_furnace") >= 1
+        if not ready:
+            st_pos = state.st.get("pos") if isinstance(state.st, Mapping) else None
+            dim = str((state.st.get("dimension") if isinstance(state.st, Mapping) else None) or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+            if isinstance(st_pos, (list, tuple)) and len(st_pos) >= 3:
+                cur3 = (float(st_pos[0]), float(st_pos[1]), float(st_pos[2]))
+                leases = lease_book_for(state).active_leases(dimension=dim)
+                ready = any(math.dist(cur3, (l.pos[0] + 0.5, l.pos[1] + 0.5, l.pos[2] + 0.5)) <= 48.0 for l in leases)
+                if not ready:
+                    m = memo_for(state)
+                    stations = list(m.stations("furnace", dimension=dim)) + list(m.stations("blast_furnace", dimension=dim))
+                    ready = any(
+                        math.dist(cur3, (p[0] + 0.5, p[1] + 0.5, p[2] + 0.5)) <= 24.0
+                        for p in stations
+                    )
+        cur = 1 if ready else 0
+        label = "背包或附近可用熔炉"
     elif lhs.startswith("@gear_ready:"):
         gear_item = lhs.split(":", 1)[1].strip()
         cur = 1 if can_afford_gear(state, gear_item, assume_no_table=assume_no_tbl) else 0
         label = f"合成 {gear_item} 所需材料与工作台条件"
+    elif lhs == "@music_disc":
+        inv = state.inventory or {}
+        disc_names = {
+            str(it.get("name") or "").removeprefix("minecraft:").strip().lower()
+            for it in (*(inv.get("items") or ()), inv.get("held"), inv.get("offhand"))
+            if isinstance(it, Mapping)
+        }
+        held_row = inv.get("held") if isinstance(inv.get("held"), Mapping) else None
+        held_name = str(held_row.get("name") or "").removeprefix("minecraft:").strip().lower() if held_row else ""
+        held_cnt = int(held_row.get("count", 0)) if held_row else 0
+        cur = sum(
+            max(state.count(n), held_cnt if n == held_name else 0)
+            for n in disc_names
+            if n.startswith("music_disc_")
+        )
+        label = "任意音乐唱片"
     else:
         names = [x.strip() for x in lhs.split("|") if x.strip()]
         cur = sum(state.count(n) for n in names)
@@ -587,16 +2237,61 @@ def is_goal_held_in_state(goal: GoalSpec, state: State) -> bool:
     return bool(held_items) and all(check_item_expr(state, expr) for expr in held_items)
 
 
+def _eval_done_predicate(state: State, expr: str, memo: Any = None) -> bool:
+    """求值单条子目标/世界记忆复合达成谓词。"""
+    raw = expr.strip()
+    if not raw:
+        return False
+    if ">=" in raw:
+        lhs, rhs = raw.split(">=", 1)
+        lhs = lhs.strip()
+        try:
+            threshold = int(rhs.strip())
+        except ValueError:
+            return False
+    else:
+        lhs = raw
+        threshold = 1
+
+    if lhs.startswith("enchantment_ready:"):
+        parts = lhs.split(":", 2)
+        if len(parts) != 3:
+            return False
+        _, item_tag, enchant_id = parts
+        item_tag, enchant_id = item_tag.strip(), enchant_id.strip()
+        if not item_tag or not enchant_id:
+            return False
+        return subgoals.enchantment_ready(state, item_tag, enchant_id, threshold)
+
+    if lhs == "mob_collection_ready":
+        return subgoals.mob_collection_ready(state, min_unique=threshold)
+
+    if lhs.startswith("landmark_reachable:"):
+        kind = lhs.split(":", 1)[1].strip()
+        if not kind:
+            return False
+        m = memo if memo is not None else memo_for(state)
+        return bool(hasattr(m, "has_landmark") and m.has_landmark(kind, dimension="overworld"))
+
+    return False
+
+
 def is_goal_achieved(
     goal: GoalSpec,
     state: State,
     completed_advs: Collection[str] = (),
+    *,
+    memo: Any = None,
 ) -> bool:
-    """检查某目标在本局是否已达成（服务端确认 advancement 或背包代理判据任一成立）。"""
+    """检查某目标在本局是否已达成（服务端确认 advancement、背包代理判据或复合谓词任一成立）。"""
     if goal.done_advancements and any(a in completed_advs for a in goal.done_advancements):
         return True
     if goal.done_items and all(check_item_expr(state, expr) for expr in goal.done_items):
         return True
+    if goal.done_predicates:
+        m = memo if memo is not None else memo_for(state)
+        if all(_eval_done_predicate(state, expr, m) for expr in goal.done_predicates):
+            return True
     return False
 
 
@@ -604,11 +2299,97 @@ def is_prereq_satisfied(
     goal: GoalSpec,
     state: State,
     completed_advs: Collection[str] = (),
+    *,
+    memo: Any = None,
 ) -> bool:
     """作为下游目标前置时的满足判定：工具/工作站类前置要求当前背包确实持有（兼容 keepInventory=False）。"""
     if goal.must_hold_for_children and (goal.held_items or goal.done_items):
         return is_goal_held_in_state(goal, state)
-    return is_goal_achieved(goal, state, completed_advs)
+    return is_goal_achieved(goal, state, completed_advs, memo=memo)
+
+
+_LANDMARK_DIMS: tuple[str, ...] = ("overworld", "the_nether", "the_end")
+
+
+def _biome_matches(alt: str, visited_biome: str) -> bool:
+    """支持精确群系名与子变种前缀/后缀匹配（如 savanna -> windswept_savanna / savanna_plateau）。"""
+    b = str(visited_biome).removeprefix("minecraft:").strip().lower()
+    if not b or not alt:
+        return False
+    return b == alt or b.startswith(f"{alt}_") or b.endswith(f"_{alt}") or f"_{alt}_" in b
+
+
+def _landmark_req_satisfied(req: str, memo: Any) -> bool:
+    alts = [a.strip().lower() for a in str(req).split("|") if a.strip()]
+    if not alts:
+        return True
+    if memo is None:
+        return False
+    has_lm = getattr(memo, "has_landmark", None)
+    get_biomes = getattr(memo, "biomes", None)
+    for dim in _LANDMARK_DIMS:
+        if callable(has_lm):
+            for alt in alts:
+                if has_lm(alt, dimension=dim):
+                    return True
+        if callable(get_biomes):
+            visited = get_biomes(dimension=dim) or ()
+            for alt in alts:
+                if any(_biome_matches(alt, vb) for vb in visited):
+                    return True
+    return False
+
+
+def goal_landmarks_satisfied(goal: GoalSpec, memo: Any) -> bool:
+    """检查目标所需的全部结构地标/生物群系先验是否已在 WorldResourceMemo 中探明。"""
+    if not goal.requires_landmarks:
+        return True
+    if memo is None:
+        return False
+    return all(_landmark_req_satisfied(req, memo) for req in goal.requires_landmarks)
+
+
+def unmet_required_landmarks(goal: GoalSpec, memo: Any) -> tuple[str, ...]:
+    """返回目标当前尚未在 WorldResourceMemo 中探明的地标/群系先验表达式元组。"""
+    if not goal.requires_landmarks:
+        return ()
+    if memo is None:
+        return tuple(goal.requires_landmarks)
+    return tuple(req for req in goal.requires_landmarks if not _landmark_req_satisfied(req, memo))
+
+
+def chain_landmarks_satisfied(chain: Sequence[GoalSpec], memo: Any) -> bool:
+    """检查未满足前置链路上的每个目标节点是否都满足地标/群系先验。"""
+    return all(goal_landmarks_satisfied(node, memo) for node in chain)
+
+
+def _locality_bonus_multiplier(goal: GoalSpec, state: State, memo: Any) -> float:
+    """若玩家正处于目标所需群系内，或距该群系/结构锚点 <=48 格，给予 1.35x 顺路加权。"""
+    if not goal.requires_landmarks:
+        return 1.0
+    st = state.st or {}
+    cur_biome = str(st.get("biome") or "").removeprefix("minecraft:").strip().lower()
+    if cur_biome:
+        for req in goal.requires_landmarks:
+            alts = [a.strip().lower() for a in str(req).split("|") if a.strip()]
+            if any(_biome_matches(alt, cur_biome) for alt in alts):
+                return 1.35
+    pos = st.get("pos")
+    if memo is not None and isinstance(pos, (list, tuple)) and len(pos) >= 3:
+        try:
+            px, pz = float(pos[0]), float(pos[2])
+        except (TypeError, ValueError):
+            return 1.0
+        if not (math.isfinite(px) and math.isfinite(pz)):
+            return 1.0
+        dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+        pos_fn = getattr(memo, "biome_or_landmark_positions", None)
+        if callable(pos_fn):
+            for req in goal.requires_landmarks:
+                for cell in pos_fn(req, dimension=dim):
+                    if math.hypot(px - (cell[0] + 0.5), pz - (cell[2] + 0.5)) <= 48.0:
+                        return 1.35
+    return 1.0
 
 
 # ============================================================================
@@ -645,10 +2426,15 @@ def validate_ledger(
     if len(candidates) > 1:
         errors.append(f"单目标晋级纪律违规：同一时刻最多允许 1 个 candidate 目标，当前有 {candidates}")
 
+    referenced_prereqs = {pid for g in ledger for pid in g.prereq_goals if pid in by_id}
     for g in ledger:
         for pid in g.prereq_goals:
             if pid not in by_id:
                 errors.append(f"{g.id}: 引用了不存在的前置目标 {pid!r}")
+        if g.id in referenced_prereqs and not (g.done_advancements or g.done_items or g.done_predicates):
+            errors.append(
+                f"{g.id}: 作为下游目标前置（prereq_goals）必须至少配置 done_advancements、done_items 或 done_predicates 之一"
+            )
 
         if g.stage in DEFAULT_CAMPAIGN_STAGES:
             cls = reg.get(g.skill)
@@ -776,6 +2562,335 @@ def is_goal_stopped_out(
     return False
 
 
+_SHARED_SUBGRAPH_WEIGHT: float = 0.35
+_SHARED_SUBGRAPH_CAP: int = 6
+HUB_DOWNSTREAM_THRESHOLD: int = 5
+
+
+def compute_downstream_counts(ledger: Collection[GoalSpec] = GOALS) -> dict[str, int]:
+    """计算台账 DAG 中每个目标的传递下游依赖节点总数（不含自身）。"""
+    by_id = {g.id: g for g in ledger}
+    children: dict[str, list[str]] = {gid: [] for gid in by_id}
+    for g in ledger:
+        for pid in g.prereq_goals:
+            if pid in children:
+                children[pid].append(g.id)
+    counts: dict[str, int] = {}
+    for gid in by_id:
+        seen: set[str] = set()
+        stack = list(children[gid])
+        while stack:
+            cur = stack.pop()
+            if cur not in seen and cur != gid:
+                seen.add(cur)
+                stack.extend(children.get(cur, ()))
+        counts[gid] = len(seen)
+    return counts
+
+
+def compute_hub_goal_ids(
+    ledger: Collection[GoalSpec] = GOALS,
+    *,
+    min_downstream: int = HUB_DOWNSTREAM_THRESHOLD,
+) -> frozenset[str]:
+    """自动由台账 DAG 下游闭包识别核心枢纽目标集合（下游节点数 >= min_downstream，无需硬编码）。"""
+    threshold = max(1, int(min_downstream))
+    counts = compute_downstream_counts(ledger)
+    return frozenset(gid for gid, cnt in counts.items() if cnt >= threshold)
+
+
+def compute_goal_marginal_rois(
+    state: State,
+    active_goals: Collection[GoalSpec],
+    *,
+    completed_advs: Collection[str] = (),
+    target_goal: Any = None,
+    ep_goal_fails: Optional[Mapping[str, int]] = None,
+    ep_goal_elapsed: Optional[Mapping[str, float]] = None,
+    telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    suspended_goals: Collection[str] = (),
+    memo: Any = None,
+) -> dict[str, float]:
+    """计算每个可执行根目标在共享子图分摊后的边际 ROI，供战略菜单超长时做 Top-K 截断。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
+    goals_tuple = tuple(active_goals)
+    by_id = {g.id: g for g in goals_tuple}
+    target_ids = set(normalize_goal_ids(target_goal))
+
+    def _unmet_chain(root: GoalSpec) -> Optional[list[GoalSpec]]:
+        chain: list[GoalSpec] = []
+        seen: set[str] = set()
+
+        def _walk(node: GoalSpec, is_root: bool) -> bool:
+            if node.id in seen:
+                return True
+            if not is_root and is_prereq_satisfied(node, state, completed_advs, memo=resolved_memo):
+                return True
+            if node.id in suspended_goals or is_goal_stopped_out(node, ep_goal_fails, ep_goal_elapsed):
+                return False
+            for pid in node.prereq_goals:
+                parent = by_id.get(pid)
+                if parent is not None and not _walk(parent, False):
+                    return False
+            seen.add(node.id)
+            chain.append(node)
+            return True
+
+        return chain if _walk(root, True) else None
+
+    chains: list[tuple[GoalSpec, list[GoalSpec]]] = []
+    node_dependents: dict[str, set[str]] = {}
+    for g in goals_tuple:
+        if is_goal_achieved(g, state, completed_advs, memo=resolved_memo):
+            continue
+        chain = _unmet_chain(g)
+        if not chain:
+            continue
+        if (
+            g.id not in target_ids
+            and len(chain) == 1
+            and chain[0].id == g.id
+            and g.prereq_items
+            and not g.gather_fallbacks
+            and not all(check_item_expr(state, expr) for expr in g.prereq_items)
+        ):
+            continue
+        if g.id not in target_ids and not chain_landmarks_satisfied(chain, resolved_memo):
+            continue
+        chains.append((g, chain))
+        if g.score > 0:
+            for x in chain:
+                node_dependents.setdefault(x.id, set()).add(g.id)
+
+    out: dict[str, float] = {}
+    for g, chain in chains:
+        p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs, memo=resolved_memo))
+        amortized_cost = 0.0
+        for x in chain:
+            raw_x_cost = effective_goal_cost(x, telemetry)
+            share_count = len(node_dependents.get(x.id, ()))
+            extra_shares = min(_SHARED_SUBGRAPH_CAP, max(0, share_count - 1))
+            amortized_cost += raw_x_cost / (1.0 + _SHARED_SUBGRAPH_WEIGHT * extra_shares)
+        out[g.id] = round(p_score / max(1.0, amortized_cost), 4) if p_score > 0 else 0.0
+    return out
+
+
+_SWORD_ITEMS: tuple[str, ...] = ("stone_sword", "iron_sword", "diamond_sword", "netherite_sword")
+_IRON_PLUS_ARMOR_ITEMS: tuple[str, ...] = (
+    "iron_helmet",
+    "iron_chestplate",
+    "iron_leggings",
+    "iron_boots",
+    "diamond_helmet",
+    "diamond_chestplate",
+    "diamond_leggings",
+    "diamond_boots",
+    "netherite_helmet",
+    "netherite_chestplate",
+    "netherite_leggings",
+    "netherite_boots",
+)
+_WOOL_COLORS: tuple[str, ...] = (
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "light_gray",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+)
+_BED_ITEMS: tuple[str, ...] = tuple(f"{c}_bed" for c in _WOOL_COLORS)
+_WOOL_ITEMS: tuple[str, ...] = tuple(f"{c}_wool" for c in _WOOL_COLORS)
+_EARLY_RISKY_ROOT_GOALS: frozenset[str] = frozenset({
+    "kill_a_mob",
+    "shoot_arrow",
+    "ol_betsy",
+    "bullseye",
+    "sniper_duel",
+    "voluntary_exile",
+    "two_birds_one_arrow",
+    "arbalistic",
+    "hero_of_the_village",
+    "adventuring_time",
+    "explore_nether",
+    "find_fortress",
+    "find_bastion",
+    "minecraft_trials_edition",
+    "revaulting",
+})
+_NAKED_POST_IRON_RISKY_ROOTS: frozenset[str] = frozenset({
+    "mine_diamond",
+    "shiny_gear",
+    "prep_diamond_pickaxe",
+    "form_obsidian",
+    "enter_the_nether",
+    "lava_bucket",
+})
+_NIGHT_UNDERGROUND_GOALS: frozenset[str] = frozenset({
+    "smelt_iron",
+    "mine_diamond",
+    "form_obsidian",
+    "mine_stone",
+    "upgrade_tools",
+    "prep_furnace",
+    "iron_tools",
+    "obtain_armor",
+    "shiny_gear",
+    "prep_diamond_pickaxe",
+    "enchant_item",
+})
+_NIGHT_SURFACE_GOALS: frozenset[str] = frozenset({
+    "prep_wood",
+    "plant_seed",
+    "breed_an_animal",
+    "fishy_business",
+    "tactical_fishing",
+})
+_NIGHT_COMBAT_GOALS: frozenset[str] = frozenset({
+    "kill_a_mob",
+    "deflect_arrow",
+    "shoot_arrow",
+    "ol_betsy",
+    "bullseye",
+    "sniper_duel",
+    "voluntary_exile",
+})
+
+
+def _resolve_is_day(state: State, explicit: Optional[bool] = None) -> Optional[bool]:
+    """解析昼夜布尔态（优先使用显式参数，其次 state.st.is_day 或 time_of_day）。"""
+    if explicit is not None:
+        return bool(explicit)
+    st = state.st or {}
+    if isinstance(st.get("is_day"), bool):
+        return st["is_day"]
+    tod = st.get("time_of_day")
+    if isinstance(tod, (int, float)) and not isinstance(tod, bool) and math.isfinite(tod):
+        tick = float(tod) % 24000.0
+        return not (state.config.night_start <= tick < state.config.night_end)
+    return None
+
+
+def _has_sleep_bed_ready(state: State, memo: Any, dim: str) -> bool:
+    """判断背包内或记忆点位中是否已有可立即睡觉/成床的床或羊毛储备。"""
+    if any(state.count(bed) >= 1 for bed in _BED_ITEMS):
+        return True
+    if any(state.count(wool) >= 3 for wool in _WOOL_ITEMS):
+        return True
+    if memo is not None and hasattr(memo, "has_station") and memo.has_station("bed", dimension=dim):
+        return True
+    if memo is not None and hasattr(memo, "get_camp"):
+        camp = memo.get_camp(dimension=dim)
+        if isinstance(camp, Mapping) and camp.get("bed") is not None:
+            return True
+    return False
+
+
+def survival_readiness_multiplier(
+    step_goal: GoalSpec,
+    root_goal: GoalSpec,
+    state: State,
+    completed_advs: Collection[str],
+    *,
+    active_goals_by_id: Optional[Mapping[str, GoalSpec]] = None,
+    memo: Any = None,
+    is_day: Optional[bool] = None,
+) -> float:
+    """计算生存就绪度门控与主世界昼夜双轨排序倍率（仅影响排序优先级，不修改原始 ROI 字段）。"""
+    st = state.st or {}
+    raw_hp = st.get("health", 20.0)
+    try:
+        hp = float(raw_hp) if raw_hp is not None and not isinstance(raw_hp, bool) else 20.0
+    except (TypeError, ValueError):
+        hp = 20.0
+    if not math.isfinite(hp):
+        hp = 20.0
+
+    dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+    resolved_memo = memo if memo is not None else memo_for(state)
+    resolved_day = _resolve_is_day(state, is_day)
+
+    has_sword = any(state.count(s) >= 1 for s in _SWORD_ITEMS)
+    has_food_reserve = cooked_food_count(state) >= 6 or inventory_food_restore(state) >= 18
+    has_iron_pick = any(state.count(p) >= 1 for p in IRON_OR_BETTER_PICKS)
+    has_shield = state.count("shield") >= 1
+    has_iron_armor = has_equipped_armor(state) or any(state.count(a) >= 1 for a in _IRON_PLUS_ARMOR_ITEMS)
+
+    mult = 1.0
+
+    # (a) Early Readiness Gate
+    if not (has_sword and has_food_reserve) and root_goal.id in _EARLY_RISKY_ROOT_GOALS:
+        mult *= 0.35
+
+    # (b) Post-Iron Survival Foundation Gate
+    lookup = active_goals_by_id if active_goals_by_id is not None else GOAL_MAP
+    smelt_iron_spec = lookup.get("smelt_iron") or GOAL_MAP.get("smelt_iron")
+    iron_tools_spec = lookup.get("iron_tools") or GOAL_MAP.get("iron_tools")
+    iron_stage_started = (
+        (smelt_iron_spec is not None and is_goal_achieved(smelt_iron_spec, state, completed_advs, memo=resolved_memo))
+        or state.count("iron_ingot") >= 1
+        or state.count("iron_pickaxe") >= 1
+    )
+    iron_tools_done = has_iron_pick or (
+        iron_tools_spec is not None and is_goal_achieved(iron_tools_spec, state, completed_advs, memo=resolved_memo)
+    )
+    if iron_stage_started:
+        if root_goal.id == "iron_tools" and not has_iron_pick:
+            mult *= 3.5
+        elif root_goal.id == "obtain_armor" and iron_tools_done and not has_iron_armor:
+            mult *= 3.5
+        elif root_goal.id == "deflect_arrow" and iron_tools_done and not has_shield and hp >= 14.0:
+            mult *= 2.8
+        if not has_iron_armor and not has_shield:
+            if root_goal.id in _NAKED_POST_IRON_RISKY_ROOTS or (
+                dim == "overworld" and root_goal.id in NETHER_END_HIGH_RISK_GOALS
+            ):
+                mult *= 0.2
+            elif root_goal.id == "allay_deliver_item_to_player":
+                mult *= 0.25
+
+    # (d) KeepInventory=False Nether/End Camp-Protection Gate (docs/11 §八 + docs/15)
+    # 仅在铁器已具基础护甲/盾牌准备跨维时介入，避免与早期/裸装基础门叠加破坏既有分段斜率。
+    if (
+        dim == "overworld"
+        and iron_stage_started
+        and (has_iron_armor or has_shield)
+        and root_goal.id in NETHER_END_HIGH_RISK_GOALS
+    ):
+        overworld_camp = resolved_memo.get_camp(dimension="overworld") if resolved_memo is not None else None
+        has_camp_kit = bool(resolved_memo is not None and resolved_memo.camp_has_recovery_kit(dimension="overworld"))
+        has_shelter = isinstance(overworld_camp, Mapping) and int(overworld_camp.get("shelter_tier", 0)) >= 1
+        if not (has_camp_kit or has_shelter):
+            mult *= 0.35
+
+    # (c) Day/Night Dual-Track Weighting (Overworld only)
+    if resolved_day is not None and dim == "overworld":
+        if resolved_day is False:
+            if (step_goal.id == "sleep_in_bed" or root_goal.id == "sleep_in_bed") and _has_sleep_bed_ready(state, resolved_memo, dim):
+                mult *= 6.0
+            elif step_goal.id in _NIGHT_SURFACE_GOALS:
+                mult *= 0.15 if (not has_iron_armor and not has_shield) else 0.5
+            elif step_goal.id in _NIGHT_COMBAT_GOALS or root_goal.id in _NIGHT_COMBAT_GOALS:
+                if not (has_iron_armor and has_shield and hp >= 16.0):
+                    mult *= 0.15
+            elif step_goal.id in _NIGHT_UNDERGROUND_GOALS:
+                mult *= 1.6
+        elif resolved_day is True:
+            if step_goal.id == "sleep_in_bed" or root_goal.id == "sleep_in_bed":
+                mult *= 0.1
+
+    return mult
+
+
 def rank_actionable_goals(
     state: State,
     active_goals: tuple[GoalSpec, ...],
@@ -786,8 +2901,11 @@ def rank_actionable_goals(
     ep_goal_elapsed: Optional[Mapping[str, float]] = None,
     telemetry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     suspended_goals: Collection[str] = (),
+    memo: Any = None,
+    is_day: Optional[bool] = None,
 ) -> list[GoalPlanStep]:
-    """对所有尚未达成且未触发止损的目标计算未满足前置链，按性价比降序返回可执行步列表。"""
+    """对所有尚未达成且未触发止损的目标计算未满足前置链，按共享子图边际性价比降序返回可执行步列表。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
     by_id = {g.id: g for g in active_goals}
     order_idx = {g.id: idx for idx, g in enumerate(active_goals)}
     target_ids = set(normalize_goal_ids(target_goal))
@@ -799,7 +2917,7 @@ def rank_actionable_goals(
         def _walk(node: GoalSpec, is_root: bool) -> bool:
             if node.id in seen:
                 return True
-            if not is_root and is_prereq_satisfied(node, state, completed_advs):
+            if not is_root and is_prereq_satisfied(node, state, completed_advs, memo=resolved_memo):
                 return True
             if node.id in suspended_goals:
                 return False
@@ -819,20 +2937,88 @@ def rank_actionable_goals(
             return None
         return chain
 
-    raw_candidates: list[tuple[tuple[int, int, float, int], GoalPlanStep]] = []
+    # 第 1 遍：收集所有可执行、未达成、未止损的 (root_goal, chain)，并统计共享子图依赖度
+    actionable_chains: list[tuple[GoalSpec, list[GoalSpec]]] = []
+    node_dependents: dict[str, set[str]] = {}
+    node_downstream_score: dict[str, int] = {}
     for g in active_goals:
-        if is_goal_achieved(g, state, completed_advs):
+        if is_goal_achieved(g, state, completed_advs, memo=resolved_memo):
+            continue
+        if (
+            g.id not in target_ids
+            and not g.prereq_goals
+            and g.prereq_items
+            and not g.gather_fallbacks
+            and not all(check_item_expr(state, expr) for expr in g.prereq_items)
+        ):
             continue
         chain = _unmet_chain(g)
         if not chain:
             continue
-        p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs))
+        if (
+            g.id not in target_ids
+            and len(chain) == 1
+            and chain[0].id == g.id
+            and g.prereq_items
+            and not g.gather_fallbacks
+            and not all(check_item_expr(state, expr) for expr in g.prereq_items)
+        ):
+            continue
+        if g.id not in target_ids and not chain_landmarks_satisfied(chain, resolved_memo):
+            continue
+        actionable_chains.append((g, chain))
+        if g.score > 0:
+            for x in chain:
+                deps = node_dependents.setdefault(x.id, set())
+                if g.id not in deps:
+                    deps.add(g.id)
+                    node_downstream_score[x.id] = node_downstream_score.get(x.id, 0) + g.score
+
+    # 第 2 遍：保留原始 path_score / path_cost / roi，同时按共享子图分摊成本计算 marginal_roi 排序
+    raw_candidates: list[tuple[tuple[int, int, int, float, float, int], GoalPlanStep]] = []
+    for g, chain in actionable_chains:
+        p_score = sum(x.score for x in chain if not is_goal_achieved(x, state, completed_advs, memo=resolved_memo))
         p_cost = sum(effective_goal_cost(x, telemetry) for x in chain)
         roi = p_score / max(1.0, p_cost)
+
+        amortized_cost = 0.0
+        for x in chain:
+            raw_x_cost = effective_goal_cost(x, telemetry)
+            share_count = len(node_dependents.get(x.id, ()))
+            extra_shares = min(_SHARED_SUBGRAPH_CAP, max(0, share_count - 1))
+            amortized_cost += raw_x_cost / (1.0 + _SHARED_SUBGRAPH_WEIGHT * extra_shares)
+
+        m_roi = p_score / max(1.0, amortized_cost) if p_score > 0 else 0.0
+        step_shared = max(1, len(node_dependents.get(chain[0].id, ())))
+
+        if g.id in target_ids:
+            mult = 1.0
+        else:
+            mult = survival_readiness_multiplier(
+                chain[0],
+                g,
+                state,
+                completed_advs,
+                active_goals_by_id=by_id,
+                memo=resolved_memo,
+                is_day=is_day,
+            ) * _locality_bonus_multiplier(g, state, resolved_memo)
+        sleep_prio = (
+            1
+            if (
+                g.id not in target_ids
+                and g.id == "sleep_in_bed"
+                and chain[0].id == "sleep_in_bed"
+                and mult >= 5.0
+            )
+            else 0
+        )
         prio = (
             1 if g.id in target_ids else 0,
+            sleep_prio,
             1 if p_score > 0 else 0,
-            round(roi, 6),
+            round(m_roi * mult, 6),
+            round(roi * mult, 6),
             -order_idx[g.id],
         )
         step = GoalPlanStep(
@@ -842,6 +3028,8 @@ def rank_actionable_goals(
             path_score=p_score,
             path_cost=round(p_cost, 1),
             roi=round(roi, 4),
+            shared_dependents=step_shared,
+            marginal_roi=round(m_roi, 4),
         )
         raw_candidates.append((prio, step))
 
@@ -862,8 +3050,11 @@ def diagnose_goal_gap(
     state: State,
     completed_advs: Collection[str] = (),
     ledger: tuple[GoalSpec, ...] = GOALS,
+    *,
+    memo: Any = None,
 ) -> dict[str, Any]:
     """诊断目标当前尚未达成的精确卡点（已完成前置、缺失前置、瓶颈目标与物资缺口）。"""
+    resolved_memo = memo if memo is not None else memo_for(state)
     by_id = {g.id: g for g in ledger}
     ordered_prereqs: list[GoalSpec] = []
     seen: set[str] = set()
@@ -878,8 +3069,8 @@ def diagnose_goal_gap(
             ordered_prereqs.append(p)
 
     _collect_prereqs(goal)
-    completed_prereqs = [p.id for p in ordered_prereqs if is_prereq_satisfied(p, state, completed_advs)]
-    missing_prereqs = [p.id for p in ordered_prereqs if not is_prereq_satisfied(p, state, completed_advs)]
+    completed_prereqs = [p.id for p in ordered_prereqs if is_prereq_satisfied(p, state, completed_advs, memo=resolved_memo)]
+    missing_prereqs = [p.id for p in ordered_prereqs if not is_prereq_satisfied(p, state, completed_advs, memo=resolved_memo)]
 
     bottleneck = by_id[missing_prereqs[0]] if missing_prereqs else goal
     missing_items: list[str] = []

@@ -1,0 +1,70 @@
+{
+  "probe": "T4-P2",
+  "target": "local-target",
+  "scope_note": "local-target (non-official sandbox/bridge); strictly separated from official competition time budget",
+  "timestamp": "2026-11-19T17:28:20Z",
+  "gateway": {
+    "healthz_url": "http://127.0.0.1:8787/healthz",
+    "ok": true,
+    "mc_target_redacted": "lan-local-mc-1.21.11",
+    "mc_version": "1.21.11"
+  },
+  "server_state": {
+    "serverBrand": "vanilla",
+    "gameMode": "survival",
+    "hardcore": false,
+    "mineflayer_bot_game_difficulty": null,
+    "mineflayer_bot_game_difficulty_note": "Mineflayer 1.21.11 difficulty packet carries string 'hard' instead of integer enum, leaving bot.game.difficulty undefined",
+    "raw_difficulty_packet": {
+      "difficulty": "hard",
+      "difficultyLocked": false
+    },
+    "mob_spawning_observed": true,
+    "observed_entity_count": 50,
+    "observed_entities_sample": {
+      "creeper": 4,
+      "skeleton": 4,
+      "zombie": 2,
+      "spider": 1,
+      "enderman": 1,
+      "chicken": 1,
+      "salmon": 9,
+      "squid": 5,
+      "glow_squid": 6,
+      "bat": 16,
+      "item": 1
+    },
+    "keep_inventory_inferred": false
+  },
+  "smoke_chain_verification": {
+    "gather_wood": {
+      "status": "PASS",
+      "evidence": "code/mcagent/logs/t4-p2-smoke-20261119/summary.md (prep_wood achieved in 31.4s, 0 bugs)"
+    },
+    "mine_stone": {
+      "status": "PASS",
+      "evidence": "code/mcagent/logs/t4-p2-smoke-20261119/summary.md (mine_stone achieved in 105.7s, /dig 50/50) & t4-p2-chain-iron-20261119 (55.8s, /dig 27/27)"
+    },
+    "craft_gear": {
+      "status": "PASS",
+      "evidence": "code/mcagent/logs/t4-p2-smoke-20261119/summary.md (prep_wooden_pickaxe achieved, /craft 6/6) & t4-p2-chain-iron-20261119 (4.9s, /craft 6/6)"
+    },
+    "smelt_iron": {
+      "status": "PASS",
+      "evidence": "Local Vanilla 1.21.11 Hard end-to-end SmeltIron(count=2) mined iron_ore, placed furnace, smelted and retrieved iron_ingot=2 (~35s, 0 errors)"
+    },
+    "survey_island": {
+      "status": "PASS_AFTER_FIX",
+      "bug_found": "SurveyIsland.can_start() did not check remaining undone sectors, causing 580 zero-step spam completions in 60s (INC-001 SKILL_SPAM_LOOP)",
+      "fix": "code/mcagent/skills/survey.py (check undone sectors in can_start) + tests/test_stage2_survey.py (23/23 OK)",
+      "rerun_evidence": "code/mcagent/logs/t4-p2-survey-fixed-20261119/summary.md (steps=2, skills_completed=1, skills_replan=0, deaths=0)"
+    },
+    "scout_island_pit_escape_blocker": {
+      "status": "FIXED_AND_VERIFIED",
+      "bug_found": "ScoutIsland._try_underground_surface_escape() gated 1x2 staircase climb-out on cur[1] < 62.0 and attempts == 0, trapping bot in Y=67 surface quarry pit; also did not refresh inventory after pickaxe broke nor fall back to soft-dig / step_up_1x2",
+      "fix": "code/mcagent/loop/starter_skills.py (_try_staircase_climb_out with allow_above_sea, inventory refresh, soft-dig, step_up_1x2 fallback) + tests/test_soak_scout_recovery.py (40/40 OK)",
+      "rerun_evidence": "code/mcagent/logs/t4-p2-chain-iron-20261119/summary.md (scout_island 8/8 completed, 0 bugs, climbed Y=65 -> Y=68, 0 deaths)"
+    }
+  },
+  "verdict": "PASS"
+}

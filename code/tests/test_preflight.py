@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 import unittest
 
 from mcagent import preflight as pf
@@ -15,7 +16,7 @@ DEV = {
     "MC_API_BASE": "http://127.0.0.1:8787/api/v1",
     "MC_USER": "qyzy_dev",
     "MC_PASS": "localdev",
-    "LLM_KEY": "sk-mRbe07wnXwL975GpfflElIbOPH69Q4YMRO5BERpSAGxTBddG",
+    "LLM_KEY": "sk-mRbe_synthetic_blocked_public_test_key_0000",
     "LLM_MODEL": "default",
     "LLM_MAX_CONCURRENCY": "48",
 }
@@ -30,8 +31,8 @@ MATCH = {
 }
 
 
-def run(env, gateway=False):
-    return pf.check_static(env, gateway_open=gateway)
+def run(env, gateway=False, running_processes=()):
+    return pf.check_static(env, gateway_open=gateway, running_processes=running_processes)
 
 
 def failed_names(checks):
@@ -99,6 +100,118 @@ class GuardTests(unittest.TestCase):
         c = next(x for x in run(env) if x.name == "端点不是本机")
         self.assertFalse(c.ok)
         self.assertEqual(c.level, pf.BLOCK)
+
+
+class ResidualProcessTests(unittest.TestCase):
+    def _proc_check(self, checks):
+        return next(x for x in checks if x.name == "无残留 soak / mcagent 进程")
+
+    def test_detects_soak_ctl_and_mcagent_processes_as_block(self):
+        for pid, cmd in [
+            (21001, "python3 scripts/soak_ctl.py run --session-dir /tmp/s"),
+            (21002, "python -m soak_ctl --session-dir /tmp/s"),
+            (21003, "/opt/venv/bin/python -m mcagent.loop --soak"),
+            (21004, "python -m mcagent.soak --hours 8"),
+            (21005, "python -m mcagent.probe --live"),
+            (21006, "python code/mcagent/loop/__main__.py"),
+        ]:
+            with self.subTest(cmd=cmd):
+                c = self._proc_check(run(MATCH, running_processes=[(pid, cmd)]))
+                self.assertFalse(c.ok)
+                self.assertEqual(c.level, pf.BLOCK)
+                self.assertIn(str(pid), c.detail)
+                self.assertTrue(
+                    "kill " in c.detail or "pkill" in c.detail,
+                    f"detail 应含清理命令提示，实际: {c.detail}",
+                )
+
+    def test_ignores_self_parent_preflight_test_runners_and_log_tools(self):
+        procs = [
+            (os.getpid(), "python -m mcagent.loop"),
+            (os.getppid(), "python scripts/soak_ctl.py"),
+            (31001, "python -m mcagent.preflight --env-file /tmp/.env"),
+            (31002, "python code/mcagent/preflight.py"),
+            (31003, "python -m unittest tests.test_preflight -v"),
+            (31004, "pytest tests/test_preflight.py"),
+            (31005, "grep -rn soak_ctl code/"),
+            (31006, "rg mcagent.loop code/"),
+            (31007, "pgrep -af mcagent"),
+            (31008, "pkill -f soak_ctl|mcagent.loop"),
+            (31009, "tail -f code/mcagent/logs/soak.log"),
+            (31010, "less code/mcagent/logs/soak.log"),
+            (31011, "cat code/mcagent/logs/soak.log"),
+            (31012, "/home/user/mcagent/.venv/bin/python -m http.server 8000"),
+        ]
+        c = self._proc_check(run(MATCH, running_processes=procs))
+        self.assertTrue(c.ok, f"不应误报自身/单测/看日志命令，实际 detail: {c.detail}")
+        self.assertEqual(c.detail, "未发现残留 soak_ctl / mcagent 后台进程")
+
+    def test_no_residual_processes_passes(self):
+        c = self._proc_check(run(MATCH, running_processes=[(9999, "bash"), (10000, "python -m http.server")]))
+        self.assertTrue(c.ok)
+
+    def test_process_lister_injection_path(self):
+        called = []
+
+        def fake_lister():
+            called.append(True)
+            return [(42424, "python -m mcagent.loop")]
+
+        checks = pf.check_static(MATCH, gateway_open=False, process_lister=fake_lister)
+        c = self._proc_check(checks)
+        self.assertTrue(called)
+        self.assertFalse(c.ok)
+        self.assertEqual(c.level, pf.BLOCK)
+        self.assertIn("42424", c.detail)
+
+
+class CampusProxyTests(unittest.TestCase):
+    def _proxy_check(self, checks):
+        return next(x for x in checks if x.name == "校园网直连未挂 7897 代理")
+
+    def test_campus_host_with_7897_proxy_blocks(self):
+        for proxy in (
+            "http://127.0.0.1:7897",
+            "socks5://localhost:7897",
+            "127.0.0.1:7897",
+            "https://127.0.0.1:7897/",
+            "[::1]:7897",
+            "7897",
+        ):
+            with self.subTest(proxy=proxy):
+                env = dict(MATCH, MC_PROXY=proxy)
+                c = self._proxy_check(run(env))
+                self.assertFalse(c.ok)
+                self.assertEqual(c.level, pf.BLOCK)
+                self.assertIn("MC_PROXY", c.detail)
+                self.assertIn("apiin.nmo.net.cn", c.detail)
+
+    def test_campus_host_with_empty_proxy_passes(self):
+        for proxy in ("", "   "):
+            with self.subTest(proxy=repr(proxy)):
+                env = dict(MATCH, MC_PROXY=proxy)
+                c = self._proxy_check(run(env))
+                self.assertTrue(c.ok)
+                self.assertEqual(c.level, pf.BLOCK)
+
+    def test_campus_host_with_non_7897_proxy_warns(self):
+        env = dict(MATCH, MC_PROXY="http://127.0.0.1:8080")
+        c = self._proxy_check(run(env))
+        self.assertFalse(c.ok)
+        self.assertEqual(c.level, pf.WARN)
+        self.assertIn("MC_PROXY", c.detail)
+
+    def test_public_official_host_with_7897_proxy_is_not_blocked(self):
+        env = dict(MATCH, MC_API_BASE="https://mc-api.windywindie.top/api/v1", MC_PROXY="http://127.0.0.1:7897")
+        checks = run(env)
+        c = self._proxy_check(checks)
+        self.assertTrue(c.ok)
+        self.assertTrue(all(x.ok for x in checks))
+
+    def test_proxy_targets_port_handles_invalid_formats_safely(self):
+        for bad in ("", "not-a-proxy", "http://127.0.0.1:badport", "http://[::1", "http://127.0.0.1:78970"):
+            with self.subTest(bad=bad):
+                self.assertFalse(pf._proxy_targets_port(bad, 7897))
 
 
 class LiveCheckTests(unittest.TestCase):

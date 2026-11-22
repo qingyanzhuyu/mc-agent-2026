@@ -1,0 +1,93 @@
+{
+  "ts": "2026-11-19 04:49:19",
+  "source": "official",
+  "base": "https://apiin.nmo.net.cn/api/v1",
+  "drills": {
+    "1_disconnect_reconnect": {
+      "ok": true,
+      "status_while_disconnected_code": "not_connected",
+      "reconnect_elapsed_s": 63.11,
+      "min_interval_honored": true,
+      "pos_after_reconnect": [
+        13033.5,
+        64,
+        -5893.8
+      ],
+      "seq_before_disconnect": 33,
+      "seqs_after_reconnect_1_min_max": [
+        1,
+        43
+      ],
+      "seqs_after_reconnect_2_min_max": [
+        1,
+        96
+      ],
+      "b4_seq_behavior": "continuous_across_reconnect",
+      "post_reconnect_action_ok": true
+    },
+    "2_safe_mode_cooldown": {
+      "ok": true,
+      "entered_safe_mode": true,
+      "initial_remaining_s": 65.0,
+      "hazard_during_safe_mode": {
+        "kind": "safe_mode"
+      },
+      "real_hold_elapsed_s": 65.2,
+      "exited_safe_mode": true,
+      "planner_resumed_skill": "gather_wood",
+      "post_cooldown_action_ok": true,
+      "bonus_official_death_loop_observed": {
+        "seq_89": {
+          "type": "death_loop",
+          "deaths": 3,
+          "cooldown_s": 300
+        },
+        "seq_90": {
+          "type": "disconnected",
+          "reason": "death loop protection"
+        },
+        "seq_95_to_96_respawn_ms": 49,
+        "hurt_source_fields": [
+          "source",
+          "source_entity",
+          "likely_attacker"
+        ]
+      }
+    },
+    "3_token_singleflight_refresh": {
+      "ok": true,
+      "concurrent_threads": 3,
+      "thread_results": [
+        {
+          "ok": true,
+          "code": "not_connected",
+          "msg": "bot not connected"
+        },
+        {
+          "ok": true,
+          "code": "not_connected",
+          "msg": "bot not connected"
+        },
+        {
+          "ok": true,
+          "code": "not_connected",
+          "msg": "bot not connected"
+        }
+      ],
+      "login_calls": 1,
+      "singleflight_verified": true,
+      "token_rotated": true,
+      "token_file_persisted": true,
+      "auth_401_refresh_ms": 428.7,
+      "relogin_kicks_old_bot_requires_reconnect": true,
+      "post_refresh_wait_ready_s": 31.98,
+      "post_refresh_ready": true,
+      "post_refresh_pos": [
+        13032.5,
+        65,
+        -5895.5
+      ],
+      "note": "_refresh_token calls _login_locked() directly; stdout confirmed exactly 1x '[auth] invalid_token，尝试重登' + 1x '[auth] 登录成功' across 3 concurrent threads in 428.7ms; per spec §1.1 re-login drops previous bot session so wait_ready() auto-reconnected in 31.98s."
+    }
+  }
+}

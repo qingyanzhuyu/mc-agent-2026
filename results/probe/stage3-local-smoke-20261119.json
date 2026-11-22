@@ -1,0 +1,319 @@
+{
+  "target": "local-target",
+  "scope_note": "local-target (non-official sandbox/bridge); strictly separated from official competition time budget",
+  "mc_version": "1.21.11",
+  "bridge": "127.0.0.1:8788",
+  "ts": "2026-11-19T19:54:28Z",
+  "tests": {
+    "empty_inv_blocked_18": {
+      "pass": true,
+      "items_count": 0,
+      "blocked_count": 18,
+      "total": 18,
+      "unblocked": []
+    },
+    "crafter_chain": {
+      "skill": "crafter_chain",
+      "outcome": "completed",
+      "error": "",
+      "verify_done": "",
+      "steps_count": 26,
+      "steps": [
+        {
+          "op": "place",
+          "ok": null,
+          "error_code": null,
+          "item": "crafter",
+          "pos": [
+            -1,
+            100,
+            0
+          ]
+        },
+        {
+          "op": "place",
+          "ok": null,
+          "error_code": null,
+          "item": "hopper",
+          "pos": [
+            -1,
+            101,
+            0
+          ]
+        },
+        {
+          "op": "window_act",
+          "ok": null,
+          "error_code": null,
+          "item": "iron_ingot",
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_act",
+          "ok": null,
+          "error_code": null,
+          "item": "crafting_table",
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_act",
+          "ok": null,
+          "error_code": null,
+          "item": "iron_ingot",
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_act",
+          "ok": null,
+          "error_code": null,
+          "item": "redstone",
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_act",
+          "ok": null,
+          "error_code": null,
+          "item": "dropper",
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_act",
+          "ok": null,
+          "error_code": null,
+          "item": "redstone",
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "window_view",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "dig",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": [
+            -1,
+            101,
+            0
+          ]
+        },
+        {
+          "op": "place",
+          "ok": null,
+          "error_code": null,
+          "item": "lever",
+          "pos": [
+            0,
+            100,
+            0
+          ]
+        },
+        {
+          "op": "interact",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": [
+            0,
+            100,
+            0
+          ]
+        }
+      ],
+      "advancement_unlocked": true,
+      "crafter_count_after": 1,
+      "pass": true
+    },
+    "ride_strider_boost": {
+      "skill": "ride_strider_boost",
+      "outcome": "completed",
+      "error": "",
+      "verify_done": "",
+      "steps_count": 5,
+      "steps": [
+        {
+          "op": "interact",
+          "ok": null,
+          "error_code": null,
+          "item": "saddle",
+          "pos": null
+        },
+        {
+          "op": "interact",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        },
+        {
+          "op": "equip",
+          "ok": null,
+          "error_code": null,
+          "item": "warped_fungus_on_a_stick",
+          "pos": null
+        },
+        {
+          "op": "use_item",
+          "ok": null,
+          "error_code": null,
+          "item": "warped_fungus_on_a_stick",
+          "pos": null
+        },
+        {
+          "op": "dismount",
+          "ok": null,
+          "error_code": null,
+          "item": null,
+          "pos": null
+        }
+      ],
+      "advancement_unlocked": true,
+      "rod_after": {
+        "name": "warped_fungus_on_a_stick",
+        "count": 1,
+        "slot": 37,
+        "durability": [
+          99,
+          100
+        ]
+      },
+      "pass": true
+    },
+    "jukebox_meadow": {
+      "skill": "jukebox_meadow",
+      "outcome": "completed",
+      "error": "",
+      "verify_done": "",
+      "steps_count": 2,
+      "steps": [
+        {
+          "op": "place",
+          "ok": null,
+          "error_code": null,
+          "item": "jukebox",
+          "pos": [
+            319,
+            110,
+            288
+          ]
+        },
+        {
+          "op": "interact",
+          "ok": null,
+          "error_code": null,
+          "item": "music_disc_13",
+          "pos": [
+            319,
+            110,
+            288
+          ]
+        }
+      ],
+      "biome_seen": "meadow",
+      "advancement_unlocked": true,
+      "pass": true
+    }
+  }
+}

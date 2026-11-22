@@ -44,25 +44,25 @@ def _make_client(handler, *, max_rps: float = 16.0, block_cache_ttl_s: float = 1
 
 class ConfigCapAndEnvTests(unittest.TestCase):
     def test_max_rps_cap_constant_and_defaults(self) -> None:
-        self.assertEqual(client_mod.MAX_RPS_CAP, 16.0)
+        self.assertEqual(client_mod.MAX_RPS_CAP, 100_000.0)
         self.assertIsInstance(client_mod.MAX_RPS_CAP, float)
         with mock.patch.dict(os.environ, {}, clear=True):
             cfg = Config("https://mock.local/api/v1", "u", "p", token_file=None)
-        self.assertEqual(cfg.max_rps, 16.0)
-        self.assertEqual(cfg.block_cache_ttl_s, 1.5)
+        self.assertEqual(cfg.max_rps, 100_000.0)
+        self.assertEqual(cfg.block_cache_ttl_s, 0.3)
 
     def test_max_rps_bounds_and_error_message(self) -> None:
-        for ok_rate in (0.1, 4, 15.5, 16, 16.0):
+        for ok_rate in (0.1, 4, 15.5, 16, 10_000, 100_000, 100_000.0):
             cfg = Config("https://mock.local/api/v1", "u", "p", max_rps=ok_rate)
             self.assertEqual(cfg.max_rps, float(ok_rate))
 
-        for bad_rate in (0, -1, 16.01, 17, float("nan"), float("inf"), float("-inf"), True, False):
+        for bad_rate in (0, -1, 100_000.01, 100_001, float("nan"), float("inf"), float("-inf"), True, False):
             with self.subTest(bad_rate=bad_rate):
                 with self.assertRaises(ValueError) as ctx:
                     Config("https://mock.local/api/v1", "u", "p", max_rps=bad_rate)
-                self.assertEqual(str(ctx.exception), "MC_MAX_RPS 必须在 (0, 16]，16 是客户端硬上限")
+                self.assertEqual(str(ctx.exception), "MC_MAX_RPS 必须在 (0, 100000]，100000 是客户端硬上限")
 
-        for bad_env in ("0", "17", "nan", "abc"):
+        for bad_env in ("0", "100001", "nan", "abc"):
             with self.subTest(bad_env=bad_env):
                 with mock.patch.dict(os.environ, {"MC_MAX_RPS": bad_env}, clear=True):
                     with self.assertRaises(ValueError):
@@ -102,9 +102,9 @@ class ConfigCapAndEnvTests(unittest.TestCase):
     def test_env_example_documents_16_rps_cache_and_observer_interval(self) -> None:
         env_example = Path(client_mod.__file__).resolve().with_name(".env.example")
         text = env_example.read_text(encoding="utf-8")
-        self.assertIn("MC_MAX_RPS=16", text)
-        self.assertIn("MC_BLOCK_CACHE_TTL_S=1.5", text)
-        self.assertIn("MC_OBSERVER_MIN_INTERVAL_S=0.25", text)
+        self.assertIn("MC_MAX_RPS=100000", text)
+        self.assertIn("MC_BLOCK_CACHE_TTL_S=0.3", text)
+        self.assertIn("MC_OBSERVER_MIN_INTERVAL_S=0.05", text)
 
 
 class RequestLimiterPriorityTests(unittest.TestCase):

@@ -40,6 +40,25 @@ const CONTROL_KEYS = ["forward", "back", "left", "right", "jump", "sneak", "spri
 const EMPTY_POSTURE = Object.freeze({ sneak: false, shield: false, jump: false });
 const NON_ATTACKABLE = new Set(["item", "experience_orb", "arrow", "spectral_arrow", "area_effect_cloud"]);
 
+function buildPathfinderMovements(bot, MovementsCtor = Movements) {
+  const moves = new MovementsCtor(bot);
+  moves.canDig = true;
+  moves.digCost = 8;
+  moves.allow1by1towers = false;
+  // Disable sprinting & parkour in the local Mineflayer bridge to avoid MC 1.21.11
+  // sprint/sprint-jump physics discrepancies ("moved wrongly!" in narrow staircases)
+  // and gap-jump overshoots near void edges.
+  moves.allowParkour = false;
+  moves.allowSprinting = false;
+  moves.scafoldingBlocks = [];
+  for (const b of bot.registry.blocksArray) {
+    if (typeof b.hardness === "number" && b.hardness > 0.25) {
+      moves.blocksCantBreak.add(b.id);
+    }
+  }
+  return moves;
+}
+
 function meleeInterval(item) {
   const name = item?.name || "";
   if (name.endsWith("_sword")) return 625;
@@ -281,16 +300,7 @@ class BotSession {
       resetObservation();
 
       try {
-        const moves = new Movements(bot);
-        moves.canDig = true;
-        moves.digCost = 8;
-        moves.allow1by1towers = false;
-        moves.scafoldingBlocks = [];
-        for (const b of bot.registry.blocksArray) {
-          if (typeof b.hardness === "number" && b.hardness > 0.25) {
-            moves.blocksCantBreak.add(b.id);
-          }
-        }
+        const moves = buildPathfinderMovements(bot);
         bot.pathfinder.thinkTimeout = 4000;
         bot.pathfinder.setMovements(moves);
       } catch (e) {
@@ -489,6 +499,11 @@ class BotSession {
     if (this._currentAbort) {
       this._currentAbort("disconnected");
     }
+    this._actionToken = null;
+    this._currentAbort = null;
+    this._actionDone = null;
+    this.usingItemState = null;
+    this.busy = null;
     if (this.bot) {
       const b = this.bot;
       this.bot = null;
@@ -1032,6 +1047,8 @@ class BotSession {
       });
     }
 
+    const actionToken = Symbol(actionName);
+    this._actionToken = actionToken;
     this.busy = actionName;
     const stopSet = new Set(Array.isArray(stopOn) ? stopOn : ["hurt", "death"]);
     const controller = new AbortController();
@@ -1058,6 +1075,9 @@ class BotSession {
       try {
         if (this.bot && this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
         if (this.bot) this.bot.stopDigging();
+        if (this.bot && this.bot.currentWindow && typeof this.bot.closeWindow === "function") {
+          this.bot.closeWindow(this.bot.currentWindow);
+        }
       } catch (_) {}
     };
 
@@ -1072,11 +1092,14 @@ class BotSession {
       } catch (error) {
         throw signal.aborted ? signal.reason : error;
       } finally {
-        this.usingItemState = null;
-        await this._applyPosture();
-        this._currentAbort = null;
-        this._actionDone = null;
-        this.busy = null;
+        if (this._actionToken === actionToken) {
+          this.usingItemState = null;
+          await this._applyPosture();
+          this._currentAbort = null;
+          this._actionDone = null;
+          this._actionToken = null;
+          this.busy = null;
+        }
       }
     })();
     this._actionDone = action.then(() => undefined, () => undefined);
@@ -1105,6 +1128,7 @@ class BotSession {
           cleanup();
           try {
             bot.pathfinder.setGoal(null);
+            bot.clearControlStates();
           } catch (_) {}
           reject(
             new ApiBizError("stalled", "Stuck for 8s without movement progress", {
@@ -1135,6 +1159,7 @@ class BotSession {
           cleanup();
           try {
             bot.pathfinder.setGoal(null);
+            bot.clearControlStates();
           } catch (_) {}
           reject(
             new ApiBizError("path_not_found", `Pathfinder ${results.status} to target`, {
@@ -1147,6 +1172,7 @@ class BotSession {
         cleanup();
         try {
           bot.pathfinder.setGoal(null);
+          bot.clearControlStates();
         } catch (_) {}
         reject(
           new ApiBizError("timeout", `Pathfinding timed out after ${timeoutMs}ms`, {
@@ -1175,6 +1201,9 @@ class BotSession {
         this.bot.stopDigging();
         this.bot.clearControlStates();
         this.bot.deactivateItem();
+        if (this.bot.currentWindow && typeof this.bot.closeWindow === "function") {
+          this.bot.closeWindow(this.bot.currentWindow);
+        }
       } catch (_) {}
     }
 
@@ -1426,10 +1455,27 @@ class BotSession {
       };
       bot._client.on("block_change", onBlockChangePkt);
 
+      const digCancellable = (targetBlk) => {
+        signal.throwIfAborted();
+        const raw = Promise.resolve().then(() => bot.dig(targetBlk));
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            try { bot.stopDigging(); } catch (_) {}
+            raw.catch(() => {});
+            reject(signal.reason);
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          raw.then(
+            (val) => { signal.removeEventListener("abort", onAbort); resolve(val); },
+            (err) => { signal.removeEventListener("abort", onAbort); reject(err); }
+          );
+        });
+      };
+
       let digMs = 0;
       try {
         const t0 = Date.now();
-        await bot.dig(blk);
+        await digCancellable(blk);
         digMs = Date.now() - t0;
         await delay(150, undefined, { signal });
       } finally {
@@ -1784,7 +1830,25 @@ class BotSession {
         }
         const foodBefore = bot.food;
         const healthBefore = round1(bot.health);
-        await bot.consume();
+        try {
+          await bot.consume();
+        } catch (err) {
+          try { bot.deactivateItem(); } catch (_) {}
+          if (signal.aborted) {
+            signal.throwIfAborted();
+          }
+          if (err instanceof ApiBizError) {
+            throw err;
+          }
+          const msg = String(err && err.message ? err.message : err || "");
+          if (/timed?\s*out/i.test(msg)) {
+            throw new ApiBizError("timeout", `Consume timed out: ${msg}`);
+          }
+          if (/aborted|interrupt|cancelled|canceled|stopped/i.test(msg)) {
+            throw new ApiBizError("interrupted", `Consume interrupted: ${msg}`);
+          }
+          throw err;
+        }
         return {
           used: itemName,
           food_before: foodBefore,
@@ -2010,7 +2074,31 @@ class BotSession {
         }
         return { times, needs };
       };
+      const closeCurrentWindow = () => {
+        try {
+          if (bot.currentWindow && typeof bot.closeWindow === "function") {
+            bot.closeWindow(bot.currentWindow);
+          }
+        } catch (_) {}
+      };
+      const craftCancellable = (rec, craftTimes, tableBlk) => {
+        signal.throwIfAborted();
+        const raw = Promise.resolve().then(() => bot.craft(rec, craftTimes, tableBlk));
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            closeCurrentWindow();
+            raw.catch(() => {});
+            reject(signal.reason);
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          raw.then(
+            (val) => { signal.removeEventListener("abort", onAbort); resolve(val); },
+            (err) => { signal.removeEventListener("abort", onAbort); reject(err); }
+          );
+        });
+      };
       const wrapCraftErr = (err, fallbackNeeds) => {
+        if (err instanceof ApiBizError) throw err;
         const msg = err && err.message ? err.message : String(err);
         if (msg.toLowerCase().includes("missing ingredient")) {
           const curInv = inventorySummaryMap(bot);
@@ -2018,6 +2106,10 @@ class BotSession {
             example_recipe_needs: fallbackNeeds,
             inventory: curInv,
           });
+        }
+        if (/updateSlot|windowOpen|did not fire within timeout/i.test(msg)) {
+          closeCurrentWindow();
+          throw new ApiBizError("window_timeout", msg);
         }
         throw err;
       };
@@ -2031,7 +2123,7 @@ class BotSession {
         try {
           for (let i = 0; i < times; i += 1) {
             signal.throwIfAborted();
-            await bot.craft(rec, 1, null);
+            await craftCancellable(rec, 1, null);
             if (i + 1 < times) await delay(60, undefined, { signal });
           }
         } catch (err) {
@@ -2067,7 +2159,7 @@ class BotSession {
           const { times, needs } = calcNeeds(rec, count);
           const beforeCount = inventorySummaryMap(bot)[itemName] || 0;
           try {
-            await bot.craft(rec, times, tableBlock);
+            await craftCancellable(rec, times, tableBlock);
           } catch (err) {
             wrapCraftErr(err, needs);
           }
@@ -2138,6 +2230,19 @@ class BotSession {
     return { kind: "block", pos };
   }
 
+  async _openWindow(openFn) {
+    try {
+      return await openFn();
+    } catch (err) {
+      if (err instanceof ApiBizError) throw err;
+      const msg = err && err.message ? err.message : String(err);
+      if (/windowOpen/i.test(msg) || /did not fire within timeout/i.test(msg)) {
+        throw new ApiBizError("window_timeout", msg);
+      }
+      throw err;
+    }
+  }
+
   async windowView(body = {}) {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("window/view", stopOn, async (ctx) => {
@@ -2149,7 +2254,7 @@ class BotSession {
         if (bot.entity.position.distanceTo(ent.position) > 3.5) {
           await this._gotoGoal(new goals.GoalFollow(ent, 2), 20000, ctx);
         }
-        const villager = await bot.openVillager(ent);
+        const villager = await this._openWindow(() => bot.openVillager(ent));
         try {
           return {
             window: "villager",
@@ -2174,7 +2279,7 @@ class BotSession {
       if (!blk) throw new ApiBizError("not_loaded", "Block not loaded");
 
       if (blk.name === "furnace" || blk.name === "blast_furnace" || blk.name === "smoker") {
-        const f = await bot.openFurnace(blk);
+        const f = await this._openWindow(() => bot.openFurnace(blk));
         try {
           const inp = f.inputItem();
           const fuel = f.fuelItem();
@@ -2198,7 +2303,7 @@ class BotSession {
         }
       }
 
-      const container = await bot.openContainer(blk);
+      const container = await this._openWindow(() => bot.openContainer(blk));
       try {
         return {
           window: blk.name,
@@ -2230,7 +2335,7 @@ class BotSession {
         if (bot.entity.position.distanceTo(ent.position) > 3.5) {
           await this._gotoGoal(new goals.GoalFollow(ent, 2), 20000, ctx);
         }
-        const villager = await bot.openVillager(ent);
+        const villager = await this._openWindow(() => bot.openVillager(ent));
         try {
           for (const op of ops) {
             signal.throwIfAborted();
@@ -2253,7 +2358,7 @@ class BotSession {
       if (!blk) throw new ApiBizError("not_loaded", "Block not loaded");
 
       if (blk.name === "furnace" || blk.name === "blast_furnace" || blk.name === "smoker") {
-        const f = await bot.openFurnace(blk);
+        const f = await this._openWindow(() => bot.openFurnace(blk));
         try {
           for (const op of ops) {
             signal.throwIfAborted();
@@ -2296,7 +2401,7 @@ class BotSession {
         }
       }
 
-      const container = await bot.openContainer(blk);
+      const container = await this._openWindow(() => bot.openContainer(blk));
       try {
         for (const op of ops) {
           signal.throwIfAborted();
@@ -2412,4 +2517,4 @@ class BotSession {
   }
 }
 
-module.exports = { BotSession };
+module.exports = { BotSession, buildPathfinderMovements };

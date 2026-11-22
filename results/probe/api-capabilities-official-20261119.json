@@ -1,0 +1,25 @@
+{
+  "source": "official",
+  "routes": {
+    "control": {
+      "ok": false,
+      "code": "bad_args",
+      "supported": true
+    },
+    "look": {
+      "skipped": "missing_angles"
+    },
+    "stop": {
+      "ok": true,
+      "result": {
+        "stopped": true,
+        "action": null
+      }
+    }
+  },
+  "status_fields": [
+    "speed",
+    "velocity",
+    "jumping"
+  ]
+}

@@ -356,10 +356,14 @@ function createBridgeServer(opts = {}) {
         });
       }
       console.error(`[http] Unexpected error on ${method} /${route}:`, err);
+      const errMsg = err && err.message ? err.message : String(err);
+      const fallbackCode = (/windowOpen/i.test(errMsg) || /did not fire within timeout/i.test(errMsg))
+        ? "window_timeout"
+        : (/Digging aborted/i.test(errMsg) ? "interrupted" : "bad_args");
       return sendJson(res, 200, {
         ok: false,
         ms,
-        error: { code: "bad_args", message: err && err.message ? err.message : String(err) },
+        error: { code: fallbackCode, message: errMsg },
       });
     }
   });

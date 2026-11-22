@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { Vec3 } = require("vec3");
-const { BotSession } = require("../lib/bot_session");
+const { BotSession, buildPathfinderMovements } = require("../lib/bot_session");
 
 function readySession() {
   const session = new BotSession({ username: "test" });
@@ -83,12 +83,21 @@ test("move_to returns stalled when its pathfinder watchdog sees no movement", as
   t.mock.method(Date, "now", () => now);
   let watchdog;
   t.mock.method(global, "setInterval", (fn) => { watchdog = fn; });
+  session.bot.setControlState("forward", true);
   const action = session.moveTo({ x: 30, z: 30 });
   const result = assert.rejects(action, { code: "stalled" });
   now += 8000;
   watchdog();
   await result;
   assert.equal(session.busy, null);
+  assert.equal(session.bot.getControlState("forward"), false);
+
+  session.bot.setControlState("forward", true);
+  const noPathAction = session.moveTo({ x: 40, z: 40 });
+  const noPathResult = assert.rejects(noPathAction, { code: "path_not_found" });
+  session.bot.emit("path_update", { status: "noPath", path: [] });
+  await noPathResult;
+  assert.equal(session.bot.getControlState("forward"), false);
 });
 
 test("control hits a visible boat and stops at intervening blocks", async () => {
@@ -128,4 +137,171 @@ test("attack respects max_hits and accepts an interval override", async () => {
   assert.equal(result.killed, false);
   await assert.rejects(session.attack({ entity_id: 2, max_hits: 0 }), { code: "bad_args" });
   await assert.rejects(session.attack({ entity_id: 2, interval_ms: 5001 }), { code: "bad_args" });
+});
+
+test("buildPathfinderMovements disables sprinting, parkour, towers, and hard-block breaking", () => {
+  class FakeMovements {
+    constructor() {
+      this.allowSprinting = true;
+      this.allowParkour = true;
+      this.allow1by1towers = true;
+      this.scafoldingBlocks = [1, 2];
+      this.blocksCantBreak = new Set();
+    }
+  }
+  const fakeBot = {
+    registry: {
+      blocksArray: [
+        { id: 10, name: "short_grass", hardness: 0 },
+        { id: 11, name: "oak_leaves", hardness: 0.2 },
+        { id: 12, name: "stone", hardness: 1.5 },
+      ],
+    },
+  };
+  const moves = buildPathfinderMovements(fakeBot, FakeMovements);
+  assert.equal(moves.canDig, true);
+  assert.equal(moves.digCost, 8);
+  assert.equal(moves.allow1by1towers, false);
+  assert.equal(moves.allowParkour, false);
+  assert.equal(moves.allowSprinting, false);
+  assert.deepEqual(moves.scafoldingBlocks, []);
+  assert.equal(moves.blocksCantBreak.has(10), false);
+  assert.equal(moves.blocksCantBreak.has(11), false);
+  assert.equal(moves.blocksCantBreak.has(12), true);
+});
+
+test("windowView and windowAct classify mineflayer windowOpen timeout as retryable window_timeout", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.blockAt = (pos) => ({ name: "furnace", position: pos });
+  bot.openFurnace = async () => {
+    throw new Error("Event windowOpen did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.windowView({ target: { pos: [1, 64, 0] } }),
+    { code: "window_timeout" }
+  );
+  await assert.rejects(
+    session.windowAct({ target: { pos: [1, 64, 0] }, ops: [{ op: "take", from: "output" }] }),
+    { code: "window_timeout" }
+  );
+
+  bot.blockAt = (pos) => ({ name: "chest", position: pos });
+  bot.openContainer = async () => {
+    throw new Error("Event windowOpen did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.windowView({ target: { pos: [1, 64, 0] } }),
+    { code: "window_timeout" }
+  );
+
+  bot.entities[9] = { id: 9, name: "villager", position: new Vec3(1.5, 64, 0.5) };
+  bot.openVillager = async () => {
+    throw new Error("Event windowOpen did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.windowView({ target: { entity_id: 9 } }),
+    { code: "window_timeout" }
+  );
+});
+
+test("craft classifies mineflayer updateSlot timeout as retryable window_timeout", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.registry = {
+    itemsByName: { oak_planks: { id: 5, name: "oak_planks" }, oak_log: { id: 17, name: "oak_log" } },
+    items: { 5: { id: 5, name: "oak_planks" }, 17: { id: 17, name: "oak_log" } },
+    blocksByName: {},
+    recipes: { 5: [{ inShape: [[17]], result: { id: 5, count: 4 } }] },
+  };
+  bot.recipesFor = () => [{ result: { id: 5, count: 4 }, delta: [{ id: 17, count: -1 }] }];
+  bot.craft = async () => {
+    throw new Error("Event updateSlot:0 did not fire within timeout of 20000ms");
+  };
+  await assert.rejects(
+    session.craft({ item: "oak_planks", count: 4 }),
+    { code: "window_timeout" }
+  );
+  assert.equal(session.busy, null);
+});
+
+test("craft aborts promptly on stop, closes open window, and releases busy lock", async () => {
+  const session = readySession();
+  const { bot } = session;
+  let closedWin = null;
+  bot.currentWindow = { id: 3, title: "Crafting" };
+  bot.closeWindow = (w) => {
+    closedWin = w;
+    bot.currentWindow = null;
+  };
+  bot.registry = {
+    itemsByName: { oak_planks: { id: 5, name: "oak_planks" }, oak_log: { id: 17, name: "oak_log" } },
+    items: { 5: { id: 5, name: "oak_planks" }, 17: { id: 17, name: "oak_log" } },
+    blocksByName: {},
+    recipes: { 5: [{ inShape: [[17]], result: { id: 5, count: 4 } }] },
+  };
+  bot.recipesFor = () => [{ result: { id: 5, count: 4 }, delta: [{ id: 17, count: -1 }] }];
+  // Simulate a hung Mineflayer bot.craft() that never resolves on its own
+  bot.craft = () => new Promise(() => {});
+
+  const craftPromise = session.craft({ item: "oak_planks", count: 4 });
+  const craftRejected = assert.rejects(craftPromise, { code: "interrupted" });
+  assert.equal(session.busy, "craft");
+
+  const stopped = await session.stop();
+  assert.equal(stopped.action, "craft");
+  assert.equal(stopped.released, true);
+  assert.equal(session.busy, null);
+  assert.ok(closedWin && closedWin.id === 3, "expected open crafting window to be closed on abort");
+  await craftRejected;
+});
+
+test("stop() and disconnect() release busy mutex when Mineflayer dig() hangs forever", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot._client = { on() {}, removeListener() {} };
+  const fakeBlock = { name: "stone", type: 1, stateId: 1, diggable: true, boundingBox: "block", position: new Vec3(1, 64, 0) };
+  bot.blockAt = () => fakeBlock;
+  bot.canDigBlock = () => true;
+  // Simulate Mineflayer bot.dig() hanging forever after stopDigging()/quit()
+  bot.dig = () => new Promise(() => {});
+
+  const digPromise = session.dig({ pos: [1, 64, 0] });
+  const digRejected = assert.rejects(digPromise, { code: "interrupted" });
+  assert.equal(session.busy, "dig");
+
+  const stopped = await session.stop();
+  assert.equal(stopped.action, "dig");
+  assert.equal(stopped.released, true);
+  assert.equal(session.busy, null);
+  await digRejected;
+
+  // Also test disconnect() during a hung dig() leaves session.busy === null for reconnect
+  const digPromise2 = session.dig({ pos: [1, 64, 0] });
+  const digRejected2 = assert.rejects(digPromise2, { code: "not_connected" });
+  assert.equal(session.busy, "dig");
+  session.disconnect();
+  assert.equal(session.busy, null);
+  await digRejected2;
+});
+
+test("useItem(food) maps Mineflayer consume 'Promise timed out.' to timeout (not bad_args)", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.food = 14;
+  bot.health = 10;
+  let deactivated = false;
+  bot.deactivateItem = () => { deactivated = true; };
+  bot.equip = async () => {};
+  bot.inventory.items = () => [{ name: "chicken", count: 2, slot: 36 }];
+  bot.consume = async () => {
+    throw new Error("Promise timed out.");
+  };
+
+  await assert.rejects(
+    session.useItem({ item: "chicken" }),
+    (err) => err && err.code === "timeout"
+  );
+  assert.equal(deactivated, true);
+  assert.equal(session.busy, null);
 });

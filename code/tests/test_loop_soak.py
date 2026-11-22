@@ -203,11 +203,17 @@ class StarterSkillsContractTests(unittest.TestCase):
         reset_world_memo()
 
     def test_all_starter_skills_pass_contract_and_one_action_per_step(self):
-        expected = {"eat_food", "scout_island", "gather_wood", "craft_gear", "mine_stone"}
-        self.assertTrue(expected.issubset(set(REGISTRY)))
-        for name in expected:
+        expected = {
+            "eat_food": "offline",
+            "scout_island": "offline",
+            "gather_wood": "live",
+            "craft_gear": "live",
+            "mine_stone": "live",
+        }
+        self.assertTrue(set(expected).issubset(set(REGISTRY)))
+        for name, level in expected.items():
             self.assertEqual(contract_errors(REGISTRY[name]), [], name)
-            self.assertEqual(REGISTRY[name].verified, "offline")
+            self.assertEqual(REGISTRY[name].verified, level, name)
 
         blocks = {
             (2, 64, 0): "oak_log", (2, 65, 0): "oak_log", (2, 66, 0): "oak_log",
