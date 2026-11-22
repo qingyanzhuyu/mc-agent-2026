@@ -1,6 +1,6 @@
 # Local NMO Agent API Bridge（队内本地/局域网联调网关）
 
-为本地或局域网自建的 **Minecraft Java `1.21.11` 原版测试服（`online-mode=false`）** 提供联调接口。覆盖下表列出的 [NMO Minecraft Agent API v1.3.11](../../docs/99-原始记录/api-spec-v1.3.11.md) 行为。
+为本地或局域网自建的 **Minecraft Java `1.21.11` 原版测试服（`online-mode=false`）** 提供联调接口。已同步对齐上游 [NMO Minecraft Agent API v1.3.19+（commit `937045f`，含 PR #4/#5）](../../docs/99-原始记录/api-spec-v1.3.19-937045f.md) 单实例行为（历史对照见 [v1.3.11](../../docs/99-原始记录/api-spec-v1.3.11.md)）。
 
 用于在官方测试服暂不可用或单皮肤站账号被队友占用时，支撑多人并行完成 `AGENTS.md` §2A.6 要求的 **`verified: live` 真机物理闭环验证**（对应 `docs/04` `B9`）。
 
@@ -96,12 +96,12 @@ curl -s http://127.0.0.1:8787/healthz
 
 ## 4. 协议对齐范围与已知近似说明
 
-| 模块 | 对齐情况（对照 `api-spec-v1.3.11.md`） |
+| 模块 | 对齐情况（对照 `api-spec-v1.3.19-937045f.md`） |
 |---|---|
-| 响应封装与状态码（§0.1） | 业务成败统一 HTTP 200 `{ok, ms, result\|error}`；非法 JSON 返 400 `bad_json`；未授权/过期返 401 `unauthorized`/`invalid_token`；未知路由返 404 `unknown_api` |
-| 认证与会话互斥（§1 / §2 / §7） | 同名 `username` 重登立即踢废旧 Token；断线重连 ≥30s 节流；60s 内死亡 3 次触发 5 分钟 `death_loop_cooldown` |
-| 观察接口（§3.1–§3.7） | `/status` 返回 20 格满氧、逐物理 tick 的 `speed` 和 `velocity`。`/events` 在配对到原版伤害包时附 `hurt.source` 与可识别的 `source_entity`。`/find_blocks` 只返回暴露方块，`/advancements` 解析原版进度包。 |
-| 动作互斥与中断（§0 / §4 / §4.15） | 单会话阻塞动作互斥（并发动作返 `busy`）；`stop_on` 控制受伤中断，死亡会中断动作；错误使用 `cause`；`/stop` 取消寻路和挖掘并等待动作释放，返回 `action`、`released`、`wait_ms` |
-| 动作扩展（§4.6 / §4.11 / §4.16–§4.17） | `/attack` 支持 `max_hits` 和 `interval_ms`；`/control` 提供短时按键和视线挥击；`/look` 转向不占动作锁；用 `/posture {"jump": true}` 显式开启水中踩水，用 `/posture {}` 复位 |
-| 寻路与挖掘（§4.1 / §4.2 / §5） | 寻路连续 8 秒无位移进展返回 `stalled`。已确认的挖掘回滚仍映射为 `protected_region`，挖掘的其他服务端确认行为与新版窗口错误码由官方端点验证 |
-| 其他已知差异 | 1. 载具骑乘态下的 `move_to` 仍通过通用寻路近似；<br>2. `/use_item` 的钓鱼咬钩与末影之眼 `bearing_deg` 为简化近似；<br>3. `/craft` 的 `count` 按“最少期望产出数量”折算配方次数（官方精确语义待 `docs/04` `C2` 复核） |
+| 响应封装与状态码（§0.1） | 业务成败统一 HTTP 200 `{ok, ms, result\|error}`；非法 JSON 返 400 `bad_json`；超 1 MiB 请求体返 **413 `body_too_large`**（v1.3.15）；未授权/过期返 401 `unauthorized`/`invalid_token`；未知路由返 404 `unknown_api`；绑定 `127.0.0.1`/`0.0.0.0`/`localhost` 时额外监听 **`[::1]`** 消除 `localhost` IPv6 回落延迟（v1.3.12） |
+| 认证与会话互斥（§1 / §2 / §7） | 同名 `username` 重登立即踢废旧 Token；断线重连 ≥30s 节流；**已同步移除 60s 死 3 次的 `death_loop_cooldown` 踢线保护（v1.3.17）**，连续死亡保留会话并自动重生 |
+| 观察接口（§3.1–§3.7） | `/status` 返回 20 格满氧、逐物理 tick 的 `speed`/`velocity` 与 **`held_controls`**（v1.3.14）；重连世界未就绪时 `/inventory`、`/find_blocks`、`/get_block`、`/get_entities` 返 `not_ready`（v1.3.13）；`/events` 附 `hurt.source`/`source_entity` 及 `/attack feedback=true` 推送的 **`attack_hit`** 事件；`/find_blocks` 改为**非阻塞球面 `stateId` 扫描**（修复对角区块遗漏，未知方块名返 `bad_args`，v1.3.13）；`/advancements` 解析原版进度包 |
+| 动作互斥与中断（§0 / §4 / §4.14–§4.15） | 单会话占锁动作互斥（并发返 `busy`）；**`/chat` 不占动作锁且不松开 `/control` 按键**，可与移动/挖掘等动作并发（v1.3.19）；`stop_on` 控制受伤中断，死亡中断动作；`/stop` 取消寻路/挖掘并松开 `/control` 按键，等待释放返回 `action`、`released`、`wait_ms` |
+| 动作扩展（§4.6 / §4.11 / §4.16–§4.17） | `/attack` 支持 `max_hits`、`interval_ms` 以及 **PR #4 `chase=false`（原地站桩挥刀 + 双射线 AABB 遮挡立返 `blocked_by_wall`/`blocking_block`、够不到返 `out_of_reach`）与 `feedback=true`（`hit_log` + `stop_reason` + `attack_hit` 事件）**；`/control` 支持短时按键、视线挥击及 **v1.3.14 `"wait": false` 实时非阻塞按住/立即接管/空调用全松开**；`/look` 不占锁；`/posture` 等待 55ms（1 tick，v1.3.12）并保留 `/control` 在按的 `sneak`/`jump` |
+| 寻路、挖掘与物理兼容（§4.1 / §4.2 / §5） | 寻路 `tickTimeout=20ms`、连续 8s 无位移返 `stalled`；**PR #5 `patchBrokenPickaxeMaterials` 修复 `minecraft-data 1.21.11` 108 个镐掘方块（黑曜石、远古残骸、深板岩矿石等）错标材质导致徒手挖速超时**；**v1.3.18 `lib/movement_compat.js` 修复鱼竿钩拉冲量与 1.21+ 传送速度保留/旋转**；挖掘回滚映射为 `protected_region` |
+| 其他已知差异 | 1. 仅单进程模拟本地/局域网单服，不模拟官方 Velocity 多后端代理路由（`routing_unavailable` / `backend_unavailable` / `status.server` / `readiness_state`）；<br>2. 载具骑乘态下的 `move_to` 仍通过通用寻路近似；<br>3. `/use_item` 的钓鱼咬钩与末影之眼 `bearing_deg` 为简化近似；<br>4. `/craft` 的 `count` 按“最少期望产出数量”折算配方次数（官方精确语义待 `docs/04` `C2` 复核） |
