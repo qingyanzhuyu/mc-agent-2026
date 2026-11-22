@@ -774,6 +774,7 @@ class ScoutIsland(Skill):
                     return False
                 return True
 
+            dug_any_stair = False
             for _step in range(4):
                 if float(cur[1]) > target_y + 1.5:
                     break
@@ -818,7 +819,7 @@ class ScoutIsland(Skill):
                                 continue
                             step_dest = [mx + 0.5, float(fy), mz + 0.5]
                             try:
-                                moved_m = _bounded_move_to(ex, step_dest, rng=1, timeout=15.0)
+                                moved_m = _bounded_move_to(ex, step_dest, rng=0.4, timeout=15.0)
                             except Replan as e:
                                 if failure(e)[0] not in NAV_FAIL_CODES:
                                     raise
@@ -856,10 +857,11 @@ class ScoutIsland(Skill):
                             continue
                         raise
                     vc and vc.invalidate(dig_pos, dimension=dim)
+                    dug_any_stair = True
                 up_dest = [nx + 0.5, float(fy + 1), nz + 0.5]
                 before_step_pos = list(cur)
                 try:
-                    moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
+                    moved_u = _bounded_move_to(ex, up_dest, rng=0.4, timeout=20.0)
                 except Replan as e:
                     if failure(e)[0] not in NAV_FAIL_CODES:
                         raise
@@ -871,9 +873,9 @@ class ScoutIsland(Skill):
                     break
 
             escaped_up = float(cur[1]) > target_y + 0.5
-            # 挖阶梯未成功抬升时，用两列交替 step_up_1x2 连续搭块攀升（最多 5 级），
+            # 挖阶梯未成功抬升（或仅跨上了已有 1 格低台但仍远低于目标高度）时，用两列交替 step_up_1x2 连续搭块攀升（最多 5 级），
             # 背包无垫块时优先就近安全挖取 1~3 块软土充当垫脚料；途中遇到高一格坑沿即直接跨出。
-            if not escaped_up:
+            if (not escaped_up) or (not dug_any_stair and float(cur[1]) < climb_cap_y - 0.2):
                 state.refresh_inventory(ex.client)
                 if total_placeable(state) == 0:
                     ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
@@ -945,7 +947,7 @@ class ScoutIsland(Skill):
                                     continue
                                 wall_dest = [ix + dx * step_dist + 0.5, float(fy), iz + dz * step_dist + 0.5]
                                 try:
-                                    moved_w = _bounded_move_to(ex, wall_dest, rng=1, timeout=15.0)
+                                    moved_w = _bounded_move_to(ex, wall_dest, rng=0.4, timeout=15.0)
                                 except Replan as e:
                                     if failure(e)[0] not in NAV_FAIL_CODES:
                                         raise
@@ -1008,7 +1010,7 @@ class ScoutIsland(Skill):
                             rim_dest = [rx + 0.5, float(fy + 1), rz + 0.5]
                             before_rim_y = float(cur[1])
                             try:
-                                moved_r = _bounded_move_to(ex, rim_dest, rng=1, timeout=20.0)
+                                moved_r = _bounded_move_to(ex, rim_dest, rng=0.4, timeout=20.0)
                             except Replan as e:
                                 if failure(e)[0] not in NAV_FAIL_CODES:
                                     raise
@@ -1073,7 +1075,7 @@ class ScoutIsland(Skill):
                             yield from nav.step_up_1x2(ex, state, place_seq, item=use_item)
                             for placed_p in place_seq:
                                 vc and vc.invalidate(placed_p, dimension=dim)
-                            moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
+                            moved_u = _bounded_move_to(ex, up_dest, rng=0.4, timeout=20.0)
                             yield rec("move_to", moved_u, pos=up_dest, fingerprints=hits)
                             st, cur = _refresh_stance(ex, state)
                         except Replan as e:
@@ -1247,11 +1249,17 @@ class ScoutIsland(Skill):
             return
         if attempts == 0 and (yield from _try_underground_surface_escape()):
             return
-        # 周边陆地站位明显高于自身（>= 2 格深坑：候选站位 y+1 > cur.y + 1.5）时，
-        # 优先向上挖阶梯或两列交替垫块爬出，避免先跑水平脱困把刚垫高的一格又走回坑底。
+        # 周边陆地站位明显高于自身（>= 2 格深坑：候选站位 y+1 > cur.y + 1.5），或身处地下（Y < 62），
+        # 或已在同一局部位置发生过水平恢复弹跳时，优先向上挖阶梯/连续交替垫块爬出，
+        # 避免先跑水平脱困把刚垫高的一格又走回坑底形成两格来回打转。
         high_stand_ys = [float(c[-1][1] + 1.0) for c in cands + climb_cands if float(c[-1][1] + 1.0) > cur[1] + 1.5]
-        if high_stand_ys:
-            if (yield from _try_staircase_climb_out(allow_above_sea=True, goal_y=min(high_stand_ys))):
+        recent_pit_bounce = any(
+            math.hypot(cur[0] - x, cur[2] - z) <= 5.0 and abs(cur[1] - y) <= 2.0
+            for x, y, z in RECENT_RECOVERY_LANDINGS
+        )
+        if high_stand_ys or cur[1] < 62.0 or recent_pit_bounce:
+            climb_goal = min(high_stand_ys) if high_stand_ys else (64.0 if cur[1] < 62.0 else None)
+            if (yield from _try_staircase_climb_out(allow_above_sea=True, goal_y=climb_goal)):
                 return
         if not attempted_recovery:
             fallback_dest = cands[0][-1] if cands else (list(target_wood.pos) if target_wood is not None else None)
