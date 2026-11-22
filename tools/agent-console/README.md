@@ -2,21 +2,23 @@
 
 AIAMC Harness 赛道的零第三方依赖可视化监控与双模式启动控制台（基于 Python 标准库 `http.server.ThreadingHTTPServer`，前端位于 `tools/agent-console/web/`）。
 
-## 1. 启动方式
+## 1. 一键启动方式（所有前端与启动器均在同一目录）
 
-在仓库根目录执行：
+本目录 `tools/agent-console/` 自包含后端、前端（`web/`）与全平台一键启动器，**点开即自动拉起服务并打开浏览器**（若已在运行则直接复用现有服务打开页面）：
 
-```bash
-python3 tools/agent-console/server.py
-```
+- **Linux 桌面双击**：直接双击 `tools/agent-console/AIAMC-Console.desktop`（或在终端执行 `./tools/agent-console/start_console.sh`）
+- **Windows / WSL2 双击**：直接双击 `tools/agent-console/start_console.bat`
+- **macOS 双击**：直接双击 `tools/agent-console/start_console.command`
+- **停止后台控制台**：
+  ```bash
+  ./tools/agent-console/start_console.sh --stop
+  ```
+- **手动前台启动并自动开浏览器**：
+  ```bash
+  python3 tools/agent-console/server.py --open --port 8795
+  ```
 
-可选参数：
-
-```bash
-python3 tools/agent-console/server.py --port 8795
-```
-
-启动后在浏览器访问 `http://127.0.0.1:8795/`。
+启动后自动打开 `http://127.0.0.1:8795/`。
 
 > **说明**：控制台仅绑定本机回环地址（`127.0.0.1` / `localhost` / `::1`），不支持对外网网卡监听。
 

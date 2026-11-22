@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AIAMC Harness 监控台
+Comment=一键启动 AIAMC 双模式（比赛 / 自搭服测试）实时监控前端并打开浏览器
+Exec=/home/de7provincien/de7provincien/aiamc/mc-agent-2026/tools/agent-console/start_console.sh
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Development;Utility;

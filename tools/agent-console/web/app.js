@@ -996,8 +996,8 @@
         <h3>🚀 主办方一键安装与比赛启动命令</h3>
         ${cmdRow("1. 锁定依赖安装", h.commands.install)}
         ${cmdRow("2. 赛前 12+3 项自检", h.commands.preflight)}
-        ${cmdRow("3. 正式 8h 全功能启动（解锁 85 技能 + 109 台账）", h.commands.match_full)}
-        ${cmdRow("4. 保守启动（仅 4 项 live 技能 + graduated 目标）", h.commands.match_conservative)}
+        ${cmdRow(`3. 正式 8h 启动（直接解锁 ${h.skills.live} 项 live 技能 + ${(h.goals.stages && h.goals.stages.graduated) || 0} 项 graduated 目标）`, h.commands.match_conservative)}
+        ${cmdRow(`4. 显式全开参数版（含 --min-verified offline --include-draft，共 ${h.skills.total} 技能 / ${h.goals.total} 台账）`, h.commands.match_full)}
         ${cmdRow("5. 无账号离线全量回归验收", h.commands.offline_verify)}
       </div>
     `;

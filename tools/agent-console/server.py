@@ -1371,7 +1371,7 @@ def build_handover_audit() -> dict[str, Any]:
     required_runtime = [
         ("pyproject.toml", "Python 依赖声明（仅 requests>=2.31.0）"),
         ("uv.lock", "依赖精确锁文件（主办方 uv sync --frozen 一键复现）"),
-        ("code/mcagent/", "完整 Agent Harness 运行时（85 L3 技能 / 109 台账 / 容错与安全看护）"),
+        ("code/mcagent/", f"完整 Agent Harness 运行时（{len(REGISTRY)} L3 技能 / {len(GOALS)} 台账 / 容错与安全看护）"),
         ("code/mcagent/.env.match.example", "主办方/比赛环境变量配置模板（无真实密钥）"),
         ("code/tests/", "离线单测与故障注入套件（无账号可跑）"),
         ("docs/99-原始记录/NMO_API_LICENSE.txt", "NMO API MIT 许可声明"),
@@ -1403,6 +1403,17 @@ def build_handover_audit() -> dict[str, Any]:
     except Exception:
         pass
 
+    draft_count = stage_counts.get("draft", 0)
+    warnings: list[str] = []
+    if len(offline_skills) > 0 or draft_count > 0:
+        warnings.append(
+            f"当前 {len(REGISTRY)} 个技能中有 {len(live_skills)} 个标为 verified='live'、{len(offline_skills)} 个为 offline，{len(GOALS)} 项台账中 {draft_count} 项为 draft；在官方端点直接跑若不加 --min-verified offline --include-draft，将仅执行已晋级的技能与目标。"
+        )
+    warnings.extend([
+        "提交给主办方时只需给核心代码 + pyproject.toml + uv.lock + .env.match.example，由主办方注入 MC_API_BASE / MC_USER / MC_PASS / LLM_BASE / LLM_KEY / LLM_MODEL=default / LLM_MAX_CONCURRENCY=2。",
+        "绝不能把 tools/local-api-bridge/、.env、.env.match、.token.json 混入主办方运行包。",
+    ])
+
     return {
         "git": _git_info(),
         "skills": {
@@ -1427,11 +1438,7 @@ def build_handover_audit() -> dict[str, Any]:
             {"path": p, "reason": r, "exists_locally": (REPO_ROOT / p).exists()} for p, r in forbidden_items
         ],
         "tracked_secrets": tracked_secrets,
-        "warnings": [
-            f"当前 main 上 85 个技能中仅有 {len(live_skills)} 个标为 verified='live'（{', '.join(live_skills)}），109 项台账中 102 项为 draft；在官方端点直接跑若不加 --min-verified offline --include-draft，只会执行木→石基础链。",
-            "提交给主办方时只需给核心代码 + pyproject.toml + uv.lock + .env.match.example，由主办方注入 MC_API_BASE / MC_USER / MC_PASS / LLM_BASE / LLM_KEY / LLM_MODEL=default / LLM_MAX_CONCURRENCY=2。",
-            "绝不能把 tools/local-api-bridge/、.env、.env.match、.token.json 混入主办方运行包。",
-        ],
+        "warnings": warnings,
         "commands": {
             "install": "uv sync --frozen",
             "preflight": "cd code && uv run python -m mcagent.preflight --live",
@@ -1768,16 +1775,48 @@ def create_server(host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> Threadin
     return ThreadingHTTPServer((host, port), ConsoleHandler)
 
 
+def _is_console_running(host: str, port: int) -> bool:
+    url = f"http://{host}:{port}/api/runs"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=1.0) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _open_browser_async(url: str) -> None:
+    def _worker() -> None:
+        time.sleep(0.35)
+        try:
+            import webbrowser
+            webbrowser.open(url, new=2)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True, name="console-open-browser").start()
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="AIAMC Harness 双模式可视化监控控制台")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（仅限本机回环，默认 127.0.0.1）")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+    parser.add_argument("--open", action="store_true", help="启动后自动打开系统默认浏览器")
     args = parser.parse_args(argv)
 
-    srv = create_server(args.host, args.port)
     url = f"http://{args.host}:{args.port}/"
+    if _is_console_running(args.host, args.port):
+        print(f"[agent-console] 已在运行 -> {url}")
+        if args.open:
+            import webbrowser
+            webbrowser.open(url, new=2)
+        return 0
+
+    srv = create_server(args.host, args.port)
     print(f"[agent-console] 启动成功 -> {url}")
     print(f"[agent-console] 仓库目录: {REPO_ROOT} | 仅本机可访问 | 按 Ctrl+C 退出")
+    if args.open:
+        _open_browser_async(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
