@@ -21,6 +21,7 @@ from ..skills import camp_plan as _camp_plan
 from ..skills.furnace_lease import best_fuel_for, lease_book_for
 from ..skills.items import best_pickaxe
 from ..skills.nether_portal import nether_preflight_missing
+from ..skills.survival_camp import _can_sleep_now
 from ..skills.survival_food import COOKED_FOODS, cooked_food_count, has_ready_food_lease, inventory_food_restore, raw_meat_count
 from ..skills.world_memo import format_memo_summary, memo_for
 from . import subgoals as subgoals_mod
@@ -81,6 +82,74 @@ def _clear_state_safety_intent(state: State) -> None:
         setter(None)
     else:
         state.safety_intent = None
+
+
+def _armor_points_of(state: State) -> float:
+    st = state.snapshot()
+    raw = st.get("armor_points", 0.0)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(float(raw)):
+        return float(raw)
+    return 0.0
+
+
+def _is_dusk_or_night(state: State) -> bool:
+    """黄昏 11800 起（刷怪前约 60 秒）至破晓 23500 均视为夜间挖洞避险窗口。"""
+    st = state.snapshot()
+    tod = st.get("time_of_day")
+    if isinstance(tod, (int, float)) and not isinstance(tod, bool) and math.isfinite(float(tod)):
+        t = int(tod) % 24000
+        return 11800 <= t <= 23500
+    return is_daytime(state) is False
+
+
+def _night_shelter_reason(state: State, *, allow_safe_mode: bool = False) -> Optional[str]:
+    """放宽后的夜间/黄昏挖洞封口触发判定：返回触发原因，否则 None。"""
+    st = state.snapshot()
+    if st.get("ready") is False or st.get("alive") is False:
+        return None
+    dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+    if dim != "overworld" or not _is_dusk_or_night(state):
+        return None
+    if any(st.get(flag) for flag in ("in_water", "submerged", "in_lava", "on_fire")):
+        return None
+    is_sealed = getattr(state, "is_in_sealed_shelter", None)
+    if callable(is_sealed) and is_sealed():
+        return None
+    pos = st.get("pos")
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        try:
+            if float(pos[1]) < 50.0:
+                return None
+        except (TypeError, ValueError):
+            pass
+    # 近 2 秒刚受伤时先交由逃生层拉距，不原地站桩挖洞
+    get_hurt = getattr(state, "get_recent_hurt", None)
+    if callable(get_hurt) and get_hurt(max_age_s=2.0):
+        return None
+    hostile = st.get("nearest_hostile") or {}
+    if isinstance(hostile, Mapping) and hostile:
+        hname = str(hostile.get("name") or "").removeprefix("minecraft:").strip().lower()
+        try:
+            hdist = float(hostile.get("dist", 99.0))
+        except (TypeError, ValueError):
+            hdist = 99.0
+        min_clear = 8.0 if hname == "creeper" else 6.5
+        if math.isfinite(hdist) and hdist < min_clear:
+            return None
+    hp = float(st.get("health", 20.0))
+    armor_pts = _armor_points_of(state)
+    unarmored = not has_equipped_armor(state)
+    if allow_safe_mode and state.in_safe_mode:
+        return "safe_mode 夜间挖洞避险"
+    if unarmored:
+        return f"无甲夜间避险(hp={hp:.1f})"
+    if armor_pts < 10.0:
+        return f"低护甲夜间避险(armor={armor_pts:.0f},hp={hp:.1f})"
+    if hp <= 14.0:
+        return f"低血量夜间避险(hp={hp:.1f})"
+    if state.count("shield") < 1 and hp < 18.0:
+        return f"无盾非满血夜间避险(hp={hp:.1f})"
+    return None
 
 
 def _extract_escape_intent(state: State) -> Optional[tuple[str, str]]:
@@ -924,12 +993,29 @@ class RulePlanner:
                     reasons.append(f"{g.id}: 缺少前置物资 {unmet} 且无补料技能")
 
         if cooling_step_id is not None:
-            sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
-            sc = self._try_make("scout_island", {"radius": sc_radius}, state)
-            if sc is not None:
-                return sc, f"目标 {cooling_step_id} 当前位置受阻或冷却，外迁探索"
-            self._last_expand_cooldown_blocked = True
-            self._last_expand_blocked_goal_id = cooling_step_id
+            st_cool = state.snapshot()
+            cool_dim = str(st_cool.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+            cool_pos = st_cool.get("pos")
+            cool_y = float(cool_pos[1]) if (isinstance(cool_pos, (list, tuple)) and len(cool_pos) >= 2 and isinstance(cool_pos[1], (int, float)) and not isinstance(cool_pos[1], bool)) else None
+            if (
+                cool_dim == "overworld"
+                and (cool_y is None or cool_y >= 50.0)
+                and _is_dusk_or_night(state)
+                and (not has_equipped_armor(state) or _armor_points_of(state) < 10.0)
+            ):
+                if (ns_why := _night_shelter_reason(state)) is not None:
+                    ns = self._try_make("night_shelter", {}, state)
+                    if ns is not None:
+                        return ns, f"夜间目标 {cooling_step_id} 冷却，禁止地表外迁改为挖洞避险 ({ns_why})"
+                self._last_expand_cooldown_blocked = True
+                self._last_expand_blocked_goal_id = cooling_step_id
+            else:
+                sc_radius = 32 if best_pickaxe(state) not in STONE_OR_BETTER_PICKS else 36
+                sc = self._try_make("scout_island", {"radius": sc_radius}, state)
+                if sc is not None:
+                    return sc, f"目标 {cooling_step_id} 当前位置受阻或冷却，外迁探索"
+                self._last_expand_cooldown_blocked = True
+                self._last_expand_blocked_goal_id = cooling_step_id
 
         return None, "；".join(reasons[:3]) or f"目标 {ranked[0].step_goal.id} 无可启动技能"
 
@@ -986,7 +1072,26 @@ class RulePlanner:
                     c = self._try_make("craft_gear", {"item": item}, state)
                     if c is not None:
                         return PlanDecision(c, "rule", f"safe_mode 期间原地合成 {item}")
+            if not self.target_goal and (ns_why := _night_shelter_reason(state, allow_safe_mode=True)):
+                ns = self._try_make("night_shelter", {}, state)
+                if ns is not None:
+                    return PlanDecision(ns, "rule", f"safe_mode 夜间挖洞封口避险 ({ns_why})")
             return PlanDecision(None, "idle", f"safe_mode 避险驻留中（剩 {state.safe_mode_remaining:.0f}s）")
+
+        # 夜间/黄昏怪多且敌怪在 6.5m+（苦力怕 8m+）缓冲外时，优先就地挖洞封口而非反复盲跑拉怪
+        if not self.target_goal and (ns_why := _night_shelter_reason(state)):
+            st_cur = state.snapshot()
+            hostile_cur = st_cur.get("nearest_hostile") or {}
+            if isinstance(hostile_cur, Mapping) and hostile_cur:
+                hname_cur = str(hostile_cur.get("name") or "").removeprefix("minecraft:").strip().lower()
+                try:
+                    hdist_cur = float(hostile_cur.get("dist", 99.0))
+                except (TypeError, ValueError):
+                    hdist_cur = 99.0
+                if math.isfinite(hdist_cur) and hdist_cur < effective_hostile_flee_dist(state, hname_cur):
+                    ns = self._try_make("night_shelter", {}, state)
+                    if ns is not None:
+                        return PlanDecision(ns, "rule", f"夜间怪群压近优先挖洞封口避险 ({ns_why})")
 
         escape = self._choose_safety_escape(state)
         if escape is not None:
@@ -1143,7 +1248,7 @@ class RulePlanner:
                 return PlanDecision(ir_lease, "rule", "铁锭熔炉租约已就绪，回炉取回铁锭防遗弃")
         needs_food_now = food <= 17.0 or hp < 18.0
         proactive_food_ok = has_sword and not (self._hub_suspensions and not self._rank(state))
-        if near_surface_for_camp and restore < 14 and day is True and safe_12 and (needs_food_now or proactive_food_ok):
+        if near_surface_for_camp and restore < 14 and day is True and not _is_dusk_or_night(state) and safe_12 and (needs_food_now or proactive_food_ok):
             gf = self._try_make("gather_food", {"target_restore": 16, "cook": True}, state)
             if gf is not None:
                 return PlanDecision(gf, "rule", f"食物底仓不足(restore={restore}<14)，白天补粮")
@@ -1158,7 +1263,7 @@ class RulePlanner:
             if gf_cook is not None:
                 return PlanDecision(gf_cook, "rule", f"营地有熔炉且持有生肉({raw_meat_count(state)})与燃料，烤肉熟化补仓")
 
-        # 8. Night Bed Sleep Fast-Path
+        # 8. Night Bed Sleep Fast-Path（提前到原版早夜 12542 / 雷暴抢睡，抢在 13000 刷怪前 23s 过夜）
         has_existing_or_held_bed = (
             any(state.count(b) >= 1 for b in _BED_ITEMS)
             or memo.has_station("bed", dimension=dim)
@@ -1166,7 +1271,8 @@ class RulePlanner:
         )
         has_wool_for_bed = any(state.count(w) >= 3 for w in _WOOL_ITEMS)
         has_bed_ready = has_existing_or_held_bed or has_wool_for_bed
-        if day is False and dim == "overworld" and safe_gt_12 and has_bed_ready:
+        can_sleep_window = _can_sleep_now(st) is True
+        if can_sleep_window and dim == "overworld" and safe_gt_12 and has_bed_ready:
             if not has_existing_or_held_bed and total_planks(state) < 3 and total_logs(state) < 1:
                 gw = self._try_make("gather_wood", {"count": 2}, state)
                 if gw is not None:
@@ -1176,22 +1282,27 @@ class RulePlanner:
                 if sleep_sk is not None:
                     return PlanDecision(sleep_sk, "rule", "夜晚安全入睡跳过黑夜并绑定重生点")
 
-        # 8.5 Nighttime Overworld Survival Guard（无床且地表黑夜：残血无甲或裸装空手重生时驻留避险待天亮，
-        # 禁止因 safe_12 在敌怪距 8~12 格时失效而把残血角色派进暗林执行 survey_island/scout_island/breed_animal 送死）
-        if dim == "overworld" and day is False and near_surface_for_camp:
-            unarmored = not has_equipped_armor(state)
-            if hp <= 8.0 and unarmored:
-                return PlanDecision(None, "idle", f"夜间残血无甲原地避险待天亮 (hp={hp:.1f})")
-            if (
-                not has_bed_ready
-                and unarmored
-                and not has_sword
-                and best_pickaxe(state) not in STONE_OR_BETTER_PICKS
-                and state.count("shield") < 1
-                and not can_afford_gear(state, "stone_sword", assume_no_table=True)
-                and not can_afford_gear(state, "wooden_pickaxe", assume_no_table=True)
-            ):
-                return PlanDecision(None, "idle", "夜间空手无甲避险驻留待天亮（防夜盲林区裸奔送死）")
+        # 8.5 Nighttime/Dusk Overworld Dig-and-Cover Shelter Guard（放宽触发条件：黄昏 11800 起或黑夜，
+        # 无甲/低护甲(<10)/低血(<=14)/无盾非满血且无可用床时，优先挖洞封口避险，彻底替代露天原地罚站送死）
+        if dim == "overworld" and near_surface_for_camp and _is_dusk_or_night(state):
+            if (ns_why := _night_shelter_reason(state)) is not None:
+                ns = self._try_make("night_shelter", {}, state)
+                if ns is not None:
+                    return PlanDecision(ns, "rule", f"夜间/黄昏主动挖洞封口避险 ({ns_why})")
+            if day is False:
+                unarmored = not has_equipped_armor(state)
+                if hp <= 8.0 and unarmored:
+                    return PlanDecision(None, "idle", f"夜间残血无甲原地避险待天亮 (hp={hp:.1f})")
+                if (
+                    not has_bed_ready
+                    and unarmored
+                    and not has_sword
+                    and best_pickaxe(state) not in STONE_OR_BETTER_PICKS
+                    and state.count("shield") < 1
+                    and not can_afford_gear(state, "stone_sword", assume_no_table=True)
+                    and not can_afford_gear(state, "wooden_pickaxe", assume_no_table=True)
+                ):
+                    return PlanDecision(None, "idle", "夜间空手无甲避险驻留待天亮（防夜盲林区裸奔送死）")
 
         # 9. Camp Surplus Deposit (尊重 ReservationBook 预留物资；距营地 <=96 格高价/满包回存)
         if _camp_plan.has_surplus_for_deposit(state, reservations=self.reservations) and _camp_plan.is_near_camp(state, max_dist=96.0) and safe_12:
@@ -1387,6 +1498,34 @@ class RulePlanner:
         survey_args: dict[str, Any] = {"sectors": 2, "radius": 32}
         if survey_cls is not None and "dimension" in getattr(survey_cls, "params", {}):
             survey_args["dimension"] = survey_dim
+
+        st_snap = state.snapshot()
+        pos_snap = st_snap.get("pos")
+        cur_y = None
+        if isinstance(pos_snap, (list, tuple)) and len(pos_snap) >= 2:
+            try:
+                cur_y = float(pos_snap[1])
+            except (TypeError, ValueError):
+                cur_y = None
+        # 主世界黄昏/黑夜地表且无甲/低护甲时，硬禁止派发地表盲探图送死，转而优先挖洞避险
+        if (
+            survey_dim == "overworld"
+            and (cur_y is None or cur_y >= 50.0)
+            and _is_dusk_or_night(state)
+            and (not has_equipped_armor(state) or _armor_points_of(state) < 10.0)
+        ):
+            if (ns_why := _night_shelter_reason(state)) is not None:
+                ns_inst, _, ns_cool = self._diagnose_skill("night_shelter", {}, state)
+                if ns_inst is not None:
+                    return ns_inst, f"夜间禁止无甲地表探图，改为挖洞避险 ({ns_why})", False
+                return None, "", ns_cool
+            return None, "", False
+        # 主世界地下（Y<58）直接派发 scout_island 挖阶梯出坑，禁止浪费数百秒跑水平 survey_island 扫块
+        if survey_dim == "overworld" and cur_y is not None and cur_y < 58.0:
+            sc_inst, _, sc_cool = self._diagnose_skill("scout_island", {"radius": scout_radius}, state)
+            if sc_inst is not None:
+                return sc_inst, scout_reason, False
+            return None, "", sc_cool
 
         prefer_survey = (self._fallback_explore_turn % 2) == 0
         order = (

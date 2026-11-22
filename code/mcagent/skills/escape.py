@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Generator, Optional
 
 from ..client import ApiError
@@ -16,7 +17,7 @@ from .items import (
     AIR, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, is_safe_solid_floor, pick_placeable, total_placeable,
 )
 from .sightline import DIG_EYE_REACH, block_cell, eye_to_block_dist, voxel_line_cells
-from .voxel_cache import voxel_cache_for
+from .voxel_cache import has_batch_get_blocks, voxel_cache_for
 
 if TYPE_CHECKING:
     from ..runtime import Executor, State
@@ -86,6 +87,21 @@ def _read_block(cache: Any, client: Any, cell: Cell, dim: str) -> Optional[dict]
             return None
         raise
     return blk if isinstance(blk, dict) else None
+
+
+def _prefetch_cells(ex: "Executor", cache: Any, cells: Sequence[Cell], dim: str) -> None:
+    """Batch-prefetch candidate cells into `cache` when `client.get_blocks_batch` is available."""
+    if not cells:
+        return
+    client = getattr(ex, "client", None)
+    if not has_batch_get_blocks(client) or not callable(getattr(cache, "get_blocks_batch", None)):
+        return
+    try:
+        cache.get_blocks_batch(client, cells, dimension=dim)
+    except ApiError as err:
+        if err.code in ("not_loaded", "not_ready", "unsupported_api", "unknown_api"):
+            return
+        raise
 
 
 def _is_dry_standable(cache: Any, client: Any, cell: Cell, dim: str) -> bool:
@@ -228,14 +244,26 @@ def _find_dry_shore(
     if not pos or len(pos) < 3:
         return None
     fx, fy, fz = block_cell(pos)
-    probed_cols = 0
+    cols: list[tuple[int, int, int]] = []
     for dx, dz in _SHORE_OFFSETS:
-        if max(abs(dx), abs(dz)) > max_radius:
+        ring = max(abs(dx), abs(dz))
+        if ring > max_radius or len(cols) >= max_cols:
             break
-        if probed_cols >= max_cols:
-            break
-        probed_cols += 1
-        sx, sz = fx + dx, fz + dz
+        cols.append((ring, fx + dx, fz + dz))
+    _prefetch_cells(
+        ex, cache,
+        [(sx, fy + ky, sz) for ring, sx, sz in cols if ring <= 3 for ky in (-2, -1, 0, 1, 2, 3)],
+        dim,
+    )
+    outer_prefetched = False
+    for ring, sx, sz in cols:
+        if ring > 3 and not outer_prefetched:
+            _prefetch_cells(
+                ex, cache,
+                [(sx2, fy + ky, sz2) for r2, sx2, sz2 in cols if r2 > 3 for ky in (-2, -1, 0, 1, 2, 3)],
+                dim,
+            )
+            outer_prefetched = True
         for dy in (0, 1, 2, -1):
             cand = (sx, fy + dy, sz)
             if cand not in tried_shores and _is_dry_standable(cache, ex.client, cand, dim):
@@ -576,6 +604,32 @@ def _score_escape_dir(
     return score + min_clear * 2.0
 
 
+def _water_probe_cells(
+    px: float,
+    py: float,
+    pz: float,
+    dirs: Sequence[tuple[float, float]],
+    probes: tuple[int, ...] = (2, 4, 6),
+) -> list[Cell]:
+    _, fy, _ = block_cell([px, py, pz])
+    cols: set[tuple[int, int]] = set()
+    cells: list[Cell] = []
+    for cx, cz in dirs:
+        norm = math.hypot(cx, cz)
+        if norm <= 1e-6:
+            continue
+        ux, uz = cx / norm, cz / norm
+        for dist in probes:
+            bx, bz = math.floor(px + ux * dist), math.floor(pz + uz * dist)
+            if (bx, bz) in cols:
+                continue
+            cols.add((bx, bz))
+            cells.append((bx, fy, bz))
+            cells.append((bx, fy - 1, bz))
+            cells.append((bx, fy - 2, bz))
+    return cells
+
+
 def _path_enters_water(
     ex: "Executor",
     px: float,
@@ -630,15 +684,10 @@ def _find_safe_dry_shore_away(
         return None
     px, py, pz = pos
     fx, fy, fz = block_cell([px, py, pz])
-    best: Optional[tuple[float, Cell]] = None
-    best_climbable_ring: Optional[int] = None
-    probed_cols = 0
+    safe_cols: list[tuple[int, int, int, float, float]] = []
     for dx, dz in _SHORE_OFFSETS:
         ring = max(abs(dx), abs(dz))
         if ring > max_radius:
-            break
-        # 一旦当前内环已经找到可直接一步登岸（dy <= 1）的安全干岸，完成该环即提前退出，绝不继续外扩扫图
-        if best_climbable_ring is not None and ring > best_climbable_ring:
             break
         sx, sz = fx + dx, fz + dz
         cx, cz = sx + 0.5, sz + 0.5
@@ -656,10 +705,29 @@ def _find_safe_dry_shore_away(
             min_clearance = min(min_clearance, d_cand)
         if not safe:
             continue
-        if probed_cols >= max_cols:
+        if len(safe_cols) >= max_cols:
             break
-        probed_cols += 1
-        d_self = math.hypot(cx - px, cz - pz)
+        safe_cols.append((ring, sx, sz, min_clearance, math.hypot(cx - px, cz - pz)))
+
+    _prefetch_cells(
+        ex, cache,
+        [(sx, fy + ky, sz) for ring, sx, sz, _, _ in safe_cols if ring <= 3 for ky in (-2, -1, 0, 1, 2, 3)],
+        dim,
+    )
+    best: Optional[tuple[float, Cell]] = None
+    best_climbable_ring: Optional[int] = None
+    outer_prefetched = False
+    for ring, sx, sz, min_clearance, d_self in safe_cols:
+        # 一旦当前内环已经找到可直接一步登岸（dy <= 1）的安全干岸，完成该环即提前退出，绝不继续外扩扫图
+        if best_climbable_ring is not None and ring > best_climbable_ring:
+            break
+        if ring > 3 and not outer_prefetched:
+            _prefetch_cells(
+                ex, cache,
+                [(sx2, fy + ky, sz2) for r2, sx2, sz2, _, _ in safe_cols if r2 > 3 for ky in (-2, -1, 0, 1, 2, 3)],
+                dim,
+            )
+            outer_prefetched = True
         for dy in (0, 1, 2, -1):
             cand = (sx, fy + dy, sz)
             if cand in tried_shores or not _is_dry_standable(cache, ex.client, cand, dim):
@@ -685,6 +753,7 @@ def _resolve_flee_vector(
     state: Optional["State"] = None,
     avoid_water: bool = False,
     in_water: bool = False,
+    close_fast: Optional[bool] = None,
 ) -> tuple[float, float, Optional[list[float]]]:
     """计算远离 18 格内全部敌对生物的单位逃离向量，避免避开近怪时直冲远程骷髅/苦力怕或从干地跳入水中。"""
     ents = _collect_nearby_hostiles(ex, px, py, pz, hostile, radius=18)
@@ -699,6 +768,7 @@ def _resolve_flee_vector(
     threats: list[tuple[float, float, str, float, Optional[int]]] = []
     nearest_pos: Optional[list[float]] = None
     nearest_d = float("inf")
+    has_close_creeper = False
     for ent in ents:
         ep = _valid_vec3(ent.get("pos"))
         if ep is None:
@@ -710,11 +780,19 @@ def _resolve_flee_vector(
         if d < nearest_d:
             nearest_d = d
             nearest_pos = [ep[0], ep[1], ep[2]]
+        if name == "creeper" and d <= 6.5:
+            has_close_creeper = True
         threats.append((ep[0], ep[2], name, d, eid))
+
+    if close_fast is None:
+        is_close_fast = nearest_pos is not None and (nearest_d <= 3.5 or has_close_creeper)
+    else:
+        is_close_fast = bool(close_fast) and (nearest_pos is not None)
+    water_probes: tuple[int, ...] = (1, 2, 3) if is_close_fast else (2, 4, 6)
 
     def _eval_dir(c: tuple[float, float]) -> float:
         sc = _score_escape_dir(px, pz, c[0], c[1], threats, attacker_id, in_water=in_water)
-        if avoid_water and _path_enters_water(ex, px, py, pz, c[0], c[1], cache, dim):
+        if avoid_water and _path_enters_water(ex, px, py, pz, c[0], c[1], cache, dim, probes=water_probes):
             sc -= 22.0
         return sc
 
@@ -722,11 +800,19 @@ def _resolve_flee_vector(
         hx, hz, _, d, _ = threats[0]
         if d >= 1e-6:
             ux0, uz0 = (px - hx) / d, (pz - hz) / d
-            if not (avoid_water and _path_enters_water(ex, px, py, pz, ux0, uz0, cache, dim)):
+            if avoid_water:
+                _prefetch_cells(
+                    ex, cache, _water_probe_cells(px, py, pz, [(ux0, uz0)], probes=water_probes), dim,
+                )
+            if not (avoid_water and _path_enters_water(ex, px, py, pz, ux0, uz0, cache, dim, probes=water_probes)):
                 return ux0, uz0, nearest_pos
             candidates: list[tuple[float, float]] = [(ux0, uz0)] + [
                 (math.cos(i * math.pi / 6.0), math.sin(i * math.pi / 6.0)) for i in range(12)
             ]
+            if avoid_water:
+                _prefetch_cells(
+                    ex, cache, _water_probe_cells(px, py, pz, candidates, probes=water_probes), dim,
+                )
             best_dir = max(candidates, key=_eval_dir)
             return best_dir[0], best_dir[1], nearest_pos
     elif len(threats) >= 2:
@@ -746,10 +832,34 @@ def _resolve_flee_vector(
         ]
         if (rnorm := math.hypot(rx, rz)) >= 1e-6:
             candidates.insert(0, (rx / rnorm, rz / rnorm))
+        if not avoid_water:
+            best_dir = max(
+                candidates,
+                key=lambda c: _score_escape_dir(px, pz, c[0], c[1], threats, attacker_id, in_water=in_water),
+            )
+            return best_dir[0], best_dir[1], nearest_pos
+        if is_close_fast:
+            best_geo = max(
+                candidates,
+                key=lambda c: _score_escape_dir(px, pz, c[0], c[1], threats, attacker_id, in_water=in_water),
+            )
+            _prefetch_cells(
+                ex, cache, _water_probe_cells(px, py, pz, [best_geo], probes=water_probes), dim,
+            )
+            if not _path_enters_water(ex, px, py, pz, best_geo[0], best_geo[1], cache, dim, probes=water_probes):
+                return best_geo[0], best_geo[1], nearest_pos
+        _prefetch_cells(
+            ex, cache, _water_probe_cells(px, py, pz, candidates, probes=water_probes), dim,
+        )
         best_dir = max(candidates, key=_eval_dir)
         return best_dir[0], best_dir[1], nearest_pos
 
     fx, fy, fz = block_cell([px, py, pz])
+    _prefetch_cells(
+        ex, cache,
+        [(fx + dx, fy + ky, fz + dz) for dx, dz in _CARDINALS for ky in (-1, 0, 1)],
+        dim,
+    )
     for dx, dz in _CARDINALS:
         if _is_dry_standable(cache, ex.client, (fx + dx, fy, fz + dz), dim):
             return float(dx), float(dz), None
@@ -781,6 +891,32 @@ def _is_ranged_los_blocked(
     return False
 
 
+def _sprint_yaw_probe_cells(
+    px: float,
+    py: float,
+    pz: float,
+    yaws: Sequence[float],
+    *,
+    lookahead: int = 5,
+    include_under: bool = False,
+) -> list[Cell]:
+    fx, fy, fz = block_cell([px, py, pz])
+    cells: list[Cell] = []
+    if include_under:
+        cells.append((fx, fy - 1, fz))
+    seen_cols: set[tuple[int, int]] = {(fx, fz)}
+    for yaw in yaws:
+        dx, dz = -math.sin(yaw), -math.cos(yaw)
+        for step in range(1, lookahead + 1):
+            cx, cz = math.floor(px + dx * step), math.floor(pz + dz * step)
+            if (cx, cz) in seen_cols:
+                continue
+            seen_cols.add((cx, cz))
+            for dy in (1, 0, -1, -2, -3):
+                cells.append((cx, fy + dy, cz))
+    return cells
+
+
 def _is_sprint_yaw_safe(
     ex: "Executor",
     px: float,
@@ -809,6 +945,7 @@ def _is_sprint_yaw_safe(
             (fx + 1, fy - 3, fz), (fx - 1, fy - 3, fz), (fx, fy - 3, fz + 1), (fx, fy - 3, fz - 1),
             (fx + 1, fy - 4, fz), (fx - 1, fy - 4, fz), (fx, fy - 4, fz + 1), (fx, fy - 4, fz - 1),
         )
+        _prefetch_cells(ex, cache, probe_cells, dim)
         has_terrain = any(
             (nb := _read_block(cache, ex.client, cell, dim)) is not None
             and (is_safe_solid_floor(nb) or _is_water_cell(nb))
@@ -853,6 +990,7 @@ def _pick_cliff_safe_yaw(
     *,
     avoid_water: bool = False,
     hostile_dir: Optional[tuple[float, float]] = None,
+    lookahead: int = 5,
 ) -> Optional[float]:
     """若首选逃离方向前方有深坑/悬崖/岩浆（干地时兼避水面），依次改选侧向 ±90°/±45°/±135°/180° 安全方向；尽量拒绝直冲敌怪正脸。"""
     offsets = (0.0, math.pi / 2, -math.pi / 2, math.pi / 4, -math.pi / 4, 3 * math.pi / 4, -3 * math.pi / 4, math.pi)
@@ -868,25 +1006,55 @@ def _pick_cliff_safe_yaw(
         dx, dz = -math.sin(yaw), -math.cos(yaw)
         return (dx * h_unit[0] + dz * h_unit[1]) > 0.70
 
+    primary_cands = [preferred_yaw + off for off in offsets[:5] if not _toward_hostile(preferred_yaw + off)]
+    secondary_cands = [preferred_yaw + off for off in offsets[5:] if not _toward_hostile(preferred_yaw + off)]
+    _prefetch_cells(
+        ex, cache,
+        _sprint_yaw_probe_cells(px, py, pz, primary_cands, lookahead=lookahead, include_under=True),
+        dim,
+    )
+    secondary_prefetched = False
+    fallback_prefetched = False
+
+    def _ensure_secondary(idx: int) -> None:
+        nonlocal secondary_prefetched
+        if idx >= 5 and not secondary_prefetched and secondary_cands:
+            _prefetch_cells(
+                ex, cache,
+                _sprint_yaw_probe_cells(px, py, pz, secondary_cands, lookahead=lookahead),
+                dim,
+            )
+            secondary_prefetched = True
+
     if avoid_water:
-        for offset in offsets:
+        for idx, offset in enumerate(offsets):
             cand = preferred_yaw + offset
             if _toward_hostile(cand):
                 continue
-            if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=True):
+            _ensure_secondary(idx)
+            if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, lookahead=lookahead, avoid_water=True):
                 return cand
-    for offset in offsets:
+    for idx, offset in enumerate(offsets):
         cand = preferred_yaw + offset
         if _toward_hostile(cand):
             continue
-        if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=False):
+        _ensure_secondary(idx)
+        if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, lookahead=lookahead, avoid_water=False):
             return cand
     if h_unit is not None:
         # 仅当所有非直冲方向全部为深崖/岩浆时才允许回退兜底
+        if not fallback_prefetched:
+            fallback_cands = [preferred_yaw + off for off in offsets if _toward_hostile(preferred_yaw + off)]
+            _prefetch_cells(
+                ex, cache,
+                _sprint_yaw_probe_cells(px, py, pz, fallback_cands, lookahead=lookahead),
+                dim,
+            )
+            fallback_prefetched = True
         for aw in ((True, False) if avoid_water else (False,)):
             for offset in offsets:
                 cand = preferred_yaw + offset
-                if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, avoid_water=aw):
+                if _is_sprint_yaw_safe(ex, px, py, pz, cand, cache, dim, lookahead=lookahead, avoid_water=aw):
                     return cand
     return None
 
@@ -973,6 +1141,23 @@ def _pick_alternate_escape_yaw(
         )
     untried_yaws: list[float] = []
     open_water_yaws: list[float] = []
+    probe_offsets: list[tuple[int, int]] = []
+    for ox, oz in candidate_dirs:
+        norm = math.hypot(ox, oz)
+        if norm <= 1e-6:
+            continue
+        nx, nz = ox / norm, oz / norm
+        cand_yaw = math.atan2(-nx, -nz)
+        if tried_yaws and any(_yaw_diff(cand_yaw, ty) < 0.65 for ty in tried_yaws):
+            continue
+        sx, sz = int(round(nx)), int(round(nz))
+        if (sx, sz) != (0, 0) and (sx, sz) not in probe_offsets:
+            probe_offsets.append((sx, sz))
+    _prefetch_cells(
+        ex, cache,
+        [(fx + sx, fy + ky, fz + sz) for sx, sz in probe_offsets for ky in (-2, -1, 0, 1, 2)],
+        dim,
+    )
     for ox, oz in candidate_dirs:
         norm = math.hypot(ox, oz)
         if norm <= 1e-6:
@@ -1060,6 +1245,11 @@ def _find_dry_pocket_breach_cell(
     if pos is None:
         return None
     fx, fy, fz = block_cell(pos)
+    _prefetch_cells(
+        ex, cache,
+        [(fx + dx, fy + ky, fz + dz) for dx, dz in _CARDINALS for ky in (-1, 0, 1, 2)],
+        dim,
+    )
     # 若四向任一方向存在 2 格高平步通道，则并非封闭 1×1 坑，无需破墙
     for dx, dz in _CARDINALS:
         f_blk = _read_block(cache, ex.client, (fx + dx, fy, fz + dz), dim)
@@ -1240,7 +1430,14 @@ def _find_skeleton_cover_cell(
     skel_cell = block_cell([hx, hy, hz])
     skel_eye = (hx, hy + 1.62, hz)
 
-    candidates: list[tuple[float, int, Cell]] = []
+    _prefetch_cells(
+        ex, cache,
+        [(fx + dx, fy + ky, fz + dz) for dx, dz in _CARDINALS for ky in (-2, -1, 0, 1, 2)],
+        dim,
+    )
+
+    standable: list[tuple[float, int, Cell, set[Cell]]] = []
+    los_cells: list[Cell] = []
     for dx, dz in _CARDINALS:
         for dy in (0, 1, -1):
             cand = (fx + dx, fy + dy, fz + dz)
@@ -1256,12 +1453,24 @@ def _find_skeleton_cover_cell(
                 skel_cell,
                 (skel_cell[0], skel_cell[1] + 1, skel_cell[2]),
             }
+            standable.append((dist_h, dy, cand, skip))
             for cell in voxel_line_cells(cand_eye, skel_eye):
-                if cell in skip:
-                    continue
-                if _is_solid_wall_block(_read_block(cache, ex.client, cell, dim)):
-                    candidates.append((-dist_h, abs(dy), cand))
-                    break
+                if cell not in skip:
+                    los_cells.append(cell)
+
+    if not standable:
+        return None
+    _prefetch_cells(ex, cache, los_cells, dim)
+
+    candidates: list[tuple[float, int, Cell]] = []
+    for dist_h, dy, cand, skip in standable:
+        cand_eye = (cand[0] + 0.5, cand[1] + 1.62, cand[2] + 0.5)
+        for cell in voxel_line_cells(cand_eye, skel_eye):
+            if cell in skip:
+                continue
+            if _is_solid_wall_block(_read_block(cache, ex.client, cell, dim)):
+                candidates.append((-dist_h, abs(dy), cand))
+                break
     if not candidates:
         return None
     return min(candidates, key=lambda item: (item[0], item[1]))[2]
@@ -1423,9 +1632,17 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         return False
 
     in_water_init = bool(st.get("in_water") or st.get("submerged"))
+    if getattr(state, "inventory_dirty", False):
+        try:
+            state.refresh_inventory(ex.client)
+        except AttributeError:
+            pass
+    has_shield = _has_shield(state, st)
+    close_fast_escape = (is_creeper and h_dist <= 6.5 and not has_shield) or (h_dist < 3.5)
     ux, uz, h_pos = _resolve_flee_vector(
         ex, px, py, pz, hostile, cache, dim, state=state,
         avoid_water=not in_water_init, in_water=in_water_init,
+        close_fast=close_fast_escape,
     )
 
     away_yaw = math.atan2(-ux, -uz)
@@ -1433,12 +1650,6 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     tried_yaws: list[float] = _load_blocked_yaws(state, dim, px, pz)
     zero_stall = bool(tried_yaws)
     burst_blocked = bool(tried_yaws and any(_yaw_diff(away_yaw, ty) < 0.75 for ty in tried_yaws))
-    if getattr(state, "inventory_dirty", False):
-        try:
-            state.refresh_inventory(ex.client)
-        except AttributeError:
-            pass
-    has_shield = _has_shield(state, st)
     shield_yaw, hurt_attacker_id = (
         _resolve_shield_guard_yaw(ex, state, px, py, pz, to_mob_yaw)
         if has_shield
@@ -1483,6 +1694,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     ex, px, py, pz, creeper_pref_yaw, cache, dim,
                     avoid_water=not in_water_init,
                     hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                    lookahead=3 if close_fast_escape else 5,
                 )
                 if safe_creeper_yaw is None:
                     break
@@ -1526,6 +1738,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 ux, uz, h_pos = _resolve_flee_vector(
                     ex, px, py, pz, mid_hostile, cache, dim, state=state,
                     avoid_water=True, in_water=False,
+                    close_fast=not has_shield,
                 )
                 away_yaw = math.atan2(-ux, -uz)
     else:
@@ -1682,6 +1895,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 ex, px, py, pz, burst_pref_yaw, cache, dim,
                 avoid_water=not in_water_init,
                 hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                lookahead=3,
             )
             before_burst = (px, py, pz)
             ok_burst = False
@@ -1723,9 +1937,15 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 for _ in range(2):
                     if isinstance(mid_hostile, dict) and mid_hostile:
                         in_w_mid = bool(st_mid.get("in_water") or st_mid.get("submerged"))
+                        md_val = mid_hostile.get("dist")
+                        md_name = bare(mid_hostile.get("name")).strip().lower()
+                        mid_fast = isinstance(md_val, (int, float)) and not isinstance(md_val, bool) and (
+                            float(md_val) < 3.5 or (md_name == "creeper" and float(md_val) <= 6.5 and not has_shield)
+                        )
                         ux, uz, h_pos = _resolve_flee_vector(
                             ex, px, py, pz, mid_hostile, cache, dim, state=state,
                             avoid_water=not in_w_mid, in_water=in_w_mid,
+                            close_fast=mid_fast,
                         )
                         away_yaw = math.atan2(-ux, -uz)
                     mid_dist_val = mid_hostile.get("dist") if isinstance(mid_hostile, dict) else None
@@ -1749,6 +1969,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                         ex, px, py, pz, alt_yaw, cache, dim,
                         avoid_water=not bool(st_mid.get("in_water") or st_mid.get("submerged")),
                         hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                        lookahead=3 if (float(mid_dist_val) < 3.5 or (mid_name == "creeper" and float(mid_dist_val) <= 6.5 and not has_shield)) else 5,
                     )
                     if safe_alt_yaw is None:
                         break
@@ -1804,12 +2025,15 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         sprint_supported = True
         fast_safe_dist = max(10.0, effective_hostile_flee_dist(state, h_name))
         consecutive_stalls = 0
+        cur_fast_dist = h_dist
         for _ in range(3):
             if _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim) or burst_blocked:
                 cand_yaw = _pick_alternate_escape_yaw(ex, px, py, pz, ux, uz, cache, dim, tried_yaws=tried_yaws)
             else:
                 cand_yaw = away_yaw
-            safe_fast_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, cand_yaw, cache, dim)
+            safe_fast_yaw = _pick_cliff_safe_yaw(
+                ex, px, py, pz, cand_yaw, cache, dim, lookahead=3 if cur_fast_dist < 3.5 else 5,
+            )
             if safe_fast_yaw is None:
                 sprint_supported = False
                 break
@@ -1845,6 +2069,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             md = mid_hostile.get("dist")
             if isinstance(md, (int, float)) and not isinstance(md, bool) and float(md) >= fast_safe_dist:
                 return True
+            cur_fast_dist = float(md) if isinstance(md, (int, float)) and not isinstance(md, bool) else cur_fast_dist
             ux, uz, h_pos = _resolve_flee_vector(ex, px, py, pz, mid_hostile, cache, dim, state=state)
             away_yaw = math.atan2(-ux, -uz)
         if sprint_supported:
@@ -2183,7 +2408,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             else away_yaw
         )
         safe_pb = _pick_cliff_safe_yaw(
-            ex, px, py, pz, pb_yaw, cache, dim, avoid_water=True, hostile_dir=(-ux, -uz),
+            ex, px, py, pz, pb_yaw, cache, dim, avoid_water=True, hostile_dir=(-ux, -uz), lookahead=3,
         )
         if safe_pb is not None:
             ok_pb, _ = yield from _control_step(
@@ -2207,7 +2432,10 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     flee_stride = 18.0 if (is_ranged and not has_shield) else (16.0 if is_creeper else 12.0)
     if not (st_cur.get("in_water") or st_cur.get("submerged")):
         # 干地逃离若远端落点伸入河道，收缩落点到入水前的干地岸段，防止 move_to 把角色带下水
-        if _path_enters_water(ex, px, py, pz, ux, uz, cache, dim, probes=(6, 8, 10, 12, int(flee_stride))):
+        stride_probes = (6, 8, 10, 12, int(flee_stride))
+        _prefetch_cells(ex, cache, _water_probe_cells(px, py, pz, [(ux, uz)], probes=stride_probes), dim)
+        if _path_enters_water(ex, px, py, pz, ux, uz, cache, dim, probes=stride_probes):
+            _prefetch_cells(ex, cache, _water_probe_cells(px, py, pz, [(ux, uz)], probes=(2, 4, 6, 8, 10)), dim)
             for cand_stride in (10.0, 8.0, 6.0, 4.0):
                 if cand_stride < flee_stride and not _path_enters_water(
                     ex, px, py, pz, ux, uz, cache, dim, probes=tuple(range(2, int(cand_stride) + 1, 2)),

@@ -140,6 +140,11 @@ def voxel_line_cells(start: Any, end: Any) -> list[Cell]:
     return out
 
 
+def _client_rtt_s(client: Any) -> float:
+    raw = getattr(client, "smoothed_rtt_s", 0.0)
+    return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) else 0.0
+
+
 def _is_cell_passable(
     ex: "Executor",
     cell: Cell,
@@ -148,13 +153,27 @@ def _is_cell_passable(
     cache: dict[Cell, dict],
 ) -> bool:
     if cell not in cache:
-        try:
-            cache[cell] = ex.client.get_block(list(cell))
-        except ApiError as exc:
-            if exc.code in ("not_loaded", "not_ready"):
-                cache[cell] = {}
-            else:
-                raise
+        client = getattr(ex, "client", None)
+        rtt = _client_rtt_s(client)
+        st_obj = getattr(ex, "state", None)
+        if rtt > 0.15 and st_obj is not None:
+            from .voxel_cache import voxel_cache_for
+            dim = str(((getattr(st_obj, "st", None) or {}).get("dimension")) or "overworld")
+            try:
+                cache[cell] = voxel_cache_for(st_obj).get_block(client, list(cell), dimension=dim)
+            except ApiError as exc:
+                if exc.code in ("not_loaded", "not_ready"):
+                    cache[cell] = {}
+                else:
+                    raise
+        else:
+            try:
+                cache[cell] = ex.client.get_block(list(cell))
+            except ApiError as exc:
+                if exc.code in ("not_loaded", "not_ready"):
+                    cache[cell] = {}
+                else:
+                    raise
     block = cache[cell]
     if not isinstance(block, dict):
         return False
@@ -187,6 +206,22 @@ def ray_clear_to_point(
 
     passable_set = frozenset(bare(name) for name in passable)
     block_cache = cache if cache is not None else {}
+    client = getattr(ex, "client", None)
+    if _client_rtt_s(client) > 0.15:
+        from .voxel_cache import has_batch_get_blocks, voxel_cache_for
+        if has_batch_get_blocks(client):
+            line_cells = [c for c in voxel_line_cells(s, aim) if c != end_cell and c not in block_cache]
+            if len(line_cells) >= 2:
+                st_obj = getattr(ex, "state", None)
+                if st_obj is not None:
+                    dim = str(((getattr(st_obj, "st", None) or {}).get("dimension")) or "overworld")
+                    fetched = voxel_cache_for(st_obj).get_blocks_batch(client, line_cells, dimension=dim)
+                else:
+                    fetched = client.get_blocks_batch(line_cells)
+                if isinstance(fetched, Mapping):
+                    for k, v in fetched.items():
+                        if isinstance(v, dict) and v:
+                            block_cache[k] = v
     delta = tuple(b - a for a, b in zip(s, aim))
     sign = tuple(1 if d > 0 else -1 for d in delta)
 

@@ -101,7 +101,7 @@ def _sweep_blocks(
     type_list = [bare(types)] if isinstance(types, str) else ([bare(t) for t in types] if types else None)
     hits: list[dict[str, Any]] = []
     try:
-        res = scan_blocks(ex, state, types=types, radius=eff_r, limit=eff_l)
+        res = scan_blocks(ex, state, types=types, radius=eff_r, limit=eff_l, verify=False)
         if res.get("ready") is False:
             return [], set(), 0
         hits = list(res.get("blocks") or [])
@@ -169,39 +169,43 @@ def _blocked_check(state: Any, not_ready_msg: str, empty_msg: str, *, allowed_di
     has_items = any(isinstance(r, dict) and int(r.get("count", 0)) >= 1 for r in ((state.inventory or {}).get("items") or ()))
     return empty_msg if (cur_dim == "overworld" and not has_items and not memo_for(state).has_landmark(dimension=cur_dim)) else ""
 
-def _block_name_at(ex: Any, cache: Any, cell: tuple[int, int, int], dim: str) -> str:
+def _block_name_at(ex: Any, cache: Any, cell: tuple[int, int, int], dim: str, *, allow_fallback: bool = True) -> str:
     try:
         blk = cache.get_block(ex.client, cell, dimension=dim)
     except ApiError as exc:
         if exc.code not in ("not_loaded", "not_ready"):
             raise
         blk = None
-    if not isinstance(blk, Mapping) or not blk.get("name"):
+    if allow_fallback and (not isinstance(blk, Mapping) or not blk.get("name")):
         blk = observe_block(ex, list(cell))
     return bare(blk.get("name")).strip().lower() if isinstance(blk, Mapping) else ""
 
-def _is_standable_dry(ex: Any, cache: Any, wx: int, wy: int, wz: int, dim: str) -> bool:
-    support = _block_name_at(ex, cache, (wx, wy - 1, wz), dim)
+def _is_standable_dry(ex: Any, cache: Any, wx: int, wy: int, wz: int, dim: str, *, allow_fallback: bool = True) -> bool:
+    support = _block_name_at(ex, cache, (wx, wy - 1, wz), dim, allow_fallback=allow_fallback)
     if not support or support in _HAZARD_BLOCKS or support in PASSABLE_COVER:
         return False
-    return _block_name_at(ex, cache, (wx, wy, wz), dim) in _PASSABLE and _block_name_at(ex, cache, (wx, wy + 1, wz), dim) in _PASSABLE
+    return (
+        _block_name_at(ex, cache, (wx, wy, wz), dim, allow_fallback=allow_fallback) in _PASSABLE
+        and _block_name_at(ex, cache, (wx, wy + 1, wz), dim, allow_fallback=allow_fallback) in _PASSABLE
+    )
 
-def _is_nether_safe_waypoint(ex: Any, cache: Any, wx: int, wy: int, wz: int, dim: str) -> bool:
-    if not _is_standable_dry(ex, cache, wx, wy, wz, dim):
+def _is_nether_safe_waypoint(ex: Any, cache: Any, wx: int, wy: int, wz: int, dim: str, *, allow_fallback: bool = True) -> bool:
+    if not _is_standable_dry(ex, cache, wx, wy, wz, dim, allow_fallback=allow_fallback):
         return False
     if dim != "the_nether":
         return True
-    if _block_name_at(ex, cache, (wx, wy + 2, wz), dim) in _NETHER_OVERHEAD_HAZARDS:
+    if _block_name_at(ex, cache, (wx, wy + 2, wz), dim, allow_fallback=allow_fallback) in _NETHER_OVERHEAD_HAZARDS:
         return False
     supported_neighbors = 0
     for dx, dz in _CARDINALS:
         nx, nz = wx + dx, wz + dz
-        nb_body = _block_name_at(ex, cache, (nx, wy, nz), dim)
-        nb_floor = _block_name_at(ex, cache, (nx, wy - 1, nz), dim)
+        nb_body = _block_name_at(ex, cache, (nx, wy, nz), dim, allow_fallback=allow_fallback)
+        nb_floor = _block_name_at(ex, cache, (nx, wy - 1, nz), dim, allow_fallback=allow_fallback)
         if nb_body in _NETHER_ADJ_HAZARDS or nb_floor in _NETHER_ADJ_HAZARDS:
             return False
         if (nb_floor and nb_floor not in _HAZARD_BLOCKS and nb_floor not in PASSABLE_COVER) or (
-            (nb_low := _block_name_at(ex, cache, (nx, wy - 2, nz), dim)) and nb_low not in _HAZARD_BLOCKS and nb_low not in PASSABLE_COVER
+            (nb_low := _block_name_at(ex, cache, (nx, wy - 2, nz), dim, allow_fallback=allow_fallback))
+            and nb_low not in _HAZARD_BLOCKS and nb_low not in PASSABLE_COVER
         ):
             supported_neighbors += 1
     return supported_neighbors >= 2
@@ -268,24 +272,46 @@ def _pick_sector_waypoint(
         if (vlen := math.hypot(vx, vz)) >= 4.0:
             ux, uz = vx / vlen, vz / vlen
     base_y, cache, memo = math.floor(oy), voxel_cache_for(state), memo_for(state)
-    eff_dists = list(dict.fromkeys(d for d in (min(radius, 48), min(radius, 40), 32, 24, 16, 8, 4) if 1 <= d <= radius)) or [max(1, min(radius, 4))]
+    raw_rtt = getattr(getattr(ex, "client", None), "smoothed_rtt_s", 0.0)
+    high_rtt = (float(raw_rtt) if isinstance(raw_rtt, (int, float)) and not isinstance(raw_rtt, bool) else 0.0) > 0.25
+    if high_rtt:
+        raw_dists = (min(radius, 32), 16, 8)
+        dy_list = (0, 1, -1)
+    else:
+        raw_dists = (min(radius, 48), min(radius, 40), 32, 24, 16, 8, 4)
+        dy_list = (0, 1, -1, 2, -2)
+    eff_dists = list(dict.fromkeys(d for d in raw_dists if 1 <= d <= radius)) or [max(1, min(radius, 4))]
+    batched = False
     if has_batch_get_blocks(getattr(ex, "client", None)):
-        cache.get_blocks_batch(ex.client, [(math.floor(ox + d * ux), base_y + dy + k, math.floor(oz + d * uz)) for d in eff_dists for dy in (0, 1, -1, 2, -2) for k in (-1, 0, 1)], dimension=dim)
-    has_origin_floor = any((b := _block_name_at(ex, cache, (math.floor(ox), base_y - k, math.floor(oz)), dim)) and b not in AIR for k in (1, 2))
+        probe_cells = [
+            (math.floor(ox + d * ux), base_y + dy + k, math.floor(oz + d * uz))
+            for d in eff_dists for dy in dy_list for k in (-1, 0, 1)
+        ]
+        probe_cells.extend((math.floor(ox), base_y - k, math.floor(oz)) for k in (1, 2))
+        if not high_rtt or base_y >= 58:
+            probe_cells.extend((math.floor(ox + d * ux), base_y - 4, math.floor(oz + d * uz)) for d in eff_dists)
+        cache.get_blocks_batch(ex.client, probe_cells, dimension=dim)
+        batched = True
+    allow_fb = not batched
+    has_origin_floor = any(
+        (b := _block_name_at(ex, cache, (math.floor(ox), base_y - k, math.floor(oz)), dim, allow_fallback=allow_fb))
+        and b not in AIR
+        for k in (1, 2)
+    )
     for dist in eff_dists:
         wx, wz = math.floor(ox + dist * ux), math.floor(oz + dist * uz)
         if memo.is_near_void_edge((wx, wz), dimension=dim):
             continue
-        for dy in (0, 1, -1, 2, -2):
-            if _is_nether_safe_waypoint(ex, cache, wx, base_y + dy, wz, dim):
+        for dy in dy_list:
+            if _is_nether_safe_waypoint(ex, cache, wx, base_y + dy, wz, dim, allow_fallback=allow_fb):
                 return [wx + 0.5, float(base_y + dy), wz + 0.5]
-        if has_origin_floor:
+        if has_origin_floor and not (high_rtt and dim == "overworld" and base_y < 58):
             if dim == "the_nether":
-                down_col = [_block_name_at(ex, cache, (wx, base_y - k, wz), dim) for k in range(1, 5)]
+                down_col = [_block_name_at(ex, cache, (wx, base_y - k, wz), dim, allow_fallback=allow_fb) for k in range(1, 5)]
                 if all(down_col) and (all(b in AIR for b in down_col) or any(b in ("lava", "flowing_lava") for b in down_col)):
                     memo.record_void_edge((wx, wz), dimension=dim)
             else:
-                col = [_block_name_at(ex, cache, (wx, base_y + dy, wz), dim) for dy in range(-4, 3)]
+                col = [_block_name_at(ex, cache, (wx, base_y + dy, wz), dim, allow_fallback=allow_fb) for dy in range(-4, 3)]
                 if all(col) and all(b in AIR for b in col):
                     memo.record_void_edge((wx, wz), dimension=dim)
     return None

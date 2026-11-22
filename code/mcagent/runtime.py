@@ -148,6 +148,7 @@ class State:
         self._seen_death_seqs: set[int] = set()
         self._unlinked_alive_death_mono: Optional[float] = None
         self._totem_guard: Optional[dict[str, Any]] = None
+        self.sealed_shelter: Optional[dict[str, Any]] = None
         self.last_hurt_at: float = 0.0
         self.last_hurt_info: dict[str, Any] = {}
 
@@ -465,6 +466,50 @@ class State:
     def deaths_in(self, window_s: float = 60) -> int:
         now = time.monotonic()
         return sum(1 for t in self.deaths if 0 <= now - t <= window_s)
+
+    @_locked
+    def set_sealed_shelter(self, info: Optional[dict[str, Any]]) -> None:
+        """登记/清除当前已封顶封闭避难坑状态（用于屏蔽洞外怪引起的误逃生）。"""
+        self.sealed_shelter = copy.deepcopy(info) if isinstance(info, dict) else None
+
+    @_locked
+    def get_sealed_shelter(self) -> Optional[dict[str, Any]]:
+        return copy.deepcopy(self.sealed_shelter) if isinstance(self.sealed_shelter, dict) else None
+
+    @_locked
+    def is_in_sealed_shelter(self) -> bool:
+        """确认角色当前仍安全位于已封口避难洞内且未受伤害/物理致命险情。"""
+        info = self.sealed_shelter
+        if not isinstance(info, dict):
+            return False
+        st = self.st or {}
+        if not st.get("alive", True):
+            return False
+        if st.get("in_lava") or st.get("submerged") or st.get("on_fire"):
+            return False
+        s_dim = str(info.get("dim") or "overworld").removeprefix("minecraft:").strip().lower()
+        cur_dim = str(st.get("dimension") or "overworld").removeprefix("minecraft:").strip().lower()
+        if s_dim and cur_dim and s_dim != cur_dim:
+            return False
+        s_pos = info.get("pos")
+        cur_pos = st.get("pos")
+        if (
+            isinstance(s_pos, (list, tuple)) and len(s_pos) >= 3
+            and isinstance(cur_pos, (list, tuple)) and len(cur_pos) >= 3
+        ):
+            try:
+                if math.dist(
+                    (float(s_pos[0]), float(s_pos[1]), float(s_pos[2])),
+                    (float(cur_pos[0]), float(cur_pos[1]), float(cur_pos[2])),
+                ) > 2.2:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        entered_at = float(info.get("entered_at") or 0.0)
+        now = time.monotonic()
+        if self.last_hurt_at > 0.0 and self.last_hurt_at >= entered_at + 0.5 and (now - self.last_hurt_at) <= 4.0:
+            return False
+        return True
 
     @_locked
     def last_hurt_source(self) -> Optional[str]:
@@ -1046,7 +1091,9 @@ class Safety:
             if (in_underground_cave and not has_equipped_armor(s) and not has_shield_def)
             else float(self.config.creeper_urgent_dist)
         )
-        creeper_urgent = hostile_name == "creeper" and hostile_dist < creeper_urgent_thresh
+        # 若角色已处于确认封口的挖洞避难所内且未受伤/未入水火岩浆，屏蔽洞外敌怪触发的误逃生（防挖开自封顶送死）
+        in_sealed_shelter = bool(hasattr(s, "is_in_sealed_shelter") and s.is_in_sealed_shelter())
+        creeper_urgent = (not in_sealed_shelter) and hostile_name == "creeper" and hostile_dist < creeper_urgent_thresh
         if creeper_urgent:
             add(
                 "flee",
@@ -1057,10 +1104,10 @@ class Safety:
                 creeper=True,
             )
         close_hostile_threshold = max(6.0, float(self.config.hostile_flee_dist))
-        close_non_creeper = (not creeper_urgent) and bool(hostile) and hostile_dist < close_hostile_threshold
+        close_non_creeper = (not in_sealed_shelter) and (not creeper_urgent) and bool(hostile) and hostile_dist < close_hostile_threshold
         emitted_flee = bool(creeper_urgent)
         if s.in_safe_mode:
-            suppress_safe_mode_urgent = bool(s.get_active_escape()) or close_non_creeper
+            suppress_safe_mode_urgent = bool(s.get_active_escape()) or close_non_creeper or in_sealed_shelter
             if close_non_creeper:
                 add(
                     "flee",
@@ -1087,7 +1134,7 @@ class Safety:
                 sev = "urgent" if (food <= self.config.food_crit and can_eat) else "soft"
                 add("eat", f"低饱食度 {food:g}", sev, food=food, has_food=can_eat)
         flee_threshold = effective_hostile_flee_dist(s, hostile_name)
-        if not emitted_flee and hostile and hostile_dist < flee_threshold:
+        if (not in_sealed_shelter) and not emitted_flee and hostile and hostile_dist < flee_threshold:
             ranged_urgent_names = ("skeleton", "stray", "bogged", "pillager", "parched", "witch", "blaze", "ghast")
             lethal_proximity_urgent = (
                 not s.get_active_escape()
@@ -1632,6 +1679,7 @@ class SafetyMonitor:
         self.session_error: Optional[str] = None
         self._last_err_msg: str = ""
         self._err_repeat: int = 0
+        self._tick_seq: int = 0
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -1662,12 +1710,22 @@ class SafetyMonitor:
             or any(rc.values())
         )
 
+    def _client_rtt_s(self) -> float:
+        raw = getattr(self.client, "smoothed_rtt_s", 0.0)
+        return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) else 0.0
+
     def _continuous_wait_s(self) -> float:
-        """Yield tightly on risk/airborne states and back off safely on dry ground."""
+        """Yield tightly on risk/airborne states and back off safely on dry ground / high RTT."""
         base = float(self.config.observer_min_interval_s)
+        rtt = self._client_rtt_s()
         if self._is_risk_state():
+            if rtt > 0.25:
+                return max(base, min(0.45, rtt * 0.35))
             return base
-        return min(float(self.config.poll_risk_s), base * 3.0)
+        safe_wait = min(float(self.config.poll_risk_s), base * 3.0)
+        if rtt > 0.25:
+            return max(safe_wait, min(1.5, rtt * 1.1))
+        return safe_wait
 
     def next_interval(self) -> float:
         if self.interval_s is not None:
@@ -1797,14 +1855,25 @@ class SafetyMonitor:
         self.state.set_support(evidence)
 
     def tick(self, *, force_status: Optional[bool] = None) -> Optional[dict]:
+        self._tick_seq += 1
         force = self.continuous if force_status is None else force_status
         self.state.refresh_status(self.client, max_age_s=0 if force else None)
         # 先处理致命状态，再查支撑与事件，避免慢请求延误已观察到的岩浆/缺氧抢占。
         hazard = self._dispatch(reconcile=False)
         self._check_support()
         hazard = self._dispatch(reconcile=True) or hazard
-        self.state.drain(self.client)
-        after_events = self._dispatch(reconcile=False)
+        rtt = self._client_rtt_s()
+        # 高 RTT 且安全空闲时每隔一拍拉 /events，减轻后台监控对公网反代的并发争抢；风险或动作进行中保持每拍拉取
+        should_drain = (
+            rtt <= 0.25
+            or self._is_risk_state()
+            or self.executor.active_action is not None
+            or (self._tick_seq % 2 == 1)
+        )
+        after_events = None
+        if should_drain:
+            self.state.drain(self.client)
+            after_events = self._dispatch(reconcile=False)
         if (self.refresh_inventory or self.continuous) and (self.state.inventory_dirty or not self.state.inventory):
             self.state.refresh_inventory(self.client)
         return after_events or hazard

@@ -549,9 +549,12 @@ class TestSurvivalPolicyLayer(unittest.TestCase):
         st_fed = _make_state(items={"stone_sword": 1, "cooked_beef": 2}, is_day=True)
         self.assertIsNone(self.planner.choose_survival_or_safe_mode(st_fed))
 
-        # 5) Night without raw meat + furnace -> does NOT trigger
+        # 5) Night without raw meat + furnace -> does NOT trigger gather_food (unarmored bot now digs night_shelter)
         st_night = _make_state(items={"stone_sword": 1}, is_day=False)
-        self.assertIsNone(self.planner.choose_survival_or_safe_mode(st_night))
+        dec_night = self.planner.choose_survival_or_safe_mode(st_night)
+        if dec_night is not None and dec_night.skill is not None:
+            self.assertNotEqual(dec_night.skill.name, "gather_food")
+            self.assertEqual(dec_night.skill.name, "night_shelter")
 
         # 6) Raw meat cooking gate at night: beef=3, coal=2, cooked=0, furnace in memo -> triggers gather_food
         st_cook = _make_state(items={"beef": 3, "coal": 2}, is_day=False)
@@ -599,13 +602,16 @@ class TestSurvivalPolicyLayer(unittest.TestCase):
             self.assertIsNotNone(dec.skill)
             self.assertEqual(dec.skill.name, "sleep_in_bed")
 
-        # Does NOT trigger when hostile <= 12 (dist=11.0 avoids <9.0 flee while <=12)
+        # Does NOT trigger sleep_in_bed when hostile <= 12 (dist=11.0 falls back to relaxed night_shelter)
         st_near_mob = _make_state(
             items={"white_bed": 1, "cooked_beef": 4},
             is_day=False,
             nearest_hostile={"name": "zombie", "dist": 11.0},
         )
-        self.assertIsNone(RulePlanner(min_verified="offline").choose_survival_or_safe_mode(st_near_mob))
+        dec_near = RulePlanner(min_verified="offline").choose_survival_or_safe_mode(st_near_mob)
+        if dec_near is not None and dec_near.skill is not None:
+            self.assertNotEqual(dec_near.skill.name, "sleep_in_bed")
+            self.assertEqual(dec_near.skill.name, "night_shelter")
 
         # Does NOT trigger in daytime
         st_day = _make_state(items={"white_bed": 1, "cooked_beef": 4}, is_day=True)

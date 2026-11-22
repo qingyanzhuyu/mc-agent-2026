@@ -302,7 +302,36 @@ class Client:
         self._block_cache_lock = threading.Lock()
         self._block_cache: dict[tuple[int, int, int], tuple[float, dict]] = {}
         self._block_cache_gen: int = 0
+        self._rtt_lock = threading.Lock()
+        self._smoothed_rtt_s: float = 0.0
         self._load_cached_token()
+
+    @property
+    def smoothed_rtt_s(self) -> float:
+        """最近只读观测请求的指数滑动平均 RTT（秒），供批量并发与缓存 TTL 自适应。"""
+        with self._rtt_lock:
+            return self._smoothed_rtt_s
+
+    def _record_rtt(self, route: str, elapsed_s: float) -> None:
+        if route not in ("status", "get_block", "events", "inventory", "find_blocks", "get_entities", "advancements"):
+            return
+        if not math.isfinite(elapsed_s) or elapsed_s < 0:
+            return
+        clamped = min(10.0, float(elapsed_s))
+        with self._rtt_lock:
+            if self._smoothed_rtt_s <= 0.0:
+                self._smoothed_rtt_s = clamped
+            else:
+                self._smoothed_rtt_s = 0.75 * self._smoothed_rtt_s + 0.25 * clamped
+
+    def _effective_block_cache_ttl(self) -> float:
+        ttl = getattr(self.cfg, "block_cache_ttl_s", 0.0)
+        if ttl <= 0:
+            return 0.0
+        rtt = self.smoothed_rtt_s
+        if rtt > 0.20:
+            return max(float(ttl), min(10.0, rtt * 6.0))
+        return float(ttl)
 
     def _is_background_thread(self) -> bool:
         return getattr(self._bg_tls, "depth", 0) > 0
@@ -388,6 +417,7 @@ class Client:
             urgent=is_urgent,
             background=self._is_background_thread() and not is_urgent,
         )
+        t_req = time.monotonic()
         try:
             if method == "GET":
                 r = self.session.get(url, headers=headers, params=body, timeout=timeout)
@@ -395,6 +425,8 @@ class Client:
                 r = self.session.post(url, headers=headers, data=json.dumps(body or {}), timeout=timeout)
         except requests.RequestException as e:
             raise ApiError("network", f"{type(e).__name__}: {e}") from e
+        if r.status_code < 500:
+            self._record_rtt(route, time.monotonic() - t_req)
 
         if r.status_code == 401:
             code = "invalid_token"
@@ -681,7 +713,7 @@ class Client:
 
     def get_block(self, pos, *, use_cache: bool = True) -> dict:
         pos_list = list(pos)
-        ttl = getattr(self.cfg, "block_cache_ttl_s", 0.0)
+        ttl = self._effective_block_cache_ttl()
         key = self._block_cache_key(pos_list) if (use_cache and ttl > 0) else None
         with self._block_cache_lock:
             gen_before = self._block_cache_gen
@@ -724,7 +756,7 @@ class Client:
 
         out: dict[tuple[int, int, int], dict] = {}
         missing: list[tuple[int, int, int]] = []
-        ttl = getattr(self.cfg, "block_cache_ttl_s", 0.0)
+        ttl = self._effective_block_cache_ttl()
         if use_cache and ttl > 0:
             now = time.monotonic()
             with self._block_cache_lock:
@@ -756,7 +788,10 @@ class Client:
             except Exception:
                 return cell, {}
 
-        workers = max(1, min(int(max_workers or 1), len(missing), 16))
+        req_workers = int(max_workers or 1)
+        if self.smoothed_rtt_s > 0.25:
+            req_workers = min(req_workers, 3)
+        workers = max(1, min(req_workers, len(missing), 16))
         if workers <= 1 or len(missing) == 1:
             for cell in missing:
                 k, val = _fetch_one(cell)
