@@ -279,12 +279,17 @@
   }
 
   async function handleStop(force = false) {
+    const btn = force ? $("btnKill") : $("btnStop");
+    btn.disabled = true;
     try {
       const res = await apiPost(force ? "/api/run/kill" : "/api/run/stop", {});
+      if (res.status) renderProcessStatus(res.status);
       showToast(res.message || "已发送停止信号", "ok");
       await refreshAll();
     } catch (err) {
       showToast(err.message, "bad");
+    } finally {
+      btn.disabled = false;
     }
   }
 
