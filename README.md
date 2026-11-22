@@ -1,6 +1,6 @@
 # 南大 AI Agent for Minecraft 开发大赛 · Harness 赛道备赛仓库
 
-> 状态：**架构收拢分支 `feat/arch-converge-v2-agy`（待合入 `main`；4 项核心技能 `verified: live` + 75 项技能 `verified: offline` / 含阶段二 37 项与阶段三 18 项 T4 精选技能，另附 `local-target` 冒烟）** · 更新 2026-11-19
+> 状态：**已合入 `main@d9e3f5c`（`feat/arch-converge-v2-agy` 268 commits 已并入主线；85 个注册 L3 技能：`4 live` + `81 offline`；109 项 `GoalSpec` 台账：94/99 计分项 / 2,925 分上限 [86.4%]；另附 `local-target` Sprint 1–4 与 `soak8h_deep` `seg-01..seg-31` 压测）** · 更新 2026-11-22
 > 初赛：**11/22（日）10:00–18:00，8 小时，每人一座虚空岛（v2 草案）** · 决赛：12/6
 > 出线：初赛取 8 队 · 报名截止：**11/18**
 
@@ -20,7 +20,7 @@
 | # | 判断 | 为什么重要 | 依据 |
 |---|---|---|---|
 | J1 | **动作互斥且同步阻塞**，所以并发只能用来"想"，不能用来"做" | 决定了整个架构：不是多 Agent 并行，而是"动作期间在另一个线程里算下一步 + 后台监控紧急抢占" | [接口 §0/§4](docs/02-接口与架构.md) |
-| J14 / J19 | **分值只由难度决定（深度已取消）；7 个 100 分项按官方判据核算都不值得进主线** | 先把约 290 分的底仓做稳，再按岛的实际情况叠加，长链必须带止损 | [性价比分层](docs/11-任务性价比分层.md) |
+| J14 / J19 | **分值只由难度决定（深度已取消）；明确放弃 5 项高脆度/极低性价比目标（合计 460 分）** | 先把约 290 分的底仓做稳，再按岛的实际情况叠加，长链必须带止损 | [性价比分层](docs/11-任务性价比分层.md) |
 | J3 | **死亡循环（60s 死 3 次 → 下线 5 分钟）是唯一的一票否决** | 8 小时一次机会，触发两次就丢 10 分钟 + 全部掉落 | [规范 §7](docs/02-接口与架构.md) |
 | J11 | **基础生存靠确定性技能推进，LLM 负责选目标与异常诊断** | 规避 LLM 30–118s 尾延迟与单步幻觉，模型抖动时仍能继续保活发育 | [关键判断 J8/J11](docs/01-关键判断.md) |
 | J5 | **40 分工程评审是最稳的分数**，靠可复现证据与纪律拿分 | 很多队"跑起来了但讲不清"；日志/故障注入单测/结构清晰度是我们主动可控的证据 | [计划 §4](plan/11-12到11-22执行计划.md) |
@@ -59,16 +59,16 @@ plan/
   赛前切换清单.md    T-7 / T-1 / T-0 与 11/22 线下交流日切换清单
 code/
   mcagent/
-    client.py        HTTP 客户端（401 单点刷新 + .token.json 复用 + 16 RPS 分级限速 + get_block 缓存 + 姿态合并，冻结面）
-    runtime.py       State / Safety / 连续异步 SafetyMonitor / Executor（可抢占锁 + 非幂等判重 + 有界 move_to 超时禁重试 + v1.3.11 精选恢复，冻结面）
+    client.py        HTTP 客户端（401 单点刷新 + .token.json 复用 + 100,000 RPS 无频控零排队快路径/429 retry_after_s 退避//stop 优先 + trust_env=False + 32 路连接池 + 8 线程并发只读 get_blocks_batch + busy:dig 连续 3 次未释放断线重连，冻结面）
+    runtime.py       State / Safety / 连续异步 SafetyMonitor（风险态 20 Hz 0.05s / 安全态 0.15s，地下无盾苦力怕 <7.5m 与残血远程 14m 预警）/ Executor（可抢占锁 + 非幂等判重 + 有界 move_to 超时禁重试 + v1.3.11 精选恢复，冻结面）
     preflight.py     赛前切换自检（12 项静态门禁：官方端点 / 凭据 / 2 路并发闸门 / 8787 网关 / 残留 soak_ctl·mcagent 进程 / apiin 误配 7897 代理拦截）
     smoke.py probe.py 冒烟与基线测量（含 --api-capabilities / --pathfinding）
     planner/         决策层：objective.py（目标级战略校验）、skill_choice.py、decision.py、llm.py（2 路 BoundedSemaphore 并发闸门）、scheduler.py
-    skills/          执行层：L2 原语（voxel_cache / reach / escape / nav / sightline / furnace_lease 等）、world_memo.py（21 类指纹 + 原子 JSON 检查点）、79 个注册 L3 技能（4 项 verified="live" + 75 项 verified="offline"，含 emergency_escape 及阶段三 18 项 T4 技能）
-    loop/            主循环与策略：engine.py（同格冷却自旋三级升级 + 30s 沿路增量扫描）、goals.py（104 项 GoalSpec 台账：89 计分项 / 2,730 分上限 [80.6%]，6 graduated / 1 candidate / 97 draft）、subgoals.py（10 项活谓词 + 10 类工作站）、strategy.py & strategy_async.py（--strategy llm）、context.py、auditor.py、tape.py
-  tests/             离线故障注入、架构契约与集成回归单测：1,421 项 Python unittest（verified: offline）
+    skills/          执行层：L2 原语（voxel_cache / reach / escape / nav / landmark_nav / mine_shaft / spawn_shelter / camp_base / camp_plan / sightline 3D DDA / furnace_lease 等）、world_memo.py（21 类结构指纹 + 4 类群系方块指纹 + 32×32 访问网格 + 虚空岛穷尽停探 + 原子 JSON 检查点）、85 个注册 L3 技能（4 项 verified="live" + 81 项 verified="offline"，含 emergency_escape、阶段三 18 项 T4 技能及新增 brush_archaeology / hatch_and_raise_sniffer / collect_froglights）
+    loop/            主循环与策略：engine.py（同格冷却自旋三级升级 + 5s 或位移 ≥8 格沿路增量扫描与零成本群系被动采样）、goals.py（109 项 GoalSpec 台账：覆盖 94/99 计分项 / 2,925 分上限 [86.4%]，6 graduated / 1 candidate (smelt_iron) / 102 draft，52 项地标先验静默门控 requires_landmarks，明确放弃 5 项合计 460 分）、subgoals.py（10 项活谓词 + 10 类工作站）、strategy.py & strategy_async.py（--strategy llm）、context.py、auditor.py、tape.py
+  tests/             离线故障注入、架构契约与集成回归单测：1,789 项 Python unittest（0 失败 0 跳过，verified: offline）
 tools/
-  local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，含 11 项 Node 网关契约单测，与比赛代码零耦合）
+  local-api-bridge/  赛前本地/局域网 v1.3.1 契约联调网关（连接 1.21.11 原版测试服，含 16 项 Node 网关契约单测，支持可取消 dig 根治 busy:dig 永久锁与 bot.consume() 超时映射 timeout，与比赛代码零耦合）
 ```
 
 ## 怎么参与
@@ -84,14 +84,14 @@ tools/
 
 - [x] 抓全公告 + 初赛细则 + 计分/判据表整理（`docs/00`、`docs/08`–`docs/13`）
 - [x] 读完接口规范 v1.3.1–v1.3.11，探通官方双端点无鉴权（2026-11-19 实测：校园网 `apiin.nmo.net.cn` 长连接 RTT `4.0–4.3 ms`，公网 `mc-api.windywindie.top` `816–973 ms`，均返 `401 unauthorized`）
-- [x] 底层容错与运行时加固（401 单点重登与 Token 持久化、16 RPS 三级限速、连续异步 `SafetyMonitor`、死亡去重与 65s 避险锁存、非幂等超时判重、有界 `move_to` 超时禁重试、`emergency()` 紧急抢占、移植 `v1.3.11` 精选恢复 4 项）
-- [x] 架构收拢至 `feat/arch-converge-v2-agy` 并合入 Stage 3（Wave A–D，**79 个注册 L3 技能**：`4` 项 `verified="live"` + `75` 项 `verified="offline"`；**104 项 `GoalSpec` 台账**：`89` 计分项 / `2,730` 分上限 [80.6%]，`6 graduated / 1 candidate / 97 draft`；10 项活谓词、21 类世界指纹、受控图腾单次安全钩子、共享子图 DAG 边际 ROI、被动机会根目标门控、30s 节流沿路扫描与 `furnace_lease` 异步租约）+ **1,421 项 Python `unittest` + 11 项 Node 网关契约单测全绿**
-- [x] 本地靶场 `local-target` 冷启动、阶段二与阶段三技能冒烟复测（2 轮 240s 冷启动验证闭环，第 2 轮 `<local_test_bot>` 0 死亡拿 10 分；阶段二 `survey_island`/`discover_structure`/`trade_villager`/`furnace_lease` 冒烟通过；阶段三 Step 0 `T4-P1..P4` 标定及 18 项空包 `blocked` 18/18 拦截 + Vanilla 1.21.11 实跑 `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 解锁真实进度；**均不进入正式比赛时间预算表**）
+- [x] 底层容错与运行时加固（401 单点重登与 Token 持久化、`100,000 RPS` 无频控零排队快路径 + `/stop` 急停优先 + HTTP 429 `retry_after_s` 退避 + `trust_env=False`、`32` 路连接池、`8` 线程并发只读 `get_blocks_batch`、风险态 `20 Hz (0.05s)` / 安全态 `0.15s` 连续异步 `SafetyMonitor`、双端根治 `busy:dig` 永久动作锁死锁、`bot.consume()` 超时映射为 `timeout`、死亡去重与 65s 避险锁存、非幂等超时判重、有界 `move_to` 超时禁重试、`emergency()` 紧急抢占、移植 `v1.3.11` 精选恢复 4 项）
+- [x] `feat/arch-converge-v2-agy`（268 commits）已合入 `main@d9e3f5c`（**85 个注册 L3 技能**：`4` 项 `verified="live"` + `81` 项 `verified="offline"`，新增 `brush_archaeology`、`hatch_and_raise_sniffer`、`collect_froglights`；**109 项 `GoalSpec` 台账**：覆盖 `94 / 99` 计分项 / **2,925 分**上限 [86.4%]，`6 graduated / 1 candidate (smelt_iron) / 102 draft`，**52 项** `requires_landmarks` 地标先验静默门控，明确放弃 5 项共 460 分；`world_memo.py` 21 类结构指纹 + 4 类群系方块指纹 + 32×32 访问网格 + 虚空岛穷尽停探、5s/位移 ≥8 格沿路扫描 + 零成本群系被动采样、`landmark_nav.py` / `mine_shaft.py` / `spawn_shelter.py` / `camp_base.py` / `camp_plan.py` / `furnace_lease.py` / `sightline.py`）+ **1,789 项 Python `unittest` + 16 项 Node 网关契约测试全绿（0 失败 0 跳过）**
+- [x] 本地靶场 `local-target` 冷启动、阶段二/三冒烟、Sprint 1–4 与 `soak8h_deep` 压测（Sprint 1–4 将 30m 死亡从 `9 → 1` [约降 89%]、未探明地标空唤醒 `28 → 0`、20m LLM 耗 `28,991` tokens [外推 8h 占官方输入额度 8.5%]；随后 `soak8h_deep` 连续 31 段 `seg-01..seg-31` 闭环双端锁自愈、水坑/隐形边界/干地 1×1 石穴三类几何陷阱脱困及 `c68cbc6` 破 30 分五项进度根因修复；阶段三 `T4-P1..P4` 标定及 18 项空包 `blocked` 拦截 + `crafter_chain`/`ride_strider_boost`/`jukebox_meadow` 3/3 解锁真实进度；**均不进入正式比赛时间预算表**）
 - [x] **官方正式皮肤站账号登录 + `ready=True`**（校园网 `apiin.nmo.net.cn` `preflight --apply --live` 15/15 全绿、`smoke` `0.5s` 登录进服就绪，Token TTL 24h）
-- [x] **官方校园网基线 `probe` + 能力标定 + AIA 实测**（`T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`、`MC_MAX_RPS` 4/8/12/16 零限流、C16 虚空保护误报 `0/12`、官方 AIA `qwen3.6-35b-a3b` 快路径 `4/4` `p50=1652.7 ms`，已关闭 `docs/04` B18/C1 等 10 项待确认项，数据归档 `results/probe/`）
+- [x] **官方校园网基线 `probe` + 能力标定 + AIA 实测**（`T_status` 稳态 `7.34 ms`、`T_move20=3648 ms`、`T_dig1=2146 ms`、11/19 历史阶梯 `MC_MAX_RPS` 4/8/12/16 零限流、C16 虚空保护误报 `0/12`、官方 AIA `qwen3.6-35b-a3b` 快路径 `4/4` `p50=1652.7 ms`，已关闭 `docs/04` B18/C1 等 10 项待确认项，数据归档 `results/probe/`）
 - [x] **官方真机故障演练 3/3 PASS**（断线重连 `63.11s`、`safe_mode` `65.2s` 冷却自愈、3 线程并发 401 单飞刷新 `login_calls=1`，归档 `results/probe/fault-drills-official-20261119.json`）
-- [x] **官方 2 小时长跑取证 + 根因修复 + 评审五部分材料冻结**（`official-soak-20261119` 有效 `6303.9s` **0 死亡 0 崩溃**、`emergency_escape` 6/6，前 `124.7s` 拿下 5 项起步目标；4 项零缺陷技能升格 `verified="live"`；暴露的 4 环死锁与 Token 烧爆已在 `c03c26e` 闭环修复；`INC-005` 可 100% 离线 `--replay`；`report.md`、`report.pdf`、`demo.md`、`results/` 已脱敏汇编就绪）
-- [ ] **阶段二/三技能真机晋级 + 合入 `main` + 赛前收尾**（阶段二/三及未实测技能共 **75 项仍保持 `verified="offline"`**、台账 97 项仍为 `draft`，`feat/arch-converge-v2-agy` **尚待最终合入 `main`**；另待 11/22 演示备用录屏、跟进官方提交入口 `docs/04` A3 与 `docs/05` 角色表人类签字）
+- [x] **官方 2 小时长跑取证 + 根因修复 + 评审五部分材料冻结**（`official-soak-20261119` 有效 `6303.9s` **0 死亡 0 崩溃**、`emergency_escape` 6/6，前 `124.7s` 拿下 5 项起步目标；4 项零缺陷技能升格 `verified="live"`；暴露的 4 环死锁与 Token 烧爆已在 `c03c26e` 闭环修复；`INC-005` 2/2 离线确定性 `--replay`；`report.md`、`report.pdf`、`demo.md`、`results/` 已脱敏汇编就绪）
+- [ ] **阶段二/三及新增技能真机晋级 + 官方复验 + 赛前收尾**（阶段二/三及未实测技能共 **81 项仍保持 `verified="offline"`**、台账 **102 项**仍为 `draft`，`c03c26e` 四环死锁修复与 `100k RPS` 改造待新一轮官方对比复验；另待 11/22 演示备用录屏、跟进官方提交入口 `docs/04` A3 与 `docs/05` 角色表人类签字）
 
 ## 已知的两个坑
 
