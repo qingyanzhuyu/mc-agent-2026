@@ -402,12 +402,21 @@ class SurveyIsland(Skill):
             if memo.get_spiral_cursor(dimension=dim)["ring"] == 0 and all(i in memo.done_sectors(dimension=dim) for i in range(sectors)):
                 memo.advance_spiral_cursor(dimension=dim, sectors_per_ring=1)
         else:
+            any_moved = False
+            any_landmarks = False
             for _ in range(sectors):
                 cur = memo.get_spiral_cursor(dimension=dim)
                 res = yield from survey_sector(ex, state, sector_idx=cur["sector"], total_sectors=8, radius=radius, ring_radius=cur["radius"], anchor=anchor)
                 if isinstance(res, Mapping) and res.get("aborted_threat"):
                     raise Replan("扇区体检期间出现近身威胁或安全意图，立即让位脱险")
+                if isinstance(res, Mapping):
+                    if res.get("moved"):
+                        any_moved = True
+                    if res.get("landmarks"):
+                        any_landmarks = True
                 memo.advance_spiral_cursor(dimension=dim, sectors_per_ring=8)
+            if not any_moved and not any_landmarks:
+                raise Replan("扇区外扩全部移动受阻（疑似困在封闭地形），优先脱困后再体检")
         self._completed_batch = True
 
     def verify_done(self, state, before_counts=None) -> str:
