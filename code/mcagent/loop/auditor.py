@@ -45,10 +45,14 @@ _ITEM_MILESTONES: tuple[tuple[str, tuple[str, ...], int], ...] = (
 
 _SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
-# 站位/工况前置未确认类环境变量：属于局部作业站位问题，不等于真实资源枯竭（如 wood / exposed_iron）
+# 站位/工况前置未确认类环境变量：属于局部作业站位或本地前置准备问题，不等于真实资源枯竭（如 wood / exposed_iron / plantable_seed）
 _STANCE_ONLY_ENV_PREDICATES: frozenset[str] = frozenset({
     "dry_work_stand",
     "unconfirmed_work_stand",
+    "reachable_stone_mining_site",
+    "safe_scout_stand",
+    "planting_preparation",
+    "reachable_planting_plot",
 })
 
 _MOB_COMBAT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -312,6 +316,7 @@ class SoakObserver:
         self._recent_steps: deque[dict] = deque(maxlen=20)
         self._stuck_window: deque[tuple[list[float], dict[str, int]]] = deque(maxlen=self.stuck_steps)
         self._goal_failures: dict[str, deque[float]] = {}
+        self._session_interruptions: dict[tuple[str, str], deque[list[Any]]] = {}
         self._incidents: dict[str, dict] = {}
         self._incident_seq = 0
         self._skill_ctx: Optional[dict] = None
@@ -579,11 +584,42 @@ class SoakObserver:
         elif outcome == "completed":
             stat["ok"] += 1
             arg_entry["ok"] += 1
-            # 经后置判据确认的成功打断该目标的连续失败，其他目标的历史保持不变。
+            # 经后置判据确认的成功打断该目标的连续失败与断线累计，其他目标/技能历史保持不变。
             self._goal_failures.pop(skill.goal, None)
+            for intr_key in [k for k in self._session_interruptions if k[0] == skill.name]:
+                del self._session_interruptions[intr_key]
         elif outcome == "budget_stopped":
             # 外层运行预算只说明未继续执行，不能判定技能失败；保留流水与姿态核对。
             stat["budget_stopped"] += 1
+        elif outcome == "action_busy":
+            key = f"{skill.name}:{error_code or 'busy'}"
+            self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
+        elif outcome == "session_interrupted":
+            now_m = time.monotonic()
+            err_tag = error_code or "session_interrupted"
+            iq = self._session_interruptions.setdefault(
+                (skill.name, err_tag),
+                deque(maxlen=max(10, self.replan_oscillation_threshold)),
+            )
+            iq.append([now_m, False])
+            recent_interrupts = [entry for entry in iq if now_m - entry[0] <= 180.0]
+            if len(recent_interrupts) < self.replan_oscillation_threshold:
+                key = f"{skill.name}:{err_tag}"
+                self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
+            else:
+                q = self._goal_failures.setdefault(
+                    skill.goal, deque(maxlen=max(10, self.replan_oscillation_threshold))
+                )
+                for entry in recent_interrupts[:-1]:
+                    if not entry[1]:
+                        q.append(entry[0])
+                        entry[1] = True
+                recent_interrupts[-1][1] = True
+                self._record_replan_failure(
+                    skill, outcome, error_code, error_msg, state, ctx, tape_slice,
+                    stat=stat, arg_entry=arg_entry, now_elapsed=now_elapsed,
+                    environment_recovery=environment_recovery, now_m=now_m,
+                )
         elif environment is not None:
             key = f"{skill.name}:env_blocked"
             self.env_variance_counts[key] = self.env_variance_counts.get(key, 0) + 1
@@ -591,18 +627,9 @@ class SoakObserver:
             if environment.missing_predicate not in _STANCE_ONLY_ENV_PREDICATES:
                 self._goal_failures.pop(skill.goal, None)
         else:
-            stat["replan"] += 1
-            arg_entry["replan"] += 1
-            if outcome == "replan":
-                self._last_replan = {
-                    "skill": skill.name,
-                    "args": dict(skill.args),
-                    "error_code": error_code,
-                    "error_msg": error_msg[:200],
-                    "elapsed_s": now_elapsed,
-                }
-            self._classify_skill_failure(
+            self._record_replan_failure(
                 skill, outcome, error_code, error_msg, state, ctx, tape_slice,
+                stat=stat, arg_entry=arg_entry, now_elapsed=now_elapsed,
                 environment_recovery=environment_recovery,
             )
 
@@ -645,6 +672,37 @@ class SoakObserver:
         self._skill_ctx = None
         self.write_summary()
 
+    def _record_replan_failure(
+        self,
+        skill,
+        outcome: str,
+        error_code: str,
+        error_msg: str,
+        state: State,
+        ctx: dict,
+        tape_slice: list[dict],
+        *,
+        stat: dict[str, int],
+        arg_entry: dict[str, Any],
+        now_elapsed: float,
+        environment_recovery: bool = False,
+        now_m: Optional[float] = None,
+    ) -> None:
+        stat["replan"] += 1
+        arg_entry["replan"] += 1
+        if outcome in ("replan", "session_interrupted"):
+            self._last_replan = {
+                "skill": skill.name,
+                "args": dict(skill.args),
+                "error_code": error_code,
+                "error_msg": error_msg[:200],
+                "elapsed_s": now_elapsed,
+            }
+        self._classify_skill_failure(
+            skill, outcome, error_code, error_msg, state, ctx, tape_slice,
+            environment_recovery=environment_recovery, now_m=now_m,
+        )
+
     def _classify_skill_failure(
         self,
         skill,
@@ -656,6 +714,7 @@ class SoakObserver:
         tape_slice: list[dict],
         *,
         environment_recovery: bool = False,
+        now_m: Optional[float] = None,
     ) -> None:
         if outcome in ("fatal", "unexpected_exception") or error_code in ("bad_args", "unknown_api"):
             self._report_incident(
@@ -678,8 +737,10 @@ class SoakObserver:
         if environment_recovery and skill.name == "scout_island" and error_code in ("path_not_found", "stalled"):
             self._goal_failures.pop(skill.goal, None)
             return
-        now_m = time.monotonic()
-        q = self._goal_failures.setdefault(skill.goal, deque(maxlen=10))
+        now_m = time.monotonic() if now_m is None else now_m
+        q = self._goal_failures.setdefault(
+            skill.goal, deque(maxlen=max(10, self.replan_oscillation_threshold))
+        )
         q.append(now_m)
         recent_n = sum(1 for t in q if now_m - t <= 180.0)
         if recent_n >= self.replan_oscillation_threshold:

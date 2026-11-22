@@ -659,7 +659,14 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
             self._assert_proactive_fields(spam20[0], obs20, expected_severity="P1")
 
     def test_stance_only_env_blocked_on_run_end_preserves_timeline_and_incidents(self):
-        for pred in ("dry_work_stand", "unconfirmed_work_stand"):
+        for pred in (
+            "dry_work_stand",
+            "unconfirmed_work_stand",
+            "reachable_stone_mining_site",
+            "safe_scout_stand",
+            "planting_preparation",
+            "reachable_planting_plot",
+        ):
             with self.subTest(predicate=pred, case="goal_miss_and_starvation"), tempfile.TemporaryDirectory() as tmp:
                 obs = SoakObserver(tmp, target_goal="smelt_iron")
                 state = _make_ready_state()
@@ -716,7 +723,14 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
                 self._assert_proactive_fields(spam[0], obs_sp, expected_severity="P1")
 
     def test_stance_only_env_blocked_on_skill_end_does_not_clear_goal_failures(self):
-        for pred in ("dry_work_stand", "unconfirmed_work_stand"):
+        for pred in (
+            "dry_work_stand",
+            "unconfirmed_work_stand",
+            "reachable_stone_mining_site",
+            "safe_scout_stand",
+            "planting_preparation",
+            "reachable_planting_plot",
+        ):
             with self.subTest(predicate=pred), tempfile.TemporaryDirectory() as tmp:
                 obs = SoakObserver(tmp, target_goal="smelt_iron")
                 state = _make_ready_state()
@@ -744,7 +758,7 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
                 self.assertTrue(any(i["code"] == "REPLAN_OSCILLATION" for i in incs), incs)
 
     def test_real_env_blocked_positive_control_clears_goal_failures_and_suppresses_incidents(self):
-        for pred in ("wood", "exposed_iron", "idle"):
+        for pred in ("wood", "exposed_iron", "idle", "plantable_seed"):
             with self.subTest(predicate=pred, case="on_skill_end"), tempfile.TemporaryDirectory() as tmp:
                 obs = SoakObserver(tmp, target_goal="smelt_iron")
                 state = _make_ready_state()
@@ -771,7 +785,7 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
                     f"{pred} 应清空 _goal_failures 避免误报 REPLAN_OSCILLATION",
                 )
 
-        for pred in ("wood", "exposed_iron"):
+        for pred in ("wood", "exposed_iron", "plantable_seed"):
             with self.subTest(predicate=pred, case="on_run_end"), tempfile.TemporaryDirectory() as tmp_end:
                 obs_end = SoakObserver(tmp_end, target_goal="smelt_iron")
                 state_end = _make_ready_state()
@@ -798,6 +812,32 @@ class ProactiveAnomalyDetectionTests(unittest.TestCase):
                     ),
                     incs,
                 )
+
+    def test_repeated_session_interrupted_escalates_to_replan_oscillation_and_resets_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obs = SoakObserver(tmp, replan_oscillation_threshold=3)
+            state = _make_ready_state()
+            skill = _make_stub_skill("smelt_iron", "iron:smelt")
+
+            # 前两次断连计入波动，不立即开单
+            for _ in range(2):
+                _run_skill_cycle(obs, skill, state, outcome="session_interrupted", error_code="not_connected")
+            self.assertEqual(obs.env_variance_counts.get("smelt_iron:not_connected"), 2)
+            self.assertFalse(any(i["code"] == "REPLAN_OSCILLATION" for i in _read_incidents(Path(tmp))))
+
+            # 成功一次应清零连续断连计数
+            _run_skill_cycle(obs, skill, state, outcome="completed")
+            self.assertEqual(obs._session_interruptions, {})
+
+            # 180s 内连续达到阈值 3 次 session_interrupted -> 升级为 REPLAN_OSCILLATION 告警
+            for _ in range(3):
+                _run_skill_cycle(obs, skill, state, outcome="session_interrupted", error_code="not_connected")
+            incs = _read_incidents(Path(tmp))
+            osc = [i for i in incs if i["code"] == "REPLAN_OSCILLATION"]
+            self.assertEqual(len(osc), 1, incs)
+            self.assertIsNotNone(obs._last_replan)
+            assert obs._last_replan is not None
+            self.assertEqual(obs._last_replan["error_code"], "not_connected")
 
     def test_skill_spam_loop_extreme_hard_floors_and_boundaries(self):
         wood_block = {
