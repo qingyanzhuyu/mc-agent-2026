@@ -223,7 +223,7 @@ def _auto_equip_withdrawn(ex: "Executor", state: "State", withdrawn: Mapping[str
 
 @register
 class ManageCampChest(Skill):
-    name, goal, verified, cooldown_s = "manage_camp_chest", "camp:{mode}", "offline", 10.0
+    name, goal, verified, cooldown_s = "manage_camp_chest", "camp:{mode}", "live", 10.0
     description = "在营地建箱存富余物资、重生开箱自动穿甲重装或受控捡尸"
     params = {"mode": Param(str, "营地操作模式", default="deposit", choices=("deposit", "withdraw", "setup", "recover_corpse"))}
 

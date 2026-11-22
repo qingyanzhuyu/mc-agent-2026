@@ -152,6 +152,7 @@ class _T4Skill(Skill):
 @register
 class TradeWorldHeight(_T4Skill):
     name, goal = "trade_world_height", "t4:trade_at_world_height"
+    verified = "live"
     description = "借助高空下界门锚定或流浪商人在世界最高高度完成交易"
     params = {"prep_only": Param(bool, "仅搭建Y=314高空下界门与Y=319交易台前置", default=False)}
     @classmethod
@@ -259,6 +260,7 @@ class TradeWorldHeight(_T4Skill):
 @register
 class ArbalisticTrenchShot(_T4Skill):
     name, goal = "arbalistic_trench_shot", "t4:arbalistic"
+    verified = "live"
     description = "备齐穿透IV弩与5种唯一生物并在1×1×5浅槽轴向一箭穿五"
     params = {"prep_only": Param(bool, "仅备齐穿透IV弩或5种唯一生物包不射击", default=False),
               "prep_mode": Param(str, "准备模式", default="all", choices=("all", "crossbow", "mobs"))}

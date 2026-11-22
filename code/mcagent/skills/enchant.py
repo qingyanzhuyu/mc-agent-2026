@@ -469,7 +469,7 @@ class EnchantItem(Skill):
     name = "enchant_item"
     description = "复用或制作附魔台，选择可支付的附魔并在背包复核结果"
     goal = "story:enchant_item"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

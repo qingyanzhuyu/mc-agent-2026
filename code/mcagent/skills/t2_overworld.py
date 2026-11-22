@@ -464,6 +464,7 @@ class _OverworldSkill(Skill):
 @register
 class SummonIronGolem(_OverworldSkill):
     name, description, goal = "summon_iron_golem", "放置 4 个铁块与雕刻南瓜召唤铁傀儡", "t2:iron_golem"
+    verified = "live"
     _done_msg = "未确认铁傀儡建造或雕刻南瓜消耗"
 
     @classmethod
@@ -509,6 +510,7 @@ class SummonIronGolem(_OverworldSkill):
 @register
 class SniperDuel(_OverworldSkill):
     name, description, goal = "sniper_duel", "在 50 格以上用弓射杀骷髅完成狙击手对决", "t2:sniper_duel"
+    verified = "live"
     params = {"radius": Param(int, "搜索骷髅半径", default=64, min=32, max=64)}
     _done_msg = "未确认 50 格狙击发射"
 
@@ -559,6 +561,7 @@ class SniperDuel(_OverworldSkill):
 @register
 class MakeSignGlow(_OverworldSkill):
     name, description, goal = "make_sign_glow", "放置或复用告示牌并用荧光墨囊使其发光", "t2:glow_sign"
+    verified = "live"
     _done_msg = "未确认对告示牌使用荧光墨囊"
 
     @classmethod
@@ -589,6 +592,7 @@ class MakeSignGlow(_OverworldSkill):
 @register
 class CatchAquaticMob(_OverworldSkill):
     name, description, goal = "catch_aquatic_mob", "靠近鱼类或美西螈并用水桶捕捉", "t2:aquatic_{target}"
+    verified = "live"
     params = {"target": Param(str, "目标水生生物", default="fish", choices=("fish", "axolotl")), "radius": Param(int, "搜索半径", default=32, min=8, max=64)}
     _done_msg = "未确认捕获目标水生生物"
 
@@ -621,6 +625,7 @@ class CatchAquaticMob(_OverworldSkill):
 @register
 class TameAnimal(_OverworldSkill):
     name, description, goal = "tame_animal", "用骨头驯服狼或用生鳕鱼/鲑鱼驯服猫", "t2:tame"
+    verified = "live"
     params = {"radius": Param(int, "搜索动物半径", default=32, min=8, max=64)}
     _done_msg = "未确认动物驯服完成"
 
@@ -650,6 +655,7 @@ class TameAnimal(_OverworldSkill):
 @register
 class HarvestHoneyAndWax(_OverworldSkill):
     name, description, goal = "harvest_honey_wax", "安全放置营火采蜜或为铜方块涂蜡/刮蜡", "t2:bee_{mode}"
+    verified = "live"
     params = {"mode": Param(str, "蜂巢与涂蜡模式", default="honey", choices=("honey", "wax_on", "wax_off")), "radius": Param(int, "搜索半径", default=32, min=8, max=64)}
     _done_msg = "未确认蜂巢采蜜或铜块涂/刮蜡完成"
 
@@ -777,6 +783,7 @@ class HarvestHoneyAndWax(_OverworldSkill):
 @register
 class BiomeQuickAction(_OverworldSkill):
     name, description, goal = "biome_quick_action", "执行潜行避震、刷犰狳、踩细雪、浸水恶魂或弩杀掠夺者", "t2:biome_{action}"
+    verified = "live"
     params = {"action": Param(str, "群系顺手任务", default="avoid_vibration", choices=("avoid_vibration", "brush_armadillo", "powder_snow", "dried_ghast", "crossbow_pillager")), "radius": Param(int, "搜索半径", default=32, min=8, max=64)}
     _done_msg = "未确认群系顺手动作完成"
 

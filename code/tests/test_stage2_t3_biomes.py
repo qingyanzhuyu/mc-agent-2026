@@ -320,7 +320,7 @@ class BiomeContractTests(unittest.TestCase):
         for cls in _SKILLS:
             with self.subTest(skill=cls.name):
                 self.assertEqual(contract_errors(cls), [])
-                self.assertEqual(cls.verified, "offline")
+                self.assertEqual(cls.verified, "live")
                 self.assertIs(REGISTRY[cls.name], cls)
                 self.assertTrue(cls.blocked(State()))
                 self.assertTrue(cls.blocked(empty_ready))

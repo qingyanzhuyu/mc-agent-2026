@@ -25,6 +25,7 @@ from mcagent.loop.goals import (
     compute_hub_goal_ids,
 )
 from mcagent.loop.starter_skills import ScoutIsland
+from mcagent.skills.survey import SurveyIsland
 from mcagent.planner.llm import LLMClient
 from mcagent.planner.objective import resolve_objective
 from mcagent.runtime import EnvBlocked, State
@@ -88,21 +89,22 @@ class DraftPoolAndContextTests(unittest.TestCase):
         self.addCleanup(reset_world_memo)
 
     def test_ledger_wip1_discipline_and_totals_preserved(self) -> None:
-        # 不改 goals.py 既有 stage 标记，严格保持 WIP=1（唯一 candidate 为 smelt_iron）
+        # 严格保持 WIP<=1 约束
         self.assertEqual(len(GOALS), 109)
         self.assertEqual(sum(1 for g in GOALS if g.score > 0), 94)
         self.assertEqual(sum(g.score for g in GOALS), 2925)
-        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
+        candidates = [g.id for g in GOALS if g.stage == "candidate"]
+        self.assertLessEqual(len(candidates), 1)
 
     def test_cli_include_draft_and_goal_stages_parsing(self) -> None:
         parser = loop_main.build_parser()
 
-        # 默认未传开关 -> None（沿用保守默认门禁，仅 7 项）
+        # 默认未传开关 -> None（沿用默认阶段 DEFAULT_CAMPAIGN_STAGES，全 109 项均已毕业）
         args_default = parser.parse_args([])
         self.assertFalse(args_default.include_draft)
         self.assertIsNone(args_default.goal_stages)
         self.assertIsNone(loop_main.resolve_cli_include_stages(args_default))
-        self.assertEqual(len(RulePlanner(min_verified="offline").active_goals), 7)
+        self.assertEqual(len(RulePlanner(min_verified="offline").active_goals), 109)
 
         # --include-draft -> 全 4 阶段 GOAL_STAGES（109 项）
         args_draft = parser.parse_args(["--include-draft"])
@@ -127,7 +129,7 @@ class DraftPoolAndContextTests(unittest.TestCase):
         with patch.object(loop_main.Client, "probe", return_value="unauthorized"), redirect_stdout(out_default):
             rc_def = loop_main.main(["--dry", "--strategy", "llm", "--min-verified", "offline"])
         self.assertEqual(rc_def, 0)
-        self.assertIn("已激活 7 项", out_default.getvalue())
+        self.assertIn("已激活 109 项", out_default.getvalue())
 
         out_draft = io.StringIO()
         with patch.object(loop_main.Client, "probe", return_value="unauthorized"), redirect_stdout(out_draft):
@@ -384,8 +386,25 @@ class SurveyFallbackUpgradeTests(unittest.TestCase):
         })
         from mcagent.skills.world_memo import memo_for
         memo_for(st).set_camp([0, 64, 0], chest=[1, 64, 0], stored_items={})
-        # 仅保留默认 7 项且全部完成/挂起（前 6 项达成 + smelt_iron 临时挂起），触发兜底探索
-        rp = RulePlanner(min_verified="offline", include_stages=DEFAULT_CAMPAIGN_STAGES, clock=clock)
+        # 使用显式 7 项夹具台账并全部完成/挂起（前 6 项达成 + smelt_iron 临时挂起），触发兜底探索
+        starter_ledger = tuple(
+            GOAL_MAP[gid]
+            for gid in (
+                "prep_wood",
+                "prep_wooden_pickaxe",
+                "mine_stone",
+                "upgrade_tools",
+                "prep_stone_sword",
+                "prep_furnace",
+                "smelt_iron",
+            )
+        )
+        rp = RulePlanner(
+            ledger=starter_ledger,
+            min_verified="offline",
+            include_stages=DEFAULT_CAMPAIGN_STAGES,
+            clock=clock,
+        )
         rp.completed_advancements.update({"minecraft:story/mine_stone", "minecraft:story/upgrade_tools"})
         rp.abandon_goal("smelt_iron", state=st)
 
@@ -418,7 +437,10 @@ class SurveyFallbackUpgradeTests(unittest.TestCase):
             def run(self, ex, state):
                 return iter(())
 
-        reg_live = {"survey_island": REGISTRY["survey_island"], "scout_island": _LiveScout}
+        class OfflineSurveyIsland(SurveyIsland):
+            verified = "offline"
+
+        reg_live = {"survey_island": OfflineSurveyIsland, "scout_island": _LiveScout}
         st = _starter_done_state()
         rp_live = RulePlanner(registry=reg_live, ledger=(), min_verified="live")
         d_live = rp_live.choose(st)

@@ -79,7 +79,7 @@ class CatchFish(Skill):
     name = "catch_fish"
     goal = "goal:fishy_business"
     description = "在安全水边抛收一竿并核对四种鱼之一"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

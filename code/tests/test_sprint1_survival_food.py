@@ -403,7 +403,7 @@ class TestRegistryAndContract(unittest.TestCase):
         self.assertIs(REGISTRY["gather_food"], GatherFood)
         self.assertEqual(contract_errors(GatherFood), [])
         self.assertEqual(set(GatherFood.params) & FORBIDDEN_PARAMS, set())
-        self.assertEqual(GatherFood.verified, "offline")
+        self.assertEqual(GatherFood.verified, "live")
         self.assertGreater(len(GatherFood.description), 0)
         self.assertLessEqual(len(GatherFood.description), 60)
         self.assertEqual(GatherFood.cooldown_s, 15.0)

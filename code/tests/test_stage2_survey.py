@@ -159,8 +159,8 @@ class SurveySkillContractTests(unittest.TestCase):
         self.assertIs(REGISTRY.get("discover_structure"), DiscoverStructure)
         self.assertEqual(contract_errors(SurveyIsland), [])
         self.assertEqual(contract_errors(DiscoverStructure), [])
-        self.assertEqual(SurveyIsland.verified, "offline")
-        self.assertEqual(DiscoverStructure.verified, "offline")
+        self.assertEqual(SurveyIsland.verified, "live")
+        self.assertEqual(DiscoverStructure.verified, "live")
         self.assertEqual(SurveyIsland.goal, "survey:{dimension}")
         self.assertEqual(DiscoverStructure.goal, "discover:{structure}")
 

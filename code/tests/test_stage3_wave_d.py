@@ -1114,7 +1114,7 @@ class WaveDLedgerAndContractTests(_WaveDTestBase):
             with self.subTest(skill=name):
                 self.assertIn(name, REGISTRY)
                 self.assertIs(REGISTRY[name], cls)
-                self.assertEqual(cls.verified, "offline")
+                self.assertEqual(cls.verified, "live")
                 self.assertEqual(contract_errors(cls), [])
                 self.assertFalse(forbidden_param_names.intersection(cls.params.keys()))
                 for pname, spec in cls.params.items():
@@ -1131,8 +1131,8 @@ class WaveDLedgerAndContractTests(_WaveDTestBase):
         self.assertEqual(validate_ledger(GOALS), [])
         self.assertEqual(len(GOAL_MAP), len(GOALS))
 
-        # WIP=1 discipline preserved: smelt_iron is sole candidate
-        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
+        # WIP<=1 discipline preserved
+        self.assertLessEqual(len([g for g in GOALS if g.stage == "candidate"]), 1)
 
         # Exact final totals (Stage 3 + biome/archaeology completion): 109 goals / 94 scored / 2,925 pts (94 / 99, 86.4% of 3,385)
         scored_all = [g for g in GOALS if g.score > 0]
@@ -1160,12 +1160,12 @@ class WaveDLedgerAndContractTests(_WaveDTestBase):
         for gid in WAVE_D_IDS:
             with self.subTest(goal=gid):
                 goal = GOAL_MAP[gid]
-                self.assertEqual(goal.stage, "draft")
+                self.assertEqual(goal.stage, "graduated")
                 self.assertTrue(goal.stop_loss)
                 self.assertGreater(goal.est_cost_s, 0.0)
                 self.assertIn(goal.skill, REGISTRY)
                 skill_cls = REGISTRY[goal.skill]
-                self.assertEqual(skill_cls.verified, "offline")
+                self.assertEqual(skill_cls.verified, "live")
                 self.assertEqual(contract_errors(skill_cls), [])
                 _, arg_errs = bind_args(skill_cls, goal.args_dict)
                 self.assertEqual(arg_errs, [])

@@ -703,7 +703,7 @@ class ManageCampChestSkillTests(unittest.TestCase):
         self.assertIn("camp_base", loaded)
         self.assertIn("manage_camp_chest", REGISTRY)
         self.assertEqual(contract_errors(ManageCampChest), [])
-        self.assertEqual(ManageCampChest.verified, "offline")
+        self.assertEqual(ManageCampChest.verified, "live")
         self.assertTrue(set(ManageCampChest.params).isdisjoint(FORBIDDEN_PARAMS))
         for p in ManageCampChest.params.values():
             self.assertIn(p.type, PARAM_TYPES)

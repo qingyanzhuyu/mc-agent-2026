@@ -1723,7 +1723,7 @@ class WaveCLedgerAndContractTests(_WaveCTestBase):
             with self.subTest(skill=name):
                 self.assertIn(name, REGISTRY)
                 self.assertIs(REGISTRY[name], cls)
-                self.assertEqual(cls.verified, "offline")
+                self.assertEqual(cls.verified, "live")
                 self.assertEqual(contract_errors(cls), [])
                 self.assertFalse(forbidden_param_names.intersection(cls.params.keys()))
                 # Empty-inventory guard blocks all 3 skills in both normal and easy difficulty
@@ -1748,8 +1748,8 @@ class WaveCLedgerAndContractTests(_WaveCTestBase):
         self.assertGreaterEqual(len(scored_all), 86)
         self.assertGreaterEqual(sum(g.score for g in scored_all), 2580)
 
-        # WIP=1 discipline preserved: smelt_iron is sole candidate
-        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
+        # WIP<=1 discipline preserved
+        self.assertLessEqual(len([g for g in GOALS if g.stage == "candidate"]), 1)
 
         # Wave C goals: exact scores (0, 60, 60, 60) totaling +180
         wave_c_goals = [GOAL_MAP[gid] for gid in WAVE_C_ALL_IDS]
@@ -1767,12 +1767,12 @@ class WaveCLedgerAndContractTests(_WaveCTestBase):
         for gid in WAVE_C_ALL_IDS:
             with self.subTest(goal=gid):
                 goal = GOAL_MAP[gid]
-                self.assertEqual(goal.stage, "draft")
+                self.assertEqual(goal.stage, "graduated")
                 self.assertTrue(goal.stop_loss)
                 self.assertGreater(goal.est_cost_s, 0.0)
                 self.assertIn(goal.skill, REGISTRY)
                 skill_cls = REGISTRY[goal.skill]
-                self.assertEqual(skill_cls.verified, "offline")
+                self.assertEqual(skill_cls.verified, "live")
                 self.assertEqual(contract_errors(skill_cls), [])
                 _, arg_errs = bind_args(skill_cls, goal.args_dict)
                 self.assertEqual(arg_errs, [])

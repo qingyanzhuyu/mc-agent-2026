@@ -204,8 +204,8 @@ class StarterSkillsContractTests(unittest.TestCase):
 
     def test_all_starter_skills_pass_contract_and_one_action_per_step(self):
         expected = {
-            "eat_food": "offline",
-            "scout_island": "offline",
+            "eat_food": "live",
+            "scout_island": "live",
             "gather_wood": "live",
             "craft_gear": "live",
             "mine_stone": "live",

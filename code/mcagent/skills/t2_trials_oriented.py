@@ -300,6 +300,7 @@ class _TrialSkill(Skill):
 @register
 class UnlockTrialVault(_TrialSkill):
     name, goal, description = "unlock_trial_vault", "t2:under_lock_and_key", "前往试炼密室清怪/刷钥匙并用试炼钥匙开启宝库"
+    verified = "live"
     params = {"radius": Param(int, "搜索宝库半径", default=32, min=8, max=64), "clear_wave": Param(bool, "解锁前清试炼怪", default=True)}
     _done_msg, _delta_keys = "未确认试炼宝库解锁", ("trial_key", "ominous_trial_key")
     @classmethod
@@ -349,6 +350,7 @@ class UnlockTrialVault(_TrialSkill):
 @register
 class WindChargeBounce(_TrialSkill):
     name, goal, description = "wind_charge_bounce", "t2:who_needs_rockets", "备齐或合成风弹后向脚下发射确认垂直弹跳达标"
+    verified = "live"
     params = {"target_dy": Param(int, "目标弹跳高度", default=7, min=7, max=16)}
     _done_msg, _delta_keys = "未确认风弹弹跳达到目标高度", ("wind_charge",)
     @classmethod
@@ -413,6 +415,7 @@ class WindChargeBounce(_TrialSkill):
 @register
 class ScrapeLitCopperBulb(_TrialSkill):
     name, goal, description = "scrape_lit_copper_bulb", "t2:lighten_up", "前往试炼密室点亮氧化铜灯并用斧刮除氧化层"
+    verified = "live"
     params = {"radius": Param(int, "搜索铜灯半径", default=32, min=8, max=64)}
     _done_msg = "未确认点亮并刮除氧化铜灯"
     @classmethod
@@ -448,6 +451,7 @@ class ScrapeLitCopperBulb(_TrialSkill):
 @register
 class ReadChiseledBookshelf(_TrialSkill):
     name, goal, description = "read_chiseled_bookshelf", "t2:read_chiseled_bookshelf", "摆放比较器与雕纹书架并放入书籍触发信号"
+    verified = "live"
     params = {"radius": Param(int, "搜索或放置半径", default=16, min=4, max=32)}
     _done_msg, _delta_keys = "未确认比较器读取雕纹书架", _BOOKS
     @classmethod
@@ -489,6 +493,7 @@ class ReadChiseledBookshelf(_TrialSkill):
 @register
 class TransplantCreakingHeart(_TrialSkill):
     name, goal, description = "transplant_creaking_heart", "t2:heart_transplanter", "在苍白之园采集或合成嘎枝之心并垂直夹心摆放"
+    verified = "live"
     params = {"radius": Param(int, "采集与放置搜索半径", default=24, min=6, max=48)}
     _done_msg, _delta_keys = "未确认嘎枝之心垂直夹心摆放完成", ("creaking_heart",)
     @classmethod

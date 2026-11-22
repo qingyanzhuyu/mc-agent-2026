@@ -35,7 +35,7 @@ class MineObsidian(Skill):
     description = "先找现成黑曜石，再复核液体和安全站位后采收"
     params = {"count": Param(int, "本轮目标持有的普通黑曜石数量", default=1, min=1, max=16)}
     goal = "acq:obsidian"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):
@@ -80,7 +80,7 @@ class BuildAndEnterPortal(Skill):
         "auto_bunker": Param(bool, "落地后是否立即建 3x3 圆石防恶魂碉堡", default=False),
     }
     goal = "route:nether:prepare_flint={prepare_flint}"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

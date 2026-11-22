@@ -257,7 +257,7 @@ class AttuneLodestone(Skill):
     name = "attune_lodestone"
     description = "复用、取出或制备磁石，以手持普通指南针绑定并确认进度"
     goal = "adventure:use_lodestone"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

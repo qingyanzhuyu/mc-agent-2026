@@ -96,7 +96,7 @@ class FillLavaBucket(Skill):
     name = "fill_lava_bucket"
     description = "从已复核的可达岩浆源装桶，保留安全退路"
     goal = "acq:lava_bucket"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

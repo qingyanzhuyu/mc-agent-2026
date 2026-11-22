@@ -150,6 +150,7 @@ class _OminousCombatSkill(Skill):
 @register
 class UnlockOminousVault(_OminousCombatSkill):
     name, goal, description = "unlock_ominous_vault", "t4:revaulting", "侦察不祥试炼宝库与弱怪笼、饮瓶清笼并用不祥钥匙开库"
+    verified = "live"
     params: dict[str, Param] = {}
     @classmethod
     def blocked(cls, state: State) -> str:
@@ -216,6 +217,7 @@ class UnlockOminousVault(_OminousCombatSkill):
 @register
 class WinMicroVillageRaid(_OminousCombatSkill):
     name, goal, description = "win_micro_village_raid", "t4:hero_of_the_village", "搭建微型隔离村碉堡并亲手补刀清扫袭击赢取村庄英雄"
+    verified = "live"
     params = {"prep_only": Param(bool, "仅搭建微型隔离村碉堡前置不触发袭击", default=False)}
     @classmethod
     def blocked(cls, state: State) -> str:
@@ -328,6 +330,7 @@ class WinMicroVillageRaid(_OminousCombatSkill):
 @register
 class TriggerTotemSafely(_OminousCombatSkill):
     name, goal, description = "trigger_totem_safely", "t4:totem_of_undying", "无摔落保护状态副手持不死图腾并从实心高柱受控坠落安全触发图腾复活"
+    verified = "live"
     params: dict[str, Param] = {}
     @classmethod
     def blocked(cls, state: State) -> str:

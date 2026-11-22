@@ -60,7 +60,7 @@ class DashboardTests(unittest.TestCase):
         text = (REPO_ROOT / "code" / "mcagent" / "loop" / "goals.py").read_text(encoding="utf-8")
         goals = {g["id"]: g for g in dash.parse_ledger(text)}
         self.assertEqual(goals["prep_wood"]["stage"], "graduated")
-        self.assertEqual(goals["smelt_iron"]["stage"], "candidate")
+        self.assertEqual(goals["smelt_iron"]["stage"], "graduated")
         self.assertEqual(goals["shiny_gear"]["score"], 60)
         self.assertEqual(goals["smelt_iron"]["skill"], "smelt_iron")
         self.assertIn("prep_diamond_pickaxe", goals)

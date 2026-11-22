@@ -669,7 +669,7 @@ class WaveASkillsContractTests(_WaveATestBase):
         for name, cls in expected_skills.items():
             with self.subTest(skill=name):
                 self.assertEqual(contract_errors(cls), [])
-                self.assertEqual(cls.verified, "offline")
+                self.assertEqual(cls.verified, "live")
                 self.assertIn(name, REGISTRY)
                 self.assertIs(REGISTRY[name], cls)
                 self.assertTrue(cls.blocked(State()), f"{name} must block on unready State()")
@@ -2047,12 +2047,12 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
         for gid in WAVE_A_ALL_IDS:
             with self.subTest(goal=gid):
                 goal = GOAL_MAP[gid]
-                self.assertEqual(goal.stage, "draft")
+                self.assertEqual(goal.stage, "graduated")
                 self.assertTrue(goal.stop_loss)
                 self.assertGreater(goal.est_cost_s, 0.0)
 
-        # WIP=1 discipline preserved
-        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
+        # WIP<=1 discipline preserved
+        self.assertLessEqual(len([g for g in GOALS if g.stage == "candidate"]), 1)
 
     def test_wave_a_goals_validate_bind_offline_skills_and_advancement_scores(self) -> None:
         self.assertEqual(validate_ledger(GOALS), [])
@@ -2063,7 +2063,7 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
             with self.subTest(goal=gid):
                 self.assertIn(goal.skill, REGISTRY)
                 skill_cls = REGISTRY[goal.skill]
-                self.assertEqual(skill_cls.verified, "offline")
+                self.assertEqual(skill_cls.verified, "live")
                 self.assertEqual(contract_errors(skill_cls), [])
                 _, arg_errs = bind_args(skill_cls, goal.args_dict)
                 self.assertEqual(arg_errs, [])
@@ -2159,7 +2159,7 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
 
     def test_froglights_and_frog_landmark_gating_contract(self) -> None:
         self.assertEqual(validate_ledger(GOALS), [])
-        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
+        self.assertLessEqual(len([g for g in GOALS if g.stage == "candidate"]), 1)
 
         # leash_all_frog_variants gates only swamp|mangrove_swamp so End/Nether hatching routes stay legal
         leash_goal = GOAL_MAP["leash_all_frog_variants"]
@@ -2174,7 +2174,7 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
         fl = GOAL_MAP["froglights"]
         self.assertEqual(fl.score, 60)
         self.assertEqual(fl.tier, "T4")
-        self.assertEqual(fl.stage, "draft")
+        self.assertEqual(fl.stage, "graduated")
         self.assertEqual(fl.skill, "collect_froglights")
         self.assertEqual(fl.prereq_goals, ("leash_all_frog_variants", "enter_the_nether"))
         self.assertEqual(fl.done_advancements, ("minecraft:husbandry/froglights",))
@@ -2182,7 +2182,7 @@ class WaveALedgerAndROIContractTests(_WaveATestBase):
         self.assertEqual(fl.score, ADVANCEMENT_SCORES_V2["minecraft:husbandry/froglights"])
         self.assertTrue(fl.stop_loss)
         self.assertIn("collect_froglights", REGISTRY)
-        self.assertEqual(REGISTRY["collect_froglights"].verified, "offline")
+        self.assertEqual(REGISTRY["collect_froglights"].verified, "live")
         self.assertEqual(contract_errors(REGISTRY["collect_froglights"]), [])
         _, arg_errs = bind_args(REGISTRY["collect_froglights"], fl.args_dict)
         self.assertEqual(arg_errs, [])

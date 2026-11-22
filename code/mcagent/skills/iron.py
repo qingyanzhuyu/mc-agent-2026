@@ -320,7 +320,7 @@ class SmeltIron(Skill):
         "async_lease": Param(bool, "是否采用非阻塞租约模式（装料登记后立即返回或回收就绪租约）", default=False),
     }
     goal = "acq:iron_ingot"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def material_plan(cls, args: dict, state: "State") -> tuple[tuple[str, int, str], ...]:

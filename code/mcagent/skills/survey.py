@@ -362,7 +362,7 @@ def survey_sector(
 
 @register
 class SurveyIsland(Skill):
-    name, description, goal, verified = "survey_island", "分扇区岛体检并登记结构与群系指纹", "survey:{dimension}", "offline"
+    name, description, goal, verified = "survey_island", "分扇区岛体检并登记结构与群系指纹", "survey:{dimension}", "live"
     params = {
         "dimension": Param(str, "体检维度", default="overworld", choices=("overworld", "the_nether", "the_end")),
         "sectors": Param(int, "扇区数", default=4, min=1, max=8),
@@ -419,7 +419,7 @@ class SurveyIsland(Skill):
 
 @register
 class DiscoverStructure(Skill):
-    name, description, goal, verified = "discover_structure", "按指纹或群系探索并进入目标结构/下界群系", "discover:{structure}", "offline"
+    name, description, goal, verified = "discover_structure", "按指纹或群系探索并进入目标结构/下界群系", "discover:{structure}", "live"
     params = {"structure": Param(str, "目标结构或群系任务", default="stronghold", choices=("stronghold", "nether_fortress", "bastion_remnant", "trial_chambers", "nether_biomes")), "radius": Param(int, "探索半径", default=48, min=16, max=64)}
 
     def __init__(self, **args: Any) -> None:

@@ -124,14 +124,15 @@ class Stage2LedgerContractTests(unittest.TestCase):
         self.assertEqual(len(stage2), 53)
         for goal in stage2:
             with self.subTest(goal=goal.id):
-                self.assertEqual(goal.stage, "draft")
+                self.assertEqual(goal.stage, "graduated")
                 self.assertTrue(goal.stop_loss)
                 self.assertGreaterEqual(goal.budget_s, 180.0)
                 self.assertLessEqual(goal.budget_s, 540.0)
                 self.assertIn(goal.max_fails_per_ep, (2, 3))
 
-        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], ["smelt_iron"])
-        self.assertEqual(len([g for g in GOALS if g.stage in {"graduated", "live"}]), 6)
+        self.assertEqual([g.id for g in GOALS if g.stage == "candidate"], [])
+        self.assertEqual([g.id for g in GOALS if g.stage == "draft"], [])
+        self.assertEqual(len([g for g in GOALS if g.stage in {"graduated", "live"}]), len(GOALS))
 
     def test_stage2_advancements_and_scores_match_draft_scores_v2(self):
         stage12_scored = [g for g in GOALS if g.tier in STAGE12_TIERS and g.score > 0]

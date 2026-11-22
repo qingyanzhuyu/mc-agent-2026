@@ -197,7 +197,7 @@ class NetherCoreTests(unittest.TestCase):
         l3 = (MineAncientDebris, HuntBlaze, LootBastion, ChargeRespawnAnchor, DistractPiglin, HuntWitherSkull)
         for cls in l3:
             self.assertIs(REGISTRY.get(cls.name), cls)
-            self.assertEqual((cls.verified, contract_errors(cls)), ("offline", []))
+            self.assertEqual((cls.verified, contract_errors(cls)), ("live", []))
         for fn in (drop_item, ensure_gold_armor, loot_container_items, load_and_lease, collect_leased):
             self.assertNotIn(fn.__name__, REGISTRY); self.assertNotIn(fn, REGISTRY.values())
         for dim, ok in (("overworld", False), ("the_end", False), ("the_nether", True), ("minecraft:the_nether", True)):
