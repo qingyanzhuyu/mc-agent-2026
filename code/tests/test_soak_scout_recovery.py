@@ -412,6 +412,88 @@ class ScoutRecoveryTests(unittest.TestCase):
         self.assertIn("place", [s["op"] for s in steps])
         self.assertGreaterEqual(state.pos[1], 57.0)
 
+    def test_sand_gravel_roof_pit_falls_back_and_climbs_out(self):
+        # 沙滩/砂砾坑：西侧顶为 water（严格禁挖），其余三面顶为 sand/gravel（降级备选可挖），须成功向上挖出且绝不碰水侧。
+        blocks = {
+            (10, 63, 0): "grass_block",
+            (14, 63, 0): "grass_block",
+            (18, 63, 0): "grass_block",
+            (0, 59, 0): "sandstone",
+            # 西侧 (-1) 顶上有水，必须避开
+            (-1, 60, 0): "sand", (-1, 61, 0): "sand", (-1, 62, 0): "sand", (-1, 63, 0): "water",
+            # 东/南/北三面顶上均为 sand/gravel
+            (1, 60, 0): "sand", (1, 61, 0): "sand", (1, 62, 0): "sand", (1, 63, 0): "sand",
+            (0, 60, 1): "gravel", (0, 61, 1): "gravel", (0, 62, 1): "gravel", (0, 63, 1): "gravel",
+            (0, 60, -1): "sand", (0, 61, -1): "sand", (0, 62, -1): "sand", (0, 63, -1): "sand",
+        }
+        failures = {(x + 0.5, 64, 0.5): "path_not_found" for x in (10, 14, 18)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 60.0, 0.5]
+        world.items.clear()
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertGreaterEqual(state.pos[1], 61.0)
+        dug_positions = [s["pos"] for s in steps if s["op"] == "dig"]
+        self.assertTrue(dug_positions)
+        self.assertTrue(all(p[0] != -1 for p in dug_positions))
+
+    def test_protected_zone_pit_walks_out_of_protection_then_climbs(self):
+        # 角色位于已知保护区 (0, 0) 半径 6 格内，东侧通道延伸到保护区外（x=7）后遇到坑壁（x=8）：
+        # 须先移出保护区边界再开阶梯向上脱困。
+        from mcagent.loop.starter_skills import PROTECTED_ZONES
+
+        blocks = {
+            (16, 63, 0): "grass_block",
+            (20, 63, 0): "grass_block",
+            (24, 63, 0): "grass_block",
+        }
+        for x in range(0, 8):
+            blocks[(x, 59, 0)] = "stone"
+        # 保护区外 x=8 处有可挖坑壁（Y=60..62）
+        for y in (59, 60, 61, 62):
+            blocks[(8, y, 0)] = "dirt"
+        failures = {(x + 0.5, 64, 0.5): "path_not_found" for x in (16, 20, 24)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 60.0, 0.5]
+        PROTECTED_ZONES.append((0.0, 0.0))
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertGreater(state.pos[0], 6.0)
+        self.assertGreaterEqual(state.pos[1], 61.0)
+        self.assertIn("dig", [s["op"] for s in steps])
+
+    def test_pickaxe_harvests_adjacent_stone_for_step_up_when_no_placeables(self):
+        # 背包有石镐但 0 垫块，四周坑壁顶上有水无法开阶梯，坑底旁边有安全托底石头：
+        # 须装备石镐挖取石头获得圆石进包，再用 step_up_1x2 垫块爬上坑沿。
+        blocks = {
+            (10, 61, 0): "grass_block",
+            (14, 61, 0): "grass_block",
+            (18, 61, 0): "grass_block",
+            (0, 59, 0): "stone",
+            (1, 59, 0): "stone",
+            (0, 59, 1): "stone",
+            (0, 58, 1): "stone",  # 托底石块
+        }
+        # 2 格深石壁（Y=60, 61），在所有墙顶上方 Y=63 放水阻止 Phase 1 挖阶梯，迫使走 Phase 2 挖石取材 + 搭块爬升
+        for x, z in ((-1, 0), (2, 0), (0, -1), (1, -1), (1, 1), (-1, 1), (0, 2)):
+            blocks[(x, 59, z)] = "stone"
+            blocks[(x, 60, z)] = "stone"
+            blocks[(x, 61, z)] = "stone"
+            blocks[(x, 63, z)] = "water"
+        blocks[(0, 58, -1)] = "stone"
+        failures = {(x + 0.5, 62, 0.5): "path_not_found" for x in (10, 14, 18)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 60.0, 0.5]
+        world.items.clear()
+        world.items["stone_pickaxe"] = 1
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        ops = [s["op"] for s in steps]
+        self.assertIn("equip", ops)
+        self.assertIn("dig", ops)
+        self.assertIn("place", ops)
+        self.assertGreaterEqual(state.pos[1], 62.0)
+
 
 if __name__ == "__main__":
     unittest.main()
