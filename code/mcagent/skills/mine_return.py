@@ -74,9 +74,10 @@ def _cur_status(ex: Executor, state: State) -> tuple[dict[str, Any], list[float]
     return st, list(st.get("pos") or state.pos), bare(st.get("dimension")).strip().lower() or "overworld"
 
 
-def _probe_name(ex: Executor, pos: Sequence[int]) -> str:
+def _probe_name(ex: Executor, pos: Sequence[int], vc=None, dim: str = "overworld") -> str:
     try:
-        return bare(ex.client.get_block(list(pos)).get("name"))
+        blk = vc.get_block(ex.client, list(pos), dimension=dim) if vc is not None else ex.client.get_block(list(pos))
+        return bare(blk.get("name"))
     except ApiError as exc:
         if exc.code in ("not_loaded", "not_ready"):
             return ""
@@ -150,7 +151,7 @@ def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> lis
             for k in range(1, segs + 1)]
 
 
-def _step_touches_lava(ex: Executor, cells: Sequence[Cell]) -> bool:
+def _step_touches_lava(ex: Executor, cells: Sequence[Cell], vc=None, dim: str = "overworld") -> bool:
     """检查待挖阶梯方块的六邻面是否紧邻岩浆，避免向上开阶时挖破隐蔽岩浆池。"""
     checked: set[Cell] = set()
     for cx, cy, cz in cells:
@@ -159,7 +160,7 @@ def _step_touches_lava(ex: Executor, cells: Sequence[Cell]) -> bool:
             if nb in checked:
                 continue
             checked.add(nb)
-            if _probe_name(ex, nb) in _LAVA_FLUIDS:
+            if _probe_name(ex, nb, vc=vc, dim=dim) in _LAVA_FLUIDS:
                 return True
     return False
 
@@ -176,6 +177,7 @@ def _climb_out_stairs(
     vc = voxel_cache_for(state)
     failed_steps: set[Cell] = set()
     no_rise_streak = 0
+    last_dir: Optional[tuple[int, int]] = None
     for _ in range(max(1, int(max_steps))):
         st, cur, dim = _cur_status(ex, state)
         if st.get("alive") is False or float(cur[1]) >= target_y - 2.0:
@@ -184,6 +186,28 @@ def _climb_out_stairs(
         can_place = total_placeable(state) >= 1
         ix, fy, iz = block_cell(cur)
         chosen: Optional[tuple[int, int, bool, bool]] = None  # (nx, nz, need_place_step, hand_rock_mode)
+
+        dir_order: list[tuple[int, int]] = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        if last_dir in dir_order:
+            dir_order.remove(last_dir)
+            dir_order.insert(0, last_dir)
+
+        # 一次性并发预取当前阶梯四向探测与防岩浆邻面体素，把 35~45 次串行 get_block 压成 1 次批查
+        if has_batch_get_blocks(getattr(ex, "client", None)):
+            probe_cells: set[Cell] = {
+                (ix, fy + 2, iz),
+                (ix, fy + 3, iz),
+                (ix + 1, fy + 2, iz), (ix - 1, fy + 2, iz),
+                (ix, fy + 2, iz + 1), (ix, fy + 2, iz - 1),
+            }
+            for dx, dz in dir_order:
+                nx, nz = ix + dx, iz + dz
+                for ky in (-1, 0, 1, 2, 3):
+                    probe_cells.add((nx, fy + ky, nz))
+                for cy in (fy + 1, fy + 2):
+                    for ox, oy, oz in _FLUID_FACES:
+                        probe_cells.add((nx + ox, cy + oy, nz + oz))
+            vc.get_blocks_batch(ex.client, sorted(probe_cells), dimension=dim)
 
         def _can_clear(names: tuple[str, str, str], *, hand_rock: bool) -> bool:
             if any(n in _UNSAFE_CLIMB for n in names):
@@ -203,31 +227,32 @@ def _climb_out_stairs(
                 passes.append((True, True))
 
         for need_place, hand_rock in passes:
-            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            for dx, dz in dir_order:
                 nx, nz = ix + dx, iz + dz
                 if (nx, fy, nz) in failed_steps:
                     continue
-                floor_n = _probe_name(ex, (nx, fy, nz))
+                floor_n = _probe_name(ex, (nx, fy, nz), vc=vc, dim=dim)
                 if need_place:
                     if not floor_n or not is_clear_space(floor_n):
                         continue
-                    sub_n = _probe_name(ex, (nx, fy - 1, nz))
+                    sub_n = _probe_name(ex, (nx, fy - 1, nz), vc=vc, dim=dim)
                     if not is_safe_solid_floor(sub_n) or sub_n in _UNSAFE_CLIMB:
                         continue
                 else:
                     # 必须校验实心立足地面（过滤 leaf_litter/short_grass/花草等地被覆盖物），避免误当台阶原地反复横跳
                     if not is_safe_solid_floor(floor_n) or floor_n in _UNSAFE_CLIMB:
                         continue
-                head_n = _probe_name(ex, (ix, fy + 2, iz))
-                s1_n = _probe_name(ex, (nx, fy + 1, nz))
-                s2_n = _probe_name(ex, (nx, fy + 2, nz))
-                roof_n = _probe_name(ex, (nx, fy + 3, nz))
+                head_n = _probe_name(ex, (ix, fy + 2, iz), vc=vc, dim=dim)
+                s1_n = _probe_name(ex, (nx, fy + 1, nz), vc=vc, dim=dim)
+                s2_n = _probe_name(ex, (nx, fy + 2, nz), vc=vc, dim=dim)
+                roof_n = _probe_name(ex, (nx, fy + 3, nz), vc=vc, dim=dim)
                 if roof_n in _FALLING_ROOF or not _can_clear((head_n, s1_n, s2_n), hand_rock=hand_rock):
                     continue
                 dig_cells = ((ix, fy + 2, iz), (nx, fy + 1, nz), (nx, fy + 2, nz))
-                if _step_touches_lava(ex, dig_cells):
+                if _step_touches_lava(ex, dig_cells, vc=vc, dim=dim):
                     continue
                 chosen = (nx, nz, need_place, hand_rock)
+                last_dir = (dx, dz)
                 break
             if chosen is not None:
                 break
@@ -248,8 +273,14 @@ def _climb_out_stairs(
                 return False
             vc.invalidate(step_cell, dimension=dim); state.refresh_inventory(ex.client)
             yield rec("place", pres, item=blk, pos=step_cell, reason="mine_return_climb")
+        # 仅取真正需要开挖的非空块，避免无谓的重复查块与装备
+        dig_targets: list[list[int]] = []
         for cell in ([ix, fy + 2, iz], [nx, fy + 1, nz], [nx, fy + 2, nz]):
-            bn = _probe_name(ex, cell)
+            bn = _probe_name(ex, cell, vc=vc, dim=dim)
+            if bn and not is_clear_space(bn):
+                dig_targets.append(cell)
+        for cell in dig_targets:
+            bn = _probe_name(ex, cell, vc=vc, dim=dim)
             if not bn or is_clear_space(bn):
                 continue
             if best_pickaxe(state) is not None:
@@ -272,14 +303,14 @@ def _climb_out_stairs(
             yield rec("dig", res, pos=cell, reason="mine_return_climb")
         up = [nx + 0.5, float(fy + 1), nz + 0.5]
         try:
-            res = _bounded_move_to(ex, up, rng=1, timeout=20.0)
+            res = _bounded_move_to(ex, up, rng=0.4, timeout=20.0)
         except Replan as err:
             if _is_preemption(err):
                 raise
             yield rec("move_to", pos=up, error_code=failure(err)[0], reason="mine_return_climb")
             return False
         yield rec("move_to", res, pos=up, reason="mine_return_climb")
-        # 核验实际海拔是否成功抬升 >=0.5 格；若 rng=1 停在同层导致未爬升，封禁该阶并在连续 3 次零抬升后及时退出防空转
+        # 核验实际海拔是否成功抬升 >=0.5 格；若停在同层未爬升，封禁该阶并在连续 3 次零抬升后及时退出防空转
         after_pos = res.get("pos") if isinstance(res, Mapping) else None
         if isinstance(after_pos, (list, tuple)) and len(after_pos) >= 3:
             after_y = float(after_pos[1])
