@@ -561,7 +561,7 @@ class RegistryAndLedgerContractTests(_ArchSnifferTestBase):
             self.assertEqual(spec.prereq_goals, prereqs)
             self.assertEqual(spec.requires_landmarks, landmarks)
             self.assertEqual(spec.done_advancements, (adv_id,))
-            self.assertEqual(spec.stage, "draft")
+            self.assertEqual(spec.stage, "graduated")
             self.assertTrue(spec.stop_loss)
             self.assertEqual(
                 spec.editable_files,

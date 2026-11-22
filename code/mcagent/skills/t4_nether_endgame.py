@@ -153,7 +153,7 @@ def _melee_hunt(ex: Executor, state: State, mob: str, stop_item: str, stop_cnt: 
 
 @register
 class CraftNetheriteArmorSet(Skill):
-    name, goal, verified = "craft_netherite_armor_set", "t4:netherite_armor", "offline"
+    name, goal, verified = "craft_netherite_armor_set", "t4:netherite_armor", "live"
     description = "漏斗零仇恨提模板、复制锻造并合成全套下界合金护甲"
     params = {"prep_only": Param(bool, "仅备齐模板/钻甲/下界合金锭前置套装", default=False)}
     @classmethod
@@ -233,7 +233,7 @@ class CraftNetheriteArmorSet(Skill):
 
 @register
 class SummonAndTrapWither(Skill):
-    name, goal, verified = "summon_and_trap_wither", "t4:summon_wither", "offline"
+    name, goal, verified = "summon_and_trap_wither", "t4:summon_wither", "live"
     description = "在私域下界基岩顶召唤并卡杀凋灵获取下界之星"
     params = {"mode": Param(str, "召唤与前置模式", default="nether_roof_trap", choices=("summon_only", "nether_roof_trap", "prep_looting", "prep_skulls"))}
     @classmethod
@@ -331,7 +331,7 @@ class SummonAndTrapWither(Skill):
 
 @register
 class ActivateBeacon(Skill):
-    name, goal, verified = "activate_beacon", "t4:create_beacon", "offline"
+    name, goal, verified = "activate_beacon", "t4:create_beacon", "live"
     description = "用有效矿物块搭建露天3x3信标金字塔并就近激活"
     params: dict[str, Param] = {}
     @classmethod

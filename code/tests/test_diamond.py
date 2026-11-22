@@ -97,7 +97,7 @@ class DiamondTests(unittest.TestCase):
 
     def test_registered_compatible_arguments_and_offline(self):
         self.assertEqual(make("mine_diamond", {"count": 4}).args["count"], 4)
-        self.assertEqual(make("craft_diamond_gear", {"item": "diamond_pickaxe"}).verified, "offline")
+        self.assertEqual(make("craft_diamond_gear", {"item": "diamond_pickaxe"}).verified, "live")
 
     def test_missing_world_context_hides_loot_and_workstation_choices(self):
         world = DiamondWorld()

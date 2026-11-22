@@ -107,7 +107,7 @@ class NetherContractTests(unittest.TestCase):
         self.assertIs(REGISTRY["mine_obsidian"], MineObsidian)
         self.assertIs(REGISTRY["build_and_enter_portal"], BuildAndEnterPortal)
         self.assertNotIn("build_pattern", REGISTRY)
-        self.assertEqual({MineObsidian.verified, BuildAndEnterPortal.verified}, {"offline"})
+        self.assertEqual({MineObsidian.verified, BuildAndEnterPortal.verified}, {"live"})
         self.assertTrue(MineObsidian.blocked(State()))
         self.assertTrue(BuildAndEnterPortal.blocked(State()))
 

@@ -181,7 +181,7 @@ class GatherFood(Skill):
         "cook": Param(bool, "是否尽量烤熟生肉", default=True),
     }
     goal = "survival:gather_food"
-    verified = "offline"
+    verified = "live"
     cooldown_s = 15.0
 
     def __init__(self, **args):

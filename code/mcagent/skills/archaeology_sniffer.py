@@ -175,6 +175,7 @@ class _ArchSnifferSkill(Skill):
 @register
 class BrushArchaeology(_ArchSnifferSkill):
     name, goal, description = "brush_archaeology", "t2:arch_{target}", "备料并用刷子刷取可疑沙子或沙砾获取陶片或嗅探兽蛋"
+    verified = "live"
     params = {"target": Param(str, "考古目标掉落物", default="sherd", choices=("sherd", "sniffer_egg")),
               "radius": Param(int, "搜索可疑方块半径", default=24, min=8, max=64)}
     _done_msg = "未确认刷出目标陶片或嗅探兽蛋"
@@ -249,6 +250,7 @@ class BrushArchaeology(_ArchSnifferSkill):
 @register
 class HatchAndRaiseSniffer(_ArchSnifferSkill):
     name, goal, description = "hatch_and_raise_sniffer", "t3:sniffer_{mode}", "放置嗅探兽蛋孵化、种植远古种子或喂食幼年嗅探兽"
+    verified = "live"
     params = {"mode": Param(str, "嗅探兽培育目标", default="plant_seed", choices=("plant_seed", "feed_snifflet")),
               "radius": Param(int, "搜索嗅探兽与地块半径", default=24, min=8, max=64)}
     _done_msg = "未确认嗅探兽远古种子种植或幼体喂食完成"

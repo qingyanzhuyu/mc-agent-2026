@@ -183,7 +183,7 @@ class Stage2WorkstationsTests(unittest.TestCase):
         for cls in (TradeVillager, TrimArmor, SmithNetheriteHoe, BrewPotion, CureZombieVillager):
             with self.subTest(skill=cls.name):
                 self.assertEqual(contract_errors(cls), [])
-                self.assertEqual(cls.verified, "offline")
+                self.assertEqual(cls.verified, "live")
                 self.assertIs(REGISTRY.get(cls.name), cls)
         for fn in (trade_once, smith_once, brew_batch):
             self.assertNotIn(fn.__name__, REGISTRY)

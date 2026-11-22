@@ -19,6 +19,10 @@ class LiveGatherWood(GatherWood):
     verified = "live"
 
 
+class OfflineScoutIsland(ScoutIsland):
+    verified = "offline"
+
+
 class LiveScoutIsland(ScoutIsland):
     verified = "live"
 
@@ -40,7 +44,7 @@ class VerificationGateTests(unittest.TestCase):
 
     def test_explicit_goal_respects_floor_even_when_candidate_is_forced(self):
         candidate = replace(self.goal, stage="candidate")
-        registry = {"gather_wood": OfflineGatherWood, "scout_island": ScoutIsland}
+        registry = {"gather_wood": OfflineGatherWood, "scout_island": OfflineScoutIsland}
         strict = CampaignPlanner(
             target_goal=candidate.id, ledger=(candidate,), registry=registry, min_verified="live",
         )
@@ -90,6 +94,7 @@ class VerificationGateTests(unittest.TestCase):
             with self.subTest(hostname=hostname):
                 cfg = Config(base=f"https://{hostname}/api/v1", username="fixture", password="fixture")
                 with patch.object(Config, "load", return_value=cfg), patch.object(loop_main, "Client") as client, \
+                        patch.dict(loop_main.REGISTRY, {"scout_island": OfflineScoutIsland}), \
                         redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                     code = loop_main.main(["--live", "--local-target", "--mode", "focus", "--skill", "scout_island"])
 

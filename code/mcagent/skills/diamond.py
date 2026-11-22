@@ -314,7 +314,7 @@ class MineDiamond(Skill):
     description = "优先取回可达钻石，安全下探并收集目标数量"
     params = {"count": Param(int, "本批目标库存，已有钻石抵扣", default=4, min=1, max=16)}
     goal = "acq:diamond"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state) -> str:
@@ -685,7 +685,7 @@ class CraftDiamondGear(Skill):
     description = "使用现有钻石甲或钻石级镐，必要时制作钻石靴、钻石镐"
     params = {"item": Param(str, "钻石装备", choices=("diamond_boots", "diamond_pickaxe"))}
     goal = "gear:{item}"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state) -> str:

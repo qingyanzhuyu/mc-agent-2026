@@ -191,7 +191,7 @@ class PlantSeed(Skill):
     name = "plant_seed"
     goal = "goal:plant_seed"
     description = "选可达地块并种下符合进度判据的种子"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):
@@ -325,7 +325,7 @@ class BreedAnimal(Skill):
     description = "用两份匹配饲料繁殖一对可安全接触的动物"
     params = {"animal": Param(str, "动物种类，自动时优先选择已有饲料的种类",
                               default="auto", choices=("auto", *_FEEDS))}
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

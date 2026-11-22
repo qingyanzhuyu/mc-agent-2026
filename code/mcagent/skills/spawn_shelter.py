@@ -271,7 +271,7 @@ class BuildSpawnShelter(Skill):
     description = "在出生点保护区外缘建造5x5圆石防爆避难所或下界门3x3圆石碉堡"
     params = {"mode": Param(str, "避难所建造模式", default="tier1_shelter", choices=("tier1_shelter", "nether_bunker"))}
     goal = "camp:shelter:{mode}"
-    verified = "offline"
+    verified = "live"
     cooldown_s = 20.0
 
     @classmethod

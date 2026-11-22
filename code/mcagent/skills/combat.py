@@ -130,7 +130,7 @@ class HuntMob(Skill):
     name = "hunt_mob"
     description = "击杀合法敌对生物，或指定种类采集战斗掉落"
     goal = "acq:combat:{target}:{drop}"
-    verified = "offline"
+    verified = "live"
     params = {
         "target": Param(str, "原版敌对生物名，any 为任意", default="any"),
         "drop": Param(str, "需要的掉落物类型，none 为只击杀", default="none", choices=("none", *_DROPS)),
@@ -246,7 +246,7 @@ class DeflectSkeletonArrow(Skill):
     name = "deflect_skeleton_arrow"
     description = "用副手盾牌格挡骷髅弹射物"
     goal = "adv:deflect_arrow"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):
@@ -390,7 +390,7 @@ class ShootMob(_RangedSkill):
     name = "shoot_mob"
     description = "用弓或弩发射真箭并验证对实体造成伤害"
     goal = "adv:shoot_arrow"
-    verified = "offline"
+    verified = "live"
 
 
 @register
@@ -398,5 +398,5 @@ class FireCrossbow(_RangedSkill):
     name = "fire_crossbow"
     description = "用弩发射箭或烟花并核对服务器进度"
     goal = "adv:ol_betsy"
-    verified = "offline"
+    verified = "live"
     crossbow_only = True

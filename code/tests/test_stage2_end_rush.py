@@ -133,7 +133,7 @@ class EndRushContractTests(EndRushTestBase):
         }
         for name, cls in expected.items():
             self.assertEqual(contract_errors(cls), [], f"{name} 契约检查失败")
-            self.assertEqual(cls.verified, "offline")
+            self.assertEqual(cls.verified, "live")
             self.assertIn(name, REGISTRY)
             self.assertIs(REGISTRY[name], cls)
             self.assertTrue(cls.blocked(State()), f"{name} 应对未就绪空 State 返回 blocked 原因")

@@ -188,7 +188,7 @@ def loot_container_items(ex: Executor, state: State, pos: Sequence[float], *, wa
 
 @register
 class MineAncientDebris(Skill):
-    name, goal, verified = "mine_ancient_debris", "nether:ancient_debris", "offline"
+    name, goal, verified = "mine_ancient_debris", "nether:ancient_debris", "live"
     description = "在下界探测暴露远古残骸或安全阶梯下行采掘"
     params = {"count": Param(int, "目标远古残骸数", default=1, min=1, max=8), "max_steps": Param(int, "阶梯掘进步数", default=24, min=4, max=48)}
     @classmethod
@@ -238,7 +238,7 @@ class MineAncientDebris(Skill):
 
 @register
 class HuntBlaze(Skill):
-    name, goal, verified = "hunt_blaze", "nether:blaze_rod", "offline"
+    name, goal, verified = "hunt_blaze", "nether:blaze_rod", "live"
     description = "在下界猎杀烈焰人并收集烈焰棒，远程优先与血量止损"
     params = {"count": Param(int, "目标烈焰棒数", default=1, min=1, max=8), "radius": Param(int, "搜索半径", default=32, min=8, max=64)}
     @classmethod
@@ -253,7 +253,7 @@ class HuntBlaze(Skill):
 
 @register
 class LootBastion(Skill):
-    name, goal, verified = "loot_bastion", "nether:loot_bastion", "offline"
+    name, goal, verified = "loot_bastion", "nether:loot_bastion", "live"
     description = "穿金甲并规避猪灵蛮兵，搜刮猪灵堡垒箱子战利品"
     params = {"radius": Param(int, "搜箱半径", default=32, min=8, max=64)}
     @classmethod
@@ -293,7 +293,7 @@ class LootBastion(Skill):
 
 @register
 class ChargeRespawnAnchor(Skill):
-    name, goal, verified = "charge_respawn_anchor", "nether:respawn_anchor", "offline"
+    name, goal, verified = "charge_respawn_anchor", "nether:respawn_anchor", "live"
     description = "仅在下界制作/放置并用萤石充能重生锚（严禁非下界操作）"
     params = {"charges": Param(int, "充能次数", default=4, min=1, max=4)}
     @classmethod
@@ -340,7 +340,7 @@ class ChargeRespawnAnchor(Skill):
 
 @register
 class DistractPiglin(Skill):
-    name, goal, verified = "distract_piglin", "nether:piglin_{mode}", "offline"
+    name, goal, verified = "distract_piglin", "nether:piglin_{mode}", "live"
     description = "向普通猪灵投掷金锭引开注意或交易换取哭泣黑曜石"
     params = {"mode": Param(str, "猪灵交互模式", default="distract", choices=("distract", "barter_crying_obsidian")), "radius": Param(int, "找猪灵半径", default=24, min=8, max=48)}
     @classmethod
@@ -380,7 +380,7 @@ class DistractPiglin(Skill):
 
 @register
 class HuntWitherSkull(Skill):
-    name, goal, verified = "hunt_wither_skull", "nether:wither_skull", "offline"
+    name, goal, verified = "hunt_wither_skull", "nether:wither_skull", "live"
     description = "在下界击杀凋灵骷髅获取头颅，带止损和血量保护"
     params = {"radius": Param(int, "搜索半径", default=32, min=8, max=64), "max_kills": Param(int, "止损最大击杀数", default=6, min=1, max=20)}
     @classmethod

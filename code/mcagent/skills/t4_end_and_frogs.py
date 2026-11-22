@@ -291,7 +291,7 @@ def _ensure_crafting_table(ex: Executor, state: State, skill_name: str, st: dict
 
 @register
 class LootEndShipElytra(Skill):
-    name, goal, verified = "loot_end_ship_elytra", "t4:end_elytra", "offline"
+    name, goal, verified = "loot_end_ship_elytra", "t4:end_elytra", "live"
     description = "登临末地船击落鞘翅展示框并拾取鞘翅"
     params = {}
 
@@ -420,7 +420,7 @@ class LootEndShipElytra(Skill):
 
 @register
 class LeashFrogVariants(Skill):
-    name, goal, verified = "leash_frog_variants", "t4:leash_all_frog_variants", "offline"
+    name, goal, verified = "leash_frog_variants", "t4:leash_all_frog_variants", "live"
     description = "顺序单拴寒温热三种变体青蛙并核验进度子条件"
     params = {}
 
@@ -598,7 +598,7 @@ class LeashFrogVariants(Skill):
 
 @register
 class CollectFroglights(Skill):
-    name, goal, verified = "collect_froglights", "t4:froglights", "offline"
+    name, goal, verified = "collect_froglights", "t4:froglights", "live"
     description = "下界拆分岩浆怪引导青蛙吞食并收集三种蛙明灯"
     params = {}
 

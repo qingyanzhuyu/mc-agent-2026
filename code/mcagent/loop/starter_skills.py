@@ -546,7 +546,7 @@ class EatFood(Skill):
     params = {}
     goal = "survive:eat"
     cooldown_s = 10.0
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state: "State") -> str:
@@ -614,7 +614,7 @@ class ScoutIsland(Skill):
     params = {"radius": Param(int, "扫描半径", default=32, min=12, max=64)}
     goal = "explore:island"
     cooldown_s = 12.0
-    verified = "offline"
+    verified = "live"
 
     def run(self, ex: "Executor", state: "State") -> Iterator[dict]:
         st, cur = _refresh_stance(ex, state)

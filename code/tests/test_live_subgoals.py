@@ -13,7 +13,7 @@ from mcagent.loop.context import (
     build_decision_context,
     format_world_landmarks,
 )
-from mcagent.loop.goals import GOALS
+from mcagent.loop.goals import GOAL_MAP, GOALS
 from mcagent.loop.reserve import ReservationBook
 from mcagent.loop.subgoals import (
     active_portal,
@@ -1038,12 +1038,14 @@ class LiveDecisionContextTests(unittest.TestCase):
         landmarks_line = format_world_landmarks(ctx.world_landmarks)
         surfaces = (rendered, ctx.subgoal_summary, landmarks_line)
 
-        forbidden_tokens = (
+        forbidden_coords = (
             "[1234, 67, -8910]",
             "[-4321, 52, 9876]",
             "[777, 70, -888]",
             "[2468.5, 81.0, -3579.25]",
             "[2471, 81, -3575]",
+        )
+        forbidden_numbers = (
             "1234", "67", "-8910",
             "-4321", "52", "9876",
             "777", "70", "-888",
@@ -1051,8 +1053,13 @@ class LiveDecisionContextTests(unittest.TestCase):
             "98765",
         )
         for text in surfaces:
-            for token in forbidden_tokens:
+            for token in forbidden_coords:
                 self.assertNotIn(token, text, msg=f"Leaked J17 token {token!r} in {text!r}")
+            for num in forbidden_numbers:
+                self.assertIsNone(
+                    re.search(rf"(?<![\d.-]){re.escape(num)}(?!\d)", text),
+                    msg=f"Leaked J17 numeric token {num!r} in {text!r}",
+                )
             self.assertIsNone(re.search(r"\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+", text))
 
         # Verify expected sanitized Chinese labels still appear
@@ -1062,10 +1069,25 @@ class LiveDecisionContextTests(unittest.TestCase):
         self.assertIn("传送门=已激活", landmarks_line)
 
     def test_empty_world_memo_emits_no_landmarks_line(self) -> None:
+        self.assertEqual(format_world_landmarks(None), "")
+        self.assertEqual(format_world_landmarks({}), "")
         state = _make_state(inventory={"items": []})
-        ctx = build_decision_context(state)
-        self.assertEqual(format_world_landmarks(ctx.world_landmarks), "")
-        self.assertNotIn("已知设施与地标：", ctx.render())
+        ctx_no_landmark_goals = build_decision_context(
+            state,
+            ledger=(GOAL_MAP["prep_wood"], GOAL_MAP["upgrade_tools"]),
+        )
+        self.assertEqual(format_world_landmarks(ctx_no_landmark_goals.world_landmarks), "")
+        self.assertNotIn("已知设施与地标：", ctx_no_landmark_goals.render())
+
+        ctx_default = build_decision_context(state)
+        self.assertIsInstance(ctx_default.world_landmarks, dict)
+        assert ctx_default.world_landmarks is not None
+        self.assertEqual(ctx_default.world_landmarks.get("stations_ready"), [])
+        self.assertEqual(ctx_default.world_landmarks.get("landmarks_discovered"), [])
+        self.assertFalse(ctx_default.world_landmarks.get("active_portal"))
+        self.assertEqual(ctx_default.world_landmarks.get("resource_counts"), {})
+        self.assertEqual(ctx_default.world_landmarks.get("pending_landmark_goals"), 64)
+        self.assertEqual(format_world_landmarks(ctx_default.world_landmarks), "已知设施与地标：待勘探目标=64项")
 
     def test_backward_compatibility_without_new_fields_and_custom_subgoal_provider(self) -> None:
         state = _make_state(inventory={"items": [{"name": "iron_ingot", "count": 6, "slot": 0}]})

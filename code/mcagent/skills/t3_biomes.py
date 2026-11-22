@@ -225,6 +225,7 @@ class _BiomeSkill(Skill):
 @register
 class KillNearSculkCatalyst(_BiomeSkill):
     name, goal, description = "kill_near_sculk_catalyst", "t3:sculk_catalyst", "在幽匿催发体 8 格内击杀生物触发幽匿蔓延"
+    verified = "live"
     params = {"radius": Param(int, "搜索幽匿催发体半径", default=24, min=8, max=64)}
     _done_msg = "未确认在幽匿催发体 8 格内完成击杀"
     @classmethod
@@ -253,6 +254,7 @@ class KillNearSculkCatalyst(_BiomeSkill):
 @register
 class AssistAxolotlHunt(_BiomeSkill):
     name, goal, description = "assist_axolotl_hunt", "t3:axolotl_hunt", "协助美西螈击杀水生猎物触发并肩作战"
+    verified = "live"
     params = {"radius": Param(int, "搜索美西螈与猎物半径", default=24, min=8, max=64)}
     _done_msg = "未确认协助美西螈击杀水生猎物"
     @classmethod
@@ -294,6 +296,7 @@ class AssistAxolotlHunt(_BiomeSkill):
 @register
 class ManageWolfArmor(_BiomeSkill):
     name, goal, description = "manage_wolf_armor", "t3:wolf_armor_{mode}", "备齐剪刀或狼铠后脱下狼铠或用犰狳鳞甲修复狼铠"
+    verified = "live"
     params = {"mode": Param(str, "操作模式", default="repair", choices=("remove", "repair")), "radius": Param(int, "搜索驯服狼半径", default=24, min=8, max=64)}
     _done_msg = "未确认脱下或修复狼铠"
     @classmethod
@@ -345,6 +348,7 @@ class ManageWolfArmor(_BiomeSkill):
 @register
 class AllayDeliverItem(_BiomeSkill):
     name, goal, description = "allay_deliver_item", "t3:allay_deliver", "给悦灵物品并丢出同类物品等待其捡回交付"
+    verified = "live"
     params = {"radius": Param(int, "搜索悦灵半径", default=24, min=8, max=64)}
     _done_msg = "未确认悦灵交付同类物品"
     @classmethod
@@ -377,6 +381,7 @@ class AllayDeliverItem(_BiomeSkill):
 @register
 class BoatWithGoat(_BiomeSkill):
     name, goal, description = "boat_with_goat", "t3:boat_goat", "备齐或合成木船并在山羊旁放船引诱上船同乘后下船"
+    verified = "live"
     params = {"radius": Param(int, "搜索山羊半径", default=24, min=8, max=64)}
     _done_msg = "未确认与山羊同乘船并安全下船"
     @classmethod
@@ -433,6 +438,7 @@ class BoatWithGoat(_BiomeSkill):
 class SilkTouchBeeNest(_BiomeSkill):
     """保守策略：API `/get_block` 不暴露蜂巢内部蜜蜂数，优先夜间/雨天（蜜蜂归巢）或巢旁可见蜜蜂时精准采集，可选放营火。"""
     name, goal, description = "silk_touch_bee_nest", "t3:silk_nest", "夜间或蜜蜂归巢时用精准采集工具完整挖取蜂巢"
+    verified = "live"
     params = {"radius": Param(int, "搜索蜂巢半径", default=24, min=8, max=64)}
     _done_msg = "未确认精准采集获得蜂巢"
     @classmethod
@@ -468,6 +474,7 @@ class SilkTouchBeeNest(_BiomeSkill):
 @register
 class CatchTadpole(_BiomeSkill):
     name, goal, description = "catch_tadpole", "t3:tadpole_bucket", "必要时先装水再靠近蝌蚪用水桶将其装入蝌蚪桶"
+    verified = "live"
     params = {"radius": Param(int, "搜索蝌蚪半径", default=24, min=8, max=64)}
     _done_msg = "未确认捕获蝌蚪装桶"
     @classmethod
@@ -503,6 +510,7 @@ class CatchTadpole(_BiomeSkill):
 @register
 class SpyglassObserve(_BiomeSkill):
     name, goal, description = "spyglass_observe", "t3:spyglass_{target}", "备齐或合成望远镜后瞄准并观察恶魂或鹦鹉"
+    verified = "live"
     params = {"target": Param(str, "观察目标", default="parrot", choices=("ghast", "parrot")), "radius": Param(int, "搜索目标半径", default=48, min=8, max=64)}
     _done_msg = "未确认望远镜观察目标生物"
     @classmethod

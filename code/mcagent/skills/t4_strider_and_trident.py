@@ -221,6 +221,7 @@ class _StriderTridentSkill(Skill):
 @register
 class RideStriderBoost(_StriderTridentSkill):
     name, goal, description = "ride_strider_boost", "t4:ride_strider", "引诱炽足兽上鞍骑乘并以诡异菌钓竿双路径触发加速"
+    verified = "live"
     params: dict[str, Param] = {}
     @classmethod
     def blocked(cls, state: State) -> str:
@@ -244,6 +245,7 @@ class RideStriderBoost(_StriderTridentSkill):
 @register
 class RideStriderOverworld(_StriderTridentSkill):
     name, goal, description = "ride_strider_overworld", "t4:ride_strider_overworld", "带炽足兽入主世界并在带顶棚的直线全岩浆源通道骑行满50格"
+    verified = "live"
     params: dict[str, Param] = {}
     @classmethod
     def blocked(cls, state: State) -> str:
@@ -303,6 +305,7 @@ class RideStriderOverworld(_StriderTridentSkill):
 @register
 class ThrowOpportunisticTrident(_StriderTridentSkill):
     name, goal, description = "throw_opportunistic_trident", "t4:throw_trident", "机会触发：持非激流三叉戟向安全被动生物或盔甲架投掷命中"
+    verified = "live"
     params: dict[str, Param] = {}
     @classmethod
     def blocked(cls, state: State) -> str:

@@ -36,7 +36,7 @@ class CraftIronGear(Skill):
     description = "按配方核对铁料并制造指定装备、桶、盾或工具"
     params = {"item": Param(str, "指定成品", choices=_GEAR)}
     goal = "acq:{item}"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

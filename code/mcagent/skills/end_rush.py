@@ -129,6 +129,7 @@ class _EndSkill(Skill):
 @register
 class EnterTheEnd(_EndSkill):
     name, description, goal = "enter_the_end", "补齐要塞末地传送门之眼并安全穿越进入末地", "end:enter_the_end"
+    verified = "live"
     params = {"radius": Param(int, "搜索要塞传送门框半径", default=32, min=8, max=64)}
     _done_msg = "尚未确认安全进入末地"
     @classmethod
@@ -210,6 +211,7 @@ class EnterTheEnd(_EndSkill):
 @register
 class EnterEndGateway(_EndSkill):
     name, description, goal = "enter_end_gateway", "向末地折跃门投掷末影珍珠并确认安全抵达外岛", "end:enter_end_gateway"
+    verified = "live"
     params = {"radius": Param(int, "搜索折跃门半径", default=48, min=8, max=64)}
     _done_msg = "尚未通过折跃门安全抵达末地外岛"
     @classmethod
@@ -243,6 +245,7 @@ class EnterEndGateway(_EndSkill):
 @register
 class FindEndCity(_EndSkill):
     name, description, goal = "find_end_city", "在末地外岛探索并搭桥抵达末地城", "end:find_end_city"
+    verified = "live"
     params = {"radius": Param(int, "扫描半径", default=48, min=16, max=64), "max_hops": Param(int, "最大探索段数", default=6, min=1, max=16)}
     _done_msg = "尚未发现并抵达末地城"
     @classmethod
@@ -315,6 +318,7 @@ def _fall_rescue(ex, state, st) -> Iterator[dict]:
 @register
 class LevitateFifty(_EndSkill):
     name, description, goal = "levitate_fifty", "借助潜影贝漂浮上升 50 格并安全落地", "end:levitate_fifty"
+    verified = "live"
     params = {"radius": Param(int, "搜索潜影贝半径", default=32, min=8, max=64)}
     _done_msg = "尚未完成 50 格漂浮上升与安全落地"
     @classmethod

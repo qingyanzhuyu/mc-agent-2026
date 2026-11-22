@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="zh-CN" data-mode="local" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIAMC Harness · 实时监控与双模式控制台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310b981'/%3E%3Crect x='6' y='6' width='9' height='9' rx='2' fill='%2306281e'/%3E%3Crect x='17' y='6' width='9' height='9' rx='2' fill='%23ecfdf5'/%3E%3Crect x='6' y='17' width='9' height='9' rx='2' fill='%23a7f3d0'/%3E%3Crect x='17' y='17' width='9' height='9' rx='2' fill='%23064e3b'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient-glow" aria-hidden="true"></div>
+
+  <!-- 顶部指挥栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span><span></span>
+      </div>
+      <div class="brand-text">
+        <div class="brand-title">AIAMC HARNESS</div>
+        <div class="brand-sub" id="gitBadge">loading...</div>
+      </div>
+    </div>
+
+    <!-- 核心双模式切换器 -->
+    <div class="mode-switcher" role="tablist" aria-label="运行模式切换">
+      <button type="button" class="mode-btn" id="btnModeMatch" data-mode="match" role="tab" aria-selected="false">
+        <span class="mode-icon">🏆</span>
+        <span class="mode-copy">
+          <strong>比赛模式</strong>
+          <small>官方端点 · AIA 代理</small>
+        </span>
+      </button>
+      <button type="button" class="mode-btn active" id="btnModeLocal" data-mode="local" role="tab" aria-selected="true">
+        <span class="mode-icon">🧪</span>
+        <span class="mode-copy">
+          <strong>自搭服测试</strong>
+          <small>本地网关 · 隔离角色</small>
+        </span>
+      </button>
+    </div>
+
+    <div class="topbar-actions">
+      <div class="proc-badge idle" id="procBadge">
+        <span class="pulse-dot"></span>
+        <span id="procBadgeText">待命</span>
+      </div>
+      <button type="button" class="icon-btn" id="btnOpenHandover" title="查看主办方交付清单">
+        📦 交付清单
+      </button>
+      <button type="button" class="icon-btn" id="btnRefresh" title="立即刷新遥测">
+        ↻ 刷新
+      </button>
+      <button type="button" class="icon-btn" id="btnTheme" title="切换深浅主题">
+        ☀
+      </button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <!-- 左侧控制与历史栏 -->
+    <aside class="sidebar">
+      <!-- 模式合规/探活卡片 -->
+      <section class="card mode-card" id="modeCard">
+        <div class="card-head">
+          <h2 id="modeCardTitle">🧪 日常自搭服测试模式</h2>
+          <span class="pill" id="modeEnvPill">LOCAL-TARGET</span>
+        </div>
+        <p class="mode-desc" id="modeCardDesc">
+          连接本地或局域网联调网关，使用隔离测试角色与可选自备模型，不会触碰正式比赛账号与官方服务器。
+        </p>
+
+        <!-- 比赛模式专属：端点与 Preflight -->
+        <div id="matchPanel" class="mode-subpanel hidden">
+          <div class="field">
+            <label for="matchEndpoint">官方比赛服入口</label>
+            <select id="matchEndpoint">
+              <option value="https://apiin.nmo.net.cn/api/v1">校园网直连 · apiin.nmo.net.cn (~5ms 推荐)</option>
+              <option value="https://mc-api.windywindie.top/api/v1">公网备用 · mc-api.windywindie.top (Cloudflare)</option>
+            </select>
+          </div>
+          <div class="compliance-locks">
+            <span class="lock-chip ok">✓ LLM_PROFILE=official</span>
+            <span class="lock-chip ok">✓ LLM_MODEL=default</span>
+            <span class="lock-chip ok">✓ 并发锁 ≤ 2</span>
+            <span class="lock-chip ok">✓ 自动附带 --live</span>
+          </div>
+          <div class="preflight-bar">
+            <div class="preflight-summary" id="preflightSummary">尚未运行赛前 12 项门禁</div>
+            <div class="btn-row">
+              <button type="button" class="btn sm" id="btnPreflightStatic">静态自检</button>
+              <button type="button" class="btn sm primary-soft" id="btnPreflightLive">联网测 RTT</button>
+              <button type="button" class="btn sm" id="btnApplyMatch" title="用 .env.match 覆盖 .env">应用 .env.match</button>
+            </div>
+          </div>
+          <div class="preflight-list hidden" id="preflightList"></div>
+        </div>
+
+        <!-- 本地测试模式专属：网关探活与快捷预设 -->
+        <div id="localPanel" class="mode-subpanel">
+          <div class="field">
+            <label for="localEndpoint">本地/自搭服联调网关 URL</label>
+            <div class="input-action">
+              <input id="localEndpoint" type="text" value="http://127.0.0.1:8787/api/v1" placeholder="http://127.0.0.1:8787/api/v1">
+              <button type="button" class="btn sm" id="btnProbeBridge">探活</button>
+            </div>
+          </div>
+          <div class="bridge-status" id="bridgeStatus">点击「探活」检测本地网关 /healthz</div>
+          <div class="preset-row">
+            <span class="preset-label">快捷预设</span>
+            <button type="button" class="chip-btn" data-preset="cold240">🚀 240s 冷启动</button>
+            <button type="button" class="chip-btn" data-preset="short180">⚡ 180s 石镐</button>
+            <button type="button" class="chip-btn" data-preset="iron360">⛏ 360s 炼铁</button>
+            <button type="button" class="chip-btn" data-preset="rule180">🧭 纯规则基线</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 启动参数配置卡片 -->
+      <section class="card launch-card">
+        <div class="card-head">
+          <h2>启动控制</h2>
+          <span class="muted mono" id="envSecretHint">凭据已脱敏保护</span>
+        </div>
+
+        <div class="form-grid">
+          <div class="field" id="fieldBotUser">
+            <label for="inputBotUser">角色名（--user 隔离）</label>
+            <input id="inputBotUser" type="text" value="dev_console_bot" placeholder="dev_console_bot">
+          </div>
+
+          <div class="field hidden" id="fieldMatchUser">
+            <label>正式皮肤站角色（来自 .env.match）</label>
+            <div class="readonly-box mono" id="matchUserReadonly">-</div>
+          </div>
+
+          <div class="field">
+            <label for="selectStrategy">决策策略</label>
+            <select id="selectStrategy">
+              <option value="llm">LLM 异步战略 + 确定性技能</option>
+              <option value="rule">纯规则规划器（零 LLM）</option>
+            </select>
+          </div>
+
+          <div class="field" id="fieldLlmProfile">
+            <label for="selectLlmProfile">测试 LLM 来源</label>
+            <select id="selectLlmProfile">
+              <option value="custom">自备模型（.env LLM_CUSTOM_*）</option>
+              <option value="official">官方 AIA 代理（default）</option>
+              <option value="none">关闭 LLM（纯规则）</option>
+            </select>
+          </div>
+
+          <div class="field" id="fieldCustomModel">
+            <label for="inputCustomModel">自备模型名（可覆盖）</label>
+            <input id="inputCustomModel" type="text" placeholder="沿用 .env LLM_CUSTOM_MODEL">
+          </div>
+
+          <div class="field">
+            <label for="inputMaxSeconds">时长预算（秒）</label>
+            <div class="input-pills">
+              <input id="inputMaxSeconds" type="number" min="0" max="86400" value="240">
+              <div class="mini-pills">
+                <button type="button" class="mini-pill" data-sec="180">3m</button>
+                <button type="button" class="mini-pill" data-sec="240">4m</button>
+                <button type="button" class="mini-pill" data-sec="1800">30m</button>
+                <button type="button" class="mini-pill" data-sec="28800">8h</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="inputMaxSteps">步数上限（0=不限）</label>
+            <input id="inputMaxSteps" type="number" min="0" max="200000" value="0">
+          </div>
+
+          <div class="field">
+            <label for="selectMinVerified">技能验证门槛</label>
+            <select id="selectMinVerified">
+              <option value="offline">offline（全部注册技能可用）</option>
+              <option value="live">live（仅已晋级 live 技能）</option>
+            </select>
+          </div>
+
+          <div class="field" id="fieldRunMode">
+            <label for="selectRunMode">运行模式</label>
+            <select id="selectRunMode">
+              <option value="campaign">campaign（主线多目标推进）</option>
+              <option value="focus">focus（单技能定向调试）</option>
+            </select>
+          </div>
+
+          <div class="field wide" id="fieldGoal">
+            <label for="inputGoal">聚焦目标（可选，逗号分隔，留空跑全主线）</label>
+            <input id="inputGoal" list="goalsDatalist" type="text" placeholder="例如: upgrade_tools 或 smelt_iron">
+            <datalist id="goalsDatalist"></datalist>
+          </div>
+
+          <div class="field wide hidden" id="fieldFocusSkill">
+            <label for="inputFocusSkill">Focus 单技能 &amp; JSON 参数</label>
+            <div class="focus-pair">
+              <input id="inputFocusSkill" list="skillsDatalist" type="text" placeholder="gather_wood">
+              <input id="inputFocusArgs" type="text" value="{}" placeholder='{"count":4}'>
+            </div>
+            <datalist id="skillsDatalist"></datalist>
+          </div>
+        </div>
+
+        <div class="checks-stack">
+          <label class="toggle-line">
+            <input type="checkbox" id="chkIncludeDraft" checked>
+            <span>解锁全部 <code>draft</code> 目标台账（<code>--include-draft</code>，覆盖 109 项 / 2,925 分）</span>
+          </label>
+          <label class="toggle-line">
+            <input type="checkbox" id="chkCheckpoint" checked>
+            <span>启用世界记忆检查点（<code>world_memo.json</code> 断点持久化）</span>
+          </label>
+          <label class="toggle-line">
+            <input type="checkbox" id="chkDisconnect" checked>
+            <span>退出时自动下线（<code>--disconnect-on-exit</code>）</span>
+          </label>
+          <label class="toggle-line" id="wrapStopOnDeath">
+            <input type="checkbox" id="chkStopOnDeath">
+            <span>死亡立即停机保留现场（<code>--stop-on-death</code>）</span>
+          </label>
+          <label class="toggle-line warn-box hidden" id="wrapAccountReserved">
+            <input type="checkbox" id="chkAccountReserved">
+            <span><strong>比赛防互踢确认：</strong>我已在 <code>docs/05</code> 账号表占位，确认独占正式角色登录</span>
+          </label>
+        </div>
+
+        <div class="launch-actions">
+          <button type="button" class="btn primary lg" id="btnStart">▶ 启动运行</button>
+          <button type="button" class="btn warn lg hidden" id="btnStop">■ 优雅停止</button>
+          <button type="button" class="btn danger sm hidden" id="btnKill" title="强制 SIGKILL">强杀</button>
+          <button type="button" class="btn sm" id="btnDry" title="不登录不占号，核验技能契约、台账与端点连通">Dry 自检</button>
+        </div>
+      </section>
+
+      <!-- 历史与实时运行列表 -->
+      <section class="card runs-card">
+        <div class="card-head">
+          <h2>运行记录</h2>
+          <span class="pill subtle" id="runsCountPill">0</span>
+        </div>
+        <div class="runs-filter">
+          <button type="button" class="filter-pill active" data-run-filter="all">全部</button>
+          <button type="button" class="filter-pill" data-run-filter="official">官方</button>
+          <button type="button" class="filter-pill" data-run-filter="local-target">自搭服</button>
+        </div>
+        <div class="runs-list" id="runsList">
+          <div class="empty-hint">正在扫描 logs/ 与 results/ ...</div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- 右侧实时观察舞台 -->
+    <main class="stage">
+      <!-- 顶部当前运行头与活跃大脑状态条 -->
+      <section class="card hero-banner">
+        <div class="hero-top">
+          <div class="hero-id">
+            <span class="source-badge local" id="runSourceBadge">LOCAL-TARGET</span>
+            <h1 id="runTitle">请选择或启动一次运行</h1>
+            <span class="mono muted" id="runSubtitle">-</span>
+          </div>
+          <div class="hero-meta" id="runGitMeta"></div>
+        </div>
+
+        <!-- 活跃思考与执行链条 -->
+        <div class="brain-strip">
+          <div class="brain-node">
+            <span class="node-label">战略目标 OBJECTIVE</span>
+            <strong class="node-value" id="brainObjective">-</strong>
+            <span class="node-sub" id="brainObjectiveSub">等待战略规划</span>
+          </div>
+          <div class="brain-arrow">➜</div>
+          <div class="brain-node">
+            <span class="node-label">执行技能 L3 SKILL</span>
+            <strong class="node-value mono" id="brainSkill">-</strong>
+            <span class="node-sub" id="brainSkillSub">空闲</span>
+          </div>
+          <div class="brain-arrow">➜</div>
+          <div class="brain-node">
+            <span class="node-label">最新原子动作 L1 OP</span>
+            <strong class="node-value mono" id="brainOp">-</strong>
+            <span class="node-sub" id="brainOpSub">-</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 核心 4 张生命体征与绩效 KPI 卡片 -->
+      <section class="kpi-grid">
+        <div class="card kpi-card score-kpi">
+          <div class="kpi-label">
+            <span>服务端实得分 (V2)</span>
+            <span class="mono muted" id="kpiAdvCount">0 进度</span>
+          </div>
+          <div class="kpi-big">
+            <span id="kpiServerScore">0</span>
+            <small>分</small>
+          </div>
+          <div class="kpi-foot">
+            <span>背包推演里程碑：<b id="kpiInferredScore">0</b> 分</span>
+            <span>达成目标：<b id="kpiGoalsCount">0</b></span>
+          </div>
+        </div>
+
+        <div class="card kpi-card vitals-kpi">
+          <div class="kpi-label">
+            <span>角色体征与坐标</span>
+            <span class="death-chip" id="kpiDeaths">0 死亡</span>
+          </div>
+          <div class="vital-bars">
+            <div class="vbar-row">
+              <span class="vbar-tag hp">❤ HP</span>
+              <div class="vbar-track"><div class="vbar-fill hp" id="barHp" style="width:0%"></div></div>
+              <span class="mono vbar-num" id="valHp">-</span>
+            </div>
+            <div class="vbar-row">
+              <span class="vbar-tag food">🍖 饱食</span>
+              <div class="vbar-track"><div class="vbar-fill food" id="barFood" style="width:0%"></div></div>
+              <span class="mono vbar-num" id="valFood">-</span>
+            </div>
+          </div>
+          <div class="kpi-foot mono">
+            <span id="kpiPos">pos: -</span>
+            <span id="kpiDist">0m</span>
+          </div>
+        </div>
+
+        <div class="card kpi-card time-kpi">
+          <div class="kpi-label">
+            <span>运行耗时与步数</span>
+            <span class="mono muted" id="kpiStopReason">-</span>
+          </div>
+          <div class="kpi-big">
+            <span id="kpiElapsed">00:00</span>
+            <small id="kpiBudgetLabel">/ 不限</small>
+          </div>
+          <div class="progress-track"><div class="progress-fill" id="barElapsed" style="width:0%"></div></div>
+          <div class="kpi-foot">
+            <span>累计动作：<b class="mono" id="kpiSteps">0</b> 步</span>
+            <span class="mono" id="kpiStepRate">-</span>
+          </div>
+        </div>
+
+        <div class="card kpi-card token-kpi">
+          <div class="kpi-label">
+            <span>LLM Token 与 8h 额度外推</span>
+            <span class="mono muted" id="kpiLlmStats">0 次</span>
+          </div>
+          <div class="kpi-big">
+            <span id="kpiTokens">0</span>
+            <small>tok</small>
+          </div>
+          <div class="progress-track"><div class="progress-fill token" id="barQuota" style="width:0%"></div></div>
+          <div class="kpi-foot">
+            <span>8h 输入外推：<b class="mono" id="kpiProjIn">0%</b></span>
+            <span>均延迟：<b class="mono" id="kpiLlmMs">0ms</b></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 双可视化图表：2D 轨迹雷达 + 得分/Token 曲线 -->
+      <section class="viz-grid">
+        <div class="card viz-card">
+          <div class="card-head">
+            <div>
+              <h2>2D 空间轨迹雷达（X / Z 俯视图 · 按高度 Y 着色）</h2>
+              <small class="muted" id="trajMeta">等待坐标采样...</small>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn xs" id="btnZoomIn" title="放大">+</button>
+              <button type="button" class="btn xs" id="btnZoomOut" title="缩小">−</button>
+              <button type="button" class="btn xs" id="btnZoomReset" title="重置视角">重置</button>
+            </div>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="trajCanvas" width="640" height="320"></canvas>
+            <div class="traj-tooltip hidden" id="trajTooltip"></div>
+          </div>
+          <div class="traj-legend">
+            <span><i class="dot y-deep"></i>深层 Y&lt;16</span>
+            <span><i class="dot y-cave"></i>地下 16–56</span>
+            <span><i class="dot y-surf"></i>地表 57–90</span>
+            <span><i class="dot y-high"></i>高处 &gt;90</span>
+            <span><i class="dot pt-goal"></i>达成目标</span>
+            <span><i class="dot pt-death"></i>死亡点</span>
+          </div>
+        </div>
+
+        <div class="card viz-card">
+          <div class="card-head">
+            <div>
+              <h2>得分进度 &amp; Token 累积曲线</h2>
+              <small class="muted" id="curveMeta">等待进度采样...</small>
+            </div>
+            <div class="curve-legend">
+              <span><i class="line-swatch score"></i>服务端得分</span>
+              <span><i class="line-swatch inferred"></i>背包里程碑</span>
+              <span><i class="line-swatch tok"></i>累计 Token</span>
+            </div>
+          </div>
+          <div class="svg-wrap" id="curveSvgWrap">
+            <div class="empty-hint">暂无进度曲线数据</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 已达成目标 + 技能耗时分布 -->
+      <section class="mid-grid">
+        <div class="card">
+          <div class="card-head">
+            <h2>已达成目标与地标发现</h2>
+            <span class="muted mono" id="goalsTotalBadge">0 项</span>
+          </div>
+          <div class="goals-chips" id="goalsChips">
+            <div class="empty-hint">尚未达成目标</div>
+          </div>
+          <div class="landmarks-bar hidden" id="landmarksBar"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>技能耗时与成败分布</h2>
+            <span class="muted mono" id="skillSummaryBadge">Top 8</span>
+          </div>
+          <div class="skill-bars" id="skillBars">
+            <div class="empty-hint">暂无技能执行记录</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 底部多标签深度面板 -->
+      <section class="card tabs-card">
+        <div class="tabs-header">
+          <div class="tab-buttons" role="tablist">
+            <button type="button" class="tab-btn active" data-tab="timeline">⚡ 事件时间线</button>
+            <button type="button" class="tab-btn" data-tab="incidents">🚨 异常诊断 <span class="count-pill" id="incCountPill">0</span></button>
+            <button type="button" class="tab-btn" data-tab="summary">📄 诊断总结</button>
+            <button type="button" class="tab-btn" data-tab="console">💻 终端输出</button>
+            <button type="button" class="tab-btn" data-tab="handover">📦 主办方交付清单</button>
+          </div>
+          <div class="tab-tools" id="timelineTools">
+            <select id="eventCategoryFilter" class="compact-select">
+              <option value="all">全部事件</option>
+              <option value="strategy">战略目标 &amp; 得分</option>
+              <option value="skill">技能起止</option>
+              <option value="step">动作步骤</option>
+              <option value="llm">LLM 调用</option>
+              <option value="safety">死亡与安全</option>
+            </select>
+            <input id="eventSearch" type="search" class="compact-search" placeholder="筛选技能/关键词...">
+          </div>
+        </div>
+
+        <div class="tab-panel active" id="tab-timeline">
+          <div class="timeline-list" id="timelineList">
+            <div class="empty-hint">暂无事件记录</div>
+          </div>
+        </div>
+
+        <div class="tab-panel" id="tab-incidents">
+          <div class="incidents-list" id="incidentsList">
+            <div class="empty-hint">本次运行 0 异常单</div>
+          </div>
+        </div>
+
+        <div class="tab-panel" id="tab-summary">
+          <pre class="code-box" id="summaryBox">暂无 summary.md（运行结束后自动生成）</pre>
+        </div>
+
+        <div class="tab-panel" id="tab-console">
+          <pre class="code-box terminal" id="consoleBox">尚未通过本控制台启动进程。点击左侧「启动运行」或「Dry 自检」查看实时输出。</pre>
+        </div>
+
+        <div class="tab-panel" id="tab-handover">
+          <div id="handoverContent" class="handover-wrap">正在加载交付审计...</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 异常包详情弹窗 -->
+  <dialog id="incidentDialog" class="modal">
+    <div class="modal-head">
+      <strong id="incModalTitle">异常详情</strong>
+      <button type="button" class="btn xs" id="btnCloseIncModal">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="replay-box">
+        <span class="muted">离线 100% 确定性重放命令：</span>
+        <code id="incReplayCmd"></code>
+        <button type="button" class="btn xs" id="btnCopyReplay">复制</button>
+      </div>
+      <pre class="code-box" id="incJsonBox"></pre>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -91,6 +91,16 @@ class RuntimeToggleSkill(Skill):
 
 
 class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
+    _FIXTURE_LEDGER = (
+        GOAL_MAP["prep_wood"],
+        GOAL_MAP["prep_wooden_pickaxe"],
+        GOAL_MAP["mine_stone"],
+        GOAL_MAP["upgrade_tools"],
+        GOAL_MAP["prep_furnace"],
+        GOAL_MAP["smelt_iron"],
+        GOAL_MAP["iron_tools"],
+    )
+
     def setUp(self) -> None:
         llm_mod._reset_semaphores()
         skill_base._COOLDOWN.clear()
@@ -136,6 +146,7 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
             mode="campaign",
             strategy="llm",
             llm=llm,
+            ledger=self._FIXTURE_LEDGER,
             min_verified="offline",
             clock=self.clock,
             on_objective_telemetry=telemetry_rows.append,
@@ -176,6 +187,7 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
             mode="campaign",
             strategy="llm",
             llm=err_llm,
+            ledger=self._FIXTURE_LEDGER,
             min_verified="offline",
             clock=self.clock,
             on_objective_telemetry=err_rows.append,
@@ -204,6 +216,7 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
             mode="campaign",
             strategy="llm",
             llm=llm,
+            ledger=self._FIXTURE_LEDGER,
             min_verified="offline",
             clock=self.clock,
             on_objective_telemetry=rows.append,
@@ -240,7 +253,7 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
         llm_stale = LLMClient(key="k", fast_proxy="", poster=stale_goal_poster, clock=self.clock, log=None)
         stale_rows: list[dict] = []
         p_stale = CampaignPlanner(
-            mode="campaign", strategy="llm", llm=llm_stale, min_verified="offline",
+            mode="campaign", strategy="llm", llm=llm_stale, ledger=self._FIXTURE_LEDGER, min_verified="offline",
             clock=self.clock, on_objective_telemetry=stale_rows.append,
         )
         p_stale.select(state_stale, [])
@@ -272,7 +285,7 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
         llm_die = LLMClient(key="k", fast_proxy="", poster=respawn_race_poster, clock=self.clock, log=None)
         die_rows: list[dict] = []
         p_die = CampaignPlanner(
-            mode="campaign", strategy="llm", llm=llm_die, min_verified="offline",
+            mode="campaign", strategy="llm", llm=llm_die, ledger=self._FIXTURE_LEDGER, min_verified="offline",
             clock=self.clock, on_objective_telemetry=die_rows.append,
         )
         p_die.select(state_die, [])
@@ -310,13 +323,12 @@ class ObjectiveStrategyAsyncAndTriggersTests(unittest.TestCase):
                 mode="campaign",
                 strategy="llm",
                 llm=llm,
+                ledger=self._FIXTURE_LEDGER if ledger is None else ledger,
                 min_verified="offline",
                 review_interval_s=review_s,
                 clock=self.clock,
                 on_objective_telemetry=rows.append,
             )
-            if ledger is not None:
-                kw["ledger"] = ledger
             if registry is not None:
                 kw["registry"] = registry
             return CampaignPlanner(**kw), rows

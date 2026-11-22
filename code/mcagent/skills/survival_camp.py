@@ -292,7 +292,7 @@ class SleepInBed(Skill):
     name = "sleep_in_bed"
     goal = "goal:sleep_in_bed"
     description = "夜间优先复用安全的床并确认实际睡眠"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

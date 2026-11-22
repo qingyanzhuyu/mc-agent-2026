@@ -190,7 +190,7 @@ class HitBullseye(Skill):
     name = "hit_bullseye"
     description = "复用或放置标靶，在合格的远端射位射面心并查进度"
     goal = "adventure:bullseye"
-    verified = "offline"
+    verified = "live"
 
     @classmethod
     def blocked(cls, state):

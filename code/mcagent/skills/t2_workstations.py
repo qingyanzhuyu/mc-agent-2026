@@ -163,7 +163,7 @@ def _can_craft_golden_apple(state) -> bool:
 
 @register
 class TradeVillager(Skill):
-    name, goal, verified = "trade_villager", "trade:villager", "offline"
+    name, goal, verified = "trade_villager", "trade:villager", "live"
     description = "寻找附近村民或流浪商人并完成一次可支付交易"
     params = {"radius": Param(int, "找村民半径", default=32, min=8, max=64)}
     _trade_result: Optional[dict] = None
@@ -205,7 +205,7 @@ class TradeVillager(Skill):
 
 @register
 class TrimArmor(Skill):
-    name, goal, verified = "trim_armor", "smith:trim", "offline"
+    name, goal, verified = "trim_armor", "smith:trim", "live"
     description = "用锻造模板和矿物在锻造台为一件盔甲添加纹饰"
     params = {"radius": Param(int, "找锻造台半径", default=24, min=8, max=64)}
     _smith_result: Optional[dict] = None
@@ -245,7 +245,7 @@ class TrimArmor(Skill):
 
 @register
 class SmithNetheriteHoe(Skill):
-    name, goal, verified = "smith_netherite_hoe", "smith:netherite_hoe", "offline"
+    name, goal, verified = "smith_netherite_hoe", "smith:netherite_hoe", "live"
     description = "用下界合金升级模板与锭将钻石锄升级为下界合金锄"
     params = {"radius": Param(int, "找锻造台半径", default=24, min=8, max=64)}
 
@@ -287,7 +287,7 @@ class SmithNetheriteHoe(Skill):
 
 @register
 class BrewPotion(Skill):
-    name, goal, verified = "brew_potion", "brew:{recipe}", "offline"
+    name, goal, verified = "brew_potion", "brew:{recipe}", "live"
     description = "在酿造台放入药水与原料酿造平凡药水、虚弱药水或虚弱喷溅药水"
     params = {"recipe": Param(str, "酿造配方", default="mundane", choices=("mundane", "weakness", "weakness_splash")), "radius": Param(int, "找酿造台半径", default=24, min=8, max=64)}
     _max_polls, _poll_sleep_s, _sleep_fn = 48, 0.5, staticmethod(time.sleep)
@@ -361,7 +361,7 @@ class BrewPotion(Skill):
 
 @register
 class CureZombieVillager(Skill):
-    name, goal, verified = "cure_zombie_villager", "cure:zombie_villager", "offline"
+    name, goal, verified = "cure_zombie_villager", "cure:zombie_villager", "live"
     description = "向附近僵尸村民投掷虚弱喷溅药水并喂食金苹果进行治疗"
     params = {"radius": Param(int, "找僵尸村民半径", default=32, min=8, max=64)}
     _cured: bool = False

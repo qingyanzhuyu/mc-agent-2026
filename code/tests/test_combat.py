@@ -168,7 +168,7 @@ class HuntMobTests(CombatTestCase):
         self.assertEqual(len(_kill_criteria()), 41)
         self.assertIn("parched", _kill_criteria())
         self.assertNotIn("cow", _kill_criteria())
-        self.assertEqual(make("hunt_mob").verified, "offline")
+        self.assertEqual(make("hunt_mob").verified, "live")
 
     def test_normal_melee_equip_then_reward(self):
         world = CombatWorld({"stone_sword": 1}, entities=[mob("spider")])

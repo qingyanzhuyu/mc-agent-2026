@@ -305,7 +305,7 @@ class RegistryContractTests(unittest.TestCase):
         for name, cls in expected.items():
             self.assertIs(REGISTRY.get(name), cls)
             self.assertEqual(contract_errors(cls), [], name)
-            self.assertEqual(cls.verified, "offline", name)
+            self.assertEqual(cls.verified, "live", name)
         self.assertIsNotNone(t2)
 
 
@@ -842,7 +842,7 @@ class BiomePrepAndLandmarkTests(unittest.TestCase):
             "whos_the_pillager_now",
         )
         for gid in nine_ids:
-            self.assertEqual(GOAL_MAP[gid].stage, "draft", gid)
+            self.assertEqual(GOAL_MAP[gid].stage, "graduated", gid)
             self.assertTrue(GOAL_MAP[gid].requires_landmarks, gid)
 
         # axolotl_in_a_bucket: with iron_ingot=3 (no bucket) -> expands to craft_iron_gear(bucket)
