@@ -22,7 +22,7 @@ description: Use when working in the mc-agent-2026 repository (NJU "AI Agent for
 | 报名/材料截止 | **11/18** |
 | 决赛 | 12/6，双赛道同场 |
 | 计分 | 游戏表现 60（advancement）+ 工程评审 40 |
-| 接口 | `https://mc-api.windywindie.top/api/v1`，以上游 v1.3.11 为规范参考，比赛服部署版本待核（`docs/04` B18） |
+| 接口 | `https://apiin.nmo.net.cn/api/v1`（校内） / `https://mc-api.windywindie.top/api/v1`（公网），以上游 `v1.3.19+`（`937045f`，见 `docs/02-接口与架构.md` 2026-11-22 更新提醒）为规范参考，比赛服部署版本待核（`docs/04` B1/B18） |
 
 ## 开工必读（按顺序）
 
@@ -74,13 +74,13 @@ uv run python -m mcagent.probe                   # 量基线，落盘 probe/*.js
 1. **注册表里挂了死代理 `127.0.0.1:7897`** → `requests` 默认会读它，报 `ProxyError` 看着像断网。
    所以 `trust_env = False` 是必须的。而且两个端点的最优路径相反：
    **MC API 直连快（666ms）、LLM 端点走代理快（219ms vs 1520ms）**。
-2. **动作互斥且阻塞 + 危险必须可抢占**：同一 bot 一次只能跑一个动作，重复调用返回 `busy`。
+2. **动作互斥且阻塞 + 危险必须可抢占**：同一 bot 一次只能跑一个占锁动作，重复调用返回 `busy`（注：`v1.3.19` 起 `/chat` 服务端不占锁、`v1.3.14` 起 `/control wait:false` 设置按键后即释锁，详见 `docs/02-接口与架构.md`）。
    24 并发只能用来"想"，不能用来"做"；遇到危险时必须走 `Executor.emergency()` 先发 `/stop` 中断当前阻塞动作并插队逃生。
 3. **思考模型的静默失败**：`max_tokens` 给小了，token 全花在 `reasoning_content` 上，
    拿到 `finish_reason=length` + `content=""`。必须把空 content 当失败重试。
    关思考的正确写法是 `chat_template_kwargs={"enable_thinking": False}`，顶层开关无效。
 4. **登录会踢人**：同一角色重复登录让旧 token 立即失效。客户端已实现 `.token.json` 落盘复用与 401 单点刷新，登录前必须去 `docs/05` 账号表占位，调试时别循环调 `login()`。
-5. **死亡循环是一票否决**：60s 死 3 次 → 自动下线 5 分钟。`State` 已用单调时钟去重并锁存 ≥65s `safe_mode`，Safety 闸优先级高于任何计划。
+5. **死亡清包仍是一级风险（2026-11-22 更新）**：上游网关 `v1.3.17` 已移除「60s 死 3 次强制下线 5 分钟（`death_loop_cooldown`）」，改为保留会话自动重生；**但正式赛 `keepInventory=false`（J21）仍会导致随身背包与护甲全部掉落**，切勿放宽安全策略或删去 `CODE_CLASS["death_loop_cooldown"]` / `safe_mode` 保护。另有 `/attack chase=false & feedback=true`、`1.21.11` 108 方块镐掘材质修复等上游更新（本地模拟网关已同步、`code/mcagent/` 尚未全量透传），动工前务必先读 `docs/02-接口与架构.md` 顶部变更提醒。
 
 ## 规则在哪里
 

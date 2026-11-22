@@ -305,3 +305,121 @@ test("useItem(food) maps Mineflayer consume 'Promise timed out.' to timeout (not
   assert.equal(deactivated, true);
   assert.equal(session.busy, null);
 });
+
+test("control wait:false returns immediately, exposes held_controls, supports takeover and empty release (v1.3.14)", async () => {
+  const session = readySession();
+  const { bot } = session;
+
+  const r1 = await session.control({ forward: true, sprint: true, ms: 500, wait: false });
+  assert.deepEqual(r1.held, ["forward", "sprint"]);
+  assert.equal(r1.release_in_ms, 500);
+  assert.equal(session.busy, null);
+  assert.equal(bot.getControlState("forward"), true);
+  assert.equal(bot.getControlState("sprint"), true);
+  const st1 = session.getStatus();
+  assert.deepEqual(st1.held_controls.keys, ["forward", "sprint"]);
+  assert.ok(st1.held_controls.release_in_ms > 0 && st1.held_controls.release_in_ms <= 500);
+
+  // New control immediately takes over and releases previous keys
+  const r2 = await session.control({ left: true, ms: 500, wait: false });
+  assert.deepEqual(r2.held, ["left"]);
+  assert.equal(bot.getControlState("forward"), false);
+  assert.equal(bot.getControlState("sprint"), false);
+  assert.equal(bot.getControlState("left"), true);
+
+  // Empty {"wait": false} immediately releases held keys
+  const r3 = await session.control({ wait: false });
+  assert.deepEqual(r3.held, []);
+  assert.deepEqual(r3.released, ["left"]);
+  assert.equal(bot.getControlState("left"), false);
+  assert.equal(session.getStatus().held_controls, null);
+});
+
+test("chat runs concurrently alongside blocking actions and does not release held controls (v1.3.19)", async () => {
+  const session = readySession();
+  const { bot } = session;
+  const sent = [];
+  bot.chat = (msg) => sent.push(msg);
+
+  // 1) Chat while a blocking action holds busy lock
+  let finishAction;
+  const blocking = session._runAction("move_to", [], () => new Promise((resolve) => {
+    finishAction = resolve;
+  }));
+  assert.equal(session.busy, "move_to");
+  const chatRes1 = await session.chat({ message: "hello while moving" });
+  assert.deepEqual(chatRes1, { sent: true });
+  assert.equal(session.busy, "move_to");
+  finishAction();
+  await blocking;
+
+  // 2) Chat while /control wait:false keys are held must NOT release them
+  session.lastChatAt = 0;
+  await session.control({ forward: true, ms: 1000, wait: false });
+  assert.equal(bot.getControlState("forward"), true);
+  const chatRes2 = await session.chat({ message: "still walking" });
+  assert.deepEqual(chatRes2, { sent: true });
+  assert.equal(bot.getControlState("forward"), true);
+  assert.deepEqual(session.getStatus().held_controls.keys, ["forward"]);
+  await session.stop();
+  assert.equal(bot.getControlState("forward"), false);
+  assert.deepEqual(sent, ["hello while moving", "still walking"]);
+
+  // 3) Chat still rejects slash commands and dead bots
+  session.lastChatAt = 0;
+  await assert.rejects(session.chat({ message: "/tp 0 64 0" }), { code: "bad_args" });
+  bot.health = 0;
+  await assert.rejects(session.chat({ message: "dead chat" }), { code: "dead" });
+});
+
+test("observation endpoints return not_ready while world/inventory are missing during reconnect (v1.3.13)", async () => {
+  const session = readySession();
+  session.bot.world = null;
+  assert.throws(() => session.getInventory(), { code: "not_ready" });
+  assert.throws(() => session.getBlock({ pos: [0, 64, 0] }), { code: "not_ready" });
+  assert.throws(() => session.getEntities({}), { code: "not_ready" });
+  await assert.rejects(session.findBlocks({ radius: 4 }), { code: "not_ready" });
+});
+
+test("findBlocks scans spherical exposed blocks asynchronously via stateId and rejects unknown blocks (v1.3.13)", async () => {
+  const session = readySession();
+  const { bot } = session;
+  bot.game = { minY: 0, height: 128 };
+  const airBlock = { id: 0, name: "air", boundingBox: "empty", transparent: true, minStateId: 0, maxStateId: 0 };
+  const stoneBlock = { id: 1, name: "stone", boundingBox: "block", transparent: false, minStateId: 1, maxStateId: 1 };
+  const oreBlock = { id: 2, name: "diamond_ore", boundingBox: "block", transparent: false, minStateId: 2, maxStateId: 2 };
+  bot.registry = {
+    blocksArray: [airBlock, stoneBlock, oreBlock],
+    blocksByName: { air: airBlock, stone: stoneBlock, diamond_ore: oreBlock },
+    blocksByStateId: { 0: airBlock, 1: stoneBlock, 2: oreBlock },
+  };
+  const blocks = new Map([
+    ["2,64,2", 2], // diagonal exposed diamond_ore within radius 4
+    ["1,64,0", 1], // exposed stone
+  ]);
+  const fakeCol = {
+    getBlockStateId(p) {
+      return blocks.get(`${p.x},${p.y},${p.z}`) ?? 0;
+    },
+  };
+  bot.world = {
+    raycast: () => null,
+    getColumn: (cx, cz) => (cx === 0 && cz === 0 ? fakeCol : null),
+  };
+  bot.blockAt = (pos) => {
+    const sid = blocks.get(`${pos.x},${pos.y},${pos.z}`) ?? 0;
+    const def = bot.registry.blocksByStateId[sid];
+    return { ...def, position: pos, getProperties: () => ({}) };
+  };
+
+  const detail = await session.findBlocks({ types: ["diamond_ore"], radius: 4 });
+  assert.equal(detail.total, 1);
+  assert.deepEqual(detail.blocks[0].pos, [2, 64, 2]);
+
+  const summary = await session.findBlocks({ radius: 4 });
+  assert.equal(summary.scanned, 2);
+  assert.equal(summary.blocks.diamond_ore.count, 1);
+  assert.equal(summary.blocks.stone.count, 1);
+
+  await assert.rejects(session.findBlocks({ types: ["nonexistent_block"], radius: 4 }), { code: "bad_args" });
+});

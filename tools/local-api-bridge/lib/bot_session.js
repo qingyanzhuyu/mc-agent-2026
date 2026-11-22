@@ -27,6 +27,7 @@ const {
   FOOD_ITEMS,
   ALWAYS_EDIBLE,
 } = require("./helpers");
+const { installMovementCompatibility } = require("./movement_compat");
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -34,6 +35,130 @@ function sleep(ms) {
 
 function round3(n) {
   return Math.round(n * 1000) / 1000 || 0;
+}
+
+// PR #5 (fd7fd7a): minecraft-data 1.21.11 tags 108 pickaxe blocks (obsidian, ancient_debris,
+// ores, etc.) with material='incorrect_for_wooden_tool', whose tool-speed map lacks pickaxes.
+// Restore 'mineable/pickaxe' so Mineflayer computes proper pickaxe digTime.
+function patchBrokenPickaxeMaterials(reg) {
+  if (!reg || !reg.materials || !reg.materials["mineable/pickaxe"]) return 0;
+  let patched = 0;
+  const seen = new Set();
+  for (const list of [reg.blocksByName, reg.blocks, reg.blocksArray]) {
+    if (!list) continue;
+    const vals = Array.isArray(list) ? list : Object.values(list);
+    for (const b of vals) {
+      if (!b || seen.has(b)) continue;
+      seen.add(b);
+      if (typeof b.material === "string" && b.material.startsWith("incorrect_for_")) {
+        b.material = "mineable/pickaxe";
+        patched += 1;
+      }
+    }
+  }
+  return patched;
+}
+
+// PR #4 (937045f): Slab ray-AABB intersection for attack occlusion check
+function rayBox(o, d, min, max) {
+  let t0 = 0;
+  let t1 = Infinity;
+  for (const a of ["x", "y", "z"]) {
+    if (Math.abs(d[a]) < 1e-9) {
+      if (o[a] < min[a] || o[a] > max[a]) return null;
+      continue;
+    }
+    let n = (min[a] - o[a]) / d[a];
+    let f = (max[a] - o[a]) / d[a];
+    if (n > f) [n, f] = [f, n];
+    t0 = Math.max(t0, n);
+    t1 = Math.min(t1, f);
+    if (t0 > t1) return null;
+  }
+  return t0;
+}
+
+// v1.3.13 (6ce15bc): Direct stateId exposed-block sphere scan yielding every 4ms
+const seeThroughCache = new WeakMap();
+function seeThroughTable(reg) {
+  let table = seeThroughCache.get(reg);
+  if (table) return table;
+  let max = 0;
+  for (const b of reg.blocksArray || []) {
+    if (typeof b.maxStateId === "number" && b.maxStateId > max) max = b.maxStateId;
+  }
+  table = new Uint8Array(max + 1);
+  for (const b of reg.blocksArray || []) {
+    if (b.boundingBox === "empty" || b.transparent) {
+      table.fill(1, b.minStateId, b.maxStateId + 1);
+    }
+  }
+  seeThroughCache.set(reg, table);
+  return table;
+}
+
+async function scanExposedSphere(session, radius, want, max) {
+  const bot = session.bot;
+  const me = bot.entity.position;
+  const see = seeThroughTable(bot.registry);
+  const minY = (bot.game && typeof bot.game.minY === "number") ? bot.game.minY : -64;
+  const maxY = minY + ((bot.game && typeof bot.game.height === "number") ? bot.game.height : 384) - 1;
+  const cols = new Map();
+  const tmp = { x: 0, y: 0, z: 0 };
+  const sid = (x, y, z) => {
+    if (y < minY || y > maxY) return -1;
+    const key = (x >> 4) * 65536 + (z >> 4);
+    let col = cols.get(key);
+    if (col === undefined) {
+      col = bot.world.getColumn(x >> 4, z >> 4) || null;
+      cols.set(key, col);
+    }
+    if (!col) return -1;
+    tmp.x = x & 15;
+    tmp.y = y;
+    tmp.z = z & 15;
+    return col.getBlockStateId(tmp);
+  };
+  const open = (x, y, z) => {
+    const v = sid(x, y, z);
+    return v >= 0 && see[v] === 1;
+  };
+  const out = [];
+  const r = Math.ceil(radius) + 1;
+  const r2 = radius * radius;
+  const cx = Math.floor(me.x);
+  const cy = Math.floor(me.y);
+  const cz = Math.floor(me.z);
+  let t0 = Date.now();
+  let n = 0;
+  for (let x = cx - r; x <= cx + r; x += 1) {
+    for (let z = cz - r; z <= cz + r; z += 1) {
+      const dxz = (x - me.x) ** 2 + (z - me.z) ** 2;
+      if (dxz > r2) continue;
+      for (let y = Math.max(cy - r, minY); y <= Math.min(cy + r, maxY); y += 1) {
+        const d2 = dxz + (y - me.y) ** 2;
+        if (d2 > r2) continue;
+        const v = sid(x, y, z);
+        if (v < 0 || !want(v)) continue;
+        if (
+          open(x + 1, y, z) || open(x - 1, y, z) ||
+          open(x, y + 1, z) || open(x, y - 1, z) ||
+          open(x, y, z + 1) || open(x, y, z - 1)
+        ) {
+          out.push([x, y, z, Math.sqrt(d2), v]);
+        }
+      }
+      if (++n % 64 === 0 && Date.now() - t0 > 4) {
+        await new Promise((res) => setImmediate(res));
+        if (session.bot !== bot || !bot.entity) {
+          throw new ApiBizError("not_connected", "bot disconnected during find_blocks");
+        }
+        t0 = Date.now();
+      }
+    }
+  }
+  out.sort((a, b) => a[3] - b[3]);
+  return out.slice(0, max);
 }
 
 const CONTROL_KEYS = ["forward", "back", "left", "right", "jump", "sneak", "sprint"];
@@ -137,18 +262,18 @@ class BotSession {
     this._actionDone = null;
 
     this.postureState = EMPTY_POSTURE;
+    // v1.3.14: /control wait:false background held keys & scheduled hits
+    this.heldControl = null;
     this.usingItemState = null;
     this.measuredVelocity = null;
     this.lastChatAt = 0;
     this.lastDisconnectAt = 0;
 
-    // Events & Death loop tracking
+    // Events tracking (v1.3.17: repeated-death disconnect & cooldown removed)
     this.seq = 0;
     this.events = [];
     this.maxEvents = 2000;
     this.lastDeath = null;
-    this.deathTimestamps = [];
-    this.deathLoopCooldownUntil = 0;
 
     // Advancements tracking
     this.advPacketsReceived = 0;
@@ -178,14 +303,6 @@ class BotSession {
 
   async ensureConnected({ enforceCooldown = false } = {}) {
     const now = Date.now();
-    if (now < this.deathLoopCooldownUntil) {
-      const rem = Math.ceil((this.deathLoopCooldownUntil - now) / 1000);
-      throw new ApiBizError(
-        "death_loop_cooldown",
-        `Bot is in death loop cooldown (${rem}s remaining)`,
-        { cooldown_remaining_seconds: rem }
-      );
-    }
     if (this.bot && (this.connected || this.connecting)) {
       return { ok: true, already_connected: true, ready: this.isReady() };
     }
@@ -205,6 +322,7 @@ class BotSession {
   }
 
   _startBot() {
+    this.releaseHeld();
     if (this.bot) {
       try {
         this.bot.removeAllListeners();
@@ -231,6 +349,14 @@ class BotSession {
     });
     this.bot = bot;
     bot.loadPlugin(pathfinder);
+    // v1.3.18: fishing bobber pull & MC 1.21+ teleport velocity compatibility
+    bot.once("inject_allowed", () => {
+      try {
+        installMovementCompatibility(bot);
+      } catch (e) {
+        this.log(`[bridge:${this.username}] Movement compat init warn: ${e.message}`);
+      }
+    });
 
     let lastHealth = 20;
     let lastTickPosition = null;
@@ -300,8 +426,14 @@ class BotSession {
       resetObservation();
 
       try {
+        // PR #5 (fd7fd7a): restore mineable/pickaxe on 108 minecraft-data 1.21.11 blocks
+        patchBrokenPickaxeMaterials(bot.registry);
+        if (bot.version) {
+          try { patchBrokenPickaxeMaterials(require("minecraft-data")(bot.version)); } catch (_) {}
+        }
         const moves = buildPathfinderMovements(bot);
         bot.pathfinder.thinkTimeout = 4000;
+        bot.pathfinder.tickTimeout = 20; // v1.3.13: lowered from 40ms to 20ms
         bot.pathfinder.setMovements(moves);
       } catch (e) {
         this.log(`[bridge:${this.username}] Movements init warn: ${e.message}`);
@@ -340,6 +472,7 @@ class BotSession {
       const now = Date.now();
       const pos = bot.entity ? vecToPos(bot.entity.position) : [0, 0, 0];
       this.postureState = EMPTY_POSTURE;
+      this.releaseHeld();
       resetObservation();
       this.lastDeath = { pos, t: now, cause: `${this.username} died` };
       this._pushEvent("death", { pos, t: now, dropped_items_at: pos });
@@ -347,19 +480,7 @@ class BotSession {
       if (this._currentAbort) {
         this._currentAbort("death");
       }
-
-      // Death loop check: 3 deaths within 60s -> 5 min cooldown & disconnect (§7)
-      this.deathTimestamps = this.deathTimestamps.filter((ts) => now - ts <= 60000);
-      this.deathTimestamps.push(now);
-      if (this.deathTimestamps.length >= 3) {
-        this.deathLoopCooldownUntil = now + 5 * 60 * 1000;
-        this._pushEvent("death_loop", {
-          deaths: this.deathTimestamps.length,
-          cooldown_until: this.deathLoopCooldownUntil,
-        });
-        this.log(`[bridge:${this.username}] Death loop triggered! Disconnecting for 5 minutes.`);
-        this.disconnect();
-      }
+      // v1.3.17 (8422c53): repeated-death disconnect & cooldown removed; session stays alive and auto-respawns.
     });
 
     bot.on("chat", (username, message) => {
@@ -418,15 +539,16 @@ class BotSession {
       this.spawned = false;
       this.lastDisconnectAt = Date.now();
       this.postureState = EMPTY_POSTURE;
+      this.releaseHeld();
       resetObservation();
       this._pushEvent("disconnected", { reason: String(reason || "end") });
       if (this._currentAbort) {
         this._currentAbort("disconnected");
       }
       this.log(`[bridge:${this.username}] Disconnected (${reason || "end"})`);
-      if (!this._manualDisconnect && this.token && Date.now() >= this.deathLoopCooldownUntil) {
+      if (!this._manualDisconnect && this.token) {
         setTimeout(() => {
-          if (!this._manualDisconnect && this.token && !this.connected && !this.connecting && Date.now() >= this.deathLoopCooldownUntil) {
+          if (!this._manualDisconnect && this.token && !this.connected && !this.connecting) {
             this.log(`[bridge:${this.username}] Auto-reconnecting after unexpected drop...`);
             this._startBot();
           }
@@ -494,8 +616,25 @@ class BotSession {
     }
   }
 
+  releaseHeld() {
+    const h = this.heldControl;
+    if (!h) return;
+    this.heldControl = null;
+    if (h.timer) clearTimeout(h.timer);
+    if (Array.isArray(h.hitTimers)) {
+      for (const t of h.hitTimers) clearTimeout(t);
+    }
+    if (this.bot && typeof this.bot.setControlState === "function") {
+      for (const k of h.keys) {
+        try { this.bot.setControlState(k, false); } catch (_) {}
+      }
+    }
+    this._applyPostureSync();
+  }
+
   disconnect() {
     this._manualDisconnect = true;
+    this.releaseHeld();
     if (this._currentAbort) {
       this._currentAbort("disconnected");
     }
@@ -520,18 +659,20 @@ class BotSession {
   }
 
   _requireReady() {
-    const now = Date.now();
-    if (now < this.deathLoopCooldownUntil) {
-      const rem = Math.ceil((this.deathLoopCooldownUntil - now) / 1000);
-      throw new ApiBizError("death_loop_cooldown", "In death loop cooldown", {
-        cooldown_remaining_seconds: rem,
-      });
-    }
     if (!this.bot || (!this.connected && !this.connecting)) {
       throw new ApiBizError("not_connected", "Bot is not connected");
     }
     if (!this.spawned || !this.bot.entity) {
       throw new ApiBizError("not_ready", "Bot is connecting / waiting for spawn");
+    }
+  }
+
+  // v1.3.13: observation endpoints return not_ready while reconnecting before world/inventory load
+  _requireWorldReady() {
+    this._requireReady();
+    const b = this.bot;
+    if (!(b.entity && b.world && typeof b.blockAt === "function" && b.inventory)) {
+      throw new ApiBizError("not_ready", "bot is (re)connecting, world not loaded yet; retry in a moment");
     }
   }
 
@@ -572,15 +713,16 @@ class BotSession {
     return serializeItem(bot.inventory.slots[45]);
   }
 
-  async _applyPosture() {
+  _applyPostureSync() {
     const bot = this.bot;
     if (!bot || !this.spawned || !this.isAlive()) return;
+    const held = this.heldControl ? this.heldControl.keys : [];
     try {
-      bot.setControlState("sneak", Boolean(this.postureState.sneak));
-      bot.setControlState("jump", Boolean(this.postureState.jump));
+      bot.setControlState("sneak", Boolean(this.postureState.sneak || held.includes("sneak")));
+      bot.setControlState("jump", Boolean(this.postureState.jump || held.includes("jump")));
       if (this.postureState.shield) {
         bot.setControlState("sprint", false);
-        const off = bot.inventory.slots[45];
+        const off = bot.inventory?.slots?.[45];
         if (off && off.name === "shield") {
           bot.activateItem(true);
         }
@@ -588,6 +730,10 @@ class BotSession {
         bot.deactivateItem();
       }
     } catch (_) {}
+  }
+
+  async _applyPosture() {
+    this._applyPostureSync();
   }
 
   // ================================================================
@@ -626,6 +772,7 @@ class BotSession {
         in_lava: false,
         in_vehicle: null,
         sneaking: false,
+        held_controls: null,
         jumping: false,
         blocking: false,
         using_item: null,
@@ -710,7 +857,10 @@ class BotSession {
       in_lava: inLava,
       in_vehicle: bot.vehicle ? { id: bot.vehicle.id, name: bot.vehicle.name || "vehicle" } : null,
       sneaking: Boolean(this.postureState.sneak || bot.getControlState("sneak")),
-      jumping: this.postureState.jump,
+      held_controls: this.heldControl
+        ? { keys: [...this.heldControl.keys], release_in_ms: Math.max(0, this.heldControl.until - Date.now()) }
+        : null,
+      jumping: Boolean(this.postureState.jump || bot.getControlState("jump")),
       blocking: Boolean(this.postureState.shield),
       using_item: this.usingItemState
         ? { name: this.usingItemState.name, elapsed_ms: Date.now() - this.usingItemState.startedAt }
@@ -733,7 +883,7 @@ class BotSession {
   }
 
   getInventory() {
-    this._requireReady();
+    this._requireWorldReady();
     const bot = this.bot;
     const items = bot.inventory.items().map(serializeItem);
     const emptySlots = typeof bot.inventory.emptySlotCount === "function" ? bot.inventory.emptySlotCount() : Math.max(0, 36 - items.length);
@@ -746,8 +896,8 @@ class BotSession {
     };
   }
 
-  findBlocks(body = {}) {
-    this._requireReady();
+  async findBlocks(body = {}) {
+    this._requireWorldReady();
     const bot = this.bot;
     const radius = body.radius === undefined ? 16 : body.radius;
     if (!isFiniteNum(radius) || radius < 1 || radius > 64) {
@@ -759,6 +909,10 @@ class BotSession {
       throw new ApiBizError("bad_args", "limit must be between 1 and 500");
     }
     const center = bot.entity.position;
+    const canFastSphere = Boolean(
+      bot.world && typeof bot.world.getColumn === "function" &&
+      bot.registry && bot.registry.blocksByStateId && Array.isArray(bot.registry.blocksArray)
+    );
 
     // Detail mode: types provided
     if (body.types !== undefined && body.types !== null) {
@@ -768,45 +922,86 @@ class BotSession {
       const ids = [];
       for (const name of body.types) {
         const clean = String(name).replace(/^minecraft:/, "");
-        const bDef = bot.registry.blocksByName[clean];
-        if (bDef) ids.push(bDef.id);
+        const bDef = bot.registry?.blocksByName?.[clean];
+        if (!bDef) {
+          throw new ApiBizError("bad_args", `unknown block ${clean}`);
+        }
+        ids.push(bDef.id);
       }
-      if (ids.length === 0) {
-        return { total: 0, blocks: [] };
-      }
-      const rawPositions = bot.findBlocks({
-        matching: ids,
-        maxDistance: r,
-        count: Math.min(4000, Math.max(limit * 15, 250)),
-      });
 
       const matched = [];
-      for (const p of rawPositions) {
-        if (!isBlockExposed(bot, p)) continue;
-        const blk = bot.blockAt(p);
-        if (!blk) continue;
-        const props = typeof blk.getProperties === "function" ? blk.getProperties() : {};
-        if (body.properties && typeof body.properties === "object") {
-          let ok = true;
-          for (const [pk, pv] of Object.entries(body.properties)) {
-            if (props[pk] !== pv) {
-              ok = false;
-              break;
+      if (canFastSphere) {
+        const idSet = new Set(ids);
+        const stateBlock = bot.registry.blocksByStateId;
+        const hits = await scanExposedSphere(
+          this,
+          radius,
+          (v) => {
+            const b = stateBlock[v];
+            return Boolean(b && idSet.has(b.id));
+          },
+          10000
+        );
+        for (const [x, y, z] of hits) {
+          const p = new Vec3(x, y, z);
+          const blk = bot.blockAt(p);
+          if (!blk) continue;
+          const props = typeof blk.getProperties === "function" ? blk.getProperties() : {};
+          if (body.properties && typeof body.properties === "object") {
+            let ok = true;
+            for (const [pk, pv] of Object.entries(body.properties)) {
+              if (String(props[pk]) !== String(pv)) {
+                ok = false;
+                break;
+              }
             }
+            if (!ok) continue;
           }
-          if (!ok) continue;
+          if (body.mature !== undefined && body.mature !== null) {
+            const ci = getCropInfo(blk);
+            if (!ci || ci.mature !== Boolean(body.mature)) continue;
+          }
+          const dist = round1(center.distanceTo(p.offset(0.5, 0.5, 0.5)));
+          matched.push({
+            name: blk.name,
+            pos: vecToBlockPos(p),
+            dist,
+            properties: props,
+          });
         }
-        if (body.mature !== undefined && body.mature !== null) {
-          const ci = getCropInfo(blk);
-          if (!ci || ci.mature !== Boolean(body.mature)) continue;
-        }
-        const dist = round1(center.distanceTo(p.offset(0.5, 0.5, 0.5)));
-        matched.push({
-          name: blk.name,
-          pos: vecToBlockPos(p),
-          dist,
-          properties: props,
+      } else {
+        const rawPositions = bot.findBlocks({
+          matching: ids,
+          maxDistance: r,
+          count: Math.min(10000, Math.max(limit * 15, 250)),
         });
+        for (const p of rawPositions) {
+          if (!isBlockExposed(bot, p)) continue;
+          const blk = bot.blockAt(p);
+          if (!blk) continue;
+          const props = typeof blk.getProperties === "function" ? blk.getProperties() : {};
+          if (body.properties && typeof body.properties === "object") {
+            let ok = true;
+            for (const [pk, pv] of Object.entries(body.properties)) {
+              if (String(props[pk]) !== String(pv)) {
+                ok = false;
+                break;
+              }
+            }
+            if (!ok) continue;
+          }
+          if (body.mature !== undefined && body.mature !== null) {
+            const ci = getCropInfo(blk);
+            if (!ci || ci.mature !== Boolean(body.mature)) continue;
+          }
+          const dist = round1(center.distanceTo(p.offset(0.5, 0.5, 0.5)));
+          matched.push({
+            name: blk.name,
+            pos: vecToBlockPos(p),
+            dist,
+            properties: props,
+          });
+        }
       }
       matched.sort((a, b) => a.dist - b.dist);
       return {
@@ -815,7 +1010,38 @@ class BotSession {
       };
     }
 
-    // Summary mode: scan exposed blocks around player
+    // Summary mode: scan exposed non-air blocks in sphere (v1.3.13: max 4000)
+    const skip = new Set(["air", "cave_air", "void_air"]);
+    if (canFastSphere) {
+      const stateBlock = bot.registry.blocksByStateId;
+      const pts = await scanExposedSphere(
+        this,
+        radius,
+        (v) => {
+          const b = stateBlock[v];
+          return Boolean(b && !skip.has(b.name));
+        },
+        4000
+      );
+      const summary = {};
+      for (const [x, y, z, d, v] of pts) {
+        const n = stateBlock[v].name;
+        const dist = round1(d);
+        const rec = summary[n];
+        if (!rec) {
+          summary[n] = { count: 1, nearest: [x, y, z], dist };
+        } else {
+          rec.count += 1;
+          if (dist < rec.dist) {
+            rec.dist = dist;
+            rec.nearest = [x, y, z];
+          }
+        }
+      }
+      return { radius: r, scanned: pts.length, blocks: summary };
+    }
+
+    // Fallback summary scan for minimal mocks without chunk columns
     const cx = Math.floor(center.x);
     const cy = Math.floor(center.y);
     const cz = Math.floor(center.z);
@@ -841,7 +1067,7 @@ class BotSession {
           if (dSq > rSq) continue;
           p.set(x, y, z);
           const blk = bot.blockAt(p);
-          if (!blk || blk.type === 0 || blk.name === "air" || blk.name === "cave_air" || blk.name === "void_air") {
+          if (!blk || blk.type === 0 || skip.has(blk.name)) {
             continue;
           }
           if (!isBlockExposed(bot, p)) continue;
@@ -865,7 +1091,7 @@ class BotSession {
   }
 
   getBlock(body = {}) {
-    this._requireReady();
+    this._requireWorldReady();
     const pos = parseBlockPos(body);
     const blk = this.bot.blockAt(pos);
     if (!blk) {
@@ -891,7 +1117,7 @@ class BotSession {
   }
 
   getEntities(body = {}) {
-    this._requireReady();
+    this._requireWorldReady();
     const radius = body.radius === undefined ? 32 : body.radius;
     if (!isFiniteNum(radius) || radius <= 0 || radius > 128) {
       throw new ApiBizError("bad_args", "radius must be between 1 and 128");
@@ -1050,6 +1276,10 @@ class BotSession {
     const actionToken = Symbol(actionName);
     this._actionToken = actionToken;
     this.busy = actionName;
+    // v1.3.14: starting any other locking action releases /control wait:false held keys
+    if (actionName !== "control") {
+      this.releaseHeld();
+    }
     const stopSet = new Set(Array.isArray(stopOn) ? stopOn : ["hurt", "death"]);
     const controller = new AbortController();
     const { signal } = controller;
@@ -1192,6 +1422,7 @@ class BotSession {
     const startedAt = Date.now();
     const action = this.busy;
     const done = this._actionDone;
+    this.releaseHeld();
     if (this._currentAbort) {
       this._currentAbort("stop");
     }
@@ -1241,9 +1472,11 @@ class BotSession {
 
     this.postureState = { sneak, shield, jump };
     await this._applyPosture();
+    // v1.3.12: wait one game tick (~55 ms) instead of 150 ms so server observes sneak/jump
+    await sleep(55);
     return {
-      sneaking: sneak,
-      jumping: jump,
+      sneaking: Boolean(this.bot.getControlState ? this.bot.getControlState("sneak") : sneak),
+      jumping: Boolean(this.bot.getControlState ? this.bot.getControlState("jump") : jump),
       blocking: shield,
       offhand: this._getOffhandItem(),
     };
@@ -1284,6 +1517,9 @@ class BotSession {
   async control(body = {}) {
     return this._runAction("control", body.stop_on, async ({ signal }) => {
       const bot = this.bot;
+      if (body.wait !== undefined && typeof body.wait !== "boolean") {
+        throw new ApiBizError("bad_args", "wait must be a boolean");
+      }
       for (const key of CONTROL_KEYS) {
         if (body[key] !== undefined && typeof body[key] !== "boolean") {
           throw new ApiBizError("bad_args", `${key} must be boolean`);
@@ -1294,7 +1530,22 @@ class BotSession {
       if (!Number.isInteger(hitCount) || hitCount < 0 || hitCount > 20 || body.hit === 0) {
         throw new ApiBizError("bad_args", "hit must be a boolean or an integer in 1–20");
       }
-      if (!pressed.length && !hitCount) throw new ApiBizError("bad_args", "control requires a key or hit");
+      if (!pressed.length && !hitCount) {
+        // v1.3.14: {"wait": false} with no keys immediately releases any held controls
+        if (body.wait === false && body.yaw === undefined && body.pitch === undefined) {
+          const had = this.heldControl ? [...this.heldControl.keys] : [];
+          this.releaseHeld();
+          return {
+            held: [],
+            released: had,
+            pos: vecToPos(bot.entity.position),
+            on_ground: Boolean(bot.entity.onGround),
+          };
+        }
+        if (body.wait !== false) {
+          throw new ApiBizError("bad_args", "control requires a key or hit");
+        }
+      }
       const held = bot.heldItem;
       const intervalMs = attackInterval(body.hit_interval_ms, held);
       const requiredMs = hitCount ? (hitCount - 1) * intervalMs + 50 : 50;
@@ -1304,6 +1555,43 @@ class BotSession {
       }
       if (body.yaw !== undefined || body.pitch !== undefined) await this._lookAngles(bot, body);
       signal.throwIfAborted();
+
+      // Any new /control takes over immediately by releasing previous held keys/timers
+      this.releaseHeld();
+
+      if (body.wait === false) {
+        // v1.3.14: non-blocking real-time control — press keys & first hit, return immediately
+        const h = { keys: pressed, until: Date.now() + ms, timer: null, hitTimers: [] };
+        this.heldControl = h;
+        for (const key of pressed) bot.setControlState(key, true);
+        const swings = hitCount ? [strikeInView(bot, 0)] : [];
+        for (let i = 1; i < hitCount; i += 1) {
+          const t = setTimeout(() => {
+            if (this.heldControl === h && this.bot === bot) {
+              try { strikeInView(bot, i * intervalMs); } catch (_) {}
+            }
+          }, i * intervalMs);
+          h.hitTimers.push(t);
+        }
+        h.timer = setTimeout(() => {
+          if (this.heldControl === h) this.releaseHeld();
+        }, ms);
+        return {
+          held: pressed,
+          release_in_ms: ms,
+          pos: vecToPos(bot.entity.position),
+          on_ground: Boolean(bot.entity.onGround),
+          in_water: Boolean(bot.entity.isInWater),
+          yaw: Math.round((bot.entity.yaw || 0) * 100) / 100,
+          pitch: Math.round((bot.entity.pitch || 0) * 100) / 100,
+          ...(hitCount ? {
+            hits: swings,
+            scheduled_hits: hitCount - 1,
+            hit_interval_ms: intervalMs,
+            held_item: held?.name ?? null,
+          } : {}),
+        };
+      }
 
       const startPos = bot.entity.position.clone();
       const startedAt = Date.now();
@@ -1895,18 +2183,33 @@ class BotSession {
       if (!Number.isInteger(body.entity_id)) {
         throw new ApiBizError("bad_args", "entity_id must be integer");
       }
-      const { max_hits: maxHits, interval_ms: requestedInterval } = body;
+      const {
+        max_hits: maxHits,
+        interval_ms: requestedInterval,
+        chase = true,
+        feedback = false,
+        timeout,
+      } = body;
       if (maxHits !== undefined && (!Number.isInteger(maxHits) || maxHits < 1)) {
         throw new ApiBizError("bad_args", "max_hits must be a positive integer");
       }
       if (requestedInterval !== undefined) attackInterval(requestedInterval);
+      if (typeof chase !== "boolean") {
+        throw new ApiBizError("bad_args", "chase must be a boolean");
+      }
+      if (typeof feedback !== "boolean") {
+        throw new ApiBizError("bad_args", "feedback must be a boolean");
+      }
+      if (timeout !== undefined && (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout < 50 || timeout > 60000)) {
+        throw new ApiBizError("bad_args", "timeout must be between 50 and 60000");
+      }
       const targetId = body.entity_id;
       let ent = bot.entities[targetId];
       if (!ent || !ent.position) {
         throw new ApiBizError("no_such_entity", `Entity ${targetId} not found`);
       }
 
-      const timeoutMs = Math.min(90000, Math.max(1000, Number(body.timeout || 20000)));
+      const effTimeout = timeout === undefined ? (chase ? 20000 : 1500) : timeout;
 
       // Auto-equip strongest melee weapon in inventory
       const weaponRank = [
@@ -1925,47 +2228,138 @@ class BotSession {
 
       const t0 = Date.now();
       let hits = 0;
-      let killed = false;
       let lastPos = ent.position.clone();
-      while (Date.now() - t0 < timeoutMs) {
-        ent = bot.entities[targetId];
-        if (!ent || !ent.isValid || (typeof ent.health === "number" && ent.health <= 0)) {
-          killed = true;
-          break;
-        }
-        lastPos = ent.position.clone();
-        const dist = bot.entity.position.distanceTo(ent.position);
-        if (dist > 3.2) {
-          bot.pathfinder.setGoal(new goals.GoalFollow(ent, 2), true);
-          await delay(200, undefined, { signal });
-        } else {
-          bot.pathfinder.setGoal(null);
-          await bot.lookAt(ent.position.offset(0, (ent.height || 1.5) * 0.7, 0), true);
-          signal.throwIfAborted();
-          bot.attack(ent);
-          hits += 1;
-          if (hits === maxHits) {
-            killed = !ent.isValid || (typeof ent.health === "number" && ent.health <= 0);
+      const hitLog = feedback ? [] : null;
+      let stopReason = null;
+      let blockingBlock = null;
+
+      if (chase && bot.pathfinder) {
+        bot.pathfinder.setGoal(new goals.GoalFollow(ent, 1.5), true);
+      }
+      try {
+        while (Date.now() - t0 < effTimeout && !signal.aborted) {
+          ent = bot.entities[targetId];
+          if (!ent || ent.isValid === false || (typeof ent.health === "number" && ent.health <= 0)) {
             break;
           }
-          await delay(Math.min(intervalMs, Math.max(0, timeoutMs - (Date.now() - t0))), undefined, { signal });
+          lastPos = ent.position.clone();
+          const dist = ent.position.distanceTo(bot.entity.position);
+          if (dist < 3.2) {
+            const entityHeight = ent.height || 1.8;
+            const halfWidth = (ent.width || 0.6) * 0.5;
+            const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0);
+            const isBlocked = (blk, aim, aimDist) => {
+              if (!blk || !blk.intersect || blk.boundingBox === "empty") return false;
+              const dir = aimDist > 1e-6 ? aim.minus(eye).scaled(1 / aimDist) : null;
+              const boxT = dir
+                ? rayBox(
+                    eye,
+                    dir,
+                    ent.position.offset(-halfWidth, 0, -halfWidth),
+                    ent.position.offset(halfWidth, entityHeight, halfWidth)
+                  )
+                : null;
+              const reachLimit = boxT !== null ? boxT : Math.max(0, aimDist - halfWidth);
+              return eye.distanceTo(blk.intersect) < reachLimit - 1e-3;
+            };
+
+            const upperAim = ent.position.offset(0, entityHeight * 0.8, 0);
+            await bot.lookAt(upperAim, true);
+            signal.throwIfAborted();
+            if (!bot.entities[targetId] || ent.isValid === false || (typeof ent.health === "number" && ent.health <= 0)) {
+              break;
+            }
+
+            let occluded = false;
+            if (!chase || feedback) {
+              const upperDist = eye.distanceTo(upperAim);
+              const upperBlk = typeof bot.blockAtCursor === "function" ? bot.blockAtCursor(upperDist) : null;
+              if (isBlocked(upperBlk, upperAim, upperDist)) {
+                const midAim = ent.position.offset(0, entityHeight * 0.5, 0);
+                await bot.lookAt(midAim, true);
+                signal.throwIfAborted();
+                if (!bot.entities[targetId] || ent.isValid === false || (typeof ent.health === "number" && ent.health <= 0)) {
+                  break;
+                }
+                const midDist = eye.distanceTo(midAim);
+                const midBlk = typeof bot.blockAtCursor === "function" ? bot.blockAtCursor(midDist) : null;
+                if (isBlocked(midBlk, midAim, midDist)) {
+                  occluded = true;
+                  if (!chase) {
+                    const blk = midBlk || upperBlk;
+                    blockingBlock = {
+                      name: blk.name,
+                      pos: blk.position ? [blk.position.x, blk.position.y, blk.position.z] : null,
+                    };
+                    stopReason = "blocked_by_wall";
+                    break;
+                  }
+                }
+              }
+            }
+
+            bot.attack(ent);
+            hits += 1;
+            if (feedback) {
+              const hitDist = ent.position.distanceTo(bot.entity.position);
+              const rec = {
+                hit: hits,
+                t_ms: Date.now() - t0,
+                entity_id: ent.id ?? targetId,
+                dist: +hitDist.toFixed(2),
+                target_pos: [+ent.position.x.toFixed(2), +ent.position.y.toFixed(2), +ent.position.z.toFixed(2)],
+                bot_hp: typeof bot.health === "number" ? +bot.health.toFixed(1) : null,
+                ...(occluded ? { occluded: true } : {}),
+              };
+              hitLog.push(rec);
+              this._pushEvent("attack_hit", rec);
+            }
+            if (maxHits && hits >= maxHits) {
+              stopReason = "max_hits";
+              break;
+            }
+          }
+          const rem = effTimeout - (Date.now() - t0);
+          if (rem <= 0) break;
+          const waitMs = (dist < 3.2 || chase) ? intervalMs : Math.min(intervalMs, 100);
+          await delay(Math.min(waitMs, rem), undefined, { signal });
+        }
+      } finally {
+        if (chase && bot.pathfinder) {
+          bot.pathfinder.setGoal(null);
         }
       }
-      bot.pathfinder.setGoal(null);
 
-      // Brief drop collection if killed nearby
-      if (hits !== maxHits && killed && bot.entity.position.distanceTo(lastPos) < 8) {
+      const curEnt = bot.entities[targetId];
+      const killed = !curEnt || curEnt.isValid === false || (typeof curEnt.health === "number" && curEnt.health <= 0);
+      if (!stopReason) {
+        if (killed) stopReason = "killed";
+        else if (signal.aborted) stopReason = "interrupted";
+        else if (!chase && hits === 0) stopReason = "out_of_reach";
+        else stopReason = "timeout";
+      }
+
+      // Brief drop collection if killed nearby and chasing (chase=false never moves)
+      if (killed && chase && hits !== maxHits && bot.entity.position.distanceTo(lastPos) < 8) {
         try {
           await this._gotoGoal(new goals.GoalNear(lastPos.x, lastPos.y, lastPos.z, 1), 3500, ctx);
           await delay(250, undefined, { signal });
         } catch (_) {}
       }
 
-      return {
+      const base = {
         killed,
         hits,
+        interval_ms: intervalMs,
         ms: Date.now() - t0,
         inventory: inventorySummaryMap(bot),
+      };
+      if (!feedback && chase) return base;
+      return {
+        ...base,
+        ...(feedback ? { hit_log: hitLog } : {}),
+        stop_reason: stopReason,
+        ...(blockingBlock ? { blocking_block: blockingBlock } : {}),
       };
     });
   }
@@ -2493,28 +2887,31 @@ class BotSession {
     });
   }
 
+  // v1.3.19 (9090de4): /chat runs concurrently alongside blocking actions and does NOT release held controls
   async chat(body = {}) {
-    return this._runAction("chat", ["hurt", "death"], async () => {
-      const raw = body.message;
-      if (typeof raw !== "string" || !raw.trim()) {
-        throw new ApiBizError("bad_args", "message must be non-empty string");
-      }
-      if (raw.trimStart().startsWith("/")) {
-        throw new ApiBizError("bad_args", "Commands starting with / are forbidden");
-      }
-      if (raw.length > 100) {
-        throw new ApiBizError("bad_args", "message exceeds 100 characters", { got: raw.length });
-      }
-      const now = Date.now();
-      if (now - this.lastChatAt < 1000) {
-        const retryMs = 1000 - (now - this.lastChatAt);
-        throw new ApiBizError("rate_limited", `retry in ${retryMs}ms`, { retry_after_s: retryMs / 1000 });
-      }
-      this.lastChatAt = now;
-      this.bot.chat(raw);
-      return { sent: true };
-    });
+    this._requireReady();
+    if (!this.isAlive()) {
+      throw new ApiBizError("dead", "Bot is dead, waiting for respawn");
+    }
+    const raw = body.message;
+    if (typeof raw !== "string" || !raw.trim()) {
+      throw new ApiBizError("bad_args", "message must be non-empty string");
+    }
+    if (raw.trimStart().startsWith("/")) {
+      throw new ApiBizError("bad_args", "Commands starting with / are forbidden");
+    }
+    if (raw.length > 100) {
+      throw new ApiBizError("bad_args", "message exceeds 100 characters", { got: raw.length });
+    }
+    const now = Date.now();
+    if (now - this.lastChatAt < 1000) {
+      const retryMs = 1000 - (now - this.lastChatAt);
+      throw new ApiBizError("rate_limited", `retry in ${retryMs}ms`, { retry_after_s: retryMs / 1000 });
+    }
+    this.lastChatAt = now;
+    this.bot.chat(raw);
+    return { sent: true };
   }
 }
 
-module.exports = { BotSession, buildPathfinderMovements };
+module.exports = { BotSession, buildPathfinderMovements, patchBrokenPickaxeMaterials, rayBox };

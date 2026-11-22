@@ -104,3 +104,26 @@ test("hurt events attribute actual health loss to matching self damage packets",
   ]);
   assert.equal(hurt[0].likely_attacker.id, 50);
 });
+
+test("repeated deaths keep the session connected without death_loop cooldown (v1.3.17)", async (t) => {
+  const { bot, session } = makeSession(t);
+  let quitCalls = 0;
+  bot.quit = () => { quitCalls += 1; };
+  bot.emit("spawn");
+
+  for (let i = 0; i < 4; i += 1) {
+    bot.health = 0;
+    bot.emit("death");
+    bot.health = 20;
+    bot.emit("spawn");
+  }
+
+  assert.equal(quitCalls, 0);
+  assert.equal(session.isReady(), true);
+  const events = session.getEvents().events;
+  assert.equal(events.filter((e) => e.type === "death").length, 4);
+  assert.equal(events.filter((e) => e.type === "death_loop").length, 0);
+  const reconnectRes = await session.ensureConnected({ enforceCooldown: true });
+  assert.equal(reconnectRes.ok, true);
+  assert.equal(reconnectRes.already_connected, true);
+});

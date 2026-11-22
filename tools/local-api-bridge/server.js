@@ -53,42 +53,40 @@ function sendJson(res, statusCode, payload, extraHeaders = null) {
   res.end(data);
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on("data", (chunk) => {
+const MAX_BODY_BYTES = 1024 * 1024;
+
+async function readBody(req) {
+  if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
+    throw new ApiBizError("body_too_large", "request body exceeds 1 MiB", {}, 413);
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    // Leave socket open long enough to send HTTP 413 on early return (v1.3.15)
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
       total += chunk.length;
-      if (total > 1024 * 1024) {
-        reject(new ApiBizError("bad_json", "Payload too large", {}, 400));
-        req.destroy();
-        return;
+      if (total > MAX_BODY_BYTES) {
+        throw new ApiBizError("body_too_large", "request body exceeds 1 MiB", {}, 413);
       }
       chunks.push(chunk);
-    });
-    req.on("end", () => {
-      if (chunks.length === 0) {
-        resolve({});
-        return;
-      }
-      const raw = Buffer.concat(chunks).toString("utf8").trim();
-      if (!raw) {
-        resolve({});
-        return;
-      }
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-          reject(new ApiBizError("bad_json", "JSON body must be an object", {}, 400));
-          return;
-        }
-        resolve(parsed);
-      } catch (_) {
-        reject(new ApiBizError("bad_json", "Invalid JSON body", {}, 400));
-      }
-    });
-    req.on("error", (err) => reject(err));
-  });
+    }
+  } catch (err) {
+    if (err instanceof ApiBizError) throw err;
+    throw new ApiBizError("bad_json", "Invalid JSON body", {}, 400);
+  }
+  if (chunks.length === 0) return {};
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    throw new ApiBizError("bad_json", "Invalid JSON body", {}, 400);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ApiBizError("bad_json", "JSON body must be an object", {}, 400);
+  }
+  return parsed;
 }
 
 const KNOWN_ROUTES = new Set([
@@ -279,7 +277,7 @@ function createBridgeServer(opts = {}) {
       } else if (method === "GET" && route === "inventory") {
         result = session.getInventory();
       } else if (method === "POST" && route === "find_blocks") {
-        result = session.findBlocks(body);
+        result = await session.findBlocks(body);
       } else if (method === "POST" && route === "get_block") {
         result = session.getBlock(body);
       } else if (method === "POST" && route === "get_entities") {
@@ -349,11 +347,12 @@ function createBridgeServer(opts = {}) {
         if (httpCode !== 401 || route !== "status") {
           log(`[http] ${method} /${route} -> err=${err.code} http=${httpCode} (${ms}ms)`);
         }
+        const extraHeaders = httpCode === 413 ? { Connection: "close" } : null;
         return sendJson(res, httpCode, {
           ok: false,
           ms,
           error: { code: err.code, message: err.msg, ...err.extra },
-        });
+        }, extraHeaders);
       }
       console.error(`[http] Unexpected error on ${method} /${route}:`, err);
       const errMsg = err && err.message ? err.message : String(err);
@@ -376,17 +375,21 @@ function createBridgeServer(opts = {}) {
     }
   }
 
-  return { server, sessionsByUser, sessionsByToken, disconnectAll, config: { mcHost, mcPort, mcVersion } };
+  return { server, requestListener: server.listeners("request")[0], sessionsByUser, sessionsByToken, disconnectAll, config: { mcHost, mcPort, mcVersion } };
 }
 
 if (require.main === module) {
   const bridgeHost = process.env.BRIDGE_HOST || "127.0.0.1";
   const bridgePort = Number(process.env.BRIDGE_PORT || 8787);
-  const { server, disconnectAll, config } = createBridgeServer();
+  const { server, requestListener, disconnectAll, config } = createBridgeServer();
+  let serverV6 = null;
 
   function shutdown(sig) {
     console.log(`\n[bridge] Caught ${sig}, disconnecting all bots...`);
     disconnectAll();
+    if (serverV6) {
+      try { serverV6.close(); } catch (_) {}
+    }
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
   }
@@ -400,6 +403,20 @@ if (require.main === module) {
         ` -> MC ${config.mcHost}:${config.mcPort} (version=${config.mcVersion})`
     );
   });
+
+  // v1.3.12: Also listen on [::1] when bound to loopback/all so http://localhost avoids IPv6 fallback delay
+  if (["127.0.0.1", "0.0.0.0", "localhost"].includes(bridgeHost)) {
+    serverV6 = http.createServer(requestListener);
+    serverV6.on("error", (e) => {
+      console.log(`[bridge] IPv6 loopback listener not started: ${e.code || e.message}`);
+    });
+    serverV6.listen({ port: bridgePort, host: "::1", ipv6Only: true }, () => {
+      console.log(
+        `[bridge] Also listening on http://[::1]:${bridgePort}/api/v1` +
+          ` (avoids localhost IPv6 fallback delay)`
+      );
+    });
+  }
 }
 
 module.exports = { createBridgeServer, sanitizeBotName, loadDotEnv };
