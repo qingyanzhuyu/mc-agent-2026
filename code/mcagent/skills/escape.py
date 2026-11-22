@@ -1071,6 +1071,26 @@ def _find_dry_pocket_breach_cell(
     return scored[0][1]
 
 
+def _dig_breach_cell(
+    ex: "Executor", state: "State", cache: Any, dim: str, breach_cell: Cell,
+) -> Generator[dict, None, bool]:
+    """破拆封闭坑壁方块前自动切出最优镐（非松软方块），避免空手/拿圆石慢挖 7s 触发 DIG_TOOL_WARNING。"""
+    blk = _read_block(cache, ex.client, breach_cell, dim)
+    bname = bare(blk.get("name")) if isinstance(blk, dict) else ""
+    if bname and not _is_soft_overhang(bname):
+        pick = best_pickaxe(state)
+        held_name = bare(((state.snapshot() or {}).get("held") or {}).get("name"))
+        if pick and held_name != pick and hasattr(ex, "equip"):
+            yield from _exec_step("equip", lambda p=pick: ex.equip(p), item=pick)
+    breach_pos = list(breach_cell)
+    return (yield from _exec_step(
+        "dig",
+        lambda bp=breach_pos: ex.dig(bp),
+        on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
+        pos=breach_pos,
+    ))
+
+
 def _find_soft_bank_dig_cell(
     ex: "Executor", st: dict, cache: Any, dim: str, tried_digs: set[Cell],
 ) -> Optional[Cell]:
@@ -1463,16 +1483,20 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
                     else away_yaw
                 )
-                safe_hold_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, hold_pref_yaw, cache, dim, avoid_water=True)
+                safe_hold_yaw = _pick_cliff_safe_yaw(
+                    ex, px, py, pz, hold_pref_yaw, cache, dim,
+                    avoid_water=True,
+                    hostile_dir=(-ux, -uz) if h_pos is not None else None,
+                )
                 if safe_hold_yaw is not None:
                     yield from _control_step(
                         ex,
                         record_extra={"skeleton_cover": True},
                         forward=True,
                         sprint=True,
-                        jump=not zero_stall,
+                        jump=(not zero_stall) or _needs_step_jump(ex, px, py, pz, safe_hold_yaw, cache, dim),
                         yaw=safe_hold_yaw,
-                        ms=450,
+                        ms=850,
                     )
                     st_hold = _refresh_status(ex, state)
                     if st_hold.get("alive") is False:
@@ -1548,7 +1572,14 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 mid_pos = st_mid.get("pos")
                 if mid_pos and len(mid_pos) >= 3:
                     px, py, pz = float(mid_pos[0]), float(mid_pos[1]), float(mid_pos[2])
-            elif (not already_los_blocked and (not has_equipped_armor(state) or hp_val < hp_risk)):
+            elif (
+                not already_los_blocked
+                and (not has_equipped_armor(state) or hp_val < hp_risk)
+                and hp_val > float(getattr(getattr(state, "config", None), "hp_crit", 6.0) or 6.0)
+                and h_dist < 10.5
+            ):
+                # 仅在血量可承受 1 箭（hp > hp_crit）且中近距（<10.5m）时原地立挡箭墙；
+                # 残血一箭即死或已距 >=10.5m 时严禁站桩放块吃箭，直接疾跑拉出 16m 射程。
                 barricaded = yield from _try_place_ranged_barricade(ex, state, st, h_pos, cache, dim)
                 if barricaded:
                     return True
@@ -1980,13 +2011,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
             else None
         )
         if breach_cell is not None:
-            breach_pos = list(breach_cell)
-            ok_br = yield from _exec_step(
-                "dig",
-                lambda bp=breach_pos: ex.dig(bp),
-                on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
-                pos=breach_pos,
-            )
+            ok_br = yield from _dig_breach_cell(ex, state, cache, dim, breach_cell)
             st_br = _refresh_status(ex, state)
             if st_br.get("alive") is False:
                 return False
@@ -2134,13 +2159,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
         if not in_w_retry and math.hypot(px - before_mt[0], pz - before_mt[2]) < 0.35:
             breach_mt = _find_dry_pocket_breach_cell(ex, st_retry, state, cache, dim, away_dir=(ux, uz))
             if breach_mt is not None:
-                breach_pos = list(breach_mt)
-                ok_br_mt = yield from _exec_step(
-                    "dig",
-                    lambda bp=breach_pos: ex.dig(bp),
-                    on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
-                    pos=breach_pos,
-                )
+                ok_br_mt = yield from _dig_breach_cell(ex, state, cache, dim, breach_mt)
                 if ok_br_mt:
                     tried_yaws.clear()
                     setattr(state, "_escape_blocked_yaws", None)
@@ -2189,13 +2208,7 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                         else None
                     )
                     if breach_rt is not None:
-                        breach_pos = list(breach_rt)
-                        ok_br_rt = yield from _exec_step(
-                            "dig",
-                            lambda bp=breach_pos: ex.dig(bp),
-                            on_ok=lambda bp=breach_pos: cache.invalidate(bp, dimension=dim),
-                            pos=breach_pos,
-                        )
+                        ok_br_rt = yield from _dig_breach_cell(ex, state, cache, dim, breach_rt)
                         if ok_br_rt:
                             tried_yaws.clear()
                             setattr(state, "_escape_blocked_yaws", None)

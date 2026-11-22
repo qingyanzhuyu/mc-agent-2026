@@ -2174,6 +2174,74 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(w.dug[0], [-84, 62, 17], f"expected breach away from east creeper at (-84,62,17), got {w.dug}")
         self.assertTrue(ok)
 
+    def test_seg23_crit_hp_skeleton_skips_stationary_barricade_and_sprints_away(self) -> None:
+        # 复现 seg-23 Death #1（t=587.36s, [-156.7, 48, -13.1]）：hp=3.3 残血（一箭即死）且骷髅在 11.1m 时，
+        # 严禁原地站桩放圆石挡箭墙吃箭，必须直接拉开距离脱离 16m 射程
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        for x in range(-168, -148):
+            for z in range(-28, -4):
+                blocks[(x, 47, z)] = "stone"
+                blocks[(x, 48, z)] = "air"
+                blocks[(x, 49, z)] = "air"
+
+        class _CritSkelWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-156.5, 48.0, -13.3], items={"cobblestone": 16})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=3.3, food=17, armor_points=0,
+                    on_ground=True, in_water=False, submerged=False,
+                    nearest_hostile={"id": 178557, "name": "skeleton", "dist": 11.1, "pos": [-160.7, 48.0, -23.3]},
+                )
+                self.placed: list[list[int]] = []
+
+            def place(self, item, pos=None, **kwargs):
+                self.placed.append(list(pos or []))
+                return {"placed": item, "pos": list(pos or [])}
+
+        w = _CritSkelWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertEqual(w.placed, [], f"must not stop to place stationary barricade at hp=3.3 / 11.1m, placed={w.placed}")
+
+    def test_seg23_dry_pocket_breach_equips_pickaxe_before_digging_stone(self) -> None:
+        # 复现 seg-23 INC-001（DIG_TOOL_WARNING）：封闭石穴速破圆石/石头前必须先切出石镐再挖，避免空手/圆石慢挖 7s
+        from mcagent.skills.escape import _dig_breach_cell
+        from mcagent.skills.voxel_cache import voxel_cache_for
+
+        blocks = {(-84, 62, 18): "stone"}
+
+        class _EquipDigWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-83.5, 62.0, 18.5], items={"stone_pickaxe": 1, "cobblestone": 15})
+                self.st["held"] = {"name": "cobblestone", "count": 15}
+                self.order: list[str] = []
+
+            def equip(self, item, slot="hand", **kwargs):
+                self.order.append(f"equip:{item}")
+                self.st["held"] = {"name": item, "count": 1}
+                return {"held": item}
+
+            def dig(self, pos, **kwargs):
+                self.order.append(f"dig:{self.st['held']['name']}")
+                return {"dug": "stone", "pos": list(pos)}
+
+        w = _EquipDigWorld()
+        ex, state = w.session()
+        gen = _dig_breach_cell(ex, state, voxel_cache_for(state), "overworld", (-84, 62, 18))
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertEqual(w.order, ["equip:stone_pickaxe", "dig:stone_pickaxe"])
+
 
 if __name__ == "__main__":
     unittest.main()
