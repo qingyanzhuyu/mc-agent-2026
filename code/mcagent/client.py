@@ -48,9 +48,14 @@ CODE_CLASS: dict[str, str] = {
     "not_ready": RETRY,
     "not_connected": RETRY,
     "wrong_server": RETRY,
+    # v1.3.16 多后端代理瞬时不可用：保留原 token 重试恢复
+    "backend_unavailable": RETRY,
+    "routing_unavailable": RETRY,
     "death_loop_cooldown": RETRY,
     "network": RETRY,
     "bad_json": RETRY,
+    # v1.3.15 请求体超过 1 MiB（HTTP 413）：原样重发仍会失败
+    "body_too_large": REPLAN,
     # 目标/条件不成立：重规划（注意 bad_args 是单次参数不合法，绝不能当 FATAL 杀掉整场进程）
     "bad_args": REPLAN,
     "path_not_found": REPLAN,
@@ -884,26 +889,34 @@ class Client:
         finally:
             self.invalidate_block_cache()
 
-    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
-        # v1.3.11 §4.6：max_hits 打够即返回；interval_ms 覆盖挥击间隔（50–5000）
-        body: dict = {"entity_id": entity_id, "timeout": timeout_ms}
+    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None,
+               chase=None, feedback=None, stop_on=None) -> dict:
+        # v1.3.11 §4.6 + PR #4 (937045f)：max_hits / interval_ms / chase=false 原地挥刀 / feedback=true 回执
+        body: dict = {"entity_id": entity_id}
+        if timeout_ms is not None:
+            body["timeout"] = timeout_ms
         if max_hits is not None:
             body["max_hits"] = max_hits
         if interval_ms is not None:
             body["interval_ms"] = interval_ms
+        if chase is not None:
+            body["chase"] = chase
+        if feedback is not None:
+            body["feedback"] = feedback
         return self.action("attack", body, stop_on=stop_on)
 
     def control(self, *, forward=None, back=None, left=None, right=None, jump=None, sneak=None,
                 sprint=None, yaw=None, pitch=None, hit=None, hit_interval_ms=None, ms=None,
-                stop_on=None) -> dict:
-        """v1.3.11 §4.16 底层按键，占动作锁。可选接口：旧部署上抛 unsupported_api（REPLAN）。"""
+                wait=None, stop_on=None) -> dict:
+        """v1.3.14 §4.16 底层按键。wait=False 时按下即返并在后台按住 ms；可选接口旧部署抛 unsupported_api。"""
         body = {k: v for k, v in {
             "forward": forward, "back": back, "left": left, "right": right,
             "jump": jump, "sneak": sneak, "sprint": sprint,
             "yaw": yaw, "pitch": pitch, "hit": hit, "hit_interval_ms": hit_interval_ms, "ms": ms,
+            "wait": wait,
         }.items() if v is not None}
         timeout = ACTION_TIMEOUT["control"]
-        if ms is None and hit is not None and hit is not True:
+        if wait is not False and ms is None and hit is not None and hit is not True:
             # 只给 hit 时服务端按 (hit-1)×间隔 算时长，间隔缺省最长 1667 ms（重锤）
             timeout += (int(hit) - 1) * (hit_interval_ms or 1667) / 1000
         return self.action("control", body, timeout, stop_on=stop_on)

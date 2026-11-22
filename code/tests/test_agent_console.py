@@ -738,6 +738,38 @@ class ProcessManagerStopKillTests(unittest.TestCase):
                 self.assertFalse(srv._pid_alive(parent_pid))
                 self.assertFalse(srv._pid_alive(child_pid))
 
+    def test_probe_local_bridge_falls_back_for_official_opensource_server(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class FakeOfficialApiHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/api/v1/status":
+                    payload = json.dumps({"ok": False, "error": {"code": "unauthorized"}}).encode("utf-8")
+                    self.send_response(401)
+                else:
+                    payload = json.dumps({"ok": False, "error": {"code": "not_found"}}).encode("utf-8")
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        httpd = HTTPServer(("127.0.0.1", 0), FakeOfficialApiHandler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            port = httpd.server_address[1]
+            res = srv.probe_local_bridge(f"http://127.0.0.1:{port}/api/v1")
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["status"], 401)
+            self.assertEqual((res.get("data") or {}).get("server_type"), "mc-agent-api")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

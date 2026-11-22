@@ -1547,10 +1547,13 @@ class BotSession {
         }
       }
       const held = bot.heldItem;
-      const intervalMs = attackInterval(body.hit_interval_ms, held);
+      if (!hitCount && body.hit_interval_ms !== undefined) {
+        throw new ApiBizError("bad_args", "hit_interval_ms needs hit");
+      }
+      const intervalMs = hitCount ? attackInterval(body.hit_interval_ms, held) : 0;
       const requiredMs = hitCount ? (hitCount - 1) * intervalMs + 50 : 50;
-      const ms = body.ms === undefined ? (hitCount && !pressed.length ? requiredMs : 300) : body.ms;
-      if (!Number.isInteger(ms) || ms < 50 || ms > 3000 || ms < requiredMs) {
+      const ms = body.ms === undefined ? (hitCount && !pressed.length ? requiredMs : 300) : Number(body.ms);
+      if (!Number.isFinite(ms) || ms < 50 || ms > 3000 || (hitCount && ms < requiredMs)) {
         throw new ApiBizError("bad_args", "ms must be 50–3000 and allow time for all hits", { required_ms: requiredMs });
       }
       if (body.yaw !== undefined || body.pitch !== undefined) await this._lookAngles(bot, body);

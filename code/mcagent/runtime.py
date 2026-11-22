@@ -1533,13 +1533,21 @@ class Executor:
             verify_done=lambda before, after: after.get(item, 0) > before.get(item, 0),
         )
 
-    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None, stop_on=None) -> dict:
-        # 限次攻击是「砍几下就走」，断流重发会多打，故不重试
+    def attack(self, entity_id, timeout_ms=20000, *, max_hits=None, interval_ms=None,
+               chase=None, feedback=None, stop_on=None) -> dict:
+        # 限次攻击 / 原地守点挥刀（chase=False）断流重发会多打，故不重试
+        extra: dict = {}
+        if chase is not None:
+            extra["chase"] = chase
+        if feedback is not None:
+            extra["feedback"] = feedback
         return self.act(
             "attack",
-            lambda: self.client.attack(entity_id, timeout_ms, max_hits=max_hits, interval_ms=interval_ms,
-                                       stop_on=stop_on),
-            retries=0 if max_hits is not None else 2,
+            lambda: self.client.attack(
+                entity_id, timeout_ms, max_hits=max_hits, interval_ms=interval_ms,
+                stop_on=stop_on, **extra,
+            ),
+            retries=0 if (max_hits is not None or chase is False) else 2,
         )
 
     def control(self, **keys) -> dict:
