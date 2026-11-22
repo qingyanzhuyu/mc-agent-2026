@@ -1603,12 +1603,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, data: Any, status: int = 200) -> None:
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _send_static(self, rel_name: str, content_type: str) -> None:
         fp = (WEB_DIR / rel_name).resolve()
@@ -1621,12 +1624,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         raw = fp.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _check_local_origin(self) -> bool:
         host = self.headers.get("Host", "")
@@ -1668,6 +1674,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         if path == "/app.js":
             self._send_static("app.js", "application/javascript; charset=utf-8")
+            return
+
+        if path == "/healthz":
+            self._send_json({"ok": True, "service": "aiamc-agent-console"})
             return
 
         if path == "/api/bootstrap":
@@ -1776,7 +1786,7 @@ def create_server(host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> Threadin
 
 
 def _is_console_running(host: str, port: int) -> bool:
-    url = f"http://{host}:{port}/api/runs"
+    url = f"http://{host}:{port}/healthz"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(url, timeout=1.0) as resp:
