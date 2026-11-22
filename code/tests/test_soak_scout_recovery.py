@@ -263,6 +263,104 @@ class ScoutRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(Replan, "全部移动受阻"):
             drive(make("survey_island", {"dimension": "overworld", "sectors": 2, "radius": 32}), ex, state)
 
+    def test_deep_pit_without_pickaxe_climbs_multi_layer_alternating_step_up_to_rim(self):
+        # 3 格深石坑（坑底站位 Y=60，坑壁 Y=60..62，坑沿站位 Y=63），无镐但有圆石：
+        # 一次 scout_island 内应优先向上用两列交替 step_up_1x2 连续搭块并直接跨上坑沿，而非先水平乱走或只垫 1 格。
+        blocks = {
+            (10, 62, 0): "grass_block",
+            (14, 62, 0): "grass_block",
+            (18, 62, 0): "grass_block",
+            # 1x2 坑底 (0, 59, 0) 与 (1, 59, 0)
+            (0, 59, 0): "stone",
+            (1, 59, 0): "stone",
+        }
+        # 四周 3 格高石墙（Y=60..62），坑沿顶面站位 Y=63
+        for y in (59, 60, 61, 62):
+            for x, z in ((-1, 0), (2, 0), (0, -1), (1, -1), (0, 1), (1, 1)):
+                blocks[(x, y, z)] = "stone"
+        failures = {(x + 0.5, 63, 0.5): "path_not_found" for x in (10, 14, 18)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 60.0, 0.5]
+        world.items["cobblestone"] = 12
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        place_steps = [s for s in steps if s["op"] == "place"]
+        self.assertGreaterEqual(len(place_steps), 3)
+        self.assertGreaterEqual(state.pos[1], 63.0)
+
+    def test_two_block_shallow_pit_detected_and_climbed_out(self):
+        # 2 格深凹坑（坑底站位 Y=62，地表草块 Y=63 即站位 Y=64，差值刚好 2 格不可跳出）：
+        # 必须按候选站位 y+1 > cur.y + 1.5 触发搭路爬升（修复旧版用方块 y 的差 1 漏判）。
+        blocks = {
+            (10, 63, 0): "grass_block",
+            (14, 63, 0): "grass_block",
+            (18, 63, 0): "grass_block",
+            (0, 61, 0): "stone",
+            (1, 61, 0): "stone",
+        }
+        for y in (61, 62, 63):
+            for x, z in ((-1, 0), (2, 0), (0, -1), (1, -1), (0, 1), (1, 1)):
+                blocks[(x, y, z)] = "stone"
+        failures = {(x + 0.5, 64, 0.5): "path_not_found" for x in (10, 14, 18)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 62.0, 0.5]
+        world.items["dirt"] = 4
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertIn("place", [s["op"] for s in steps])
+        self.assertGreaterEqual(state.pos[1], 64.0)
+
+    def test_wide_pit_approaches_wall_before_pillaring_out_to_rim(self):
+        # 较宽石坑（坑壁距起点 3 格，在 x=3 处，Y=60..62）：搭柱前先贴近坑壁，再交替垫高并跨上坑沿 Y=63。
+        blocks = {
+            (12, 62, 0): "grass_block",
+            (16, 62, 0): "grass_block",
+            (20, 62, 0): "grass_block",
+        }
+        # 坑底 x in [-2..2], z in [-1..1]
+        for x in range(-2, 3):
+            for z in range(-1, 2):
+                blocks[(x, 59, z)] = "stone"
+        # 东侧坑壁在 x=3，Y=60..62（顶面可站立于 Y=63）
+        for y in (59, 60, 61, 62):
+            for z in range(-1, 2):
+                blocks[(3, y, z)] = "stone"
+        failures = {(x + 0.5, 63, 0.5): "path_not_found" for x in (12, 16, 20)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 60.0, 0.5]
+        world.items["cobblestone"] = 12
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        self.assertIn("place", [s["op"] for s in steps])
+        self.assertGreaterEqual(state.pos[1], 63.0)
+        self.assertGreaterEqual(state.pos[0], 3.0)
+
+    def test_pit_escape_harvests_adjacent_soft_dirt_when_inventory_empty(self):
+        # 2 格深石壁坑且背包全空无镐，但坑底旁边有一块安全泥土（下方有石托底）：
+        # 先自动挖取泥土进包，再用 step_up_1x2 垫块爬上坑沿。
+        blocks = {
+            (10, 63, 0): "grass_block",
+            (14, 63, 0): "grass_block",
+            (18, 63, 0): "grass_block",
+            (0, 61, 0): "stone",
+            (1, 61, 0): "stone",
+            (0, 61, 1): "dirt",
+            (0, 60, 1): "stone",  # 泥土下方实心托底
+        }
+        for y in (61, 62, 63):
+            for x, z in ((-1, 0), (2, 0), (0, -1), (1, -1), (1, 1), (-1, 1), (0, 2)):
+                blocks[(x, y, z)] = "stone"
+        failures = {(x + 0.5, 64, 0.5): "path_not_found" for x in (10, 14, 18)}
+        world = ScoutFailureWorld(blocks=blocks, failures=failures)
+        world.st["pos"] = [0.5, 62.0, 0.5]
+        world.items.clear()
+        ex, state = world.session()
+        steps = drive(make("scout_island"), ex, state)
+        ops = [s["op"] for s in steps]
+        self.assertIn("dig", ops)
+        self.assertIn("place", ops)
+        self.assertGreaterEqual(state.pos[1], 64.0)
+
 
 if __name__ == "__main__":
     unittest.main()

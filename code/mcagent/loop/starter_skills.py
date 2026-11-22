@@ -18,7 +18,7 @@ from ..client import ApiError
 from ..runtime import EnvBlocked, Replan, has_equipped_armor
 from ..skills import nav
 from ..skills.base import Param, Skill, failure, rec
-from ..skills.items import AIR, MINE_TRAILS, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, pick_placeable
+from ..skills.items import AIR, MINE_TRAILS, NAV_FAIL_CODES, bare, best_pickaxe, is_clear_space, pick_placeable, total_placeable
 from ..skills.mine_return import is_underground_in_mine, return_to_surface_from_mine
 from ..skills.recipes import craft_recipe
 from ..skills.registry import register
@@ -724,22 +724,35 @@ class ScoutIsland(Skill):
             return False
 
         def _try_staircase_climb_out(
-            *, allow_above_sea: bool = False, min_target_y: Optional[float] = None,
+            *,
+            allow_above_sea: bool = False,
+            min_target_y: Optional[float] = None,
+            goal_y: Optional[float] = None,
         ) -> Generator[dict, None, bool]:
-            """被周围方块围困在矿井/地表凹坑时，优先持镐或徒手挖软壁开 1~4 级 1x2 阶梯，否则用垫块 step_up_1x2 脱困。"""
+            """被周围方块围困在矿井/地表凹坑时，优先持镐或徒手挖软壁开 1~4 级 1x2 阶梯，否则用两列交替 step_up_1x2 连续垫块搭路脱困。"""
             nonlocal st, cur
             if not allow_above_sea and cur[1] >= 62.0:
                 return False
             vc = _voxel_cache(state)
             unsafe = {"water", "lava", "flowing_water", "flowing_lava", "bedrock", "crafting_table"}
+            liquids = {"water", "lava", "flowing_water", "flowing_lava"}
             falling = {"sand", "red_sand", "gravel", "water", "lava", "flowing_water", "flowing_lava"}
             soft_diggable = {
                 "dirt", "grass_block", "coarse_dirt", "podzol", "rooted_dirt",
                 "sand", "red_sand", "gravel", "mud", "clay", "snow_block", "snow",
                 "short_grass", "tall_grass", "leaf_litter",
             }
+            harvestable_placeable = {
+                "dirt", "grass_block", "coarse_dirt", "podzol", "rooted_dirt",
+                "sand", "red_sand", "gravel", "mud", "clay",
+            }
             start_y = float(cur[1])
             target_y = max(start_y, float(min_target_y) if min_target_y is not None else start_y)
+            climb_cap_y = (
+                min(start_y + 5.0, float(goal_y))
+                if goal_y is not None and float(goal_y) > start_y + 0.5
+                else target_y + 3.5
+            )
 
             def _is_soft(name: str) -> bool:
                 return name in soft_diggable or name.endswith("_leaves")
@@ -782,35 +795,47 @@ class ScoutIsland(Skill):
                         chosen_dir = (ix + dx, fy, iz + dz)
                         break
                 if chosen_dir is None:
-                    # 凹坑中央四邻均为空时，先贴近一格到坑壁再向上挖阶梯；
+                    # 凹坑中央四邻均为空时，沿四向扫描 1~3 格内的坑壁并先贴近再向上挖阶梯；
                     # 若 GoalNear(rng>=1) 因距离=1 格原地未动，直接隔空开凿 2 格外的坑壁并一并踏上台阶。
-                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                        mx, mz = ix + dx, iz + dz
-                        if not _valid_step_dir(mx, fy, mz, dx, dz, bool(pick)):
-                            continue
-                        mid_b = _get_block(ex, vc, [mx, fy, mz], dim)
-                        mid_h = _get_block(ex, vc, [mx, fy + 1, mz], dim)
-                        mid_f = bare(_get_block(ex, vc, [mx, fy - 1, mz], dim).get("name", ""))
-                        if not (mid_f and mid_f not in AIR and mid_f not in unsafe and is_clear_space(mid_b) and is_clear_space(mid_h)):
-                            continue
-                        step_dest = [mx + 0.5, float(fy), mz + 0.5]
-                        try:
-                            moved_m = _bounded_move_to(ex, step_dest, rng=1, timeout=15.0)
-                        except Replan as e:
-                            if failure(e)[0] not in NAV_FAIL_CODES:
-                                raise
-                            yield rec("move_to", pos=step_dest, fingerprints=hits, error_code=failure(e)[0])
-                            continue
-                        yield rec("move_to", moved_m, pos=step_dest, fingerprints=hits)
-                        st, cur = _refresh_stance(ex, state)
-                        ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
-                        if _valid_step_dir(ix, fy, iz, dx, dz, bool(pick)):
-                            chosen_dir = (ix + dx, fy, iz + dz)
-                            overhead_cells = [[ix, fy + 2, iz]]
-                        elif _valid_step_dir(mx, fy, mz, dx, dz, bool(pick)):
-                            chosen_dir = (mx + dx, fy, mz + dz)
-                            overhead_cells = [[mx, fy + 2, mz]]
-                        break
+                    for step_dist in (1, 2, 3):
+                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                            mx, mz = ix + dx * step_dist, iz + dz * step_dist
+                            if not _valid_step_dir(mx, fy, mz, dx, dz, bool(pick)):
+                                continue
+                            path_clear = True
+                            for k in range(1, step_dist + 1):
+                                px, pz = ix + dx * k, iz + dz * k
+                                mid_b = _get_block(ex, vc, [px, fy, pz], dim)
+                                mid_h = _get_block(ex, vc, [px, fy + 1, pz], dim)
+                                mid_f = bare(_get_block(ex, vc, [px, fy - 1, pz], dim).get("name", ""))
+                                if not (
+                                    mid_f and mid_f not in AIR and mid_f not in unsafe
+                                    and is_clear_space(mid_b) and is_clear_space(mid_h)
+                                ):
+                                    path_clear = False
+                                    break
+                            if not path_clear:
+                                continue
+                            step_dest = [mx + 0.5, float(fy), mz + 0.5]
+                            try:
+                                moved_m = _bounded_move_to(ex, step_dest, rng=1, timeout=15.0)
+                            except Replan as e:
+                                if failure(e)[0] not in NAV_FAIL_CODES:
+                                    raise
+                                yield rec("move_to", pos=step_dest, fingerprints=hits, error_code=failure(e)[0])
+                                continue
+                            yield rec("move_to", moved_m, pos=step_dest, fingerprints=hits)
+                            st, cur = _refresh_stance(ex, state)
+                            ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
+                            if _valid_step_dir(ix, fy, iz, dx, dz, bool(pick)):
+                                chosen_dir = (ix + dx, fy, iz + dz)
+                                overhead_cells = [[ix, fy + 2, iz]]
+                            elif step_dist == 1 and _valid_step_dir(mx, fy, mz, dx, dz, bool(pick)):
+                                chosen_dir = (mx + dx, fy, mz + dz)
+                                overhead_cells = [[mx, fy + 2, mz]]
+                            break
+                        if chosen_dir is not None:
+                            break
                 if chosen_dir is None:
                     break
                 nx, fy, nz = chosen_dir
@@ -846,43 +871,226 @@ class ScoutIsland(Skill):
                     break
 
             escaped_up = float(cur[1]) > target_y + 0.5
-            # 无镐且坑壁为硬石（或仅退回原坑未真正抬升）时，若背包有可放垫块（泥土/圆石），在相邻空位放块垫高一级
+            # 挖阶梯未成功抬升时，用两列交替 step_up_1x2 连续搭块攀升（最多 5 级），
+            # 背包无垫块时优先就近安全挖取 1~3 块软土充当垫脚料；途中遇到高一格坑沿即直接跨出。
             if not escaped_up:
                 state.refresh_inventory(ex.client)
-                try:
-                    block_item = pick_placeable(state)
-                except Replan:
-                    block_item = None
-                if block_item:
+                if total_placeable(state) == 0:
                     ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
-                    head_clear = is_clear_space(_get_block(ex, vc, [ix, fy + 2, iz], dim))
-                    if head_clear:
+                    harvested = 0
+                    for dy_off in (0, -1):
+                        if harvested >= 3:
+                            break
                         for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                            nx, nz = ix + dx, iz + dz
-                            if _is_protected([nx, fy, nz]):
+                            if harvested >= 3:
+                                break
+                            hp = [ix + dx, fy + dy_off, iz + dz]
+                            if _is_protected(hp):
                                 continue
-                            below_n = bare(_get_block(ex, vc, [nx, fy - 1, nz], dim).get("name", ""))
-                            if not below_n or below_n in AIR or below_n in unsafe:
+                            hname = bare(_get_block(ex, vc, hp, dim).get("name", ""))
+                            if hname not in harvestable_placeable:
                                 continue
-                            if not (
-                                is_clear_space(_get_block(ex, vc, [nx, fy, nz], dim))
-                                and is_clear_space(_get_block(ex, vc, [nx, fy + 1, nz], dim))
-                                and is_clear_space(_get_block(ex, vc, [nx, fy + 2, nz], dim))
-                            ):
+                            if dy_off == -1:
+                                under_h = bare(_get_block(ex, vc, [hp[0], hp[1] - 1, hp[2]], dim).get("name", ""))
+                                if not under_h or under_h in AIR or under_h in unsafe:
+                                    continue
+                            near_liquid = any(
+                                bare(_get_block(ex, vc, [hp[0] + adx, hp[1] + ady, hp[2] + adz], dim).get("name", "")) in liquids
+                                for adx, ady, adz in ((0, 1, 0), (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1))
+                            )
+                            if near_liquid:
                                 continue
                             try:
-                                yield from nav.step_up_1x2(ex, state, [[nx, fy, nz]], item=block_item)
-                                vc and vc.invalidate([nx, fy, nz], dimension=dim)
-                                up_dest = [nx + 0.5, float(fy + 1), nz + 0.5]
-                                moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
-                                yield rec("move_to", moved_u, pos=up_dest, fingerprints=hits)
+                                yield from nav.dig_with_recovery(ex, state, hp, collect=True)
+                            except Replan as e:
+                                code_h, _ = failure(e)
+                                if code_h in ("replan", "interrupted") or "抢占" in str(e):
+                                    raise
+                                continue
+                            vc and vc.invalidate(hp, dimension=dim)
+                            harvested += 1
+                    if harvested > 0:
+                        state.refresh_inventory(ex.client)
+                        st, cur = _refresh_stance(ex, state)
+
+                # 宽坑中央搭柱前先贴近坑壁（1~3 格内），确保搭到顶后可直接跨上坑沿而非悬在坑中央孤柱上
+                if total_placeable(state) > 0:
+                    ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
+                    adjacent_wall = any(
+                        (wn := bare(_get_block(ex, vc, [ix + dx, fy, iz + dz], dim).get("name", "")))
+                        and wn not in AIR and wn not in unsafe
+                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                    )
+                    if not adjacent_wall:
+                        approached = False
+                        for step_dist in (1, 2, 3):
+                            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                                wx, wz = ix + dx * (step_dist + 1), iz + dz * (step_dist + 1)
+                                wall_n = bare(_get_block(ex, vc, [wx, fy, wz], dim).get("name", ""))
+                                if not wall_n or wall_n in AIR or wall_n in unsafe:
+                                    continue
+                                path_clear = True
+                                for k in range(1, step_dist + 1):
+                                    px, pz = ix + dx * k, iz + dz * k
+                                    mid_b = _get_block(ex, vc, [px, fy, pz], dim)
+                                    mid_h = _get_block(ex, vc, [px, fy + 1, pz], dim)
+                                    mid_f = bare(_get_block(ex, vc, [px, fy - 1, pz], dim).get("name", ""))
+                                    if not (
+                                        mid_f and mid_f not in AIR and mid_f not in unsafe
+                                        and is_clear_space(mid_b) and is_clear_space(mid_h)
+                                    ):
+                                        path_clear = False
+                                        break
+                                if not path_clear:
+                                    continue
+                                wall_dest = [ix + dx * step_dist + 0.5, float(fy), iz + dz * step_dist + 0.5]
+                                try:
+                                    moved_w = _bounded_move_to(ex, wall_dest, rng=1, timeout=15.0)
+                                except Replan as e:
+                                    if failure(e)[0] not in NAV_FAIL_CODES:
+                                        raise
+                                    yield rec("move_to", pos=wall_dest, fingerprints=hits, error_code=failure(e)[0])
+                                    continue
+                                yield rec("move_to", moved_w, pos=wall_dest, fingerprints=hits)
                                 st, cur = _refresh_stance(ex, state)
+                                approached = True
+                                break
+                            if approached:
+                                break
+
+                pillar_cols: set[tuple[int, int]] = set()
+                for _layer in range(6):
+                    if float(cur[1]) >= climb_cap_y - 0.2:
+                        break
+                    ix, fy, iz = math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2])
+                    head_blk = _get_block(ex, vc, [ix, fy + 2, iz], dim)
+                    if not is_clear_space(head_blk):
+                        head_name = bare(head_blk.get("name", ""))
+                        roof_above = bare(_get_block(ex, vc, [ix, fy + 3, iz], dim).get("name", ""))
+                        state.refresh_inventory(ex.client)
+                        pick = best_pickaxe(state)
+                        can_clear_head = (
+                            bool(head_name)
+                            and head_name not in unsafe
+                            and roof_above not in falling
+                            and not _is_protected([ix, fy + 2, iz])
+                            and (bool(pick) or _is_soft(head_name))
+                        )
+                        if not can_clear_head:
+                            break
+                        if pick and bare((state.st.get("held") or {}).get("name")) != pick:
+                            yield rec("equip", ex.equip(pick, "hand"), item=pick)
+                            st, cur = _refresh_stance(ex, state)
+                        try:
+                            yield from nav.dig_with_recovery(ex, state, [ix, fy + 2, iz], collect=False)
+                        except Replan as e:
+                            code_d, _ = failure(e)
+                            if code_d in ("replan", "interrupted") or "抢占" in str(e):
+                                raise
+                            break
+                        vc and vc.invalidate([ix, fy + 2, iz], dimension=dim)
+
+                    # 已至少抬升 1 格后，先检查是否已触达非搭柱坑沿（高 1 格且上方两格净空）：跨出无需额外垫块
+                    if _layer > 0:
+                        stepped_rim = False
+                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                            rx, rz = ix + dx, iz + dz
+                            if (rx, rz) in pillar_cols or _is_protected([rx, fy, rz]):
+                                continue
+                            rim_floor = bare(_get_block(ex, vc, [rx, fy, rz], dim).get("name", ""))
+                            if not rim_floor or rim_floor in AIR or rim_floor in unsafe:
+                                continue
+                            if not (
+                                is_clear_space(_get_block(ex, vc, [rx, fy + 1, rz], dim))
+                                and is_clear_space(_get_block(ex, vc, [rx, fy + 2, rz], dim))
+                            ):
+                                continue
+                            rim_dest = [rx + 0.5, float(fy + 1), rz + 0.5]
+                            before_rim_y = float(cur[1])
+                            try:
+                                moved_r = _bounded_move_to(ex, rim_dest, rng=1, timeout=20.0)
                             except Replan as e:
                                 if failure(e)[0] not in NAV_FAIL_CODES:
                                     raise
-                                yield rec("move_to", pos=[nx + 0.5, float(fy + 1), nz + 0.5], fingerprints=hits, error_code=failure(e)[0])
+                                yield rec("move_to", pos=rim_dest, fingerprints=hits, error_code=failure(e)[0])
+                                continue
+                            yield rec("move_to", moved_r, pos=rim_dest, fingerprints=hits)
+                            st, cur = _refresh_stance(ex, state)
+                            if float(cur[1]) >= before_rim_y + 0.5:
+                                stepped_rim = True
+                                break
+                        if stepped_rim:
                             break
-                    escaped_up = float(cur[1]) > target_y + 0.5
+
+                    if _layer >= 5:
+                        break
+                    state.refresh_inventory(ex.client)
+                    avail_blocks = total_placeable(state)
+                    if avail_blocks < 1:
+                        break
+
+                    # 挑选相邻列构建 1 块或两列交替 2 块台阶
+                    step_options: list[tuple[tuple[int, int, int], int, int, list[list[int]]]] = []
+                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, nz = ix + dx, iz + dz
+                        if _is_protected([nx, fy, nz]):
+                            continue
+                        if not (
+                            is_clear_space(_get_block(ex, vc, [nx, fy, nz], dim))
+                            and is_clear_space(_get_block(ex, vc, [nx, fy + 1, nz], dim))
+                            and is_clear_space(_get_block(ex, vc, [nx, fy + 2, nz], dim))
+                        ):
+                            continue
+                        below1_blk = _get_block(ex, vc, [nx, fy - 1, nz], dim)
+                        below1 = bare(below1_blk.get("name", ""))
+                        place_seq: list[list[int]] = []
+                        if below1 and below1 not in AIR and below1 not in unsafe:
+                            place_seq = [[nx, fy, nz]]
+                        elif is_clear_space(below1_blk) and not _is_protected([nx, fy - 1, nz]):
+                            below2 = bare(_get_block(ex, vc, [nx, fy - 2, nz], dim).get("name", ""))
+                            if below2 and below2 not in AIR and below2 not in unsafe:
+                                place_seq = [[nx, fy - 1, nz], [nx, fy, nz]]
+                        if not place_seq or avail_blocks < len(place_seq):
+                            continue
+                        is_partner = 0 if (_layer > 0 and (nx, nz) in pillar_cols) else 1
+                        near_wall = 0 if any(
+                            (wn := bare(_get_block(ex, vc, [nx + wdx, fy + 1, nz + wdz], dim).get("name", "")))
+                            and wn not in AIR and wn not in unsafe
+                            for wdx, wdz in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                        ) else 1
+                        step_options.append(((is_partner, near_wall, len(place_seq)), nx, nz, place_seq))
+
+                    if not step_options:
+                        break
+                    step_options.sort(key=lambda item: item[0])
+                    climbed_layer = False
+                    for _, nx, nz, place_seq in step_options:
+                        up_dest = [nx + 0.5, float(fy + 1), nz + 0.5]
+                        before_y = float(cur[1])
+                        try:
+                            pref = pick_placeable(state)
+                            use_item = pref if state.count(pref) >= len(place_seq) else None
+                            yield from nav.step_up_1x2(ex, state, place_seq, item=use_item)
+                            for placed_p in place_seq:
+                                vc and vc.invalidate(placed_p, dimension=dim)
+                            moved_u = _bounded_move_to(ex, up_dest, rng=1, timeout=20.0)
+                            yield rec("move_to", moved_u, pos=up_dest, fingerprints=hits)
+                            st, cur = _refresh_stance(ex, state)
+                        except Replan as e:
+                            code_s, _ = failure(e)
+                            if code_s in ("replan", "interrupted") or "抢占" in str(e):
+                                raise
+                            if code_s in NAV_FAIL_CODES:
+                                yield rec("move_to", pos=up_dest, fingerprints=hits, error_code=code_s)
+                            continue
+                        if float(cur[1]) >= before_y + 0.5:
+                            pillar_cols.add((ix, iz))
+                            pillar_cols.add((nx, nz))
+                            climbed_layer = True
+                            break
+                    if not climbed_layer:
+                        break
+                escaped_up = float(cur[1]) > target_y + 0.5
 
             if escaped_up:
                 RECENT_RECOVERY_LANDINGS.clear()
@@ -964,8 +1172,12 @@ class ScoutIsland(Skill):
                     memo.mark_grid_visited(cur, dimension=dim)
                 return True
 
-            # 2) 若周边全封死在地下或地表凹坑且背包有镐，安全向上开 1~2 级 1x2 阶梯脱困
-            return (yield from _try_staircase_climb_out(allow_above_sea=bool(surface_targets)))
+            # 2) 若周边全封死在地下或地表凹坑，优先安全向上开 1x2 阶梯或连续交替垫块脱困
+            surface_goal_y = min((float(t[1]) for t in surface_targets), default=None)
+            return (yield from _try_staircase_climb_out(
+                allow_above_sea=bool(surface_targets),
+                goal_y=surface_goal_y,
+            ))
 
         if not cands and not climb_cands:
             if (yield from _try_water_escape()):
@@ -1035,12 +1247,15 @@ class ScoutIsland(Skill):
             return
         if attempts == 0 and (yield from _try_underground_surface_escape()):
             return
+        # 周边陆地站位明显高于自身（>= 2 格深坑：候选站位 y+1 > cur.y + 1.5）时，
+        # 优先向上挖阶梯或两列交替垫块爬出，避免先跑水平脱困把刚垫高的一格又走回坑底。
+        high_stand_ys = [float(c[-1][1] + 1.0) for c in cands + climb_cands if float(c[-1][1] + 1.0) > cur[1] + 1.5]
+        if high_stand_ys:
+            if (yield from _try_staircase_climb_out(allow_above_sea=True, goal_y=min(high_stand_ys))):
+                return
         if not attempted_recovery:
             fallback_dest = cands[0][-1] if cands else (list(target_wood.pos) if target_wood is not None else None)
             if (yield from _recover_with_guard(fallback_dest)):
-                return
-        if any(c[-1][1] > cur[1] + 1.5 for c in cands + climb_cands):
-            if (yield from _try_staircase_climb_out(allow_above_sea=True)):
                 return
         if last_nav_err is not None:
             raise last_nav_err
