@@ -45,14 +45,21 @@ WEB_DIR = HERE / "web"
 
 
 def _ensure_venv_python() -> None:
-    """若用系统 python3 直接启动且缺少 requests，则自动切到仓库 .venv 解释器。"""
+    """若用系统 python 直接启动且缺少 requests，则自动切到仓库 .venv 解释器。"""
     if os.environ.get("_AIAMC_CONSOLE_REEXEC") == "1":
         return
     if importlib.util.find_spec("requests") is not None:
         return
-    for cand in (REPO_ROOT / ".venv" / "bin" / "python", REPO_ROOT / ".venv" / "bin" / "python3"):
+    candidates = (
+        (REPO_ROOT / ".venv" / "Scripts" / "python.exe",)
+        if os.name == "nt"
+        else (REPO_ROOT / ".venv" / "bin" / "python", REPO_ROOT / ".venv" / "bin" / "python3")
+    )
+    for cand in candidates:
         if cand.is_file():
             os.environ["_AIAMC_CONSOLE_REEXEC"] = "1"
+            if os.name == "nt":
+                raise SystemExit(subprocess.call([str(cand), *sys.argv]))
             os.execv(str(cand), [str(cand), *sys.argv])
 
 
@@ -160,9 +167,13 @@ def _host_of(url: str) -> str:
 
 
 def _resolve_python_runner() -> list[str]:
-    """优先直启仓库 .venv/bin/python，避免 uv 包装层吞掉 SIGINT 或强杀后遗留子进程。"""
-    venv_py = REPO_ROOT / ".venv" / "bin" / "python"
-    if venv_py.is_file() and os.access(venv_py, os.X_OK):
+    """优先直启仓库 .venv 解释器，避免 uv 包装层吞掉中断信号或强杀后遗留子进程。"""
+    venv_py = (
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else REPO_ROOT / ".venv" / "bin" / "python"
+    )
+    if venv_py.is_file() and (os.name == "nt" or os.access(venv_py, os.X_OK)):
         return [str(venv_py)]
     if shutil.which("uv"):
         return ["uv", "run", "python"]
@@ -624,6 +635,12 @@ class ProcessManager:
             env.update(spec["env_overrides"])
             env["PYTHONUNBUFFERED"] = "1"
 
+            popen_kwargs: dict[str, Any] = {}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            else:
+                popen_kwargs["start_new_session"] = True
+
             proc = subprocess.Popen(
                 spec["argv"],
                 cwd=str(CODE_DIR),
@@ -634,7 +651,7 @@ class ProcessManager:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                start_new_session=True,
+                **popen_kwargs,
             )
 
             self._proc = proc
@@ -683,12 +700,53 @@ class ProcessManager:
                     self._console_lines.append(f"[console] 进程已退出，exit_code={rc}")
 
     def stop(self, *, force: bool = False) -> dict[str, Any]:
-        sig = signal.SIGKILL if force else signal.SIGINT
         with self._lock:
             proc = self._proc if self._is_alive_locked() else None
             if proc is not None:
                 self._state = "stopping"
 
+        if os.name == "nt":
+            if proc is None:
+                return {"ok": True, "message": "当前没有运行中的进程", "status": self.status()}
+            pid = proc.pid
+            sig_label = "TASKKILL /T /F" if force else "TERMINATE"
+            with self._lock:
+                self._console_lines.append(f"[console] Windows 停止进程 pid={pid} ({sig_label})")
+            if force:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                        check=False,
+                    )
+                except OSError:
+                    proc.kill()
+            else:
+                try:
+                    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                    if ctrl_break is not None:
+                        proc.send_signal(ctrl_break)
+                    else:
+                        proc.terminate()
+                except Exception:
+                    proc.terminate()
+            try:
+                proc.wait(timeout=1.5 if force else 0.8)
+            except subprocess.TimeoutExpired:
+                pass
+            if proc.poll() is not None:
+                with self._lock:
+                    if self._proc is proc:
+                        self._returncode = proc.returncode
+                        self._ended_at = self._ended_at or time.time()
+                        self._state = "exited"
+            alive = proc.poll() is None
+            msg = f"已停止进程 {pid}" if not alive else f"已发送停止信号到 {pid}（等待退出中）"
+            return {"ok": True, "message": msg, "killed_pids": [pid], "remaining_pids": [pid] if alive else [], "status": self.status()}
+
+        sig = signal.SIGKILL if force else signal.SIGINT
         target_pids: list[int] = []
         pgids: set[int] = set()
         if proc is not None:

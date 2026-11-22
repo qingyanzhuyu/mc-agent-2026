@@ -1,7 +1,19 @@
 @echo off
 setlocal
 set "SCRIPT_DIR=%~dp0"
-for /f "usebackq delims=" %%i in (`wsl wslpath -a "%SCRIPT_DIR%start_console.sh"`) do set "WSL_SCRIPT=%%i"
-wsl bash -lc "'%WSL_SCRIPT%'"
-start "" "http://127.0.0.1:8795/"
+for %%I in ("%SCRIPT_DIR%..\..") do set "REPO_ROOT=%%~fI"
+
+if exist "%REPO_ROOT%\.venv\Scripts\python.exe" (
+    "%REPO_ROOT%\.venv\Scripts\python.exe" "%SCRIPT_DIR%server.py" --open
+    goto :eof
+)
+
+where uv >nul 2>nul
+if %errorlevel%==0 (
+    cd /d "%REPO_ROOT%"
+    uv run python "%SCRIPT_DIR%server.py" --open
+    goto :eof
+)
+
+python "%SCRIPT_DIR%server.py" --open
 endlocal
