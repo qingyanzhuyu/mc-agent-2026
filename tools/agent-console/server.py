@@ -160,6 +160,10 @@ def _host_of(url: str) -> str:
 
 
 def _resolve_python_runner() -> list[str]:
+    """优先直启仓库 .venv/bin/python，避免 uv 包装层吞掉 SIGINT 或强杀后遗留子进程。"""
+    venv_py = REPO_ROOT / ".venv" / "bin" / "python"
+    if venv_py.is_file() and os.access(venv_py, os.X_OK):
+        return [str(venv_py)]
     if shutil.which("uv"):
         return ["uv", "run", "python"]
     return [sys.executable]
@@ -427,11 +431,119 @@ def build_launch_spec(
 
 
 # ============================================================================
-# 子进程生命周期管理
+# 子进程生命周期管理（直启 + 进程树/残留进程收割）
 # ============================================================================
 
+def _find_descendant_pids(root_pid: int, proc_root: Path = Path("/proc")) -> list[int]:
+    """扫描 /proc 找出 root_pid 的全部后代 PID（子进程优先，便于自底向上收割）。"""
+    if root_pid <= 0 or not proc_root.is_dir():
+        return []
+    children_of: dict[int, list[int]] = collections.defaultdict(list)
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for ent in entries:
+        if not ent.name.isdigit():
+            continue
+        try:
+            stat_txt = (ent / "stat").read_text(encoding="utf-8", errors="replace")
+            rparen = stat_txt.rfind(")")
+            if rparen < 0:
+                continue
+            fields = stat_txt[rparen + 2:].split()
+            if len(fields) < 2:
+                continue
+            pid = int(ent.name)
+            ppid = int(fields[1])
+            children_of[ppid].append(pid)
+        except (OSError, ValueError):
+            continue
+
+    descendants: list[int] = []
+    stack = list(children_of.get(root_pid, ()))
+    seen: set[int] = {root_pid}
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        descendants.append(cur)
+        stack.extend(children_of.get(cur, ()))
+    descendants.reverse()
+    return descendants
+
+
+def _find_external_loop_procs(
+    *,
+    exclude_pids: Optional[set[int]] = None,
+    proc_root: Path = Path("/proc"),
+) -> list[dict[str, Any]]:
+    """发现当前仓库下正在运行的 `mcagent.loop` 进程（含控制台重启后脱离句柄的残留进程）。"""
+    if not proc_root.is_dir():
+        return []
+    skip = set(exclude_pids or ()) | {os.getpid()}
+    repo_str = str(REPO_ROOT.resolve())
+    found: list[dict[str, Any]] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for ent in entries:
+        if not ent.name.isdigit():
+            continue
+        pid = int(ent.name)
+        if pid in skip:
+            continue
+        try:
+            raw = (ent / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        args = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        if not args:
+            continue
+        cmd = " ".join(args)
+        if "mcagent.loop" not in cmd:
+            continue
+        if any(tok in cmd for tok in ("unittest", "pytest", "preflight", "--dry", "--replay")):
+            continue
+        # 归属校验：cwd 或 cmdline 指向本仓库，避免误碰其他目录的无关进程
+        in_repo = repo_str in cmd
+        if not in_repo:
+            try:
+                cwd = os.readlink(ent / "cwd")
+                in_repo = cwd == repo_str or cwd.startswith(repo_str + os.sep)
+            except OSError:
+                in_repo = False
+        if not in_repo:
+            continue
+        run_id = None
+        if "--run-dir" in args:
+            idx = args.index("--run-dir")
+            if idx + 1 < len(args):
+                run_id = run_id_for_path(Path(args[idx + 1]))
+        mode = "match" if "--live" in args else ("local" if "--local-target" in args else None)
+        found.append({"pid": pid, "run_id": run_id, "mode": mode, "cmd": cmd[:300]})
+    found.sort(key=lambda r: r["pid"])
+    return found
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 class ProcessManager:
-    """管理本控制台启动的单个 `mcagent.loop` 实例。"""
+    """管理本控制台启动（以及残留接管）的 `mcagent.loop` 实例。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -461,7 +573,7 @@ class ProcessManager:
             if self._started_at is not None:
                 end = time.time() if running else (self._ended_at or time.time())
                 elapsed = round(max(0.0, end - self._started_at), 1)
-            return {
+            snap = {
                 "state": self._state,
                 "running": running,
                 "pid": self._proc.pid if running and self._proc is not None else None,
@@ -473,7 +585,22 @@ class ProcessManager:
                 "ended_at": self._ended_at,
                 "elapsed_s": elapsed,
                 "returncode": self._returncode,
+                "external": False,
             }
+        if not snap["running"]:
+            ext = _find_external_loop_procs()
+            if ext:
+                first = ext[0]
+                snap.update({
+                    "state": "running",
+                    "running": True,
+                    "pid": first["pid"],
+                    "run_id": first["run_id"] or snap["run_id"],
+                    "mode": first["mode"] or snap["mode"],
+                    "cmd_display": first["cmd"],
+                    "external": True,
+                })
+        return snap
 
     def console_tail(self, limit: int = 200) -> list[str]:
         with self._lock:
@@ -481,9 +608,13 @@ class ProcessManager:
         return items[-max(1, limit):]
 
     def start(self, spec: dict[str, Any]) -> dict[str, Any]:
+        ext = _find_external_loop_procs()
         with self._lock:
             if self._is_alive_locked():
                 raise RuntimeError(f"已有运行中的实例 (pid={self._proc.pid}, run={self._run_id})，请先停止后再启动")
+            if ext:
+                pids = ", ".join(str(x["pid"]) for x in ext)
+                raise RuntimeError(f"检测到残留/外部运行的 mcagent.loop 进程 (pid={pids})，请先点「优雅停止」或「强杀」清理")
 
             run_dir: Path = spec["run_dir"]
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -552,20 +683,78 @@ class ProcessManager:
                     self._console_lines.append(f"[console] 进程已退出，exit_code={rc}")
 
     def stop(self, *, force: bool = False) -> dict[str, Any]:
+        sig = signal.SIGKILL if force else signal.SIGINT
         with self._lock:
-            if not self._is_alive_locked() or self._proc is None:
-                return {"ok": True, "message": "当前没有运行中的进程", "status": self._snapshot_locked()}
-            proc = self._proc
-            sig = signal.SIGKILL if force else signal.SIGINT
-            self._state = "stopping"
-            self._console_lines.append(f"[console] 发送信号 {sig.name} 到进程组 pid={proc.pid}")
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            proc.kill() if force else proc.terminate()
-        return {"ok": True, "message": f"已发送 {sig.name}", "status": self.status()}
+            proc = self._proc if self._is_alive_locked() else None
+            if proc is not None:
+                self._state = "stopping"
+
+        target_pids: list[int] = []
+        pgids: set[int] = set()
+        if proc is not None:
+            pgids.add(proc.pid)
+            target_pids.extend(_find_descendant_pids(proc.pid))
+            target_pids.append(proc.pid)
+
+        # 同时纳入脱离句柄的外部/残留 mcagent.loop 进程及其子进程，彻底杜绝残留
+        for ext in _find_external_loop_procs():
+            ep = int(ext["pid"])
+            for dp in _find_descendant_pids(ep):
+                if dp not in target_pids:
+                    target_pids.append(dp)
+            if ep not in target_pids:
+                target_pids.append(ep)
+            try:
+                pg = os.getpgid(ep)
+                if pg > 0 and pg != os.getpgrp():
+                    pgids.add(pg)
+            except OSError:
+                pass
+
+        if not target_pids and not pgids:
+            return {"ok": True, "message": "当前没有运行中的进程", "status": self.status()}
+
+        with self._lock:
+            self._console_lines.append(
+                f"[console] 发送 {sig.name} -> pids={target_pids} pgids={sorted(pgids)}"
+            )
+
+        for pg in pgids:
+            try:
+                os.killpg(pg, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        for pid in target_pids:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        # 短暂等待回收，确保强杀立即生效且状态立刻更新
+        deadline = time.monotonic() + (1.5 if force else 0.8)
+        while time.monotonic() < deadline:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+            if not any(_pid_alive(pid) for pid in target_pids):
+                break
+            time.sleep(0.05)
+
+        still_alive = [pid for pid in target_pids if _pid_alive(pid)]
+        if proc is not None and proc.poll() is not None:
+            with self._lock:
+                if self._proc is proc:
+                    self._returncode = proc.returncode
+                    self._ended_at = self._ended_at or time.time()
+                    self._state = "exited"
+
+        msg = (
+            f"已强杀进程 {target_pids}" if (force and not still_alive)
+            else f"已发送 {sig.name} 到 {target_pids}" + (f"（等待退出中: {still_alive}）" if still_alive else "（已退出）")
+        )
+        return {"ok": True, "message": msg, "killed_pids": target_pids, "remaining_pids": still_alive, "status": self.status()}
 
     def _snapshot_locked(self) -> dict[str, Any]:
         return {

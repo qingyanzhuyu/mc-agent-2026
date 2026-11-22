@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -669,6 +670,73 @@ class LoopbackHttpTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertFalse(data["ok"])
         self.assertIn("不支持的模式", data["error"])
+
+
+class ProcessManagerStopKillTests(unittest.TestCase):
+    def test_graceful_stop_exits_python_process_cleanly(self) -> None:
+        mgr = srv.ProcessManager()
+        with unittest.mock.patch.object(srv, "_find_external_loop_procs", return_value=[]):
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "run-sigint"
+                spec = {
+                    "mode": "local",
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        "import signal, sys, time; signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); print('ready', flush=True); time.sleep(30)",
+                    ],
+                    "env_overrides": {},
+                    "cmd_display": "python sleep",
+                    "run_dir": run_dir,
+                    "meta": {"mode": "local"},
+                }
+                st = mgr.start(spec)
+                self.assertTrue(st["running"])
+                pid = st["pid"]
+                time.sleep(0.25)
+                res = mgr.stop(force=False)
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["remaining_pids"], [])
+                self.assertFalse(mgr.status()["running"])
+                self.assertFalse(srv._pid_alive(pid))
+
+    def test_force_kill_reaps_parent_and_child_process_tree(self) -> None:
+        mgr = srv.ProcessManager()
+        with unittest.mock.patch.object(srv, "_find_external_loop_procs", return_value=[]):
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "run-sigkill"
+                child_pid_file = run_dir / "child.pid"
+                script = (
+                    "import signal, subprocess, sys, time; "
+                    "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                    f"c = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)']); "
+                    f"open({str(child_pid_file)!r}, 'w').write(str(c.pid)); "
+                    "print('spawned', c.pid, flush=True); "
+                    "time.sleep(30)"
+                )
+                spec = {
+                    "mode": "local",
+                    "argv": [sys.executable, "-c", script],
+                    "env_overrides": {},
+                    "cmd_display": "python parent+child",
+                    "run_dir": run_dir,
+                    "meta": {"mode": "local"},
+                }
+                st = mgr.start(spec)
+                parent_pid = st["pid"]
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and not child_pid_file.is_file():
+                    time.sleep(0.05)
+                self.assertTrue(child_pid_file.is_file())
+                child_pid = int(child_pid_file.read_text().strip())
+                self.assertTrue(srv._pid_alive(child_pid))
+
+                res = mgr.stop(force=True)
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["remaining_pids"], [])
+                self.assertFalse(mgr.status()["running"])
+                self.assertFalse(srv._pid_alive(parent_pid))
+                self.assertFalse(srv._pid_alive(child_pid))
 
 
 if __name__ == "__main__":
