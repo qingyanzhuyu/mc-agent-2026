@@ -45,6 +45,9 @@ class FakeSession {
   async look(params) {
     return { forwarded: params };
   }
+  async findBlocks(params) {
+    return { total: 0, blocks: [], forwarded: params };
+  }
 }
 
 async function withServer(fn) {
@@ -204,5 +207,44 @@ test("Auth & multi-teammate session isolation: §1.1 duplicate login invalidates
       headers: { Authorization: `Bearer ${loginB.token}` },
     });
     assert.equal(afterLogout.status, 401);
+  });
+});
+
+test("HTTP contract (v1.3.15): body > 1 MiB returns 413 body_too_large and async find_blocks resolves", async () => {
+  await withServer(async (base) => {
+    const login = await (
+      await fetch(`${base}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "bigbody", password: "dev" }),
+      })
+    ).json();
+
+    const oversized = JSON.stringify({ pad: "x".repeat(1024 * 1024 + 64) });
+    const res413 = await fetch(`${base}/api/v1/find_blocks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${login.token}`,
+        "Content-Type": "application/json",
+      },
+      body: oversized,
+    });
+    assert.equal(res413.status, 413);
+    const payload413 = await res413.json();
+    assert.equal(payload413.ok, false);
+    assert.equal(payload413.error.code, "body_too_large");
+
+    const fbRes = await fetch(`${base}/api/v1/find_blocks`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${login.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ radius: 8 }),
+    });
+    assert.equal(fbRes.status, 200);
+    const fbJson = await fbRes.json();
+    assert.equal(fbJson.ok, true);
+    assert.deepEqual(fbJson.result.forwarded, { radius: 8 });
   });
 });
