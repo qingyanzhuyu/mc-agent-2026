@@ -6,6 +6,7 @@ from itertools import combinations
 
 from ..runtime import EnvBlocked, Replan
 from .base import Param, Skill, failure, rec
+from .camp_plan import state_dim
 from .field import collect_drops, scan_blocks, scan_entities
 from .interaction import use_item_on
 from .items import AIR, bare
@@ -17,6 +18,8 @@ from .survival import (
     _can_reach, _cell, _fresh_inventory, _has_progress, _neighbors, _plank_plan,
     _require_ready, _site_missing, _stand_for,
 )
+from .voxel_cache import voxel_cache_for
+from .workstations import reclaim_field_station, record_placed_station
 
 
 # criteria-1.21.11.json husbandry/plant_seed，物品映射到本次必须观察到的作物方块。
@@ -90,10 +93,12 @@ def _place_local_table(ex, state):
     for cand in _neighbors(self_cell):
         if _block(ex, cand) in AIR and _block(ex, _above(cand, -1)) in _SUPPORT:
             res = ex.place(item="crafting_table", pos=list(cand))
+            voxel_cache_for(state).invalidate(cand, dimension=state_dim(state))
             yield rec("place", res, item="crafting_table", pos=list(cand))
+            record_placed_station(state, "crafting_table", cand)
             _fresh_inventory(ex, state)
-            return True
-    return False
+            return cand
+    return None
 
 
 def _craft_wooden_hoe(ex, state):
@@ -113,10 +118,11 @@ def _craft_wooden_hoe(ex, state):
                 raise
             yield from _craft_planks_from_logs(ex, state, 6)
             yield from craft_recipe(ex, state, "crafting_table", goal_qty=1)
-        placed = yield from _place_local_table(ex, state)
-        if not placed:
+        tpos = yield from _place_local_table(ex, state)
+        if not tpos:
             raise
     yield from craft_recipe(ex, state, "wooden_hoe", goal_qty=1)
+    yield from reclaim_field_station(ex, state, "crafting_table", tpos, newly_placed=True)
 
 
 def _gather_wheat(ex, state, goal_qty, *, radius=_GRASS_RADIUS, limit=_GRASS_LIMIT):

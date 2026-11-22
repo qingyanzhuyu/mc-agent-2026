@@ -17,6 +17,7 @@ from .registry import register
 from .sightline import ENTITY_EYE_REACH, STATION_EYE_REACH, can_reach_block, eye_to_block_dist, eye_to_point_dist, feet_pos
 from .trade_smith_brew import brew_batch, smith_once, trade_once
 from .world_memo import memo_for
+from .workstations import find_known_station, reclaim_field_station
 
 _ADJACENT = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _TRIM_MATERIALS = ("iron_ingot", "copper_ingot", "gold_ingot", "lapis_lazuli", "emerald", "diamond", "redstone", "quartz", "amethyst_shard", "netherite_ingot")
@@ -60,12 +61,25 @@ def _find_station_nearby(ex, state, station: str, radius: int, *, skill_name: st
     return None
 
 
-def _ensure_station(ex, state, station: str, radius: int, *, skill_name: str = "", landmark: Optional[str] = None):
+def _ensure_station_tracked(ex, state, station: str, radius: int, *, skill_name: str = "", landmark: Optional[str] = None):
     if (found := (yield from _find_station_nearby(ex, state, station, radius, skill_name=skill_name))) is not None:
-        return found
-    refresh_inventory(ex, state)
+        return found, False
     status = state.refresh_status(ex.client, max_age_s=0)
     dim = str(status.get("dimension") or "overworld")
+    if (known := find_known_station(ex, state, station, dimension=dim, max_dist=16.0)) is not None:
+        if can_reach_block(ex, status, known, reach=STATION_EYE_REACH):
+            return list(known), False
+        stand = _find_adjacent_stand(ex, known)
+        if stand is not None:
+            cx, cy, cz = stand
+            yield from move_local(ex, state, (cx + 0.5, cy, cz + 0.5), rng=1, max_distance=min(max(radius, 16), 64))
+        else:
+            yield rec("move_to", ex.move_to(pos=list(known), rng=2), pos=list(known))
+        status = state.refresh_status(ex.client, max_age_s=0)
+        if bare(_observed_block(ex, known).get("name")) == station and (can_reach_block(ex, status, known, reach=STATION_EYE_REACH) or eye_to_block_dist(status, known) <= STATION_EYE_REACH + 1.0):
+            return list(known), False
+    refresh_inventory(ex, state)
+    status = state.refresh_status(ex.client, max_age_s=0)
     if state.count(station) >= 1:
         px, py, pz = _cell(status.get("pos"))
         for dx, dz in _ADJACENT:
@@ -73,11 +87,16 @@ def _ensure_station(ex, state, station: str, radius: int, *, skill_name: str = "
             if _standable_cell(ex, cand):
                 yield from place_block(ex, state, station, cand)
                 memo_for(state).record_station(station, cand, dimension=dim)
-                return list(cand)
+                return list(cand), True
     if landmark and (yield from goto_known_landmark_or_biome(ex, state, landmark)):
         if (found := (yield from _find_station_nearby(ex, state, station, radius, skill_name=skill_name))) is not None:
-            return found
+            return found, False
     raise EnvBlocked(f"{radius} 格内未找到可达的 {station}，且缺少可放置工作站或安全落点", missing_predicate=f"station_ready:{station}", searched_volume=f"半径 {radius} 格 {station}", wake_on="chunk_moved")
+
+
+def _ensure_station(ex, state, station: str, radius: int, *, skill_name: str = "", landmark: Optional[str] = None):
+    pos, _ = yield from _ensure_station_tracked(ex, state, station, radius, skill_name=skill_name, landmark=landmark)
+    return pos
 
 
 def _approach_entity(ex, state, entity: dict, *, reach: float = ENTITY_EYE_REACH, max_distance: int = 64):
@@ -223,10 +242,11 @@ class TrimArmor(Skill):
         template, armor, material = _trim_inputs(state)
         if not (template and armor and material):
             raise Replan(self.blocked(state) or "缺少纹饰锻造所需材料")
-        pos = yield from _ensure_station(ex, state, "smithing_table", self.args["radius"], skill_name=self.name)
+        pos, newly_placed = yield from _ensure_station_tracked(ex, state, "smithing_table", self.args["radius"], skill_name=self.name)
         res = yield from smith_once(ex, state, pos, template=template, base=armor, addition=material, expected_output=armor)
         self._smith_result = res
         yield rec("trim_armor_evidence", res, template=template, armor=armor, material=material)
+        yield from reclaim_field_station(ex, state, "smithing_table", pos, newly_placed=newly_placed)
 
     def verify_done(self, state, before_counts=None) -> str:
         res = self._smith_result
@@ -272,14 +292,16 @@ class SmithNetheriteHoe(Skill):
             if "diamond_hoe" in RECIPES:
                 yield from craft_recipe(ex, state, "diamond_hoe", goal_qty=1)
             else:
-                yield from _ensure_station(ex, state, "crafting_table", radius, skill_name=self.name)
+                table_pos, table_new = yield from _ensure_station_tracked(ex, state, "crafting_table", radius, skill_name=self.name)
                 yield rec("craft", ex.craft("diamond_hoe", 1), item="diamond_hoe", count=1)
                 refresh_inventory(ex, state)
                 if state.count("diamond_hoe") < 1:
                     raise Replan("合成 diamond_hoe 后背包未确认产出")
-        pos = yield from _ensure_station(ex, state, "smithing_table", radius, skill_name=self.name)
+                yield from reclaim_field_station(ex, state, "crafting_table", table_pos, newly_placed=table_new)
+        pos, newly_placed = yield from _ensure_station_tracked(ex, state, "smithing_table", radius, skill_name=self.name)
         res = yield from smith_once(ex, state, pos, template="netherite_upgrade_smithing_template", base="diamond_hoe", addition="netherite_ingot", expected_output="netherite_hoe")
         yield rec("netherite_hoe_evidence", res, output="netherite_hoe")
+        yield from reclaim_field_station(ex, state, "smithing_table", pos, newly_placed=newly_placed)
 
     def verify_done(self, state, before_counts=None) -> str:
         return "" if state.count("netherite_hoe") >= 1 else "背包未确认下界合金锄 netherite_hoe"
@@ -320,7 +342,7 @@ class BrewPotion(Skill):
             already_weak = _has_weakness_potion(state.inventory)
             if state.count("potion") < 1 or state.count("gunpowder") < 1 or (not already_weak and state.count("fermented_spider_eye") < 1):
                 raise Replan("缺少酿造 weakness_splash 所需的 potion、fermented_spider_eye 或 gunpowder")
-            pos = yield from _ensure_station(ex, state, "brewing_stand", radius, skill_name=self.name, landmark="village")
+            pos, newly_placed = yield from _ensure_station_tracked(ex, state, "brewing_stand", radius, skill_name=self.name, landmark="village")
             if not already_weak:
                 yield from brew_batch(ex, state, pos, bottle_item="potion", ingredient="fermented_spider_eye", **kw)
                 refresh_inventory(ex, state)
@@ -332,10 +354,11 @@ class BrewPotion(Skill):
                 raise Replan("酿造虚弱喷溅药水后未确认产出 splash_potion")
             self._brew_result, self._primary_ingredient = res, ("gunpowder" if already_weak else "fermented_spider_eye")
             yield rec("brew_potion_evidence", res, recipe=recipe, output=res["output"], potion=res.get("potion"))
+            yield from reclaim_field_station(ex, state, "brewing_stand", pos, newly_placed=newly_placed)
             return
         if state.count("potion") < 1 or state.count(ing) < 1:
             raise Replan(f"缺少酿造 {recipe} 所需的 potion 或 {ing}")
-        pos = yield from _ensure_station(ex, state, "brewing_stand", radius, skill_name=self.name, landmark="village")
+        pos, newly_placed = yield from _ensure_station_tracked(ex, state, "brewing_stand", radius, skill_name=self.name, landmark="village")
         res = yield from brew_batch(ex, state, pos, bottle_item="potion", ingredient=ing, **kw)
         if recipe == "weakness":
             refresh_inventory(ex, state)
@@ -343,6 +366,7 @@ class BrewPotion(Skill):
                 res = yield from brew_batch(ex, state, pos, bottle_item="potion", ingredient="gunpowder", **kw)
         self._brew_result, self._primary_ingredient = res, ing
         yield rec("brew_potion_evidence", res, recipe=recipe, output=res["output"], potion=res.get("potion"))
+        yield from reclaim_field_station(ex, state, "brewing_stand", pos, newly_placed=newly_placed)
 
     def verify_done(self, state, before_counts=None) -> str:
         res = self._brew_result
@@ -379,13 +403,14 @@ class CureZombieVillager(Skill):
         if reason := self.blocked(state):
             raise Replan(reason)
         if state.count("golden_apple") < 1:
-            yield from _ensure_station(ex, state, "crafting_table", radius, skill_name=self.name, landmark="village")
+            table_pos, table_new = yield from _ensure_station_tracked(ex, state, "crafting_table", radius, skill_name=self.name, landmark="village")
             before_ga = state.count("golden_apple")
             yield rec("craft", ex.craft("golden_apple", 1), item="golden_apple", count=1)
             refresh_inventory(ex, state)
             if state.count("golden_apple") <= before_ga:
                 raise Replan("合成 golden_apple 后背包未确认产出")
             self._crafted_golden_apple = True
+            yield from reclaim_field_station(ex, state, "crafting_table", table_pos, newly_placed=table_new)
         zv = (yield from _scan_sorted_entities_or_landmark(ex, state, ("zombie_villager",), radius, label="僵尸村民", pred="zombie_villager", wake_on="night", landmark="village"))[0]
         yield from _approach_entity(ex, state, zv, reach=ENTITY_EYE_REACH, max_distance=radius)
         splash_before = state.count("splash_potion")

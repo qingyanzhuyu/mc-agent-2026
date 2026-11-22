@@ -201,13 +201,15 @@ class CraftGearAndMineStoneIntegrationTests(unittest.TestCase):
         drive(make("craft_gear", {"item": "stone_pickaxe"}), ex, state)
         self.assertIn((8, 64, 0), memo_for(state).stations("crafting_table"))
 
-        # 2) 新放工作台也记录至 memo.stations
+        # 2) 新放野外工作台先入账、合成完成后自动回收并销账；基地 camp 范围内的工作台则保留在台账中
         reset_world_memo()
         _COOLDOWN.clear()
         world2 = IntegrationWorld(items={"oak_planks": 4, "stick": 2, "cobblestone": 3})
         ex2, state2 = world2.session()
-        drive(make("craft_gear", {"item": "stone_pickaxe"}), ex2, state2)
-        self.assertEqual(memo_for(state2).stations("crafting_table"), [(1, 64, 0)])
+        steps2 = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex2, state2)
+        self.assertEqual(steps2[-1].get("reason"), "reclaim_station")
+        self.assertEqual(memo_for(state2).stations("crafting_table"), [])
+        self.assertEqual(state2.count("crafting_table"), 1)
 
     def test_mine_stone_uses_voxel_cache_and_clears_soft_los_block(self):
         # (2, 65, 0) 的 dirt 遮挡 (3, 65, 0) 的 stone；且存在多个仅触发一次 get_block 的探槽观察

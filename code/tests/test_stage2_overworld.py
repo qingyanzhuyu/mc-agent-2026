@@ -888,6 +888,32 @@ class BiomePrepAndLandmarkTests(unittest.TestCase):
         ]})
         self.assertEqual(len(rank_actionable_goals(st_empty, g_pair)), 2)
 
+    def test_smelt_copper_converts_logs_to_planks_before_loading_fuel(self):
+        from unittest.mock import patch
+        from mcagent.skills.t2_overworld import _smelt_copper_ingots
+
+        blocks = {(x, 63, z): "grass_block" for x in range(-4, 5) for z in range(-4, 5)}
+        blocks[(2, 64, 0)] = "furnace"
+        w = OverworldTestWorld(blocks=blocks, items={"raw_copper": 3, "oak_log": 1})
+        ex, st = w.session()
+        with patch("mcagent.skills.t2_overworld.time.sleep", return_value=None):
+            gen = _smelt_copper_ingots(ex, st, 3, 16)
+            for _ in gen:
+                pass
+        crafted = [args["item"] for op, args in w.calls if op == "craft"]
+        self.assertIn("oak_planks", crafted)
+        fuel_puts = [
+            op["item"]
+            for op_name, args in w.calls
+            if op_name == "window_act"
+            for op in args["ops"]
+            if op.get("op") == "put" and op.get("to") == "fuel"
+        ]
+        self.assertEqual(fuel_puts, ["oak_planks"])
+        self.assertEqual(w.items.get("copper_ingot", 0), 3)
+        self.assertEqual(w.items.get("oak_log", 0), 0)
+        self.assertEqual(w.items.get("oak_planks", 0), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

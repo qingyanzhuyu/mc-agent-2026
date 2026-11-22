@@ -38,12 +38,22 @@ CATEGORY_BLOCKS: dict[str, tuple[str, ...]] = {
     "lava": ("lava", "lava_cauldron"),
     "iron_ore": ("iron_ore", "deepslate_iron_ore", "raw_iron_block"),
     "coal_ore": ("coal_ore", "deepslate_coal_ore"),
+    "copper_ore": ("copper_ore", "deepslate_copper_ore", "raw_copper_block"),
+    "lapis_ore": ("lapis_ore", "deepslate_lapis_ore"),
+    "gold_ore": ("gold_ore", "deepslate_gold_ore", "nether_gold_ore", "raw_gold_block"),
+    "redstone_ore": ("redstone_ore", "deepslate_redstone_ore"),
     "diamond_ore": ("diamond_ore", "deepslate_diamond_ore"),
+    "emerald_ore": ("emerald_ore", "deepslate_emerald_ore"),
+    "quartz_ore": ("nether_quartz_ore",),
+    "ancient_debris": ("ancient_debris",),
     "obsidian": ("obsidian", "crying_obsidian"),
     "station": (
         "crafting_table", "furnace", "blast_furnace", "smoker", "enchanting_table",
         "anvil", "chipped_anvil", "damaged_anvil",
         "smithing_table", "jukebox", "note_block", "crafter", "beacon",
+        "brewing_stand", "stonecutter", "chest", "trapped_chest", "barrel", "ender_chest",
+        "campfire", "soul_campfire", "respawn_anchor", "bell", "grindstone", "loom",
+        "cartography_table", "fletching_table", "composter", "lectern",
         *BED_BLOCKS,
     ),
 }
@@ -100,7 +110,10 @@ SPIRAL_RING_RADII: tuple[int, ...] = (48, 96, 160, 240, 320)
 _BLOCK_TO_CATEGORY: dict[str, str] = {b: c for c, bs in CATEGORY_BLOCKS.items() for b in bs}
 _CATEGORY_LABELS: dict[str, str] = {
     "wood": "原木", "water": "水源", "lava": "熔岩", "coal_ore": "煤矿",
-    "iron_ore": "铁矿", "diamond_ore": "钻石矿", "obsidian": "黑曜石", "station": "工作站", "structure": "结构",
+    "copper_ore": "铜矿", "iron_ore": "铁矿", "lapis_ore": "青金石矿",
+    "gold_ore": "金矿", "redstone_ore": "红石矿", "diamond_ore": "钻石矿",
+    "emerald_ore": "绿宝石矿", "quartz_ore": "下界石英矿", "ancient_debris": "远古残骸",
+    "obsidian": "黑曜石", "station": "工作站", "structure": "结构",
 }
 _STATUS_LABELS: dict[str, str] = {"untested": "未探测", "reachable": "已确认可达", "unreachable": "可重探"}
 _FALLBACK_CAT = "_pos"
@@ -249,13 +262,21 @@ def _parse_heading(value: Any) -> Optional[list[int]]:
 def _copy_shaft(shaft: Mapping[str, Any]) -> dict[str, Any]:
     raw_bi = shaft.get("branch_index")
     branch_index = {str(k): int(v) for k, v in raw_bi.items()} if isinstance(raw_bi, Mapping) else {}
-    return {
+    out: dict[str, Any] = {
         "entry": [int(v) for v in shaft["entry"]],
         "lowest_y": int(shaft["lowest_y"]),
         "lowest_pos": [int(v) for v in shaft["lowest_pos"]],
         "heading": [int(v) for v in shaft["heading"]],
         "branch_index": branch_index,
     }
+    raw_seals = shaft.get("seal_cells")
+    if isinstance(raw_seals, Sequence) and not isinstance(raw_seals, (str, bytes)):
+        parsed_seals = [[int(v) for v in c[:3]] for c in raw_seals if isinstance(c, (list, tuple)) and len(c) >= 3]
+        if parsed_seals:
+            out["seal_cells"] = parsed_seals
+    if shaft.get("sealed") is True:
+        out["sealed"] = True
+    return out
 
 
 def _is_recovery_kit_item(name: str) -> bool:
@@ -342,6 +363,7 @@ class WorldResourceMemo:
         self._lock = threading.RLock()
         self._entries: dict[tuple[str, str, Cell], ResourceEntry] = {}
         self._stations: dict[tuple[str, str], list[Cell]] = {}
+        self._station_meta: dict[tuple[str, str, Cell], dict[str, Any]] = {}
         self._landmarks: dict[tuple[str, str], list[tuple[Cell, dict[str, Any]]]] = {}
         self._portals: dict[str, list[Cell]] = {}
         self._blocked_regions: dict[tuple[str, tuple[int, ...]], float] = {}
@@ -365,6 +387,7 @@ class WorldResourceMemo:
         with self._lock:
             self._entries.clear()
             self._stations.clear()
+            self._station_meta.clear()
             self._landmarks.clear()
             self._portals.clear()
             self._blocked_regions.clear()
@@ -505,14 +528,65 @@ class WorldResourceMemo:
         out.sort(key=(lambda e: (_origin_dist(origin, e.pos), -e.updated_at)) if origin is not None else (lambda e: (e.last_dist if e.last_dist is not None else math.inf, -e.updated_at)))
         return out
 
-    def _record_station_locked(self, kind: str, cell: Cell, dim: str) -> None:
+    @staticmethod
+    def _station_kind_matches(stored_kind: str, query_kind: str) -> bool:
+        return (
+            stored_kind == query_kind
+            or (query_kind == "bed" and stored_kind.endswith("_bed"))
+            or (query_kind == "furnace" and stored_kind in ("blast_furnace", "smoker"))
+            or (query_kind == "anvil" and stored_kind in ("chipped_anvil", "damaged_anvil"))
+            or (query_kind == "chest" and stored_kind in ("trapped_chest", "barrel"))
+        )
+
+    def _is_near_camp_locked(self, cell: Cell, dim: str, *, radius: float = 10.0) -> bool:
+        camp = self._camps.get(dim)
+        if not isinstance(camp, Mapping):
+            return False
+        cpos = camp.get("pos")
+        if isinstance(cpos, (list, tuple)) and len(cpos) >= 3:
+            try:
+                if math.dist(cell, (float(cpos[0]), float(cpos[1]), float(cpos[2]))) <= radius:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        for field_k in ("chest", "bed", "furnace", "crafting_table"):
+            fpos = camp.get(field_k)
+            if isinstance(fpos, (list, tuple)) and len(fpos) >= 3:
+                try:
+                    if math.dist(cell, (float(fpos[0]), float(fpos[1]), float(fpos[2]))) <= 1.5:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+        return False
+
+    def _record_station_locked(
+        self, kind: str, cell: Cell, dim: str, *, scope: Optional[str] = None, status: str = "active",
+    ) -> None:
         k = bare(kind).strip().lower()
         if not k:
             raise ValueError(f"非法工作站类型: {kind!r}")
+        now = float(self._clock())
         cells = self._stations.setdefault((dim, k), [])
-        if any(math.dist(cell, existing) <= 1.5 for existing in cells):
-            return
-        cells.append(cell)
+        target_cell = cell
+        for existing in cells:
+            if math.dist(cell, existing) <= 1.5:
+                target_cell = existing
+                break
+        else:
+            cells.append(cell)
+        meta_key = (dim, k, target_cell)
+        prev = self._station_meta.get(meta_key)
+        inferred_scope = (
+            scope
+            if scope in ("camp", "field")
+            else ("camp" if (prev and prev.get("scope") == "camp") or self._is_near_camp_locked(target_cell, dim) else "field")
+        )
+        self._station_meta[meta_key] = {
+            "scope": inferred_scope,
+            "placed_at": float(prev["placed_at"]) if (prev and "placed_at" in prev) else now,
+            "verified_at": now,
+            "status": str(status or "active"),
+        }
 
     def _record_landmark_locked(self, kind: str, cell: Cell, dim: str, meta: Optional[Mapping[str, Any]] = None) -> bool:
         k = bare(kind).strip().lower()
@@ -528,14 +602,87 @@ class WorldResourceMemo:
         self.landmark_version += 1
         return True
 
-    def record_station(self, kind: str, pos: Any, *, dimension: str = "overworld") -> None:
-        """记录工作站坐标，同维度同类型 1.5 格内去重。"""
+    def record_station(
+        self, kind: str, pos: Any, *, dimension: str = "overworld", scope: Optional[str] = None,
+    ) -> None:
+        """记录工作站坐标，同维度同类型 1.5 格内去重，并登记 camp/field 标签与核验时间。"""
         k = bare(kind).strip().lower()
         if not k:
             raise ValueError(f"非法工作站类型: {kind!r}")
+        if scope is not None and scope not in ("camp", "field"):
+            raise ValueError(f"非法工作站作用域: {scope!r}")
         dim, cell = _norm_dim(dimension), block_cell(pos)
         with self._lock:
-            self._record_station_locked(k, cell, dim)
+            self._record_station_locked(k, cell, dim, scope=scope)
+
+    def remove_station(self, kind: Optional[str], pos: Any, *, dimension: str = "overworld") -> bool:
+        """从工作站台账销账（主动回收或现场核验已消失/被毁时调用）。"""
+        dim, cell = _norm_dim(dimension), block_cell(pos)
+        k = bare(kind).strip().lower() if kind is not None else None
+        if kind is not None and not k:
+            return False
+        removed = False
+        with self._lock:
+            for (d, sk) in list(self._stations.keys()):
+                if d != dim:
+                    continue
+                if k is not None and not self._station_kind_matches(sk, k):
+                    continue
+                cells = self._stations.get((d, sk)) or []
+                kept: list[Cell] = []
+                for existing in cells:
+                    if math.dist(cell, existing) <= 1.5:
+                        removed = True
+                        self._station_meta.pop((d, sk, existing), None)
+                    else:
+                        kept.append(existing)
+                if kept:
+                    self._stations[(d, sk)] = kept
+                else:
+                    self._stations.pop((d, sk), None)
+            # 若普通资源台账 _entries 中也登记了该位置的工作站，一并标为 depleted 防脏复访
+            entry = self._entries.get((dim, "station", cell))
+            if entry is not None:
+                entry.status = "depleted"
+                entry.updated_at = float(self._clock())
+            # 同步清理 camp 中与被拆床位/工作站完全一致的坐标字段
+            camp = self._camps.get(dim)
+            if isinstance(camp, dict):
+                for field_k, family in (("bed", "bed"), ("furnace", "furnace"), ("crafting_table", "crafting_table")):
+                    fpos = camp.get(field_k)
+                    if (
+                        isinstance(fpos, (list, tuple))
+                        and len(fpos) >= 3
+                        and (k is None or self._station_kind_matches(k, family) or self._station_kind_matches(family, k))
+                        and math.dist(cell, (float(fpos[0]), float(fpos[1]), float(fpos[2]))) <= 1.5
+                    ):
+                        camp[field_k] = None
+        return removed
+
+    def get_station_meta(
+        self, kind: Optional[str], pos: Any, *, dimension: str = "overworld",
+    ) -> Optional[dict[str, Any]]:
+        """查询工作站的元数据副本（scope / placed_at / verified_at / status）。"""
+        dim, cell = _norm_dim(dimension), block_cell(pos)
+        k = bare(kind).strip().lower() if kind is not None else None
+        with self._lock:
+            for (d, sk, scell), meta in self._station_meta.items():
+                if d != dim:
+                    continue
+                if k is not None and not self._station_kind_matches(sk, k):
+                    continue
+                if math.dist(cell, scell) <= 1.5:
+                    return dict(meta)
+        return None
+
+    def is_camp_station(self, kind: Optional[str], pos: Any, *, dimension: str = "overworld") -> bool:
+        """判断指定工作站是否属于基地常驻设施（scope=='camp' 或紧邻基地锚点）。"""
+        dim, cell = _norm_dim(dimension), block_cell(pos)
+        with self._lock:
+            meta = self.get_station_meta(kind, cell, dimension=dim)
+            if meta is not None and meta.get("scope") == "camp":
+                return True
+            return self._is_near_camp_locked(cell, dim)
 
     def has_station(self, kind: str, *, dimension: str = "overworld") -> bool:
         """判断指定维度是否存在指定类型的工作站。"""
@@ -553,16 +700,8 @@ class WorldResourceMemo:
             for (d, sk), cells in self._stations.items():
                 if d != dim:
                     continue
-                if k is not None:
-                    matched = (
-                        sk == k
-                        or (k == "bed" and sk.endswith("_bed"))
-                        or (k == "furnace" and sk in ("blast_furnace", "smoker"))
-                        or (k == "anvil" and sk in ("chipped_anvil", "damaged_anvil"))
-                        or (k == "chest" and sk in ("trapped_chest", "barrel"))
-                    )
-                    if not matched:
-                        continue
+                if k is not None and not self._station_kind_matches(sk, k):
+                    continue
                 for cell in cells:
                     if cell not in seen:
                         seen.add(cell)
@@ -874,10 +1013,10 @@ class WorldResourceMemo:
             camp["pos"] = list(pos_cell)
             for kind, cell in station_updates.items():
                 camp[kind] = list(cell)
-                self._record_station_locked(kind, cell, dim)
+                self._record_station_locked(kind, cell, dim, scope="camp")
             for rname, cell in chest_updates.items():
                 camp["chests"][rname] = list(cell)
-                self._record_station_locked("chest", cell, dim)
+                self._record_station_locked("chest", cell, dim, scope="camp")
             if "chest" in station_updates and "kit" not in camp["chests"] and norm_role is None:
                 camp["chests"]["kit"] = list(station_updates["chest"])
             if camp["chest"] is None and camp["chests"]:
@@ -1014,8 +1153,10 @@ class WorldResourceMemo:
         heading: Optional[Sequence[int]] = None,
         branch_level: Optional[int] = None,
         branch_idx: Optional[int] = None,
+        seal_cells: Optional[Sequence[Any]] = None,
+        sealed: Optional[bool] = None,
     ) -> Optional[dict[str, Any]]:
-        """增量更新已存在的指定维度主矿井档案（仅深化最低深度），不存在时返回 `None`。"""
+        """增量更新已存在的指定维度主矿井档案（仅深化最低深度，并支持井口封堵坐标登记），不存在时返回 `None`。"""
         dim = _norm_dim(dimension)
         new_low_y = _require_int(lowest_y, "最低Y坐标") if lowest_y is not None else None
         lp = block_cell(lowest_pos) if lowest_pos is not None else None
@@ -1031,6 +1172,9 @@ class WorldResourceMemo:
             parsed_branch_idx = _require_int(branch_idx, "支道索引")
             if parsed_branch_idx < 0:
                 raise ValueError(f"非法支道索引: {branch_idx!r}")
+        parsed_seals: Optional[list[list[int]]] = None
+        if seal_cells is not None:
+            parsed_seals = [list(block_cell(c)) for c in seal_cells]
         with self._lock:
             existing = self._mine_shafts.get(dim)
             if existing is None:
@@ -1048,6 +1192,16 @@ class WorldResourceMemo:
                 existing["heading"] = parsed_heading
             if parsed_branch_level is not None and parsed_branch_idx is not None:
                 existing["branch_index"][str(parsed_branch_level)] = parsed_branch_idx
+            if parsed_seals is not None:
+                if parsed_seals:
+                    existing["seal_cells"] = parsed_seals
+                else:
+                    existing.pop("seal_cells", None)
+            if sealed is not None:
+                if sealed:
+                    existing["sealed"] = True
+                else:
+                    existing.pop("sealed", None)
             return _copy_shaft(existing)
 
     def next_mine_branch(self, level_y: int, *, dimension: str = "overworld") -> int:
@@ -1287,6 +1441,18 @@ class WorldResourceMemo:
             for (dim, kind), cells in self._stations.items():
                 if cells:
                     stations_out.setdefault(dim, {})[kind] = [list(c) for c in cells]
+            station_meta_out: list[dict[str, Any]] = [
+                {
+                    "dimension": dim,
+                    "kind": kind,
+                    "pos": list(cell),
+                    "scope": str(meta.get("scope") or "field"),
+                    "placed_at": float(meta.get("placed_at", 0.0)),
+                    "verified_at": float(meta.get("verified_at", 0.0)),
+                    "status": str(meta.get("status") or "active"),
+                }
+                for (dim, kind, cell), meta in self._station_meta.items()
+            ]
             landmarks_out: dict[str, dict[str, list[dict[str, Any]]]] = {}
             for (dim, kind), items in self._landmarks.items():
                 if items:
@@ -1317,6 +1483,7 @@ class WorldResourceMemo:
                 "schema_version": 1,
                 "landmark_version": int(self.landmark_version),
                 "stations": stations_out,
+                "station_meta": station_meta_out,
                 "landmarks": landmarks_out,
                 "portals": portals_out,
                 "resources": resources_out,
@@ -1669,12 +1836,59 @@ class WorldResourceMemo:
                         if isinstance(raw_v, bool) or not isinstance(raw_v, int) or raw_v < 0:
                             return False
                         branch_index_out[str(lvl)] = int(raw_v)
-                    new_mine_shafts[dim] = {
+                    shaft_entry: dict[str, Any] = {
                         "entry": list(entry_cell),
                         "lowest_y": int(lowest_y_raw),
                         "lowest_pos": list(lowest_pos_cell),
                         "heading": head,
                         "branch_index": branch_index_out,
+                    }
+                    raw_seals = shaft_raw.get("seal_cells")
+                    if raw_seals is not None:
+                        if not isinstance(raw_seals, list):
+                            return False
+                        parsed_seals: list[list[int]] = []
+                        for sc in raw_seals:
+                            sc_cell = _parse_cell(sc)
+                            if sc_cell is None:
+                                return False
+                            parsed_seals.append(list(sc_cell))
+                        if parsed_seals:
+                            shaft_entry["seal_cells"] = parsed_seals
+                    if shaft_raw.get("sealed") is True:
+                        shaft_entry["sealed"] = True
+                    new_mine_shafts[dim] = shaft_entry
+
+            new_station_meta: dict[tuple[str, str, Cell], dict[str, Any]] = {}
+            if "station_meta" in data:
+                sm_raw = data["station_meta"]
+                if not isinstance(sm_raw, list):
+                    return False
+                for row in sm_raw:
+                    if not isinstance(row, Mapping):
+                        return False
+                    r_dim = row.get("dimension")
+                    r_kind = row.get("kind")
+                    r_cell = _parse_cell(row.get("pos"))
+                    r_scope = row.get("scope", "field")
+                    if (
+                        not isinstance(r_dim, str)
+                        or not isinstance(r_kind, str)
+                        or r_cell is None
+                        or r_scope not in ("camp", "field")
+                    ):
+                        return False
+                    nk = bare(r_kind).strip().lower()
+                    if not nk:
+                        return False
+                    nd = _norm_dim(r_dim)
+                    placed_at = row.get("placed_at", 0.0)
+                    verified_at = row.get("verified_at", 0.0)
+                    new_station_meta[(nd, nk, r_cell)] = {
+                        "scope": r_scope,
+                        "placed_at": float(placed_at) if isinstance(placed_at, (int, float)) and not isinstance(placed_at, bool) and math.isfinite(float(placed_at)) else 0.0,
+                        "verified_at": float(verified_at) if isinstance(verified_at, (int, float)) and not isinstance(verified_at, bool) and math.isfinite(float(verified_at)) else 0.0,
+                        "status": str(row.get("status") or "active"),
                     }
 
             new_visited_grid: dict[str, set[tuple[int, int]]] = {}
@@ -1735,6 +1949,7 @@ class WorldResourceMemo:
             with self._lock:
                 self._entries = new_entries
                 self._stations = new_stations
+                self._station_meta = new_station_meta
                 self._landmarks = new_landmarks
                 self._portals = new_portals
                 self.visited_biomes = new_biomes

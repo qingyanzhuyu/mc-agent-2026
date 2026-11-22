@@ -5,7 +5,6 @@ from collections.abc import Collection, Mapping, Sequence
 import math
 from typing import TYPE_CHECKING, Any, Optional
 
-from ..loop.reserve import ReservationBook, reserved_item_counts
 from ..runtime import Replan
 from .items import PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare
 from .recipes import RECIPES
@@ -13,7 +12,13 @@ from .sightline import STATION_EYE_REACH, point3
 from .world_memo import ALL_LOG_BLOCKS, memo_for
 
 if TYPE_CHECKING:
+    from ..loop.reserve import ReservationBook
     from ..runtime import State
+
+
+def _reserved_item_counts(state: "State", reservations: Optional["ReservationBook"]) -> Mapping[str, int]:
+    from ..loop.reserve import reserved_item_counts
+    return reserved_item_counts(state, reservations)
 
 INTERACT_EYE_REACH: float = STATION_EYE_REACH
 SWORD_ORDER = ("netherite_sword", "diamond_sword", "iron_sword", "copper_sword", "stone_sword", "golden_sword", "wooden_sword")
@@ -113,9 +118,9 @@ def _excess_best_one(
     return out
 
 
-def compute_deposit_plan(state: "State", *, reservations: Optional[ReservationBook] = None, include_bulk: Optional[bool] = None) -> list[tuple[str, int]]:
+def compute_deposit_plan(state: "State", *, reservations: Optional["ReservationBook"] = None, include_bulk: Optional[bool] = None) -> list[tuple[str, int]]:
     """按随身配额计算应存入营地箱的富余物资清单 `[(item, qty), ...]`，严格尊重 `ReservationBook` 预留。"""
-    reserved = reserved_item_counts(state, reservations)
+    reserved = _reserved_item_counts(state, reservations)
     plan = _excess_best_one(state, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, reserved=reserved)
     plan.extend(_excess_best_one(state, SWORD_ORDER, STONE_OR_BETTER_SWORDS, reserved=reserved))
     if (shields := state.count("shield") - (1 + reserved.get("shield", 0))) > 0:
@@ -152,9 +157,9 @@ def compute_deposit_plan(state: "State", *, reservations: Optional[ReservationBo
     return plan
 
 
-def has_surplus_for_deposit(state: "State", *, reservations: Optional[ReservationBook] = None) -> bool:
+def has_surplus_for_deposit(state: "State", *, reservations: Optional["ReservationBook"] = None) -> bool:
     """判断当前是否携带足够触发营地存箱的未预留高价值/满包/富余物资。"""
-    reserved = reserved_item_counts(state, reservations)
+    reserved = _reserved_item_counts(state, reservations)
     unres = lambda it: max(0, state.count(it) - reserved.get(it, 0))
     if (
         unres("iron_ingot") >= 8

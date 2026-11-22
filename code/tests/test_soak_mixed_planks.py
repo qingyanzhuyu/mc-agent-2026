@@ -50,7 +50,7 @@ class MixedPlankRecoveryTests(unittest.TestCase):
         self.assertEqual([(s["op"], s["item"]) for s in steps], [
             ("craft", "stick"), ("craft", "birch_planks"),
             ("craft", "crafting_table"), ("place", "crafting_table"),
-            ("craft", "wooden_pickaxe"),
+            ("craft", "wooden_pickaxe"), ("dig", "crafting_table"),
         ])
         self.assertEqual(state.count("wooden_pickaxe"), 1)
 
@@ -60,7 +60,7 @@ class MixedPlankRecoveryTests(unittest.TestCase):
         self.assertTrue(can_afford_gear(state, "wooden_pickaxe"))
         steps = drive(make("craft_gear", {"item": "wooden_pickaxe"}), ex, state)
         self.assertEqual([s["item"] for s in steps], [
-            "crafting_table", "crafting_table", "wooden_pickaxe",
+            "crafting_table", "crafting_table", "wooden_pickaxe", "crafting_table",
         ])
         self.assertEqual(state.count("wooden_pickaxe"), 1)
 

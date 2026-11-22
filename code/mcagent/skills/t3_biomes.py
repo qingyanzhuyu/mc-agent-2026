@@ -17,6 +17,7 @@ from .registry import register
 from .sightline import (DIG_EYE_REACH, ENTITY_EYE_REACH, STATION_EYE_REACH, block_cell,
                         block_center, can_reach_block, can_see_block, eye_to_block_dist, eye_to_point_dist)
 from .voxel_cache import voxel_cache_for
+from .workstations import find_known_station, reclaim_field_station, record_placed_station
 
 _CARDINALS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _MELEE = ("netherite_sword", "diamond_sword", "iron_sword", "stone_sword", "netherite_axe", "diamond_axe", "iron_axe", "stone_axe", "mace", "wooden_sword")
@@ -134,21 +135,31 @@ def _find_place_cell(ex: Executor, st: dict, radius: int = 3) -> tuple[int, int,
              and can_reach_block(ex, st, (ox + dx, oy + dy, oz + dz), reach=DIG_EYE_REACH)]
     return min(cands, key=lambda c: eye_to_block_dist(st, c)) if cands else None
 def _craft_item(ex: Executor, state: State, item: str, *, need_table: bool = True, err_msg: str | None = None) -> Generator[dict, None, None]:
+    tpos: tuple[int, int, int] | None = None
+    newly_placed = False
     if need_table:
         st = state.refresh_status(ex.client, max_age_s=0)
         tables = _ready(scan_blocks(ex, state, "crafting_table", radius=16, limit=5))["blocks"]
         if tables:
             tcell = block_cell(min(tables, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+            record_placed_station(state, "crafting_table", tcell, dimension=_dim(state))
             if not can_reach_block(ex, st, tcell, reach=STATION_EYE_REACH):
                 yield from _approach_block(ex, state, tcell, reach=STATION_EYE_REACH)
+        elif (known := find_known_station(ex, state, "crafting_table", max_dist=16.0)) is not None:
+            if not can_reach_block(ex, st, known, reach=STATION_EYE_REACH):
+                yield from _approach_block(ex, state, known, reach=STATION_EYE_REACH)
         elif state.count("crafting_table") >= 1:
             if (pcell := _find_place_cell(ex, st)) is not None:
                 yield from place_block(ex, state, "crafting_table", pcell)
+                tpos = pcell
+                newly_placed = True
     before = state.count(item)
     yield rec("craft", ex.craft(item, 1), item=item, count=1)
     refresh_inventory(ex, state)
     if state.count(item) <= before:
         raise Replan(err_msg or f"合成 {item} 后背包数量未增加")
+    if tpos is not None and newly_placed:
+        yield from reclaim_field_station(ex, state, "crafting_table", tpos, newly_placed=newly_placed)
 def _standable_near(ex: Executor, target: Sequence[float], origin: Sequence[float], radius: int = 3, *, blk: tuple[int, int, int] | None = None, reach: float = STATION_EYE_REACH) -> tuple[int, int, int] | None:
     tx, ty, tz = blk if blk is not None else block_cell(target)
     cands = [(tx + dx, ty + dy, tz + dz) for dy in (0, -1, 1, -2, 2) for dx in range(-radius, radius + 1) for dz in range(-radius, radius + 1)

@@ -301,10 +301,11 @@ class WorldMemoSkillsIntegrationTests(unittest.TestCase):
         memo2.record_seen("station", "crafting_table", [30, 64, 0], dist=30.0)
 
         steps2 = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex2, state2)
-        self.assertEqual([s["op"] for s in steps2], ["craft", "place", "craft"])
+        self.assertEqual([s["op"] for s in steps2], ["craft", "place", "craft", "dig"])
+        self.assertEqual(steps2[-1].get("reason"), "reclaim_station")
         self.assertTrue(memo2.is_blocked((30, 64, 0), category="station"))
         self.assertEqual(state2.count("stone_pickaxe"), 1)
-        self.assertTrue(has_known_table(state2.pos))
+        self.assertEqual(memo2.stations("crafting_table"), [])
 
         # 3) 寻路失败的工作台标记 unreachable 后，下一次重入不再重复尝试撞该工作台
         reset_world_memo()
@@ -316,7 +317,7 @@ class WorldMemoSkillsIntegrationTests(unittest.TestCase):
         )
         ex3, state3 = world3.session()
         steps3 = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex3, state3)
-        self.assertEqual([s["op"] for s in steps3], ["move_to", "craft", "place", "craft"])
+        self.assertEqual([s["op"] for s in steps3], ["move_to", "craft", "place", "craft", "dig"])
         self.assertTrue(memo_for(state3).is_blocked((6, 66, 0), category="station"))
 
         world3.items.update({"stick": 2, "cobblestone": 3, "oak_planks": 4})
@@ -324,7 +325,8 @@ class WorldMemoSkillsIntegrationTests(unittest.TestCase):
         world3.blocks.pop((1, 64, 0), None)
         ex3.acts.clear()
         steps3_retry = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex3, state3)
-        self.assertEqual([s["op"] for s in steps3_retry], ["craft", "place", "craft"])
+        # 第一次野外工作台已回收进背包，第二次无需重新合成工作台，直接放置->合成->回收
+        self.assertEqual([s["op"] for s in steps3_retry], ["place", "craft", "dig"])
         self.assertNotIn("move_to", ex3.acts)
 
     def test_protected_region_in_gather_wood_and_mine_stone_syncs_to_memo(self):

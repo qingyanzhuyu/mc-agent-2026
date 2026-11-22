@@ -4,10 +4,19 @@ from __future__ import annotations
 import math
 import unittest
 
-from mcagent.loop.policy import CampaignPlanner, PlanDecision, RulePlanner
+from mcagent.loop.context import summarize_inventory_and_status
+from mcagent.loop.policy import CampaignPlanner, PlanDecision, RulePlanner, build_state_summary
+from mcagent.planner.objective import OBJECTIVE_SYSTEM_PROMPT
+from mcagent.planner.skill_choice import SKILL_SYSTEM_PROMPT, validate_choice
 from mcagent.runtime import EnvBlocked, RuntimeConfig, State
 from mcagent.skills import make
-from mcagent.skills.survival_food import inventory_food_restore
+from mcagent.skills.furnace_lease import lease_book_for
+from mcagent.skills.survival_food import (
+    TWO_DAY_FOOD_RESTORE,
+    cooked_food_restore,
+    effective_food_restore,
+    inventory_food_restore,
+)
 from mcagent.skills.testing import GridWorld, drive
 from mcagent.skills.world_memo import memo_for, reset_all_world_memos
 
@@ -141,6 +150,86 @@ class TestProactiveFoodReserve(unittest.TestCase):
         self.assertEqual(gated2.skill.name, "scout_island")
         self.assertEqual(gated3.skill.name, "scout_island")
         self.assertEqual(gated4.skill.name, "smelt_iron")
+
+    def test_two_day_effective_food_stops_overhunting_and_respects_furnace_lease(self):
+        # 5 cows nearby; each drops 3 raw beef (cooked value = 24). Two cows = 48 >= 32 -> stops after 2 cows, never 4!
+        cows = [
+            {"id": 300 + i, "type": "animal", "name": "cow", "pos": [2.5 + i * 1.5, 64.0, 0.5], "health": 10, "alive": True}
+            for i in range(5)
+        ]
+        w = _ForageFoodWorld(items={"stone_sword": 1}, entities=cows)
+        ex, st = w.session()
+        skill = make("gather_food", {"target_restore": TWO_DAY_FOOD_RESTORE, "cook": True, "hunt": True})
+        drive(skill, ex, st)
+        killed = sum(1 for e in w.entities if e.get("alive") is False)
+        self.assertEqual(killed, 2)
+        self.assertGreaterEqual(effective_food_restore(st), TWO_DAY_FOOD_RESTORE)
+
+        # Active furnace lease counts toward effective_food_restore and stops proactive hunting & pre-mine gate
+        st_lease = State(RuntimeConfig())
+        st_lease.set_status({"pos": [0.5, 68.0, 0.5], "dimension": "overworld", "ready": True, "alive": True, "health": 20.0, "food": 20.0, "is_day": True, "nearest_hostile": None})
+        st_lease.set_inventory({"items": [{"name": "stone_sword", "count": 1, "slot": 0}, {"name": "stone_pickaxe", "count": 1, "slot": 1}], "empty_slots": 34})
+        lease_book_for(st_lease).register_lease(
+            (2, 68, 0), dimension="overworld", station_kind="furnace",
+            input_item="beef", expected_output="cooked_beef", count=4, consumer="gather_food",
+        )
+        self.assertEqual(effective_food_restore(st_lease), 32)
+        rp = RulePlanner(min_verified="offline")
+        self.assertIsNone(rp.choose_proactive_survival(st_lease))
+        cp = CampaignPlanner(mode="campaign", strategy="rule", min_verified="offline")
+        smelt_choice = PlanDecision(make("smelt_iron", {"count": 4}), "rule", "test smelt_iron")
+        self.assertEqual(cp._apply_pre_mine_food_gate(st_lease, smelt_choice).skill.name, "smelt_iron")
+
+    def test_cook_only_and_ready_lease_dispatch_never_hunt_and_full_two_day_blocks_redisp(self):
+        # 1) Policy dispatches hunt=False when cooking camp raw meat or retrieving ready food lease
+        rp = RulePlanner(min_verified="offline")
+        st_raw = State(RuntimeConfig())
+        st_raw.set_status({"pos": [0.5, 64.0, 0.5], "dimension": "overworld", "ready": True, "alive": True, "health": 20.0, "food": 20.0, "is_day": True, "nearest_hostile": None})
+        st_raw.set_inventory({"items": [{"name": "beef", "count": 2, "slot": 0}, {"name": "coal", "count": 2, "slot": 1}, {"name": "stone_sword", "count": 1, "slot": 2}], "empty_slots": 33})
+        memo_for(st_raw).record_station("furnace", [2, 64, 0], dimension="overworld")
+        dec_cook = rp.choose_proactive_survival(st_raw)
+        self.assertIsNotNone(dec_cook)
+        self.assertEqual(dec_cook.skill.name, "gather_food")
+        self.assertFalse(dec_cook.skill.args["hunt"])
+
+        # 2) Once cooked_food_restore >= 32 (4 cooked_beef), even stray raw meat + furnace will NOT interrupt main quest
+        st_full = State(RuntimeConfig())
+        st_full.set_status({"pos": [0.5, 64.0, 0.5], "dimension": "overworld", "ready": True, "alive": True, "health": 20.0, "food": 20.0, "is_day": True, "nearest_hostile": None})
+        st_full.set_inventory({"items": [{"name": "cooked_beef", "count": 4, "slot": 0}, {"name": "chicken", "count": 1, "slot": 1}, {"name": "coal", "count": 2, "slot": 2}, {"name": "stone_sword", "count": 1, "slot": 3}], "empty_slots": 32})
+        memo_for(st_full).record_station("furnace", [2, 64, 0], dimension="overworld")
+        self.assertEqual(cooked_food_restore(st_full), 32)
+        self.assertIsNone(rp.choose_proactive_survival(st_full))
+
+        # 3) GatherFood.can_start rejects default 32-pt gather_food when already >=32 cooked, while allowing Nether 64-pt prep
+        st_fed = State(RuntimeConfig())
+        st_fed.set_status({"pos": [0.5, 64.0, 0.5], "dimension": "overworld", "ready": True, "alive": True, "health": 20.0, "food": 20.0, "is_day": True, "nearest_hostile": None})
+        st_fed.set_inventory({"items": [{"name": "cooked_beef", "count": 4, "slot": 0}, {"name": "stone_sword", "count": 1, "slot": 1}], "empty_slots": 34})
+        self.assertFalse(make("gather_food").can_start(st_fed))
+        ok_choice, errs = validate_choice({"skill": "gather_food", "args": {}, "why": "再找吃的"}, st_fed)
+        self.assertFalse(ok_choice)
+        self.assertTrue(errs)
+        self.assertTrue(make("gather_food", {"target_restore": 64, "cook": True}).can_start(st_fed))
+
+        # 4) hunt=False never attacks nearby animals even if inventory_food_restore < target_restore
+        w_nohunt = _ForageFoodWorld(
+            items={"stone_sword": 1},
+            entities=[{"id": 401, "type": "animal", "name": "cow", "pos": [2.5, 64.0, 0.5], "health": 10, "alive": True}],
+        )
+        ex, st_nh = w_nohunt.session()
+        skill_nh = make("gather_food", {"target_restore": 32, "cook": True, "hunt": False})
+        drive(skill_nh, ex, st_nh)
+        self.assertTrue(w_nohunt.entities[0]["alive"])
+
+    def test_prompts_and_summaries_surface_two_day_food_threshold(self):
+        st_fed = State(RuntimeConfig())
+        st_fed.set_status({"pos": [0.5, 64.0, 0.5], "dimension": "overworld", "ready": True, "alive": True, "health": 20.0, "food": 20.0, "is_day": True, "nearest_hostile": None})
+        st_fed.set_inventory({"items": [{"name": "cooked_beef", "count": 4, "slot": 0}], "empty_slots": 35})
+        self.assertIn("够2天-勿补粮", summarize_inventory_and_status(st_fed))
+        self.assertIn("够2天-勿补粮", build_state_summary(st_fed))
+        self.assertIn("32", OBJECTIVE_SYSTEM_PROMPT)
+        self.assertIn("2 个游戏日", OBJECTIVE_SYSTEM_PROMPT)
+        self.assertIn("32", SKILL_SYSTEM_PROMPT)
+        self.assertIn("gather_food", SKILL_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

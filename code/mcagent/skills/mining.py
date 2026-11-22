@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Iterator, Mapping, Sequence
 from typing import Any
 
 from ..runtime import Executor, Replan, State
@@ -78,6 +78,8 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
               allowed_picks: frozenset[str] = STONE_OR_BETTER_PICKS,
               solid: frozenset[str] = SOLID_SUPPORT,
               after_dig: Callable[[], Generator[dict, None, Any]] | None = None,
+              plug_caves: bool = True,
+              known_air: Collection[Sequence[int]] = (),
               ) -> Generator[dict, None, tuple[list[float] | None, Any]]:
     """Descend one column, or pause before moving when after_dig returns evidence."""
     if len(pos) != 3 or any(type(axis) is not int for axis in pos):
@@ -93,9 +95,14 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
     if not safe_mine_column(ex, pos, solid=solid):
         raise MineStepUnsafe("cut", "探矿阶梯站位或承重/净空变化，停止挖掘以保留支撑")
 
+    known_air_set: set[tuple[int, int, int]] = {
+        (int(c[0]), int(c[1]), int(c[2])) for c in known_air
+    } | {(cx, cy, cz), (cx, cy + 1, cz), (cx, cy + 2, cz)}
+
     for dy in (2, 1, 0):
         target = [x, y + dy, z]
         if block_name(ex, target) in AIR:
+            known_air_set.add((x, y + dy, z))
             continue
         yield from prepare_mining_pick(ex, state, allowed=allowed_picks)
         current = state.refresh_status(ex.client, max_age_s=0)
@@ -107,6 +114,7 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
             raise MineStepUnsafe("cut", "探矿阶梯站位或承重/净空变化，停止挖掘以保留支撑")
         name = block_name(ex, target)
         if name in AIR:
+            known_air_set.add((x, y + dy, z))
             continue
         if name not in solid:
             raise MineStepUnsafe("cut", "探矿阶梯目标方块变化，停止挖掘以保留支撑")
@@ -134,6 +142,11 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
                     and _same_world(start, after_dig_status)):
                 raise MineStepUnsafe("cut", f"探矿阶梯开凿 {target} 后方块未清除，改试其他方向")
             raise Replan("探矿阶梯开凿后站位或方块状态异常，停止下行")
+        if plug_caves:
+            from .mine_shaft import plug_cave_breach
+            if (yield from plug_cave_breach(ex, state, target, known_air=known_air_set, player_cell=(cx, cy, cz))):
+                raise MineStepUnsafe("cut", "下挖打穿自然矿道已立即封堵，换向避开")
+        known_air_set.add((x, y + dy, z))
         if after_dig is not None:
             observation = yield from after_dig()
             if observation is not None:

@@ -116,7 +116,9 @@ class SmeltIronTests(unittest.TestCase):
         steps, ex, state = self.run_skill(world)
         self.assertEqual([r["op"] for r in steps], [
             "equip", "dig", "equip", "dig", "equip", "dig", "place", "window_view",
-            "window_act", "window_act", "window_view", "window_view", "window_act", "window_view"])
+            "window_act", "window_act", "window_view", "window_view", "window_act", "window_view",
+            "equip", "dig"])
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
         ops = [c[1]["ops"][0] for c in world.calls if c[0] == "window_act"]
         self.assertEqual(ops, [
             {"op": "put", "item": "raw_iron", "count": 3, "to": "input"},
@@ -204,7 +206,9 @@ class SmeltIronTests(unittest.TestCase):
                                  views=[view(), view(output=1), view()])
         steps, _, state = self.run_skill(world)
         digs = [args["pos"] for op, args in world.calls if op == "dig"]
-        self.assertEqual(digs, [[1, 63, 0], [2, 63, 0]])
+        # 前两次为探矿与采铁，末次为清空野外临时熔炉后有镐回收
+        self.assertEqual(digs[:2], [[1, 63, 0], [2, 63, 0]])
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
         self.assertEqual(world.blocks[(1, 62, 0)], "stone")
         self.assertEqual(state.count("iron_ingot"), 1)
         self.assertEqual(SmeltIron().verify_done(state, {}), "")
@@ -376,8 +380,33 @@ class SmeltIronTests(unittest.TestCase):
         _, _, state = self.run_skill(world)
         fuels = [c[1]["ops"][0]["item"] for c in world.calls if c[0] == "window_act"
                  and c[1]["ops"][0].get("to") == "fuel"]
-        self.assertEqual(fuels, ["oak_planks", "birch_log"])
+        self.assertEqual(fuels, ["oak_planks", "birch_planks"])
         self.assertEqual(state.count("iron_ingot"), 2)
+        self.assertEqual(state.count("birch_log"), 0)
+        self.assertEqual(state.count("birch_planks"), 3)
+
+    def test_small_batch_converts_log_to_planks_before_smelting(self):
+        with self.subTest("single_iron_with_log"):
+            world = IronWorld(items={"raw_iron": 1, "oak_log": 1, "furnace": 1},
+                              views=[view(), view(output=1), view()])
+            _, _, state = self.run_skill(world, count=1)
+            fuels = [c[1]["ops"][0]["item"] for c in world.calls if c[0] == "window_act"
+                     and c[1]["ops"][0].get("to") == "fuel"]
+            self.assertEqual(fuels, ["oak_planks"])
+            self.assertEqual(state.count("iron_ingot"), 1)
+            self.assertEqual(state.count("oak_log"), 0)
+            self.assertEqual(state.count("oak_planks"), 3)
+
+        with self.subTest("log_with_sticks_prefers_crafting_planks_over_raw_log"):
+            world = IronWorld(items={"raw_iron": 2, "oak_log": 1, "stick": 4, "furnace": 1},
+                              views=[view(), view(output=2), view()])
+            _, _, state = self.run_skill(world, count=2)
+            fuels = [c[1]["ops"][0]["item"] for c in world.calls if c[0] == "window_act"
+                     and c[1]["ops"][0].get("to") == "fuel"]
+            self.assertEqual(fuels, ["oak_planks"])
+            self.assertEqual(state.count("iron_ingot"), 2)
+            self.assertEqual(state.count("oak_planks"), 2)
+            self.assertEqual(state.count("stick"), 4)
 
     def test_reuses_furnace_and_collects_all_output(self):
         world = IronWorld(items={"raw_iron": 3, "coal": 1}, blocks={(2, 64, 0): "furnace"},

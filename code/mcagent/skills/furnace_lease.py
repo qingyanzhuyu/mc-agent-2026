@@ -11,13 +11,25 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from ..runtime import Executor, Replan, State
+from .base import failure
 from .items import bare
+from .recipes import craft_recipe
 from .windows import _positive_count, _put, _take, window_amount, window_section, window_view
 from .world_memo import memo_for
 
 SMELTING_STATIONS: tuple[str, ...] = ("furnace", "blast_furnace", "smoker")
 STATION_SECONDS_PER_ITEM: dict[str, float] = {"furnace": 10.0, "blast_furnace": 5.0, "smoker": 5.0}
 _WOODS = ("oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "cherry", "mangrove", "pale_oak")
+LOG_TO_PLANK_FUEL: dict[str, str] = {
+    **{f"{w}_log": f"{w}_planks" for w in _WOODS},
+    **{f"stripped_{w}_log": f"{w}_planks" for w in _WOODS},
+    **{f"{w}_wood": f"{w}_planks" for w in _WOODS},
+    **{f"stripped_{w}_wood": f"{w}_planks" for w in _WOODS},
+    "bamboo_block": "bamboo_planks",
+    "stripped_bamboo_block": "bamboo_planks",
+}
+RAW_LOG_FUELS: frozenset[str] = frozenset(LOG_TO_PLANK_FUEL)
+_COAL_FUELS: frozenset[str] = frozenset({"coal", "charcoal"})
 EXTENDED_FUEL_BURNS: dict[str, float] = {
     "lava_bucket": 100.0, "coal_block": 80.0, "dried_kelp_block": 20.0, "blaze_rod": 12.0,
     "coal": 8.0, "charcoal": 8.0, "bamboo_planks": 1.5, "bamboo_mosaic": 1.5, "bamboo_block": 1.5,
@@ -74,22 +86,71 @@ def smelt_output_for(input_item: str, expected_output: str | None = None) -> str
     raise Replan(f"未知熔炼输入物品的产物映射: {input_item!r}")
 
 
-def best_fuel_for(state: State, items_needed: int, *, allow_lava_bucket: bool = True) -> tuple[str, int] | None:
-    """Pick the single owned fuel item minimizing waste for `items_needed` items."""
+def best_fuel_for(
+    state: State, items_needed: int, *, allow_lava_bucket: bool = True, allow_logs: bool = True,
+) -> tuple[str, int] | None:
+    """Pick the single owned fuel item for `items_needed` items.
+
+    Priority tiers: coal/charcoal first -> other non-log fuels (planks, sticks, etc. minimizing waste)
+    -> raw logs as last resort when `allow_logs=True`.
+    """
     if type(items_needed) is not int or items_needed <= 0:
         return None
-    best_key: tuple[float, int, int, str] | None = None
+    best_key: tuple[int, float, int, int, str] | None = None
     best_choice: tuple[str, int] | None = None
     for name, burn in EXTENDED_FUEL_BURNS.items():
         if name == "lava_bucket" and not allow_lava_bucket:
             continue
+        is_log = name in RAW_LOG_FUELS
+        if is_log and not allow_logs:
+            continue
         needed = math.ceil(round(items_needed / burn, 12))
         if state.count(name) < needed:
             continue
-        key = (round(needed * burn - items_needed, 9), 1 if name == "lava_bucket" else 0, needed, name)
+        tier = 0 if name in _COAL_FUELS else (2 if is_log else 1)
+        key = (tier, round(needed * burn - items_needed, 9), 1 if name == "lava_bucket" else 0, needed, name)
         if best_key is None or key < best_key:
             best_key, best_choice = key, (name, needed)
     return best_choice
+
+
+def ensure_plank_fuel(
+    ex: Executor,
+    state: State,
+    items_needed: int,
+    *,
+    allow_lava_bucket: bool = True,
+) -> Generator[dict, None, int]:
+    """Convert owned burnable logs into planks before smelting when non-log fuel cannot cover `items_needed`.
+
+    Returns the number of log/wood blocks crafted into planks. Stops cleanly on `inventory_full`
+    so callers can still fall back if the bag has no free slot for a new plank stack.
+    """
+    if type(items_needed) is not int or items_needed <= 0:
+        return 0
+    converted = 0
+    max_crafts = max(1, math.ceil(items_needed / 3.0))
+    for _ in range(max_crafts):
+        if best_fuel_for(state, items_needed, allow_lava_bucket=allow_lava_bucket, allow_logs=False) is not None:
+            break
+        log_item = next(
+            (lg for lg, pl in LOG_TO_PLANK_FUEL.items() if state.count(lg) >= 1 and state.count(pl) >= 1),
+            None,
+        ) or next((lg for lg in LOG_TO_PLANK_FUEL if state.count(lg) >= 1), None)
+        if log_item is None:
+            break
+        plank_item = LOG_TO_PLANK_FUEL[log_item]
+        before = state.count(plank_item)
+        try:
+            yield from craft_recipe(ex, state, plank_item, goal_qty=before + 1)
+        except Replan as exc:
+            if failure(exc)[0] == "inventory_full":
+                break
+            raise
+        if state.count(plank_item) <= before:
+            break
+        converted += 1
+    return converted
 
 
 @dataclass

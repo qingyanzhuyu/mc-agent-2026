@@ -18,6 +18,7 @@ from .sightline import (DIG_EYE_REACH, ENTITY_EYE_REACH, STATION_EYE_REACH, bloc
                         can_reach_block, eye_to_block_dist, eye_to_point_dist, feet_pos)
 from .trade_smith_brew import smith_once, trade_once
 from .voxel_cache import voxel_cache_for
+from .workstations import find_known_station, reclaim_field_station, record_placed_station
 
 ARMOR_SLOTS = ("helmet", "chestplate", "leggings", "boots")
 VALID_PYRAMID_BLOCKS = ("iron_block", "gold_block", "emerald_block", "diamond_block", "netherite_block")
@@ -64,7 +65,7 @@ def _approach_ent(ex: Executor, state: State, ent: Mapping[str, Any], *, reach: 
     if eye_to_point_dist(st, ent["pos"]) <= reach: return st
     yield rec("move_to", ex.move_to(pos=(dest := [float(v) for v in ent["pos"]]), rng=2), pos=dest); return state.refresh_status(ex.client, max_age_s=0)
 def _place_cell(ex: Executor, state: State, item: str, cell: tuple[int, int, int]) -> Generator[dict, None, None]:
-    r = ex.place(item, list(cell)); voxel_cache_for(state).invalidate(cell, dimension=_dim(state)); yield rec("place", r, item=item, pos=list(cell))
+    r = ex.place(item, list(cell)); dim = _dim(state); voxel_cache_for(state).invalidate(cell, dimension=dim); record_placed_station(state, item, cell, dimension=dim); yield rec("place", r, item=item, pos=list(cell))
 def _reach_dig(ex: Executor, state: State, cell: tuple[int, int, int]) -> Generator[dict, None, None]:
     yield from _approach_block(ex, state, cell, reach=DIG_EYE_REACH); r = ex.dig(list(cell), collect=True); voxel_cache_for(state).invalidate(cell, dimension=_dim(state)); yield rec("dig", r, pos=list(cell))
 def _ensure_block(ex: Executor, state: State, cell: tuple[int, int, int], item: str, *, allow: Sequence[str] = ()) -> Generator[dict, None, None]:
@@ -79,19 +80,20 @@ def _craft_inc(ex: Executor, state: State, item: str, count: int = 1) -> Generat
 def _equip_hand(ex: Executor, state: State, item: str) -> Generator[dict, None, None]:
     held = (state.inventory or {}).get("held") or (state.st or {}).get("held") or {}
     if bare(held.get("name")) != bare(item): yield rec("equip", ex.equip(bare(item), "hand"), item=bare(item), slot="hand")
-def _ensure_station(ex: Executor, state: State, types: Any, item: str, skill: str, st: Mapping[str, Any]) -> Generator[dict, None, tuple[int, int, int] | None]:
+def _ensure_station(ex: Executor, state: State, types: Any, item: str, skill: str, st: Mapping[str, Any]) -> Generator[dict, None, tuple[tuple[int, int, int], bool] | None]:
     if found := _ready(scan_blocks(ex, state, types, radius=16, limit=4, skill_name=skill))["blocks"]:
-        return block_cell(min(found, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"])
+        pos = block_cell(min(found, key=lambda b: eye_to_block_dist(st, b["pos"]))["pos"]); record_placed_station(state, item, pos, dimension=_dim(state)); return pos, False
+    if (known := find_known_station(ex, state, item, dimension=_dim(state), max_dist=16.0)) is not None: return known, False
     if state.count(item) < 1: return None
     ox, oy, oz = block_cell(st["pos"])
     cands = [(eye_to_block_dist(st, c := (ox + dx, oy + dy, oz + dz)), c) for dy in (0, -1, 1) for dx in range(-3, 4) for dz in range(-3, 4)
              if not _overlaps(c, st["pos"]) and _is_air(ex, c) and is_safe_solid_floor(observe_block(ex, [c[0], c[1] - 1, c[2]])) and can_reach_block(ex, st, c, reach=STATION_EYE_REACH)]
     if not cands: return None
-    yield from _place_cell(ex, state, item, pos := min(cands)[1]); return pos
-def _ensure_table(ex: Executor, state: State, skill: str, st: Mapping[str, Any]) -> Generator[dict, None, tuple[int, int, int]]:
+    yield from _place_cell(ex, state, item, pos := min(cands)[1]); return pos, True
+def _ensure_table(ex: Executor, state: State, skill: str, st: Mapping[str, Any]) -> Generator[dict, None, tuple[tuple[int, int, int], bool]]:
     for attempt_craft in (False, True):
-        if tpos := (yield from _ensure_station(ex, state, "crafting_table", "crafting_table", skill, st if not attempt_craft else state.refresh_status(ex.client, max_age_s=0))):
-            yield from _approach_block(ex, state, tpos, reach=STATION_EYE_REACH); return tpos
+        if res := (yield from _ensure_station(ex, state, "crafting_table", "crafting_table", skill, st if not attempt_craft else state.refresh_status(ex.client, max_age_s=0))):
+            yield from _approach_block(ex, state, res[0], reach=STATION_EYE_REACH); return res
         planks = sum(state.count(bare(r.get("name"))) for r in (state.inventory or {}).get("items", ()) if isinstance(r, Mapping) and bare(r.get("name")).endswith("_planks"))
         if attempt_craft or planks < 4 or not (yield from _craft_inc(ex, state, "crafting_table", 1)): break
     raise Replan("3×3 合成需要附近存在或可放置工作台 (crafting_table)")
@@ -192,9 +194,9 @@ class CraftNetheriteArmorSet(Skill):
                     time.sleep(0.35)
                 if state.count(_TEMPLATE) >= 1: break
         if state.count(_TEMPLATE) >= 1 and state.count(_TEMPLATE) < len(missing) and state.count("diamond") >= 7 and state.count("netherrack") >= 1:
-            yield from _ensure_table(ex, state, self.name, state.refresh_status(ex.client, max_age_s=0))
-            while state.count(_TEMPLATE) < len(missing) and state.count("diamond") >= 7 and state.count("netherrack") >= 1:
-                if not (yield from _craft_inc(ex, state, _TEMPLATE, 1)): break
+            tpos, tnew = yield from _ensure_table(ex, state, self.name, state.refresh_status(ex.client, max_age_s=0))
+            while state.count(_TEMPLATE) < len(missing) and state.count("diamond") >= 7 and state.count("netherrack") >= 1 and (yield from _craft_inc(ex, state, _TEMPLATE, 1)): pass
+            yield from reclaim_field_station(ex, state, "crafting_table", tpos, newly_placed=tnew)
         need_dia = tuple(f"diamond_{s}" for s in missing if state.count(f"diamond_{s}") < 1)
         if need_dia and state.count("emerald") >= 8:
             for v in sorted(_ready(scan_entities(ex, state, "villager", radius=32))["entities"], key=lambda e: eye_to_point_dist(st, e["pos"])):
@@ -206,10 +208,10 @@ class CraftNetheriteArmorSet(Skill):
                     continue
                 refresh_inventory(ex, state); need_dia = tuple(f"diamond_{s}" for s in missing if state.count(f"diamond_{s}") < 1)
         if state.count("netherite_ingot") < len(missing) and state.count("netherite_scrap") >= 4 and state.count("gold_ingot") >= 4:
-            yield from _ensure_table(ex, state, self.name, state.refresh_status(ex.client, max_age_s=0))
+            tpos, tnew = yield from _ensure_table(ex, state, self.name, state.refresh_status(ex.client, max_age_s=0))
             while state.count("netherite_ingot") < len(missing) and state.count("netherite_scrap") >= 4 and state.count("gold_ingot") >= 4:
-                qty = min(len(missing) - state.count("netherite_ingot"), state.count("netherite_scrap") // 4, state.count("gold_ingot") // 4)
-                if not (yield from _craft_inc(ex, state, "netherite_ingot", qty)): break
+                if not (yield from _craft_inc(ex, state, "netherite_ingot", min(len(missing) - state.count("netherite_ingot"), state.count("netherite_scrap") // 4, state.count("gold_ingot") // 4))): break
+            yield from reclaim_field_station(ex, state, "crafting_table", tpos, newly_placed=tnew)
         if state.count("netherite_ingot") < len(missing) and (pick := _pick(state, _DEBRIS_PICKS)):
             if debris := [b for b in _ready(scan_blocks(ex, state, "ancient_debris", radius=24, limit=8, skill_name=self.name))["blocks"] if block_cell(b["pos"])[1] <= 22]:
                 st = state.refresh_status(ex.client, max_age_s=0); yield from _drink_fire_res(ex, state, st); yield from _equip_hand(ex, state, pick)
@@ -220,10 +222,11 @@ class CraftNetheriteArmorSet(Skill):
             if not ready_all: raise Replan(f"下界合金甲前置材料不足（模板 {state.count(_TEMPLATE)}/{len(missing)}，锭 {state.count('netherite_ingot')}/{len(missing)}）")
             self._prepped = True; return
         if not ready_all: raise Replan("锻造下界合金全套材料不足，需先补齐模板、钻甲与下界合金锭")
-        tpos = yield from _ensure_station(ex, state, "smithing_table", "smithing_table", self.name, state.refresh_status(ex.client, max_age_s=0))
-        if tpos is None: raise EnvBlocked("附近无锻造台且背包缺少 smithing_table", missing_predicate="smithing_table", searched_volume="半径 16 格", wake_on="chunk_moved")
-        yield from _approach_block(ex, state, tpos, reach=STATION_EYE_REACH)
+        sres = yield from _ensure_station(ex, state, "smithing_table", "smithing_table", self.name, state.refresh_status(ex.client, max_age_s=0))
+        if sres is None: raise EnvBlocked("附近无锻造台且背包缺少 smithing_table", missing_predicate="smithing_table", searched_volume="半径 16 格", wake_on="chunk_moved")
+        tpos, snew = sres; yield from _approach_block(ex, state, tpos, reach=STATION_EYE_REACH)
         for slot in missing: yield from smith_once(ex, state, tpos, template=_TEMPLATE, base=f"diamond_{slot}", addition="netherite_ingot", expected_output=f"netherite_{slot}"); refresh_inventory(ex, state)
+        yield from reclaim_field_station(ex, state, "smithing_table", tpos, newly_placed=snew)
     def verify_done(self, state: State, before_counts: dict | None = None) -> str:
         missing = [s for s in ARMOR_SLOTS if state.count(f"netherite_{s}") < 1]
         if self.args["prep_only"]:
@@ -256,11 +259,11 @@ class SummonAndTrapWither(Skill):
                     if _is_preemption(exc): raise
                 refresh_inventory(ex, state)
             if not enchantment_ready(state, "sword", "looting", 3) and state.count("enchanted_book") >= 1 and (sw := _pick(state, _SWORDS)):
-                if (apos := (yield from _ensure_station(ex, state, _ANVIL_BLOCKS, "anvil", self.name, st))) is not None:
-                    yield from _approach_block(ex, state, apos, reach=STATION_EYE_REACH); tgt = {"pos": list(apos)}
+                if (ares := (yield from _ensure_station(ex, state, _ANVIL_BLOCKS, "anvil", self.name, st))) is not None:
+                    apos, anew = ares; yield from _approach_block(ex, state, apos, reach=STATION_EYE_REACH); tgt = {"pos": list(apos)}
                     yield rec("window_view", ex.window_view(tgt), target=tgt)
                     ops = [{"op": "put", "item": sw, "count": 1, "to": "left"}, {"op": "put", "item": "enchanted_book", "count": 1, "to": "right", "enchanted": True}, {"op": "take", "from": "output"}]
-                    yield rec("window_act", ex.window_act(tgt, ops), target=tgt, item=sw); refresh_inventory(ex, state)
+                    yield rec("window_act", ex.window_act(tgt, ops), target=tgt, item=sw); refresh_inventory(ex, state); yield from reclaim_field_station(ex, state, "anvil", apos, newly_placed=anew)
             if not enchantment_ready(state, "sword", "looting", 3): raise Replan("尚未获得抢夺III剑")
             return
         if mode == "prep_skulls":
@@ -348,8 +351,9 @@ class ActivateBeacon(Skill):
         self._activated = False; refresh_inventory(ex, state); st = state.refresh_status(ex.client, max_age_s=0)
         if reason := self.blocked(state): raise Replan(reason)
         if state.count("beacon") < 1:
-            yield from _ensure_table(ex, state, self.name, st)
+            tpos, tnew = yield from _ensure_table(ex, state, self.name, st)
             if not (yield from _craft_inc(ex, state, "beacon", 1)): raise Replan("合成信标后背包未确认获得 beacon")
+            yield from reclaim_field_station(ex, state, "crafting_table", tpos, newly_placed=tnew)
         fx, fy, fz = block_cell(feet_pos(st)); site, digs = None, []
         for dx, dz in _BEACON_OFFSETS:
             cand = (fx + dx, fy, fz + dz)

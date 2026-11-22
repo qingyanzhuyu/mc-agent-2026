@@ -37,11 +37,11 @@ class TableRecoveryTests(unittest.TestCase):
         ex, state = world.session()
         KNOWN_TABLES.append((6, 66, 0))
         steps = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex, state)
-        self.assertEqual([s["op"] for s in steps], ["move_to", "craft", "place", "craft"])
+        self.assertEqual([s["op"] for s in steps], ["move_to", "craft", "place", "craft", "dig"])
         self.assertEqual(steps[0]["error_code"], "path_not_found")
         self.assertEqual(state.count("stone_pickaxe"), 1)
         self.assertNotIn((6, 66, 0), KNOWN_TABLES)
-        self.assertTrue(has_known_table(state.pos))
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
 
     def test_missing_replacement_materials_invalidates_anchor_and_planner_gathers(self):
         # Captured incident had enough sticks/cobble, but only three planks.
@@ -98,7 +98,7 @@ class TableRecoveryTests(unittest.TestCase):
         ex, state = world.session()
         KNOWN_TABLES.append((6, 66, 0))
         steps = drive(make("craft_gear", {"item": "stone_pickaxe"}), ex, state)
-        self.assertEqual([s["op"] for s in steps], ["move_to", "craft", "place", "craft"])
+        self.assertEqual([s["op"] for s in steps], ["move_to", "craft", "place", "craft", "dig"])
         self.assertNotIn((6, 66, 0), KNOWN_TABLES)
         self.assertEqual(state.count("stone_pickaxe"), 1)
 

@@ -18,6 +18,7 @@ from ..client import FATAL, ApiError, Client
 from ..runtime import EnvBlocked, Executor, Fatal, Replan, Safety, SafetyMonitor, State, _inv_fingerprint, has_equipped_armor
 from ..skills.base import Skill, failure
 from ..skills.items import bare
+from ..skills.ore_ledger import ores_for_dimension, record_ore_observations
 from ..skills.world_memo import STRUCTURE_FINGERPRINTS, entity_landmark_tags, memo_for, structure_tags_for
 from .auditor import SoakObserver
 from .goals import GOAL_MAP, GoalSpec, is_goal_achieved, normalize_goal_ids
@@ -115,6 +116,10 @@ def _roadside_structure_blocks(dimension: str) -> list[str]:
             if eff and eff not in seen:
                 seen.add(eff)
                 blocks.append(eff)
+    for bname in ores_for_dimension(dim):
+        if bname and bname not in seen:
+            seen.add(bname)
+            blocks.append(bname)
     return blocks
 
 
@@ -388,6 +393,14 @@ class MainLoop:
                                     newly_recorded.append(tag)
                             except Exception:
                                 continue
+                    memo.ingest_find_blocks(payload, dimension=dim, origin=cur_pos)
+                    ore_rows = [
+                        {"name": raw_name, "pos": raw_pos}
+                        for raw_name, raw_pos in rows
+                        if raw_name and raw_pos is not None
+                    ]
+                    if ore_rows:
+                        record_ore_observations(self.state, ore_rows, dimension=dim, origin=cur_pos)
 
         get_entities = getattr(self.client, "get_entities", None)
         if callable(get_entities):

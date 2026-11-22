@@ -120,6 +120,8 @@ def _make_state(
 
 class NightShelterSkillTests(unittest.TestCase):
     def setUp(self) -> None:
+        from mcagent.loop.starter_skills import PROTECTED_ZONES
+        PROTECTED_ZONES.clear()
         skill_base._COOLDOWN.clear()
         reset_all_world_memos()
 
@@ -225,7 +227,15 @@ class RelaxedNightPolicyTests(unittest.TestCase):
 
     def test_dusk_11900_triggers_night_shelter_before_mob_spawns(self) -> None:
         planner = RulePlanner(min_verified="live")
-        st_dusk = _make_state(items={"stone_sword": 1, "stone_pickaxe": 1}, is_day=True, time_of_day=11900, armor_points=0.0)
+        # 黄昏 11900 持镐健康无床：优先转入封口矿道挖矿（而非露天罚站）
+        st_dusk_pick = _make_state(items={"stone_sword": 1, "stone_pickaxe": 1}, is_day=True, time_of_day=11900, armor_points=0.0)
+        dec_pick = planner.choose_survival_or_safe_mode(st_dusk_pick)
+        self.assertIsNotNone(dec_pick)
+        assert dec_pick is not None and dec_pick.skill is not None
+        self.assertIn(dec_pick.skill.name, ("smelt_iron", "mine_stone", "mine_diamond"))
+
+        # 黄昏 11900 无镐无床：立即触发挖洞封口避险
+        st_dusk = _make_state(items={"stone_sword": 1}, is_day=True, time_of_day=11900, armor_points=0.0)
         dec = planner.choose_survival_or_safe_mode(st_dusk)
         self.assertIsNotNone(dec)
         assert dec is not None and dec.skill is not None

@@ -119,8 +119,9 @@ class IronReachIntegrationTests(unittest.TestCase):
         vc.mark_unreachable("smelt_iron", [2, 64, 0], dimension="overworld", stance_cell=(0, 64, 0))
 
         steps = drive(SmeltIron(count=1), ex, state)
-        digs = [args["pos"] for op, args in world.calls if op == "dig"]
+        digs = [s["pos"] for s in steps if s.get("op") == "dig" and s.get("reason") != "reclaim_station"]
         self.assertEqual(digs, [[3, 64, 0]])
+        self.assertEqual(steps[-1].get("reason"), "reclaim_station")
         self.assertFalse(any(s.get("op") == "ore_route_skip" for s in steps))
         self.assertEqual(state.count("iron_ingot"), 1)
 
@@ -161,8 +162,9 @@ class IronReachIntegrationTests(unittest.TestCase):
                 )
                 ex, state = world.session()
                 steps = drive(SmeltIron(count=1), ex, state)
-                digs = [args["pos"] for op, args in world.calls if op == "dig"]
+                digs = [s["pos"] for s in steps if s.get("op") == "dig" and s.get("reason") != "reclaim_station"]
                 self.assertEqual(digs, [[1, 65, 0], [2, 65, 0]])
+                self.assertEqual(steps[-1].get("reason"), "reclaim_station")
                 self.assertFalse(any(op == "move_to" for op, _ in world.calls))
                 self.assertTrue(any(s.get("op") == "dig" and s.get("reason") == "clear_los" for s in steps))
                 self.assertEqual(state.count("iron_ingot"), 1)
