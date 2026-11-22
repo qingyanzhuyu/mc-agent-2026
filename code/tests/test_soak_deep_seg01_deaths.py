@@ -2721,6 +2721,60 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         flee_shield = [h for h in hz_shield if h.get("kind") == "flee"]
         self.assertFalse(any(h.get("severity") == "urgent" for h in flee_shield))
 
+    def test_seg30_return_to_surface_stops_at_open_sky_shaft_exit_below_hilltop_camp(self) -> None:
+        # 复现 seg-30 600s/991s/1275s 三连 100s 卡顿：营地在山顶 Y=73（ref_y=73），矿井口在露天河谷 [-38, 59, 49]；
+        # 沿 primary_mine_shaft 返回露天井口 [-39.3, 58, 49.5] 后，因 58 < 73-3 且旧代码仅查 cur[1]>=ref_y-3，
+        # 继续强追 Y=67/69/73 营地与出生点导致反复跌回死坑 [-32, 54.5, 48.5] 耗时 338s；
+        # 必须在到达露天井口（Y>=57 且头顶无实心岩顶）时立刻返回 True 停止继续翻山。
+        from mcagent.skills.mine_return import return_to_surface_from_mine
+        from mcagent.skills.world_memo import memo_for, reset_all_world_memos
+
+        reset_all_world_memos()
+        self.addCleanup(reset_all_world_memos)
+
+        class _ShaftMouthWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(
+                    blocks={(-40, 57, 49): "grass_block", (-84, 19, 43): "stone"},
+                    pos=[-84.4, 20.0, 43.5],
+                    items={"stone_pickaxe": 1},
+                )
+                self.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20)
+                self.move_reasons: list[list[float]] = []
+
+            def move_to(self, x=None, z=None, *, y=None, pos=None, rng=2, timeout=30.0, retries=0, **kwargs):
+                dest = list(pos) if pos is not None else [x, y, z]
+                self.move_reasons.append(dest)
+                # 走到矿井口 [-38.5, 59.0, 49.5] 时落位露天 [-39.3, 58.0, 49.5]
+                if abs(dest[0] - (-38.5)) <= 2.0 and abs(dest[2] - 49.5) <= 2.0:
+                    self.st["pos"] = [-39.3, 58.0, 49.5]
+                else:
+                    self.st["pos"] = list(dest)
+                return {"pos": list(self.st["pos"])}
+
+        w = _ShaftMouthWorld()
+        ex, state = w.session()
+        memo = memo_for(state)
+        memo.set_mine_shaft([-38, 59, 49], dimension="overworld", lowest_y=20, lowest_pos=[-84, 20, 43])
+        memo.set_camp(pos=[-86, 73, 16], crafting_table=[-63, 67, 26], dimension="overworld")
+        memo.set_spawn([-63, 69, 16], dimension="overworld")
+
+        recs = []
+        gen = return_to_surface_from_mine(ex, state, max_climb_steps=4)
+        ok = False
+        try:
+            while True:
+                recs.append(next(gen))
+        except StopIteration as stop:
+            ok = bool(stop.value)
+        self.assertTrue(ok)
+        reasons = [r.get("reason") for r in recs]
+        self.assertTrue(any(r == "return_primary_mine_shaft" for r in reasons))
+        self.assertFalse(
+            any(str(r).startswith(("return_camp_", "return_spawn")) for r in reasons),
+            f"must stop at open-sky shaft exit Y=58 instead of chasing hilltop camp/spawn, got {reasons}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

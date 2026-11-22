@@ -318,9 +318,16 @@ def return_to_surface_from_mine(
         return True
     memo = memo_for(state)
     ref_y = float(target_y) if target_y is not None else (_reference_surface_y(state, dim) or 62.0)
-    if float(cur[1]) >= ref_y - 3.0:
-        return True
-    if target_y is None and float(cur[1]) >= 60.0 and not _has_solid_mine_ceiling(ex, cur):
+
+    def _at_surface(pt: Sequence[float]) -> bool:
+        py_now = float(pt[1])
+        if py_now >= ref_y - 3.0:
+            return True
+        # 与 is_underground_in_mine 的 Y>56 露天校验保持一致：回到露天矿井口（Y>=57 且头顶无实心岩顶）即已出井，
+        # 不得继续强追 Y=73 山顶营地/出生点导致跌入河谷反复超时。
+        return target_y is None and py_now >= 57.0 and not _has_solid_mine_ceiling(ex, pt)
+
+    if _at_surface(cur):
         return True
 
     # 1. 若有当前会话记录的阶梯轨迹且起点在上方，先分段原路退回井口
@@ -337,7 +344,7 @@ def return_to_surface_from_mine(
                 ok, cur = yield from _try_move_wp(ex, state, wp, reason="return_mine_trail")
                 if not ok:
                     break
-                if float(cur[1]) >= ref_y - 3.0:
+                if _at_surface(cur):
                     if MINE_TRAILS and MINE_TRAILS[-1] is trail:
                         MINE_TRAILS.pop()
                     return True
@@ -369,12 +376,12 @@ def return_to_surface_from_mine(
         for idx, wp in enumerate(wps):
             ok, cur = yield from _try_move_wp(ex, state, wp, reason=f"return_{label}")
             if ok:
-                if float(cur[1]) >= ref_y - 3.0:
+                if _at_surface(cur):
                     return True
                 continue
             if idx < len(wps) - 1 and math.dist(cur, anchor) <= 64.0:
                 ok2, cur = yield from _try_move_wp(ex, state, wps[-1], reason=f"return_{label}_direct")
-                if ok2 and float(cur[1]) >= ref_y - 3.0:
+                if ok2 and _at_surface(cur):
                     return True
             break
 
