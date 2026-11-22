@@ -5,7 +5,7 @@ import math, sys
 from collections.abc import Generator, Mapping, Sequence
 
 from ..client import ApiError
-from ..runtime import EnvBlocked, Executor, Replan, State
+from ..runtime import EnvBlocked, Executor, Replan, State, has_equipped_armor
 from .base import Param, Skill, rec
 from .encounter import _ARROWS, _retreat_clear, combat_melee, shoot_projectile
 from .field import _grounded, equip_item, place_block, scan_blocks, scan_entities
@@ -30,7 +30,14 @@ def _dim(state: State) -> str: return str((state.st or {}).get("dimension") or "
 def _pt(c: tuple[int, int, int]) -> tuple[float, float, float]: return (c[0] + 0.5, float(c[1]), c[2] + 0.5)
 def _is_air(ex: Executor, pos: Sequence[int]) -> bool: return bare(observe_block(ex, list(pos)).get("name")) in AIR
 def _has_floor(ex: Executor, c: tuple[int, int, int]) -> bool: return is_safe_solid_floor(observe_block(ex, [c[0], c[1] - 1, c[2]]))
-def _gate(state: State, ok: bool, msg: str) -> str: return "世界尚未就绪（ready=false）" if not state.ready else ("" if ok else msg)
+def _gate(state: State, ok: bool, msg: str) -> str:
+    if not state.ready:
+        return "世界尚未就绪（ready=false）"
+    hp = (state.st or {}).get("health")
+    hp_crit = float(getattr(getattr(state, "config", None), "hp_crit", 6.0) or 6.0)
+    if isinstance(hp, (int, float)) and not isinstance(hp, bool) and float(hp) <= hp_crit:
+        return f"残血危急(hp={hp:g}<={hp_crit:g})，暂停高风险群系/结构探索优先回血"
+    return "" if ok else msg
 def _env_blocked(msg: str, pred: str, vol: str, *, wake_on: str = "chunk_moved") -> EnvBlocked:
     return EnvBlocked(msg, missing_predicate=pred, searched_volume=vol, wake_on=wake_on)
 def _ready(scan: dict) -> dict:
@@ -341,7 +348,14 @@ class AllayDeliverItem(_BiomeSkill):
     params = {"radius": Param(int, "搜索悦灵半径", default=24, min=8, max=64)}
     _done_msg = "未确认悦灵交付同类物品"
     @classmethod
-    def blocked(cls, state: State) -> str: return _gate(state, _pick_allay_item(state) is not None, "背包缺少数量 >= 2 的可丢弃同类物品")
+    def blocked(cls, state: State) -> str:
+        base = _gate(state, _pick_allay_item(state) is not None, "背包缺少数量 >= 2 的可丢弃同类物品")
+        if base:
+            return base
+        hp = (state.st or {}).get("health")
+        if isinstance(hp, (int, float)) and not isinstance(hp, bool) and float(hp) <= 10.0 and not has_equipped_armor(state):
+            return f"无甲低血(hp={hp:g}<=10)，禁止前往掠夺者前哨站寻找悦灵"
+        return ""
     def _run(self, ex: Executor, state: State):
         st, radius = self._begin(ex, state), self.args["radius"]
         allays = yield from _req_ents_or_landmark(ex, state, "allay", radius, f"半径 {radius} 格内未发现悦灵", "visible_entity:allay", "pillager_outpost")

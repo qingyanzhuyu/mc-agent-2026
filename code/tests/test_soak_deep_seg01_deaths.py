@@ -2640,6 +2640,53 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertEqual(len(recs), 2)
         self.assertEqual(skill.verify_done(state, before_counts), "")
 
+    def test_seg28_crit_hp_blocks_allay_outpost_and_landmark_backtrack(self) -> None:
+        # 复现 seg-25（hp=2.0）与 seg-28（hp=0.9）两度复发的致死链：刚从蜘蛛/苦力怕逃出仅剩 0.9 血无甲，
+        # allay_deliver_item 立即启动并借 goto_known_landmark_or_biome 折返掠夺者前哨站 [-83, 68, -33] 撞回怪堆秒死；
+        # 1) AllayDeliverItem.blocked 在无甲低血（<=10）及全 T3 技能在残血（<=hp_crit=6）必须阻断；
+        # 2) goto_known_landmark_or_biome 在残血（<=hp_crit=6）必须直接返回 False 严禁发出 move_to。
+        from mcagent.skills.landmark_nav import goto_known_landmark_or_biome
+        from mcagent.skills.t3_biomes import AllayDeliverItem
+        from mcagent.skills.world_memo import memo_for, reset_all_world_memos
+
+        reset_all_world_memos()
+        self.addCleanup(reset_all_world_memos)
+
+        class _OutpostWorld(GridWorld):
+            def __init__(self, health: float) -> None:
+                super().__init__(blocks={}, pos=[-100.7, 67.0, -35.1], items={"cobblestone": 8})
+                self.st.update(dimension="overworld", ready=True, alive=True, health=health, food=16, armor_points=0)
+                self.moves = 0
+
+            def move_to(self, *args, **kwargs):
+                self.moves += 1
+                return {"pos": list(self.st["pos"])}
+
+        # 场景 A：残血 hp=0.9 无甲 -> blocked 拦截且 landmark_nav 拒绝折返
+        w_crit = _OutpostWorld(health=0.9)
+        ex_c, st_c = w_crit.session()
+        memo_for(st_c).record_landmark("pillager_outpost", (-83, 68, -33), dimension="overworld")
+        self.assertTrue(bool(AllayDeliverItem.blocked(st_c)), "AllayDeliverItem must be blocked at hp=0.9")
+
+        gen = goto_known_landmark_or_biome(ex_c, st_c, "pillager_outpost")
+        moved = True
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            moved = bool(stop.value)
+        self.assertFalse(moved)
+        self.assertEqual(w_crit.moves, 0, "landmark_nav must NOT walk back to outpost at crit hp=0.9")
+
+        # 场景 B：无甲低血 hp=8.0 -> AllayDeliverItem 仍阻断；满血 hp=18.0 -> 放行
+        w_low = _OutpostWorld(health=8.0)
+        _, st_l = w_low.session()
+        self.assertTrue(bool(AllayDeliverItem.blocked(st_l)), "AllayDeliverItem must be blocked unarmored at hp=8.0")
+
+        w_full = _OutpostWorld(health=18.0)
+        _, st_f = w_full.session()
+        self.assertEqual(AllayDeliverItem.blocked(st_f), "")
+
 
 if __name__ == "__main__":
     unittest.main()

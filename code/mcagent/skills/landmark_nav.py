@@ -61,6 +61,17 @@ def goto_known_landmark_or_biome(
     - 发出单次阻塞 `move_to` 后立刻 `yield` 并刷新状态（AGENTS.md §9.2 #1）。
     """
     st = state.refresh_status(ex.client, max_age_s=0)
+    label_check = kinds if isinstance(kinds, str) else ",".join(str(k) for k in kinds)
+    hp = (st or {}).get("health")
+    hp_crit = min(6.0, float(getattr(getattr(state, "config", None), "hp_crit", 6.0) or 6.0))
+    if (
+        isinstance(hp, (int, float))
+        and not isinstance(hp, bool)
+        and float(hp) <= hp_crit
+        and not any(tag in label_check.lower() for tag in ("bunker", "shelter", "camp"))
+    ):
+        # 残血危急（<=6.0，如刚逃离蜘蛛/苦力怕仅剩 0.9~2.0 血）严禁立即折返奔赴野外结构地标撞回怪堆（避难所/碉堡回撤除外）
+        return False
     dim = _norm_dim(state)
     cells = _collect_anchor_cells(state, kinds, dimension=dim)
     if not cells:
