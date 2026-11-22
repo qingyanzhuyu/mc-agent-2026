@@ -2454,6 +2454,107 @@ class TestSoakDeepSeg01Deaths(unittest.TestCase):
         self.assertFalse(ok2)
         self.assertLessEqual(w2.moves, 3, f"must abort within <=3 non-rising move_to steps, got {w2.moves}")
 
+    def test_seg26_open_sky_riverbank_below_hilltop_camp_not_treated_as_underground_mine(self) -> None:
+        # 复现 seg-26 [72..104]（INC-003 DIG_TOOL_WARNING ×7）：营地在山顶 Y=73（ref_y=73），
+        # 角色站在露天河岸 Y=62.4（<= 73-8）树林旁时，is_underground_in_mine 必须核验头顶是否存在非树冠实心岩顶，
+        # 绝不能把露天河谷误判为矿道导致 gather_wood 卡死 4 分钟并徒手挖 7 块石头。
+        from mcagent.skills.mine_return import is_underground_in_mine, return_to_surface_from_mine
+        from mcagent.skills.world_memo import memo_for, reset_all_world_memos
+
+        reset_all_world_memos()
+        self.addCleanup(reset_all_world_memos)
+
+        # 场景 A：河岸 Y=62.4，头顶仅空气与橡树树冠（oak_leaves），非矿井
+        blocks_open = {
+            (-91, 61, 15): "grass_block",
+            (-91, 66, 15): "oak_leaves",
+            (-91, 67, 15): "oak_log",
+        }
+        w_open = GridWorld(blocks=blocks_open, pos=[-90.5, 62.4, 15.3], items={})
+        w_open.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20)
+        ex_o, st_o = w_open.session()
+        memo_for(st_o).set_camp(pos=[-86, 73, 16], dimension="overworld")
+        self.assertFalse(is_underground_in_mine(ex_o, st_o))
+
+        recs = []
+        gen = return_to_surface_from_mine(ex_o, st_o, max_climb_steps=4)
+        ok_ret = False
+        try:
+            while True:
+                recs.append(next(gen))
+        except StopIteration as stop:
+            ok_ret = bool(stop.value)
+        self.assertTrue(ok_ret)
+        self.assertEqual(recs, [], "open-sky riverbank must return immediately without hand-digging stone")
+
+        # 场景 B：同海拔 Y=62.4 但头顶存在实心石顶 -> 确为山洞/矿道，必须判 True
+        blocks_cave = {
+            (-91, 61, 15): "stone",
+            (-91, 66, 15): "stone",
+        }
+        w_cave = GridWorld(blocks=blocks_cave, pos=[-90.5, 62.4, 15.3], items={})
+        w_cave.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20)
+        ex_c, st_c = w_cave.session()
+        memo_for(st_c).set_camp(pos=[-86, 73, 16], dimension="overworld")
+        self.assertTrue(is_underground_in_mine(ex_c, st_c))
+
+        # 场景 C：低于海平面深矿 Y=48（<=56 且 <= ref_y-8），即使未探测顶石仍判 True
+        w_deep = GridWorld(blocks={(-91, 47, 15): "stone"}, pos=[-90.5, 48.0, 15.3], items={})
+        w_deep.st.update(dimension="overworld", ready=True, alive=True, health=20.0, food=20)
+        ex_d, st_d = w_deep.session()
+        memo_for(st_d).set_camp(pos=[-86, 73, 16], dimension="overworld")
+        self.assertTrue(is_underground_in_mine(ex_d, st_d))
+
+    def test_seg26_close_range_followup_rejects_180_turn_back_into_skeleton(self) -> None:
+        # 复现 seg-26 [19..23]（INC-001 SKILL_POSTCONDITION_FAIL）：贴脸 <2.5m 骷髅在西侧(-X)，
+        # 东侧(+X)为深崖/悬空而北侧(-Z)为通畅矿道时，close-range _pick_cliff_safe_yaw 必须透传 hostile_dir，
+        # 拒绝掉头 180° 冲回西侧骷髅脸上，改沿北侧通道脱险。
+        from mcagent.skills.escape import _flee_hostile
+
+        blocks: dict[tuple[int, int, int], str] = {}
+        # 当前脚下 (-71, 28, 45) 及西侧(-X)和北侧(-Z)有地面，东侧(+X)为深坑，南侧(+Z)为深坑
+        for x in range(-78, -70):
+            blocks[(x, 28, 45)] = "stone"
+        for z in range(36, 46):
+            blocks[(-71, 28, z)] = "stone"
+
+        class _CloseRangeCaveWorld(GridWorld):
+            def __init__(self) -> None:
+                super().__init__(blocks=blocks, pos=[-70.5, 29.0, 45.5], items={"stone_pickaxe": 1})
+                self.st.update(
+                    dimension="overworld", ready=True, alive=True, health=17.0, food=20,
+                    armor_points=0, in_water=False, on_ground=True,
+                    nearest_hostile={"id": 187365, "name": "skeleton", "dist": 1.8, "pos": [-72.3, 29.0, 45.5]},
+                )
+                self.control_yaws: list[float] = []
+
+            def control(self, **kwargs):
+                yaw = float(kwargs.get("yaw", 0.0))
+                self.control_yaws.append(yaw)
+                # 沿所选 yaw 移动 5m
+                dx, dz = -math.sin(yaw) * 5.0, -math.cos(yaw) * 5.0
+                nx, nz = self.st["pos"][0] + dx, self.st["pos"][2] + dz
+                self.st["pos"] = [nx, 29.0, nz]
+                d = math.hypot(nx - (-72.3), nz - 45.5)
+                self.st["nearest_hostile"] = {"id": 187365, "name": "skeleton", "dist": round(d, 2), "pos": [-72.3, 29.0, 45.5]}
+                return {"pos": list(self.st["pos"]), "moved": 5.0}
+
+        w = _CloseRangeCaveWorld()
+        ex, state = w.session()
+        gen = _flee_hostile(ex, state)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            pass
+        self.assertTrue(w.control_yaws)
+        # 西向(-X)对应 dx = -sin(yaw) < -0.70（即朝向骷髅正脸）；必须拒绝西向而选北向(-Z)
+        first_dx = -math.sin(w.control_yaws[0])
+        self.assertGreater(
+            first_dx, -0.70,
+            f"close-range escape must NOT turn 180 deg straight into west skeleton, yaw={w.control_yaws[0]}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

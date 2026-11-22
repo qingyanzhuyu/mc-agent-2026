@@ -1678,12 +1678,17 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                 if (burst_blocked or zero_stall or _is_yaw_wall_blocked(ex, px, py, pz, ux, uz, cache, dim))
                 else away_yaw
             )
-            safe_burst_yaw = _pick_cliff_safe_yaw(ex, px, py, pz, burst_pref_yaw, cache, dim, avoid_water=not in_water_init)
+            safe_burst_yaw = _pick_cliff_safe_yaw(
+                ex, px, py, pz, burst_pref_yaw, cache, dim,
+                avoid_water=not in_water_init,
+                hostile_dir=(-ux, -uz) if h_pos is not None else None,
+            )
             before_burst = (px, py, pz)
             ok_burst = False
             if safe_burst_yaw is not None:
+                burst_jump = (not zero_stall) or _needs_step_jump(ex, px, py, pz, safe_burst_yaw, cache, dim)
                 ok_burst, _ = yield from _control_step(
-                    ex, forward=True, sprint=True, jump=not zero_stall, yaw=safe_burst_yaw, ms=900,
+                    ex, forward=True, sprint=True, jump=burst_jump, yaw=safe_burst_yaw, ms=900,
                 )
             if ok_burst:
                 st_mid = _refresh_status(ex, state)
@@ -1743,12 +1748,14 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
                     safe_alt_yaw = _pick_cliff_safe_yaw(
                         ex, px, py, pz, alt_yaw, cache, dim,
                         avoid_water=not bool(st_mid.get("in_water") or st_mid.get("submerged")),
+                        hostile_dir=(-ux, -uz) if h_pos is not None else None,
                     )
                     if safe_alt_yaw is None:
                         break
                     before_alt = (px, py, pz)
+                    alt_jump = (not zero_stall) or _needs_step_jump(ex, px, py, pz, safe_alt_yaw, cache, dim)
                     ok_alt, _ = yield from _control_step(
-                        ex, forward=True, sprint=True, jump=not zero_stall, yaw=safe_alt_yaw, ms=800,
+                        ex, forward=True, sprint=True, jump=alt_jump, yaw=safe_alt_yaw, ms=800,
                     )
                     if not ok_alt:
                         break

@@ -101,8 +101,23 @@ def _reference_surface_y(state: State, dim: str) -> Optional[float]:
     return max(ys) if ys else None
 
 
+def _has_solid_mine_ceiling(ex: Executor, pos: Sequence[float | int]) -> bool:
+    """检查角色正上方 2..8 格是否存在非树冠实心岩顶/土顶（区分山谷露天河岸与真实山洞/矿道）。"""
+    cx, cy, cz = block_cell(pos)
+    cells = [(cx, cy + dy, cz) for dy in (2, 3, 4, 5, 6, 7, 8)]
+    if has_batch_get_blocks(getattr(ex, "client", None)):
+        snap = client_get_blocks_batch(ex.client, cells)
+        names = [bare((snap.get(c) or {}).get("name")) for c in cells]
+    else:
+        names = [_probe_name(ex, c) for c in cells]
+    return any(
+        n and not is_clear_space(n) and not n.endswith("_leaves") and not n.endswith("_log")
+        for n in names
+    )
+
+
 def is_underground_in_mine(ex: Executor, state: State) -> bool:
-    """判断角色是否身处主世界地下矿道（明显低于地表/营地/井口，或低海拔且头顶有实心岩顶）。"""
+    """判断角色是否身处主世界地下矿道（低于海平面深矿，或虽低于高坡营地但头顶确有实心岩顶；露天河谷/海滩不误判）。"""
     st = state.st if isinstance(state.st, Mapping) and state.st.get("pos") is not None else state.refresh_status(ex.client, max_age_s=0)
     if not isinstance(st, Mapping) or (bare(st.get("dimension")).strip().lower() or "overworld") != "overworld":
         return False
@@ -112,17 +127,14 @@ def is_underground_in_mine(ex: Executor, state: State) -> bool:
     py = float(pos[1])
     ref_y = _reference_surface_y(state, "overworld")
     if ref_y is not None and py <= ref_y - 8.0:
-        return True
+        # 低于海平面浅层（Y<=56）直接判地下；Y>56（如 Y=62 河岸/林地而营地在 Y=73 山顶）必须核验头顶实心岩顶，
+        # 避免把露天河谷误判为矿井并触发 gather_wood 徒手挖石头爬山。
+        if py <= 56.0:
+            return True
+        return _has_solid_mine_ceiling(ex, pos)
     if py >= _CEILING_CHECK_MAX_Y:
         return False
-    cx, cy, cz = block_cell(pos)
-    cells = [(cx, cy + dy, cz) for dy in (2, 3, 4, 5, 6)]
-    if has_batch_get_blocks(getattr(ex, "client", None)):
-        snap = client_get_blocks_batch(ex.client, cells)
-        names = [bare((snap.get(c) or {}).get("name")) for c in cells]
-    else:
-        names = [_probe_name(ex, c) for c in cells]
-    return any(n and n not in AIR and not n.endswith("_leaves") for n in names)
+    return _has_solid_mine_ceiling(ex, pos)
 
 
 def _shaft_return_waypoints(cur: Sequence[float], entry: Sequence[float]) -> list[list[float]]:
@@ -307,6 +319,8 @@ def return_to_surface_from_mine(
     memo = memo_for(state)
     ref_y = float(target_y) if target_y is not None else (_reference_surface_y(state, dim) or 62.0)
     if float(cur[1]) >= ref_y - 3.0:
+        return True
+    if target_y is None and float(cur[1]) >= 60.0 and not _has_solid_mine_ceiling(ex, cur):
         return True
 
     # 1. 若有当前会话记录的阶梯轨迹且起点在上方，先分段原路退回井口
