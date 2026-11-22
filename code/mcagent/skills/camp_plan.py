@@ -44,7 +44,7 @@ BULK_QUOTAS: tuple[tuple[str, int], ...] = (
     ("coal", 8), ("charcoal", 8), ("torch", 16), ("string", 8), ("bone", 8), ("leather", 8),
 )
 VAULT_QUOTAS: tuple[tuple[str, int], ...] = (
-    ("iron_ingot", 4), ("diamond", 0), ("obsidian", 0), ("raw_iron", 0), ("gold_ingot", 0),
+    ("iron_ingot", 4), ("diamond", 0), ("obsidian", 0), ("raw_iron", 6), ("gold_ingot", 0),
     ("blaze_rod", 0), ("ender_pearl", 2), ("totem_of_undying", 1), ("wither_skeleton_skull", 0),
     ("ancient_debris", 0), ("netherite_scrap", 0), ("netherite_ingot", 0),
     ("netherite_upgrade_smithing_template", 0), ("lapis_lazuli", 0), ("redstone", 0), ("emerald", 0),
@@ -207,6 +207,8 @@ def compute_withdraw_plan(state: "State", stored_items: Mapping[str, int]) -> li
     if not (has_pick and has_sword and has_armor):
         if (need_iron := max(0, 6 - state.count("iron_ingot"))) > 0 and stored.get("iron_ingot", 0) > 0:
             plan.append(("iron_ingot", min(need_iron, stored["iron_ingot"])))
+        elif (need_raw := max(0, 6 - state.count("iron_ingot") - state.count("raw_iron"))) > 0 and stored.get("raw_iron", 0) > 0:
+            plan.append(("raw_iron", min(need_raw, stored["raw_iron"])))
         if (not has_pick or not has_sword) and (need_cob := max(0, 12 - state.count("cobblestone"))) > 0 and stored.get("cobblestone", 0) > 0:
             plan.append(("cobblestone", min(need_cob, stored["cobblestone"])))
         cur_planks = sum(state.count(p) for p in PLANK_ITEMS)

@@ -11,7 +11,7 @@ from weakref import WeakKeyDictionary
 
 from ..runtime import EnvBlocked, Replan, has_equipped_armor
 from .base import Param, Skill, failure, rec
-from .field import move_local
+from .field import collect_drops, move_local
 from .furnace import collect_furnace, inspect_furnace, load_furnace
 from .furnace_lease import (
     EXTENDED_FUEL_BURNS, FurnaceLease, SMELTING_STATIONS, best_fuel_for,
@@ -452,6 +452,12 @@ class SmeltIron(Skill):
         state.refresh_inventory(ex.client)
         if result.get("warning"):
             raise Replan(f"挖掘 {pos} 后背包 {expected_drop} 未确认增加或工具告警：{result.get('warning', '')}")
+        if state.count(expected_drop) <= before and callable(getattr(ex.client, "get_entities", None)):
+            try:
+                yield from collect_drops(ex, state, expected_drop, count=1, radius=6, max_targets=2)
+            except Replan:
+                pass
+            state.refresh_inventory(ex.client)
         if state.count(expected_drop) <= before:
             raise _OreDropUncollected(f"挖掘 {pos} 后背包 {expected_drop} 未确认增加或工具告警：")
         if expected_drop == "raw_iron_block":

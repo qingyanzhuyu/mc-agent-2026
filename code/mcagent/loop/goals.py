@@ -281,7 +281,7 @@ GOALS: tuple[GoalSpec, ...] = (
         tier="T1",
         score=5,
         skill="smelt_iron",
-        skill_args=(("count", 12), ("async_lease", True)),
+        skill_args=(("count", 6),),
         prereq_goals=("upgrade_tools", "prep_furnace"),
         done_advancements=("minecraft:story/smelt_iron",),
         done_items=("iron_ingot>=1",),
@@ -306,7 +306,7 @@ GOALS: tuple[GoalSpec, ...] = (
         must_hold_for_children=True,
         held_items=("@iron_plus_pickaxe>=1",),
         gather_fallbacks=(
-            ("iron_ingot>=3", "smelt_iron", (("count", 12), ("async_lease", True))),
+            ("iron_ingot>=3", "smelt_iron", (("count", 6),)),
             *_stick_fallbacks(2),
         ),
         budget_s=150.0,
@@ -327,7 +327,7 @@ GOALS: tuple[GoalSpec, ...] = (
         done_advancements=("minecraft:story/obtain_armor",),
         done_items=("iron_helmet|iron_chestplate|iron_leggings|iron_boots>=1",),
         gather_fallbacks=(
-            ("iron_ingot>=4", "smelt_iron", (("count", 12), ("async_lease", True))),
+            ("iron_ingot>=4", "smelt_iron", (("count", 6),)),
         ),
         budget_s=150.0,
         max_fails_per_ep=3,
@@ -346,7 +346,7 @@ GOALS: tuple[GoalSpec, ...] = (
         done_advancements=("minecraft:story/lava_bucket",),
         done_items=("lava_bucket>=1",),
         gather_fallbacks=(
-            ("bucket|iron_ingot>=3", "smelt_iron", (("count", 12), ("async_lease", True))),
+            ("bucket|iron_ingot>=3", "smelt_iron", (("count", 6),)),
             ("bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=210.0,
@@ -986,7 +986,7 @@ GOALS: tuple[GoalSpec, ...] = (
         prereq_items=("bucket|water_bucket>=1",),
         done_advancements=("minecraft:husbandry/axolotl_in_a_bucket",),
         gather_fallbacks=(
-            ("bucket|water_bucket|iron_ingot>=3", "smelt_iron", (("count", 3), ("async_lease", True))),
+            ("bucket|water_bucket|iron_ingot>=3", "smelt_iron", (("count", 3),)),
             ("bucket|water_bucket>=1", "craft_iron_gear", (("item", "bucket"),)),
         ),
         budget_s=300.0,
@@ -1057,7 +1057,7 @@ GOALS: tuple[GoalSpec, ...] = (
         prereq_items=("honeycomb|shears>=1",),
         done_advancements=("minecraft:husbandry/wax_on",),
         gather_fallbacks=(
-            ("honeycomb|shears|iron_ingot>=2", "smelt_iron", (("count", 2), ("async_lease", True))),
+            ("honeycomb|shears|iron_ingot>=2", "smelt_iron", (("count", 2),)),
             ("honeycomb|shears>=1", "craft_iron_gear", (("item", "shears"),)),
         ),
         budget_s=240.0,
@@ -1179,7 +1179,7 @@ GOALS: tuple[GoalSpec, ...] = (
         gather_fallbacks=(
             ("arrow|spectral_arrow|tipped_arrow>=2", "hunt_mob", (("target", "skeleton"), ("drop", "arrow"), ("count", 2))),
             ("crossbow|string>=1", "hunt_mob", (("target", "spider"), ("drop", "string"), ("count", 2))),
-            ("crossbow|iron_ingot>=1", "smelt_iron", (("count", 2), ("async_lease", True))),
+            ("crossbow|iron_ingot>=1", "smelt_iron", (("count", 2),)),
         ),
         budget_s=240.0,
         max_fails_per_ep=3,
@@ -2133,6 +2133,18 @@ def eval_item_expr(state: State, expr: str) -> tuple[bool, int, int, str]:
         need = 1
 
     assume_no_tbl = not has_known_table(state.pos)
+    if assume_no_tbl:
+        st_pos_tbl = state.st.get("pos") if isinstance(state.st, Mapping) else None
+        if isinstance(st_pos_tbl, (list, tuple)) and len(st_pos_tbl) >= 3:
+            dim_tbl = str((state.st.get("dimension") if isinstance(state.st, Mapping) else None) or "overworld").removeprefix("minecraft:").strip().lower() or "overworld"
+            cur3_tbl = (float(st_pos_tbl[0]), float(st_pos_tbl[1]), float(st_pos_tbl[2]))
+            m_tbl = memo_for(state)
+            if any(
+                math.dist(cur3_tbl, (p[0] + 0.5, p[1] + 0.5, p[2] + 0.5)) <= 24.0
+                and not m_tbl.is_blocked(p, dimension=dim_tbl, category="station")
+                for p in m_tbl.stations("crafting_table", dimension=dim_tbl)
+            ):
+                assume_no_tbl = False
 
     if lhs == "@logs":
         cur = total_logs(state)
@@ -2822,20 +2834,29 @@ def survival_readiness_multiplier(
     # (b) Post-Iron Survival Foundation Gate
     lookup = active_goals_by_id if active_goals_by_id is not None else GOAL_MAP
     smelt_iron_spec = lookup.get("smelt_iron") or GOAL_MAP.get("smelt_iron")
+    iron_tools_spec = lookup.get("iron_tools") or GOAL_MAP.get("iron_tools")
     iron_stage_started = (
         (smelt_iron_spec is not None and is_goal_achieved(smelt_iron_spec, state, completed_advs, memo=resolved_memo))
         or state.count("iron_ingot") >= 1
         or state.count("iron_pickaxe") >= 1
     )
+    iron_tools_done = has_iron_pick or (
+        iron_tools_spec is not None and is_goal_achieved(iron_tools_spec, state, completed_advs, memo=resolved_memo)
+    )
     if iron_stage_started:
         if root_goal.id == "iron_tools" and not has_iron_pick:
             mult *= 3.5
-        elif root_goal.id == "obtain_armor" and has_iron_pick and not has_iron_armor:
+        elif root_goal.id == "obtain_armor" and iron_tools_done and not has_iron_armor:
             mult *= 3.5
-        elif root_goal.id == "deflect_arrow" and has_iron_pick and not has_shield and hp >= 14.0:
+        elif root_goal.id == "deflect_arrow" and iron_tools_done and not has_shield and hp >= 14.0:
             mult *= 2.8
-        if not has_iron_armor and not has_shield and root_goal.id in _NAKED_POST_IRON_RISKY_ROOTS:
-            mult *= 0.2
+        if not has_iron_armor and not has_shield:
+            if root_goal.id in _NAKED_POST_IRON_RISKY_ROOTS or (
+                dim == "overworld" and root_goal.id in NETHER_END_HIGH_RISK_GOALS
+            ):
+                mult *= 0.2
+            elif root_goal.id == "allay_deliver_item_to_player":
+                mult *= 0.25
 
     # (d) KeepInventory=False Nether/End Camp-Protection Gate (docs/11 §八 + docs/15)
     # 仅在铁器已具基础护甲/盾牌准备跨维时介入，避免与早期/裸装基础门叠加破坏既有分段斜率。
