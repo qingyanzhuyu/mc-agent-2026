@@ -97,7 +97,9 @@ function seeThroughTable(reg) {
   return table;
 }
 
+// v1.3.20 (7f0e7ab): Palette-filtered, nearest-first chunk-column exposed-block sphere scan with cutoff2 pruning
 async function scanExposedSphere(session, radius, want, max) {
+  if (max <= 0) return [];
   const bot = session.bot;
   const me = bot.entity.position;
   const see = seeThroughTable(bot.registry);
@@ -105,14 +107,19 @@ async function scanExposedSphere(session, radius, want, max) {
   const maxY = minY + ((bot.game && typeof bot.game.height === "number") ? bot.game.height : 384) - 1;
   const cols = new Map();
   const tmp = { x: 0, y: 0, z: 0 };
-  const sid = (x, y, z) => {
-    if (y < minY || y > maxY) return -1;
-    const key = (x >> 4) * 65536 + (z >> 4);
+  const colKey = (cx, cz) => cx * 4294967296 + (cz >>> 0);
+  const getCol = (cx, cz) => {
+    const key = colKey(cx, cz);
     let col = cols.get(key);
     if (col === undefined) {
-      col = bot.world.getColumn(x >> 4, z >> 4) || null;
+      col = bot.world.getColumn(cx, cz) || null;
       cols.set(key, col);
     }
+    return col;
+  };
+  const sid = (x, y, z) => {
+    if (y < minY || y > maxY) return -1;
+    const col = getCol(x >> 4, z >> 4);
     if (!col) return -1;
     tmp.x = x & 15;
     tmp.y = y;
@@ -123,47 +130,403 @@ async function scanExposedSphere(session, radius, want, max) {
     const v = sid(x, y, z);
     return v >= 0 && see[v] === 1;
   };
-  const out = [];
-  const r = Math.ceil(radius) + 1;
+
   const r2 = radius * radius;
-  const cx = Math.floor(me.x);
-  const cy = Math.floor(me.y);
-  const cz = Math.floor(me.z);
-  let t0 = Date.now();
-  let n = 0;
-  for (let x = cx - r; x <= cx + r; x += 1) {
-    for (let z = cz - r; z <= cz + r; z += 1) {
-      const dxz = (x - me.x) ** 2 + (z - me.z) ** 2;
-      if (dxz > r2) continue;
-      for (let y = Math.max(cy - r, minY); y <= Math.min(cy + r, maxY); y += 1) {
-        const d2 = dxz + (y - me.y) ** 2;
-        if (d2 > r2) continue;
-        const v = sid(x, y, z);
-        if (v < 0 || !want(v)) continue;
-        if (
-          open(x + 1, y, z) || open(x - 1, y, z) ||
-          open(x, y + 1, z) || open(x, y - 1, z) ||
-          open(x, y, z + 1) || open(x, y, z - 1)
-        ) {
-          out.push([x, y, z, Math.sqrt(d2), v]);
-        }
-      }
-      if (++n % 64 === 0 && Date.now() - t0 > 4) {
-        await new Promise((res) => setImmediate(res));
-        if (session.bot !== bot || !bot.entity) {
-          throw new ApiBizError("not_connected", "bot disconnected during find_blocks");
-        }
-        t0 = Date.now();
-      }
+  const xMin = Math.floor(me.x - radius);
+  const xMax = Math.ceil(me.x + radius);
+  const zMin = Math.floor(me.z - radius);
+  const zMax = Math.ceil(me.z + radius);
+  const yMin = Math.max(Math.floor(me.y - radius), minY);
+  const yMax = Math.min(Math.ceil(me.y + radius), maxY);
+  if (yMin > yMax) return [];
+
+  const chunkCols = [];
+  for (let cx = xMin >> 4; cx <= (xMax >> 4); cx += 1) {
+    const bx0 = cx << 4;
+    const nearX = me.x < bx0 ? bx0 : (me.x > bx0 + 15 ? bx0 + 15 : me.x);
+    const dxNear = nearX - me.x;
+    const dxNear2 = dxNear * dxNear;
+    if (dxNear2 > r2) continue;
+    for (let cz = zMin >> 4; cz <= (zMax >> 4); cz += 1) {
+      const bz0 = cz << 4;
+      const nearZ = me.z < bz0 ? bz0 : (me.z > bz0 + 15 ? bz0 + 15 : me.z);
+      const dzNear = nearZ - me.z;
+      const colMinDist2 = dxNear2 + dzNear * dzNear;
+      if (colMinDist2 > r2) continue;
+      const col = getCol(cx, cz);
+      if (!col) continue;
+      chunkCols.push({ cx, cz, bx0, bz0, col, colMinDist2 });
     }
   }
+  chunkCols.sort((a, b) => a.colMinDist2 - b.colMinDist2);
+
+  const out = [];
+  let cutoff2 = r2;
+  let hasCutoff = false;
+  let t0 = Date.now();
+  let ops = 0;
+  const want0 = Boolean(want(0));
+  const solidCache = new Map();
+  const isAllSolid = (cx, si, cz, expectMinY) => {
+    const col = getCol(cx, cz);
+    if (!col) return true;
+    if (!Array.isArray(col.sections)) return false;
+    const cMinY = typeof col.minY === "number" ? col.minY : minY;
+    if (cMinY !== expectMinY) return false;
+    if (si < 0 || si >= col.sections.length) return true;
+    const key = colKey(cx, cz);
+    let arr = solidCache.get(key);
+    if (!arr) {
+      arr = new Int8Array(col.sections.length);
+      arr.fill(-1);
+      solidCache.set(key, arr);
+    }
+    if (arr[si] !== -1) return arr[si] === 1;
+    const sec = col.sections[si];
+    let solid = false;
+    if (!sec) {
+      solid = see[0] !== 1;
+    } else {
+      const d = sec.data;
+      if (d && Array.isArray(d.palette)) {
+        solid = true;
+        for (let i = 0; i < d.palette.length; i += 1) {
+          if (see[d.palette[i]] === 1) { solid = false; break; }
+        }
+      } else if (d && typeof d.value === "number") {
+        solid = see[d.value] !== 1;
+      }
+    }
+    arr[si] = solid ? 1 : 0;
+    return solid;
+  };
+
+  for (const { cx, cz, bx0, bz0, col, colMinDist2 } of chunkCols) {
+    if (colMinDist2 > cutoff2) break;
+    const lx0 = Math.max(0, xMin - bx0);
+    const lx1 = Math.min(15, xMax - bx0);
+    const lz0 = Math.max(0, zMin - bz0);
+    const lz1 = Math.min(15, zMax - bz0);
+
+    if (Array.isArray(col.sections)) {
+      const colMinY = typeof col.minY === "number" ? col.minY : minY;
+      const secMin = Math.max(0, (yMin - colMinY) >> 4);
+      const secMax = Math.min(col.sections.length - 1, (yMax - colMinY) >> 4);
+      for (let si = secMin; si <= secMax; si += 1) {
+        const secY0 = colMinY + (si << 4);
+        const secY1 = secY0 + 15;
+        const nearY = me.y < secY0 ? secY0 : (me.y > secY1 ? secY1 : me.y);
+        const dyNear = nearY - me.y;
+        if (colMinDist2 + dyNear * dyNear > cutoff2) continue;
+
+        const section = col.sections[si];
+        if (!section && !want0) continue;
+
+        const data = section && section.data;
+        const hasPalette = Boolean(data && Array.isArray(data.palette));
+        const isSingle = Boolean(data && !hasPalette && typeof data.value === "number");
+        const singleVal = !section ? 0 : (isSingle ? data.value : -1);
+
+        let palMatch = null;
+        let rawData = null;
+        if (!section || isSingle) {
+          if (!want(singleVal)) continue;
+        } else if (hasPalette) {
+          const palette = data.palette;
+          let any = false;
+          palMatch = new Uint8Array(palette.length);
+          for (let pi = 0; pi < palette.length; pi += 1) {
+            if (want(palette[pi])) { palMatch[pi] = 1; any = true; }
+          }
+          if (!any) continue;
+          if (data.data && typeof data.data.get === "function") rawData = data.data;
+        }
+
+        const selfSolid = isAllSolid(cx, si, cz, colMinY);
+        let fX0 = false, fX1 = false, fZ0 = false, fZ1 = false, fY0 = false, fY1 = false;
+        if (selfSolid) {
+          fX0 = !isAllSolid(cx - 1, si, cz, colMinY);
+          fX1 = !isAllSolid(cx + 1, si, cz, colMinY);
+          fZ0 = !isAllSolid(cx, si, cz - 1, colMinY);
+          fZ1 = !isAllSolid(cx, si, cz + 1, colMinY);
+          fY0 = !isAllSolid(cx, si - 1, cz, colMinY);
+          fY1 = !isAllSolid(cx, si + 1, cz, colMinY);
+          if (!fX0 && !fX1 && !fZ0 && !fZ1 && !fY0 && !fY1) continue;
+        }
+
+        const ly0 = Math.max(0, yMin - secY0);
+        const ly1 = Math.min(15, yMax - secY0);
+        if (!section || isSingle) {
+          for (let lx = lx0; lx <= lx1; lx += 1) {
+            const x = bx0 + lx;
+            const dx2 = (x - me.x) ** 2;
+            if (dx2 > cutoff2) continue;
+            const xFace = (fX0 && lx === 0) || (fX1 && lx === 15);
+            for (let lz = lz0; lz <= lz1; lz += 1) {
+              const z = bz0 + lz;
+              const dxz = dx2 + (z - me.z) ** 2;
+              if (dxz > cutoff2) continue;
+              const xzFace = xFace || (fZ0 && lz === 0) || (fZ1 && lz === 15);
+              for (let ly = ly0; ly <= ly1; ly += 1) {
+                if (selfSolid && !xzFace && !(fY0 && ly === 0) && !(fY1 && ly === 15)) continue;
+                const y = secY0 + ly;
+                const d2 = dxz + (y - me.y) ** 2;
+                if (d2 > cutoff2) continue;
+                if (
+                  open(x + 1, y, z) || open(x - 1, y, z) ||
+                  open(x, y + 1, z) || open(x, y - 1, z) ||
+                  open(x, y, z + 1) || open(x, y, z - 1)
+                ) {
+                  out.push([x, y, z, d2, singleVal]);
+                }
+              }
+              if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+                await new Promise((res) => setImmediate(res));
+                if (session.bot !== bot || !bot.entity) {
+                  throw new ApiBizError("not_connected", "bot disconnected during find_blocks");
+                }
+                t0 = Date.now();
+              }
+            }
+          }
+          continue;
+        }
+
+        const secGet = data && typeof data.get === "function" ? data : null;
+        for (let lx = lx0; lx <= lx1; lx += 1) {
+          const x = bx0 + lx;
+          const dx2 = (x - me.x) ** 2;
+          if (dx2 > cutoff2) continue;
+          const xFace = (fX0 && lx === 0) || (fX1 && lx === 15);
+          for (let lz = lz0; lz <= lz1; lz += 1) {
+            const z = bz0 + lz;
+            const dxz = dx2 + (z - me.z) ** 2;
+            if (dxz > cutoff2) continue;
+            const xzFace = xFace || (fZ0 && lz === 0) || (fZ1 && lz === 15);
+            const xzIdx = (lz << 4) | lx;
+            for (let ly = ly0; ly <= ly1; ly += 1) {
+              if (selfSolid && !xzFace && !(fY0 && ly === 0) && !(fY1 && ly === 15)) continue;
+              const y = secY0 + ly;
+              const d2 = dxz + (y - me.y) ** 2;
+              if (d2 > cutoff2) continue;
+              let v;
+              if (rawData) {
+                const pi = rawData.get((ly << 8) | xzIdx);
+                if (!palMatch[pi]) continue;
+                v = data.palette[pi];
+              } else if (secGet) {
+                v = secGet.get((ly << 8) | xzIdx);
+                if (!want(v)) continue;
+              } else {
+                tmp.x = lx;
+                tmp.y = y;
+                tmp.z = lz;
+                v = col.getBlockStateId(tmp);
+                if (v < 0 || !want(v)) continue;
+              }
+              if (
+                open(x + 1, y, z) || open(x - 1, y, z) ||
+                open(x, y + 1, z) || open(x, y - 1, z) ||
+                open(x, y, z + 1) || open(x, y, z - 1)
+              ) {
+                out.push([x, y, z, d2, v]);
+              }
+            }
+            if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+              await new Promise((res) => setImmediate(res));
+              if (session.bot !== bot || !bot.entity) {
+                throw new ApiBizError("not_connected", "bot disconnected during find_blocks");
+              }
+              t0 = Date.now();
+            }
+          }
+        }
+      }
+    } else {
+      for (let lx = lx0; lx <= lx1; lx += 1) {
+        const x = bx0 + lx;
+        const dx2 = (x - me.x) ** 2;
+        if (dx2 > cutoff2) continue;
+        for (let lz = lz0; lz <= lz1; lz += 1) {
+          const z = bz0 + lz;
+          const dxz = dx2 + (z - me.z) ** 2;
+          if (dxz > cutoff2) continue;
+          for (let y = yMin; y <= yMax; y += 1) {
+            const d2 = dxz + (y - me.y) ** 2;
+            if (d2 > cutoff2) continue;
+            tmp.x = lx;
+            tmp.y = y;
+            tmp.z = lz;
+            const v = col.getBlockStateId(tmp);
+            if (v < 0 || !want(v)) continue;
+            if (
+              open(x + 1, y, z) || open(x - 1, y, z) ||
+              open(x, y + 1, z) || open(x, y - 1, z) ||
+              open(x, y, z + 1) || open(x, y, z - 1)
+            ) {
+              out.push([x, y, z, d2, v]);
+            }
+          }
+          if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+            await new Promise((res) => setImmediate(res));
+            if (session.bot !== bot || !bot.entity) {
+              throw new ApiBizError("not_connected", "bot disconnected during find_blocks");
+            }
+            t0 = Date.now();
+          }
+        }
+      }
+    }
+
+    if (out.length > max || (!hasCutoff && out.length === max)) {
+      out.sort((a, b) => a[3] - b[3]);
+      out.length = max;
+      cutoff2 = out[max - 1][3];
+      hasCutoff = true;
+    }
+    if ((++ops & 63) === 0 && Date.now() - t0 > 4) {
+      await new Promise((res) => setImmediate(res));
+      if (session.bot !== bot || !bot.entity) {
+        throw new ApiBizError("not_connected", "bot disconnected during find_blocks");
+      }
+      t0 = Date.now();
+    }
+  }
+
   out.sort((a, b) => a[3] - b[3]);
-  return out.slice(0, max);
+  if (out.length > max) out.length = max;
+  for (let i = 0; i < out.length; i += 1) out[i][3] = Math.sqrt(out[i][3]);
+  return out;
 }
 
 const CONTROL_KEYS = ["forward", "back", "left", "right", "jump", "sneak", "sprint"];
 const EMPTY_POSTURE = Object.freeze({ sneak: false, shield: false, jump: false });
 const NON_ATTACKABLE = new Set(["item", "experience_orb", "arrow", "spectral_arrow", "area_effect_cloud"]);
+// v1.3.21 (a9d5ceb): hazardous blocks avoided by pathfinder movements
+const EXTRA_AVOID_BLOCKS = [
+  "sweet_berry_bush", "cactus", "magma_block", "campfire", "soul_campfire", "powder_snow", "wither_rose",
+];
+
+// v1.3.21 (a9d5ceb): safe goto wrapper rejecting empty noPath/timeout, waiting on partial, always clearing goal
+function createSafeGoto(bot) {
+  return function safeGoto(goal, { allowPartial = false } = {}) {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let tickCount = 0;
+      let partialPending = false;
+      let partialReason = null;
+      let partialStartTick = -1;
+
+      const makeErr = (name, message) => { const e = new Error(message); e.name = name; return e; };
+      const finish = (err, val) => {
+        if (done) return;
+        done = true;
+        bot.removeListener("goal_reached", onReached);
+        bot.removeListener("path_update", onUpdate);
+        bot.removeListener("goal_updated", onGoalUpdated);
+        bot.removeListener("path_stop", onStop);
+        bot.removeListener("path_reset", onReset);
+        bot.removeListener("physicsTick", onTick);
+        setTimeout(() => {
+          if (bot.pathfinder && bot.pathfinder.goal === goal) {
+            try { bot.pathfinder.setGoal(null); } catch (_) {}
+          }
+          if (err) reject(err);
+          else resolve(val);
+        }, 0);
+      };
+
+      const onReached = () => finish(null, { reached: true, partial: false });
+      const onGoalUpdated = (newGoal) => {
+        if (newGoal !== goal) finish(makeErr("GoalChanged", "The goal was changed before it could be completed!"));
+      };
+      const onStop = () => finish(makeErr("PathStopped", "Path was stopped before it could be completed! Thus, the desired goal was not reached."));
+      const onReset = () => { partialPending = false; };
+      const onUpdate = (results) => {
+        if (!results) return;
+        if (results.status === "partial") {
+          partialPending = false;
+          return;
+        }
+        if (results.status === "noPath" || results.status === "timeout") {
+          if (allowPartial && Array.isArray(results.path) && results.path.length > 0) {
+            partialPending = true;
+            partialReason = results.status;
+            partialStartTick = tickCount;
+            return;
+          }
+          if (Array.isArray(results.path)) results.path.length = 0;
+          if (results.status === "noPath") finish(makeErr("NoPath", "No path to the goal!"));
+          else finish(makeErr("Timeout", "Took too long to decide path to goal!"));
+          return;
+        }
+        if (results.status === "success" && Array.isArray(results.path) && results.path.length === 0) {
+          const p = bot.entity && bot.entity.position;
+          if (p && typeof goal.isEnd === "function" && (goal.isEnd(p.floored()) || goal.isEnd(p.floored().offset(0, 1, 0)))) {
+            finish(null, { reached: true, partial: false });
+          }
+        }
+      };
+      const onTick = () => {
+        tickCount += 1;
+        if (!partialPending || tickCount <= partialStartTick) return;
+        const pf = bot.pathfinder;
+        if (pf && !pf.isMoving() && !pf.isMining() && !pf.isBuilding()) {
+          finish(null, { reached: false, partial: true, reason: partialReason });
+        }
+      };
+
+      bot.on("path_stop", onStop);
+      bot.on("goal_reached", onReached);
+      bot.on("path_update", onUpdate);
+      bot.on("goal_updated", onGoalUpdated);
+      bot.on("path_reset", onReset);
+      bot.on("physicsTick", onTick);
+      bot.pathfinder.setGoal(goal);
+    });
+  };
+}
+
+// v1.3.21 (a9d5ceb): micro-align using real control keys (auto-sneak < 0.5 blocks) after entering target block
+async function alignToPoint(session, aimX, aimZ, { tol = 0.15, maxMs = 600, stopWhen = null, signal = null } = {}) {
+  const bot = session.bot;
+  if (!bot || bot.vehicle || !bot.entity || typeof bot.look !== "function" || typeof bot.setControlState !== "function") return;
+  const landBy = Date.now() + 400;
+  while (Date.now() < landBy && session.bot === bot && bot.entity && !bot.entity.onGround && !bot.entity.isInWater && !bot.entity.isInLava) {
+    if (!session.isAlive() || signal?.aborted || (stopWhen && stopWhen())) break;
+    await sleep(50);
+  }
+  if (session.bot !== bot || !bot.entity || signal?.aborted) return;
+  const p0 = bot.entity.position;
+  const d0 = Math.hypot(aimX - p0.x, aimZ - p0.z);
+  if (d0 <= tol || d0 > 1.35) return;
+  const deadline = Date.now() + maxMs;
+  let bestDist = d0;
+  let staleTicks = 0;
+  try {
+    while (Date.now() < deadline) {
+      if (session.bot !== bot || !bot.entity || !session.isAlive() || signal?.aborted) break;
+      if (stopWhen && stopWhen()) break;
+      const p = bot.entity.position;
+      const dx = aimX - p.x;
+      const dz = aimZ - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d <= tol) break;
+      if (d < bestDist - 0.01) { bestDist = d; staleTicks = 0; }
+      else if (++staleTicks >= 4) break;
+      bot.look(Math.atan2(-dx, -dz), 0, true);
+      bot.setControlState("forward", true);
+      bot.setControlState("sprint", false);
+      bot.setControlState("sneak", d < 0.5 && Boolean(bot.entity.onGround));
+      await sleep(50);
+    }
+  } finally {
+    if (session.bot === bot && bot.entity && typeof bot.clearControlStates === "function") {
+      bot.clearControlStates();
+    }
+  }
+  if (session.bot === bot && bot.entity && !signal?.aborted) await sleep(50);
+}
 
 function buildPathfinderMovements(bot, MovementsCtor = Movements) {
   const moves = new MovementsCtor(bot);
@@ -179,6 +542,13 @@ function buildPathfinderMovements(bot, MovementsCtor = Movements) {
   for (const b of bot.registry.blocksArray) {
     if (typeof b.hardness === "number" && b.hardness > 0.25) {
       moves.blocksCantBreak.add(b.id);
+    }
+  }
+  if (moves.blocksToAvoid && bot.registry?.blocksByName) {
+    for (const name of EXTRA_AVOID_BLOCKS) {
+      if (bot.registry.blocksByName[name]) {
+        moves.blocksToAvoid.add(bot.registry.blocksByName[name].id);
+      }
     }
   }
   return moves;
@@ -349,6 +719,7 @@ class BotSession {
     });
     this.bot = bot;
     bot.loadPlugin(pathfinder);
+    if (bot.pathfinder) bot.pathfinder.goto = createSafeGoto(bot);
     // v1.3.18: fishing bobber pull & MC 1.21+ teleport velocity compatibility
     bot.once("inject_allowed", () => {
       try {
@@ -432,6 +803,7 @@ class BotSession {
           try { patchBrokenPickaxeMaterials(require("minecraft-data")(bot.version)); } catch (_) {}
         }
         const moves = buildPathfinderMovements(bot);
+        if (bot.pathfinder) bot.pathfinder.goto = createSafeGoto(bot);
         bot.pathfinder.thinkTimeout = 4000;
         bot.pathfinder.tickTimeout = 20; // v1.3.13: lowered from 40ms to 20ms
         bot.pathfinder.setMovements(moves);
@@ -899,14 +1271,23 @@ class BotSession {
   async findBlocks(body = {}) {
     this._requireWorldReady();
     const bot = this.bot;
-    const radius = body.radius === undefined ? 16 : body.radius;
-    if (!isFiniteNum(radius) || radius < 1 || radius > 64) {
-      throw new ApiBizError("bad_args", "radius must be a number between 1 and 64");
+    if (body.types !== undefined && body.types !== null && !Array.isArray(body.types)) {
+      throw new ApiBizError("bad_args", "types must be an array of block names");
     }
+    const hasTypes = Array.isArray(body.types) && body.types.length > 0;
+    const maxRadius = hasTypes ? 128 : 64;
+    const rawRadius = body.radius === undefined ? 16 : Number(body.radius);
+    if (!Number.isFinite(rawRadius) || rawRadius < 1) {
+      throw new ApiBizError("bad_args", `radius must be a number between 1 and ${maxRadius}`);
+    }
+    const radius = Math.min(rawRadius, maxRadius);
     const r = Math.floor(radius);
-    const limit = body.limit === undefined ? 20 : body.limit;
-    if (!isFiniteNum(limit) || limit < 1 || limit > 500) {
+    const limit = body.limit === undefined ? 20 : Number(body.limit);
+    if (!Number.isFinite(limit) || limit < 1 || limit > 500) {
       throw new ApiBizError("bad_args", "limit must be between 1 and 500");
+    }
+    if ((body.properties || body.mature !== undefined) && !hasTypes) {
+      throw new ApiBizError("bad_args", "properties / mature filters require types");
     }
     const center = bot.entity.position;
     const canFastSphere = Boolean(
@@ -914,11 +1295,8 @@ class BotSession {
       bot.registry && bot.registry.blocksByStateId && Array.isArray(bot.registry.blocksArray)
     );
 
-    // Detail mode: types provided
-    if (body.types !== undefined && body.types !== null) {
-      if (!Array.isArray(body.types) || body.types.length === 0) {
-        throw new ApiBizError("bad_args", "types must be a non-empty array when provided");
-      }
+    // Detail mode: types provided (v1.3.20: radius up to 128, clamped)
+    if (hasTypes) {
       const ids = [];
       for (const name of body.types) {
         const clean = String(name).replace(/^minecraft:/, "");
@@ -1337,73 +1715,68 @@ class BotSession {
     return abortPromise ? Promise.race([action, abortPromise]) : action;
   }
 
-  async _gotoGoal(goal, timeoutMs = 60000, ctx = null) {
+  async _gotoGoal(goal, timeoutMs = 60000, ctx = null, { allowPartial = false, stallMs = 8000 } = {}) {
     const bot = this.bot;
     const signal = ctx?.signal;
     signal?.throwIfAborted();
     if (!bot || !bot.pathfinder) {
       throw new ApiBizError("path_not_found", "Pathfinder unavailable");
     }
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      let lastProgressPos = bot.entity.position.clone();
-      let lastProgressAt = Date.now();
-      const stuckInterval = setInterval(() => {
+    const gotoFn = typeof bot.pathfinder.goto === "function"
+      ? (g, opts) => bot.pathfinder.goto(g, opts)
+      : createSafeGoto(bot);
+
+    let lastProgressPos = bot.entity.position.clone();
+    let lastProgressAt = Date.now();
+    let stuckResets = 0;
+    let savedMovements = null;
+
+    const onReset = (reason) => {
+      if (reason !== "stuck") return;
+      stuckResets += 1;
+      const m = bot.pathfinder && bot.pathfinder.movements;
+      if (stuckResets >= 2 && !savedMovements && m && (m.allowParkour || m.allowSprinting)) {
+        savedMovements = { m, parkour: m.allowParkour, sprint: m.allowSprinting };
+        m.allowParkour = false;
+        m.allowSprinting = false;
+        stuckResets = 0;
+        lastProgressAt = Date.now();
+        if (this.log) this.log(`[bridge:${this.username}] pathfinder stuck x2, retrying without parkour/sprint`);
+        if (typeof bot.pathfinder.setMovements === "function") bot.pathfinder.setMovements(m);
+      }
+    };
+    bot.on("path_reset", onReset);
+
+    let stuckInterval = null;
+    let timer = null;
+    let onAbort = null;
+    const clearGoalAndControls = () => {
+      try {
+        if (bot.pathfinder) bot.pathfinder.setGoal(null);
+        if (typeof bot.clearControlStates === "function") bot.clearControlStates();
+      } catch (_) {}
+    };
+
+    const guard = new Promise((_, reject) => {
+      stuckInterval = setInterval(() => {
         if (!bot.entity) return;
         const d = bot.entity.position.distanceTo(lastProgressPos);
         if (d >= 0.35) {
           lastProgressPos = bot.entity.position.clone();
           lastProgressAt = Date.now();
-        } else if (Date.now() - lastProgressAt >= 8000) {
-          cleanup();
-          try {
-            bot.pathfinder.setGoal(null);
-            bot.clearControlStates();
-          } catch (_) {}
+          stuckResets = 0;
+        } else if (Date.now() - lastProgressAt >= stallMs) {
+          clearGoalAndControls();
           reject(
-            new ApiBizError("stalled", "Stuck for 8s without movement progress", {
+            new ApiBizError("stalled", `Stuck for ${Math.round(stallMs / 1000)}s without movement progress`, {
               pos: vecToPos(bot.entity.position),
             })
           );
         }
-      }, 1000);
-      const cleanup = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        clearInterval(stuckInterval);
-        bot.removeListener("goal_reached", onReached);
-        bot.removeListener("path_update", onPathUpdate);
-        signal?.removeEventListener("abort", onAbort);
-      };
-      const onAbort = () => {
-        cleanup();
-        reject(signal.reason);
-      };
-      const onReached = () => {
-        cleanup();
-        resolve();
-      };
-      const onPathUpdate = (results) => {
-        if (results && (results.status === "noPath" || (results.status === "timeout" && (!results.path || results.path.length === 0)))) {
-          cleanup();
-          try {
-            bot.pathfinder.setGoal(null);
-            bot.clearControlStates();
-          } catch (_) {}
-          reject(
-            new ApiBizError("path_not_found", `Pathfinder ${results.status} to target`, {
-              pos: vecToPos(bot.entity.position),
-            })
-          );
-        }
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        try {
-          bot.pathfinder.setGoal(null);
-          bot.clearControlStates();
-        } catch (_) {}
+      }, 400);
+
+      timer = setTimeout(() => {
+        clearGoalAndControls();
         reject(
           new ApiBizError("timeout", `Pathfinding timed out after ${timeoutMs}ms`, {
             pos: vecToPos(bot.entity.position),
@@ -1411,11 +1784,42 @@ class BotSession {
         );
       }, timeoutMs);
 
-      signal?.addEventListener("abort", onAbort, { once: true });
-      bot.on("goal_reached", onReached);
-      bot.on("path_update", onPathUpdate);
-      bot.pathfinder.setGoal(goal);
+      if (signal) {
+        onAbort = () => {
+          clearGoalAndControls();
+          reject(signal.reason);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
     });
+
+    let gotoPromise;
+    try {
+      gotoPromise = Promise.resolve(gotoFn(goal, { allowPartial }));
+    } catch (syncErr) {
+      gotoPromise = Promise.reject(syncErr);
+    }
+    // Prevent unhandled rejection if guard settles first
+    gotoPromise.catch(() => {});
+
+    try {
+      return await Promise.race([gotoPromise, guard]);
+    } catch (err) {
+      clearGoalAndControls();
+      if (err instanceof ApiBizError) throw err;
+      throw new ApiBizError("path_not_found", err?.message || "No path to target", {
+        pos: bot.entity ? vecToPos(bot.entity.position) : [0, 0, 0],
+      });
+    } finally {
+      clearInterval(stuckInterval);
+      clearTimeout(timer);
+      bot.removeListener("path_reset", onReset);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      if (savedMovements && bot.pathfinder && bot.pathfinder.movements === savedMovements.m) {
+        savedMovements.m.allowParkour = savedMovements.parkour;
+        savedMovements.m.allowSprinting = savedMovements.sprint;
+      }
+    }
   }
 
   async stop() {
@@ -1632,27 +2036,57 @@ class BotSession {
     const stopOn = body.stop_on || ["hurt", "death"];
     return this._runAction("move_to", stopOn, async (ctx) => {
       const bot = this.bot;
-      const rng = body.range === undefined ? 1 : Number(body.range);
-      if (!isFiniteNum(rng) || rng < 0) {
-        throw new ApiBizError("bad_args", "range must be a non-negative number");
+      const hasRange = body.range !== undefined && body.range !== null;
+      let rng = 1;
+      if (hasRange) {
+        rng = Number(body.range);
+        if (!Number.isFinite(rng) || rng < 0) {
+          throw new ApiBizError("bad_args", "range must be a non-negative number");
+        }
+      }
+      const timeoutMs = body.timeout === undefined ? 60000 : Number(body.timeout);
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new ApiBizError("bad_args", "timeout must be a positive number");
+      }
+      const allowPartial = body.allow_partial === undefined ? false : body.allow_partial;
+      if (typeof allowPartial !== "boolean") {
+        throw new ApiBizError("bad_args", "allow_partial must be a boolean");
       }
 
       const startDim = (bot.game && bot.game.dimension) || "overworld";
 
-      if (body.entity_id !== undefined && body.entity_id !== null) {
-        if (!Number.isInteger(body.entity_id)) {
+      let aimX;
+      let aimY = null;
+      let aimZ;
+      let bx;
+      let by = null;
+      let bz;
+      let hasY;
+      let effRange;
+      let isItem = false;
+      const entityId = body.entity_id;
+
+      if (entityId !== undefined && entityId !== null) {
+        if (!Number.isInteger(entityId)) {
           throw new ApiBizError("bad_args", "entity_id must be integer");
         }
-        const ent = bot.entities[body.entity_id];
+        const ent = bot.entities[entityId];
         if (!ent || !ent.position) {
-          throw new ApiBizError("no_such_entity", `Entity ${body.entity_id} not found`);
+          throw new ApiBizError("no_such_entity", `Entity ${entityId} not found`);
         }
-        const d0 = bot.entity.position.distanceTo(ent.position);
-        if (d0 > Math.max(rng, 1)) {
-          await this._gotoGoal(new goals.GoalFollow(ent, Math.max(1, rng)), 120000, ctx);
-        }
+        isItem = ent.name === "item";
+        effRange = hasRange ? rng : (isItem ? 0.5 : 2);
+        aimX = ent.position.x;
+        aimY = ent.position.y;
+        aimZ = ent.position.z;
+        bx = Math.floor(aimX);
+        by = Math.floor(aimY);
+        bz = Math.floor(aimZ);
+        hasY = true;
       } else {
-        let tx, ty, tz;
+        let tx;
+        let ty = null;
+        let tz;
         if (Array.isArray(body.pos)) {
           if (body.pos.length !== 3 || !body.pos.every(isFiniteNum)) {
             throw new ApiBizError("bad_args", "pos must be [x, y, z]");
@@ -1669,15 +2103,91 @@ class BotSession {
             throw new ApiBizError("bad_args", "y must be finite number");
           }
         }
-
-        const goal = ty !== null
-          ? new goals.GoalNear(tx, ty, tz, Math.max(1, rng))
-          : new goals.GoalNearXZ(tx, tz, Math.max(1, rng));
-        await this._gotoGoal(goal, 150000, ctx);
+        effRange = hasRange ? rng : 1;
+        aimX = Number.isInteger(tx) ? tx + 0.5 : tx;
+        aimZ = Number.isInteger(tz) ? tz + 0.5 : tz;
+        bx = Math.floor(tx);
+        bz = Math.floor(tz);
+        hasY = ty !== null;
+        if (hasY) {
+          aimY = ty;
+          by = Math.floor(ty);
+        }
       }
 
-      const endDim = (bot.game && bot.game.dimension) || "overworld";
-      const out = { pos: vecToPos(bot.entity.position) };
+      const distTo = (p) => (hasY
+        ? Math.hypot(p.x - aimX, p.y - aimY, p.z - aimZ)
+        : Math.hypot(p.x - aimX, p.z - aimZ));
+      const exact = effRange < 1;
+      const alignTol = Math.max(effRange, 0.15);
+      const p0 = bot.entity.position;
+      const inTargetBlock = Math.floor(p0.x) === bx && Math.floor(p0.z) === bz && (!hasY || Math.abs(p0.y - by) <= 0.55);
+      const alreadyAt = exact
+        ? (inTargetBlock && Math.hypot(p0.x - aimX, p0.z - aimZ) <= alignTol)
+        : (distTo(p0) <= effRange);
+      if (alreadyAt) {
+        return { pos: vecToPos(p0), dist: +distTo(p0).toFixed(2) };
+      }
+
+      const isFullSolid = (b) => Boolean(
+        b && b.boundingBox === "block" && b.name !== "ladder" && b.name !== "vine" &&
+        (!Array.isArray(b.shapes) || b.shapes.length === 0 || b.shapes.some((sh) => sh[4] >= 1))
+      );
+
+      const t0 = Date.now();
+      let pathRes = null;
+      try {
+        if (exact && !allowPartial && hasY && typeof bot.blockAt === "function") {
+          const tb = bot.blockAt(new Vec3(bx, by, bz));
+          if (isFullSolid(tb)) {
+            throw new ApiBizError(
+              "path_not_found",
+              `target block (${bx}, ${by}, ${bz}) is solid (${tb.name}); use range >= 1 or aim above it`,
+              { pos: vecToPos(p0), dist_left: round1(distTo(p0)), ms: 0, target_solid: true }
+            );
+          }
+        }
+        if (!(exact && inTargetBlock)) {
+          const goal = hasY
+            ? (exact ? new goals.GoalBlock(bx, by, bz) : new goals.GoalNear(bx, by, bz, effRange))
+            : (exact ? new goals.GoalXZ(bx, bz) : new goals.GoalNearXZ(bx, bz, effRange));
+          pathRes = await this._gotoGoal(goal, timeoutMs, ctx, { allowPartial });
+        }
+        if (exact && !(pathRes && pathRes.partial)) {
+          await alignToPoint(this, aimX, aimZ, {
+            tol: alignTol,
+            stopWhen: isItem ? () => !bot.entities[entityId] : null,
+            signal: ctx?.signal,
+          });
+        }
+      } catch (e) {
+        const curDim = (bot.game && bot.game.dimension) || startDim;
+        if (curDim !== startDim) {
+          return { pos: vecToPos(bot.entity.position), dimension_changed: { from: startDim, to: curDim } };
+        }
+        const from = bot.entity ? bot.entity.position : p0;
+        const diag = { pos: vecToPos(from), dist_left: round1(distTo(from)), ms: Date.now() - t0 };
+        if (hasY && typeof bot.blockAt === "function") {
+          const tb = bot.blockAt(new Vec3(bx, by, bz));
+          if (!tb) diag.target_unloaded = true;
+          else if (exact && tb.boundingBox === "block") diag.target_solid = true;
+        } else if (!hasY && bot.world && typeof bot.world.getColumn === "function") {
+          if (!bot.world.getColumn(bx >> 4, bz >> 4)) diag.target_unloaded = true;
+        }
+        if (e instanceof ApiBizError) {
+          e.extra = { ...(e.extra || {}), ...diag };
+          throw e;
+        }
+        throw new ApiBizError("path_not_found", e?.message || "No path to target", diag);
+      }
+
+      const pf = bot.entity.position;
+      const endDim = (bot.game && bot.game.dimension) || startDim;
+      const out = {
+        pos: vecToPos(pf),
+        dist: +distTo(pf).toFixed(2),
+        ...(pathRes && pathRes.partial ? { partial: true } : {}),
+      };
       if (endDim !== startDim) {
         out.dimension_changed = { from: startDim, to: endDim };
       }
@@ -2917,4 +3427,12 @@ class BotSession {
   }
 }
 
-module.exports = { BotSession, buildPathfinderMovements, patchBrokenPickaxeMaterials, rayBox };
+module.exports = {
+  BotSession,
+  buildPathfinderMovements,
+  patchBrokenPickaxeMaterials,
+  rayBox,
+  scanExposed: scanExposedSphere,
+  createSafeGoto,
+  EXTRA_AVOID_BLOCKS,
+};

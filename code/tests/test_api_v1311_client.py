@@ -106,6 +106,25 @@ class ControlLookBodyTests(unittest.TestCase):
         self.assertEqual(self.calls[-1][1]["feedback"], True)
         self.assertEqual(self.calls[-1][1]["timeout"], 1500)
 
+    def test_move_to_v1321_allow_partial_and_optional_range(self) -> None:
+        self.client.move_to(200, -300, allow_partial=True)
+        route, body = self.calls[-1]
+        self.assertEqual(route, "move_to")
+        self.assertEqual(body, {"range": 1, "allow_partial": True, "x": 200, "z": -300, "stop_on": ["hurt", "death"]})
+
+        # entity_id with rng=None omits range so server applies item=0.5 / mob=2 default
+        self.client.move_to(entity_id=99, rng=None)
+        self.assertEqual(self.calls[-1][1], {"entity_id": 99, "stop_on": ["hurt", "death"]})
+
+        # find_blocks typed radius=128 passes through without clamping at 64
+        self.client.find_blocks(types=["sugar_cane"], radius=128, limit=20)
+        self.assertEqual(self.calls[-1], ("find_blocks", {"radius": 128, "limit": 20, "types": ["sugar_cane"]}))
+
+        ex = Executor(self.client, State(), log=lambda *_: None)
+        ex.move_to(100, -200, y=64, rng=0, allow_partial=True)
+        self.assertEqual(self.calls[-1][1]["range"], 0)
+        self.assertEqual(self.calls[-1][1]["allow_partial"], True)
+
 
 class CapabilityProbeTests(unittest.TestCase):
     def _old_server(self, *, envelope: bool = False):

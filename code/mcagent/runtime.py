@@ -1487,20 +1487,25 @@ class Executor:
         pos=None,
         timeout=None,
         *,
+        allow_partial=None,
         retries=2,
         stop_on=None,
     ) -> dict:
         if retries is None:
             retries = 2
 
+        extra: dict = {}
+        if allow_partial is not None:
+            extra["allow_partial"] = allow_partial
+
         def _call() -> dict:
             if timeout is None:
                 return self.client.move_to(
-                    x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, stop_on=stop_on
+                    x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, stop_on=stop_on, **extra
                 )
             try:
                 return self.client.move_to(
-                    x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, timeout=timeout, stop_on=stop_on
+                    x, z, y=y, entity_id=entity_id, rng=rng, pos=pos, timeout=timeout, stop_on=stop_on, **extra
                 )
             except ApiError as err:
                 if err.code == "network" and isinstance(err.__cause__, requests.ReadTimeout):
