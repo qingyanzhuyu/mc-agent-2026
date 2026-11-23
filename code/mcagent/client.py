@@ -833,8 +833,14 @@ class Client:
         body["stop_on"] = list(conditions)
         return self.call(name, body, timeout=timeout or ACTION_TIMEOUT.get(name, 30))
 
-    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None, *, stop_on=None) -> dict:
-        body: dict = {"range": rng}
+    def move_to(self, x=None, z=None, y=None, entity_id=None, rng=1, pos=None, timeout=None, *,
+                allow_partial=None, stop_on=None) -> dict:
+        # v1.3.21 §4.1：rng=None 时不传 range 以使用服务端默认（item=0.5 / 实体=2 / 坐标=1）；allow_partial 允许部分逼近
+        body: dict = {}
+        if rng is not None:
+            body["range"] = rng
+        if allow_partial is not None:
+            body["allow_partial"] = allow_partial
         if entity_id is not None:
             body["entity_id"] = entity_id
         elif pos is not None:
