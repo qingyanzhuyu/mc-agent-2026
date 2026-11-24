@@ -130,6 +130,36 @@ _NO_PROGRESS_BASE_COOLDOWN_S = 30.0
 _NO_PROGRESS_COOLDOWN_CAP_S = 300.0
 
 
+_RESCUE_OFFSETS: tuple[tuple[int, int, int], ...] = (
+    (0, 2, 0),                                    # 头顶两格：夜间"挖三填一"的封口块
+    (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1),  # 脚部四向：自封墙
+    (1, 1, 0), (-1, 1, 0), (0, 1, 1), (0, 1, -1),  # 头部四向
+)
+_AIR_NAMES = frozenset({"", "air", "cave_air", "void_air"})
+
+
+def rescue_breach_cell(read_block: Callable[[tuple[int, int, int]], Optional[str]], pos: Any) -> Optional[tuple[int, int, int]]:
+    """被困自救：返回最该挖掉的那一格（优先头顶封口块，其次脚/头四向），无可挖则 None。
+
+    真机事故（2026-11-24）：bot 夜间挖洞封口后，逃敌技能每次冲撞还能挤出 0.4~0.57 格，
+    于是"零位移"判定永不成立、破墙分支永不执行，17 次冲撞都困在原地。
+    """
+    try:
+        fx, fy, fz = (math.floor(float(v)) for v in list(pos)[:3])
+    except Exception:
+        return None
+    for dx, dy, dz in _RESCUE_OFFSETS:
+        cell = (fx + dx, fy + dy, fz + dz)
+        name = read_block(cell)
+        if name is None:
+            continue
+        lowered = bare(name).strip().lower()
+        if lowered in _AIR_NAMES or lowered in ("bedrock", "obsidian", "crying_obsidian", "water", "lava", "flowing_water", "flowing_lava"):
+            continue
+        return cell
+    return None
+
+
 def note_no_progress(
     book: dict[tuple[str, str], int],
     skill: Any,
@@ -204,6 +234,8 @@ class MainLoop:
         # 真机事故（2026-11-24）：discover_structure 在 20 分钟里被启动 1879 次，
         # 每次只做 1 个动作就自称完成，策略立刻重选 —— 整轮空转。
         self._no_progress: dict[tuple[str, str], int] = {}
+        # 连续"技能结束时净位移 < 1.5 格"的次数，达到阈值就自救破一格
+        self._stuck_streak: int = 0
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
         self._custom_sleep = sleep
@@ -278,6 +310,33 @@ class MainLoop:
             except (TypeError, ValueError):
                 return None
         return None
+
+    def _try_self_rescue_breach(self) -> bool:
+        """连续被困时主动挖一格脱困（头顶封口块优先），成功返回 True。"""
+        pos = self._pos_tuple(self.state)
+        if pos is None:
+            return False
+
+        def _read(cell: tuple[int, int, int]) -> Optional[str]:
+            try:
+                block = self.client.get_block(list(cell))
+            except Exception:
+                return None
+            return bare((block or {}).get("name")) if isinstance(block, dict) else None
+
+        cell = rescue_breach_cell(_read, pos)
+        if cell is None:
+            self._stuck_streak = 0
+            return False
+        try:
+            self.executor.dig(list(cell))
+        except Exception as exc:  # 挖不动就算了，下一拍再试
+            self.log(f"[loop] 自救破格 {list(cell)} 失败：{exc}")
+            self._stuck_streak = 0
+            return False
+        self.log(f"[loop] 连续 {self._stuck_streak} 次技能净位移不足，自救破 {list(cell)} 脱困")
+        self._stuck_streak = 0
+        return True
 
     @classmethod
     def _cell_key(cls, state: State) -> tuple[str, int, int]:
@@ -1369,20 +1428,28 @@ class MainLoop:
                     if moved_away or finished_name not in ("scout_island", "emergency_escape"):
                         self._reset_failure_tier(end_pos)
                     # 零进度完成护栏：完成但没走一步、也没挪窝 → 指数退避，防止空转死循环
+                    moved_dist = (
+                        math.dist(skill_start_pos, end_pos)
+                        if (skill_start_pos is not None and end_pos is not None)
+                        else None
+                    )
                     streak = note_no_progress(
                         self._no_progress,
                         finished_skill,
                         steps=steps - steps_at_skill_start,
-                        moved=(
-                            math.dist(skill_start_pos, end_pos)
-                            if (skill_start_pos is not None and end_pos is not None)
-                            else None
-                        ),
+                        moved=moved_dist,
                     )
                     if streak >= _NO_PROGRESS_STREAK_BEFORE_COOLDOWN:
                         self.log(
                             f"[loop] {finished_skill} 连续 {streak} 次零进度完成，已冷却抑制空转"
                         )
+                    # 被困自救：连续两次技能跑完都没挪出 1.5 格 → 主动挖一格（头顶封口块优先）
+                    if moved_dist is not None and moved_dist < 1.5:
+                        self._stuck_streak += 1
+                    else:
+                        self._stuck_streak = 0
+                    if self._stuck_streak >= 2:
+                        self._try_self_rescue_breach()
                     skills_ok += 1
                     goal_specs = list(self._resolve_target_goal_specs())
                     active_rules_goals = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()
