@@ -2309,9 +2309,13 @@ def _flee_hostile(ex: "Executor", state: "State") -> Generator[dict, None, bool]
     # 1) 若四面被实心方块围困于 1×1 干地凹坑/石穴，优先速破 1 格墙体开出 2 格门洞；
     # 2) 否则在敌怪 <=5.0 格或零位移回弹时沿避开 tried_yaws 的防跳崖替代角（零位移平地禁跳防回弹，遇 1 格台阶仍允许跳）脱困。
     if (burst_blocked or zero_stall) and not (st_cur.get("in_water") or st_cur.get("submerged")):
+        # 注意：不能只在 `zero_stall`（严格零位移）时才破墙。
+        # 真机事故（2026-11-24）：bot 被封在自己挖的洞里，每次冲撞还能挤出 0.4~0.57 格，
+        # 于是永远不算 zero_stall，只在原地反复冲撞 17 次也不去挖墙。
+        # 只要判定撞墙/净位移不足（burst_blocked）就先尝试破一格开出口。
         breach_cell = (
             _find_dry_pocket_breach_cell(ex, st_cur, state, cache, dim, away_dir=(ux, uz))
-            if zero_stall
+            if (zero_stall or burst_blocked)
             else None
         )
         if breach_cell is not None:
