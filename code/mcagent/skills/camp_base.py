@@ -318,14 +318,18 @@ class ManageCampChest(Skill):
         if after.get("ready") is False or after.get("alive") is False:
             raise Replan("前往死亡点途中角色死亡或世界未就绪")
         refresh_inventory(ex, state)
-        if (scan := scan_entities(ex, state, "item", radius=16, limit=40)).get("ready") is True:
-            lost = {bare(x) for x in (last_death.get("lost_items") or last_death.get("items") or ()) if bare(x)}
-            seen = list(dict.fromkeys(n for ent in scan.get("entities") or () if (n := _drop_name(ent))))
-            for drop_item in [n for n in seen if n in lost] + [n for n in seen if n not in lost]:
-                try:
-                    yield from collect_drops(ex, state, drop_item, count=1, radius=12, max_targets=3)
-                except (EnvBlocked, Replan):
-                    continue
+        scan = scan_entities(ex, state, "item", radius=16, limit=40)
+        if scan.get("ready") is not True:
+            # 区块未就绪（刚重生/切维度）时扫不到掉落物。此时**绝不能**删死亡记录，
+            # 否则"捡尸"会变成"尸体永久消失"：日志报成功，物资一件没捡回来。
+            raise Replan("掉落实体尚未就绪，保留死亡坐标下一拍再捡")
+        lost = {bare(x) for x in (last_death.get("lost_items") or last_death.get("items") or ()) if bare(x)}
+        seen = list(dict.fromkeys(n for ent in scan.get("entities") or () if (n := _drop_name(ent))))
+        for drop_item in [n for n in seen if n in lost] + [n for n in seen if n not in lost]:
+            try:
+                yield from collect_drops(ex, state, drop_item, count=1, radius=12, max_targets=3)
+            except (EnvBlocked, Replan):
+                continue
         memo.clear_last_death(dimension=dim)
         self._op_result = {"mode": "recover_corpse", "death_pos": list(death_pos)}
 

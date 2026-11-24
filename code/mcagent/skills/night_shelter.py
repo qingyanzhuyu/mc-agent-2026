@@ -603,7 +603,6 @@ class NightShelter(Skill):
     goal = "safety:night_shelter"
     verified = "live"
     cooldown_s = 90.0        # 挖洞避险失败后 90s 内不再重选，避免死循环
-    cooldown_s = 15.0
 
     @classmethod
     def blocked(cls, state: "State") -> str:
@@ -896,7 +895,11 @@ class NightShelter(Skill):
             yield from self._exit_shelter(ex, state, plan, fx, fy, fz, dim=dim)
             self._exited_cleanly = True
         finally:
-            if callable(setter):
+            # 只有**确认已经出坑**时才清除封口记录。
+            # 真机事故（2026-11-24）：原来无条件 `setter(None)`，一旦 run 中途抛 Replan 或被引擎
+            # abort（GeneratorExit），"被封在洞里、封口块在 cap 坐标"这条唯一记录就被抹掉，
+            # 而坑还封着 —— bot 从此在 1×1 洞里原地撞墙，日志里只剩 path_not_found。
+            if callable(setter) and getattr(self, "_exited_cleanly", False):
                 setter(None)
 
     def verify_done(self, state: "State", before_counts: Optional[dict[str, int]] = None) -> str:

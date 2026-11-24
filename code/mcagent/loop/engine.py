@@ -311,6 +311,18 @@ class MainLoop:
                 return None
         return None
 
+    def _note_stuck_progress(self, start_pos: Optional[tuple[float, float, float]]) -> None:
+        """按技能起止位移累计"被困"计数，连续两次没挪出 1.5 格就自救破一格。"""
+        end_pos = self._pos_tuple(self.state)
+        if start_pos is None or end_pos is None:
+            return
+        if math.dist(start_pos, end_pos) < 1.5:
+            self._stuck_streak += 1
+        else:
+            self._stuck_streak = 0
+        if self._stuck_streak >= 2:
+            self._try_self_rescue_breach()
+
     def _try_self_rescue_breach(self) -> bool:
         """连续被困时主动挖一格脱困（头顶封口块优先），成功返回 True。"""
         pos = self._pos_tuple(self.state)
@@ -1369,6 +1381,10 @@ class MainLoop:
                                     else set(self._server_advancements)
                                 ),
                             )
+                        # 失败分支也要算"被困"：逃敌技能往往是被 Replan 打断而不是正常完成，
+                        # 只有完成分支计数的话，被封在洞里时自救永远不会触发。
+                        if not is_death_err:
+                            self._note_stuck_progress(skill_start_pos)
                         active_skill = None
                         if is_death_err:
                             init_api_err = e if isinstance(e, ApiError) else None
@@ -1444,12 +1460,7 @@ class MainLoop:
                             f"[loop] {finished_skill} 连续 {streak} 次零进度完成，已冷却抑制空转"
                         )
                     # 被困自救：连续两次技能跑完都没挪出 1.5 格 → 主动挖一格（头顶封口块优先）
-                    if moved_dist is not None and moved_dist < 1.5:
-                        self._stuck_streak += 1
-                    else:
-                        self._stuck_streak = 0
-                    if self._stuck_streak >= 2:
-                        self._try_self_rescue_breach()
+                    self._note_stuck_progress(skill_start_pos)
                     skills_ok += 1
                     goal_specs = list(self._resolve_target_goal_specs())
                     active_rules_goals = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()

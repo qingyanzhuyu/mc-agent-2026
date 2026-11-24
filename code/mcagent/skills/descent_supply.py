@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import os
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from ..runtime import State

@@ -358,7 +358,10 @@ class NightCheckMiningPolicyTests(unittest.TestCase):
         assert dec_safe is not None and dec_safe.skill is not None
         self.assertEqual(dec_safe.skill.name, "night_shelter")
 
-        # 8) 夜间无床 + 持镐但敌怪已逼近至 7.5m -> 紧急直接挖洞封口而非开慢速阶梯
+        # 8) 夜间无床 + 持镐 + 敌怪已逼近至 7.5m -> **改为下矿脱敌**（向下开阶梯比挖洞封口好）
+        #    行为变更说明（2026-11-24，按使用方要求）：原逻辑在此场景选 night_shelter，
+        #    实机结果是 bot 把自己封进 1×1 洞里出不来，原地撞墙 17 次（每次只挤出 0.4 格），
+        #    整轮空转。现在只要能下矿就下矿，挖洞封口只保留给"没有镐"的情况。
         st_mob = _make_night_state(
             items={"stone_pickaxe": 1},
             nearest_hostile={"name": "zombie", "dist": 7.5},
@@ -366,7 +369,18 @@ class NightCheckMiningPolicyTests(unittest.TestCase):
         )
         dec_mob = planner.choose_survival_or_safe_mode(st_mob)
         assert dec_mob is not None and dec_mob.skill is not None
-        self.assertEqual(dec_mob.skill.name, "night_shelter")
+        self.assertIn(dec_mob.skill.name, ("smelt_iron", "mine_stone", "mine_diamond"))
+        self.assertIn("下矿脱敌", dec_mob.reason)
+
+        # 9) 夜间无床 + **没有镐** + 敌怪逼近 -> 仍退回挖洞封口（挖不动石头只能躲）
+        st_mob_nopick = _make_night_state(
+            items={},
+            nearest_hostile={"name": "zombie", "dist": 7.5},
+            time_of_day=15000,
+        )
+        dec_nopick = planner.choose_survival_or_safe_mode(st_mob_nopick)
+        assert dec_nopick is not None and dec_nopick.skill is not None
+        self.assertEqual(dec_nopick.skill.name, "night_shelter")
 
 
 if __name__ == "__main__":
