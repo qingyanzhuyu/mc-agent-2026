@@ -592,7 +592,10 @@ class DiscoverStructure(Skill):
             return "" if (cur >= NETHER_BIOMES or (self._done and len(cur) > len(self._before_biomes))) else "尚未在下界发现新的下界群系"
         req_dim = _REQUIRED_DIM[structure]
         if not memo.has_landmark(structure, dimension=req_dim): return f"尚未记录 {structure} 结构地标"
-        if self._done: return ""
+        # 注意：**不能**只看 `self._done` 就判完成。真机事故（2026-11-24）：记忆里已有
+        # stronghold 地标时，run() 每轮把同一个地标再记一次就置 `_done=True`，于是
+        # verify_done 立刻返回 ""，策略下一拍又选它 —— 20 分钟内被启动 1879 次、目标
+        # follow_ender_eye 却一步没推进。这里改为必须真的走到结构跟前才算完成。
         try:
             if any(eye_to_block_dist(_state_dict(state), cell) <= 16.0 for cell in memo.landmarks(structure, dimension=req_dim)): return ""
         except Replan:

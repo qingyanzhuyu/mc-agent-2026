@@ -123,6 +123,45 @@ def _roadside_structure_blocks(dimension: str) -> list[str]:
     return blocks
 
 
+_NO_PROGRESS_MIN_STEPS = 1          # 一次"完成"里最多走了几步仍算零进度
+_NO_PROGRESS_MIN_MOVE = 1.0         # 位移小于该值仍算零进度
+_NO_PROGRESS_STREAK_BEFORE_COOLDOWN = 2   # 连续几次才开始冷却（避免误伤首轮）
+_NO_PROGRESS_BASE_COOLDOWN_S = 30.0
+_NO_PROGRESS_COOLDOWN_CAP_S = 300.0
+
+
+def note_no_progress(
+    book: dict[tuple[str, str], int],
+    skill: Any,
+    *,
+    steps: int,
+    moved: Optional[float],
+    cap_s: float = _NO_PROGRESS_COOLDOWN_CAP_S,
+) -> int:
+    """记录"完成但零进度"，返回当前连续次数；达到阈值就给该技能打冷却。
+
+    真机事故（2026-11-24）：`discover_structure` 把"已知地标"当成本轮成果，
+    每次启动只走 1 步就自称完成，目标 `follow_ender_eye` 永远不推进，
+    20 分钟内被策略重选 1879 次，整轮空转。这里做通用护栏：
+    同一 (技能, 目标) 连续零进度完成 >= 2 次后，按 30s→60s→120s… 指数退避（上限 cap）。
+    """
+    key = (getattr(skill, "name", ""), getattr(skill, "goal", ""))
+    if steps <= _NO_PROGRESS_MIN_STEPS and (moved is None or moved < _NO_PROGRESS_MIN_MOVE):
+        streak = int(book.get(key, 0)) + 1
+        book[key] = streak
+        if streak >= _NO_PROGRESS_STREAK_BEFORE_COOLDOWN:
+            delay = min(
+                float(cap_s),
+                _NO_PROGRESS_BASE_COOLDOWN_S * (2 ** (streak - _NO_PROGRESS_STREAK_BEFORE_COOLDOWN)),
+            )
+            marker = getattr(skill, "mark_failed", None)
+            if callable(marker):
+                marker(cooldown_s=delay)
+        return streak
+    book.pop(key, None)
+    return 0
+
+
 @dataclass
 class RunResult:
     steps: int
@@ -161,6 +200,10 @@ class MainLoop:
         self.log = log
         self.recent_failures: deque[str] = deque(maxlen=12)
         self._path_failures: dict[str, int] = {}
+        # 零进度完成护栏：同一 (技能, 目标) 反复"报告完成但没走一步、也没挪窝"的计数。
+        # 真机事故（2026-11-24）：discover_structure 在 20 分钟里被启动 1879 次，
+        # 每次只做 1 个动作就自称完成，策略立刻重选 —— 整轮空转。
+        self._no_progress: dict[tuple[str, str], int] = {}
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
         self._custom_sleep = sleep
@@ -1104,6 +1147,7 @@ class MainLoop:
 
                 active_skill = decision.skill
                 skill_start_pos = self._pos_tuple(self.state)
+                steps_at_skill_start = steps
                 self.log(f"[loop] -> {active_skill} ({decision.source}: {decision.reason})")
                 if self.observer is not None:
                     self.observer.on_skill_start(active_skill, decision.source, decision.reason, self.state)
@@ -1324,6 +1368,21 @@ class MainLoop:
                     )
                     if moved_away or finished_name not in ("scout_island", "emergency_escape"):
                         self._reset_failure_tier(end_pos)
+                    # 零进度完成护栏：完成但没走一步、也没挪窝 → 指数退避，防止空转死循环
+                    streak = note_no_progress(
+                        self._no_progress,
+                        finished_skill,
+                        steps=steps - steps_at_skill_start,
+                        moved=(
+                            math.dist(skill_start_pos, end_pos)
+                            if (skill_start_pos is not None and end_pos is not None)
+                            else None
+                        ),
+                    )
+                    if streak >= _NO_PROGRESS_STREAK_BEFORE_COOLDOWN:
+                        self.log(
+                            f"[loop] {finished_skill} 连续 {streak} 次零进度完成，已冷却抑制空转"
+                        )
                     skills_ok += 1
                     goal_specs = list(self._resolve_target_goal_specs())
                     active_rules_goals = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()
