@@ -1222,8 +1222,10 @@ class RulePlanner:
                 return PlanDecision(setup_sk, "rule", "冷启动石镐与熔炉就绪，自动建出生点营地箱(Tier 0)")
 
         # 6.6 Tier 1 Blast-Proof Spawn Shelter Auto Upgrade
+        # 选址要为每个候选打上百次 /get_block（实测 100 秒还没放第一块砖），
+        # 所以要求周边 24 格内无敌对生物：怪贴脸时先逃/先打，别站在原地慢慢选址。
         shelter_tier = int(camp.get("shelter_tier", 0)) if isinstance(camp, Mapping) else 0
-        if dim == "overworld" and safe_12 and near_surface_for_camp and shelter_tier < 1 and total_cobble(state) >= 48:
+        if dim == "overworld" and safe_12 and hdist >= 24.0 and near_surface_for_camp and shelter_tier < 1 and total_cobble(state) >= 48:
             sh_sk = self._try_make("build_spawn_shelter", {"mode": "tier1_shelter"}, state)
             if sh_sk is not None:
                 return PlanDecision(sh_sk, "rule", "圆石充足，建造出生点 5x5 圆石防爆避难所(Tier 1)")

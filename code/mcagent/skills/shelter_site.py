@@ -64,9 +64,40 @@ def _read_blocks(ex: Executor, cells: Sequence[Cell]) -> dict[Cell, dict]:
     return {c: _observed_block(ex, c) for c in cells}
 
 
+def _center_column_ok(snap: Mapping[Cell, dict], cx: int, cy: int, cz: int) -> bool:
+    """只凭中心柱 5 格判断这块地基是否**必然**不合格（粗筛）。
+
+    判定严格等价于 `evaluate_shelter_site` 里 dx=dz=0（内圈列）那一支：
+    中心柱不通过 ⇒ 全量评估一定返回 None。因此先用 5 格砍掉绝大多数候选，
+    避免为每个候选都去打 5×5×5=125 次 `/get_block`（实测选址一轮上千次请求）。
+    """
+    if is_protected_cell((cx, cy - 1, cz)) or is_protected_cell((cx, cy, cz)):
+        return False
+    b_m2 = snap.get((cx, cy - 2, cz)) or {}
+    b_m1 = snap.get((cx, cy - 1, cz)) or {}
+    names = {bare((snap.get((cx, cy + dy, cz)) or {}).get("name")) for dy in (-1, 0, 1, 2)}
+    if any(n in _FLUID_OR_BEDROCK for n in names):
+        return False
+    n_m2 = bare(b_m2.get("name"))
+    n_m1 = bare(b_m1.get("name"))
+    n_0 = bare((snap.get((cx, cy, cz)) or {}).get("name"))
+    n_1 = bare((snap.get((cx, cy + 1, cz)) or {}).get("name"))
+    if is_safe_solid_floor(b_m1):
+        if n_0 in _PROTECTED_CAMP_BLOCKS or is_clearable_cover(n_0):
+            # 内圈：净空格必须可清理；被保护的营地设施格反而允许
+            return is_clearable_cover(n_1) or n_1 in _PROTECTED_CAMP_BLOCKS
+        return n_0 in _TRIM_TERRAIN and is_clearable_cover(n_1)
+    if is_clearable_cover(n_m1) and n_m2 not in _FLUID_OR_BEDROCK and is_safe_solid_floor(b_m2):
+        return is_clearable_cover(n_0) and is_clearable_cover(n_1)
+    return False
+
+
 def evaluate_shelter_site(ex: Executor, cx: int, cy: int, cz: int, *, radius: int = 2) -> Optional[dict[str, Any]]:
     """评估 5×5 避难所候选地基：支持 ±1 格高差轻量削平/垫平，严禁破坏营地箱/悬空/进水/保护区。"""
     if is_protected_cell((cx, cy, cz)):
+        return None
+    # 粗筛：先花 5 次请求看中心柱，不合格的候选直接淘汰（原先一律 125 次）
+    if not _center_column_ok(_read_blocks(ex, [(cx, cy + dy, cz) for dy in (-2, -1, 0, 1, 2)]), cx, cy, cz):
         return None
     cells = [
         (cx + dx, cy + dy, cz + dz)

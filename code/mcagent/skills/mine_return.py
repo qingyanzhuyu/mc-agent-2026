@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Generator, Mapping, Sequence
 from typing import Any, Optional
 
@@ -34,6 +35,13 @@ from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_ca
 from .world_memo import ALL_LOG_BLOCKS, memo_for
 
 Cell = tuple[int, int, int]
+
+
+def _walk_up_first_enabled() -> bool:
+    """是否先尝试"纯走上行"再开凿（`MC_RETURN_WALK_UP_FIRST=1` 开启，默认关）。"""
+    return str(os.environ.get("MC_RETURN_WALK_UP_FIRST", "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 _PLANK_ITEMS: tuple[str, ...] = tuple(item for item in RECIPES if item.endswith("_planks"))
 _ANY_PICKAXE: frozenset[str] = frozenset(PICKAXE_ORDER)
 _SOFT_HAND_DIG: frozenset[str] = frozenset({
@@ -525,7 +533,9 @@ def return_to_surface_from_mine(
 
     # 2.5 先试着"走上去"：不挖任何方块，让寻路器沿**已有阶梯/矿道**上爬。
     #     现实里 bot 常常已经挖过下行阶梯，却因为轨迹只在内存（重启即丢）而重新挖一条。
-    if is_underground_in_mine(ex, state):
+    #     默认关闭：服务端 `move_to` 会"报成功但没真上去"，据此跳过开凿可能反而困死，
+    #     需要时用 `MC_RETURN_WALK_UP_FIRST=1` 打开。
+    if _walk_up_first_enabled() and is_underground_in_mine(ex, state):
         for probe_dy in (8.0, 16.0, 28.0):
             before_y = float(cur[1])
             walk_wp = [cur[0], before_y + probe_dy, cur[2]]

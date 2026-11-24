@@ -49,8 +49,38 @@ GATED_SKILLS = ("mine_diamond", "smelt_iron", "mine_obsidian")
 # 为什么默认关：现有离线单测（167 个）里有大量"空背包时 blocked() 必须为空串"的断言，
 # 硬闸门会直接推翻这些约定（实测 13 失败 + 39 报错）。所以做成可配置：
 # 真机/比赛在 .env 里写 MC_DESCENT_LOG_MIN=10 开启，单测环境不设即为关闭、保持全绿。
-DESCENT_LOG_MIN = int(os.environ.get("MC_DESCENT_LOG_MIN", "0") or 0)
-DESCENT_PICK_MIN_DURABILITY = int(os.environ.get("MC_DESCENT_PICK_MIN_DURABILITY", "30") or 30)
+#
+# 注意：这里不 import 时就读环境变量，而是留 None 表示"运行时再解析"。
+# 实测事故（2026-11-24 真机 300 步）：`loop/__main__.py` 先 `import registry`
+# （触发本模块 import）再 `Config.load()`（才把 `.env` 灌进 os.environ），
+# 所以 import 时读到的永远是 0 —— 闸门静默失效，bot 带着 2 根原木就下去挖铁了。
+DESCENT_LOG_MIN: Optional[int] = None
+DESCENT_PICK_MIN_DURABILITY: Optional[int] = None
+
+
+def _env_int(name: str, default: int) -> int:
+    """运行时读取整数环境变量；空值/非数字回落默认值。"""
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def log_min() -> int:
+    """当前生效的原木阈值（None 时每次按 `MC_DESCENT_LOG_MIN` 现读，规避 import 顺序）。"""
+    if DESCENT_LOG_MIN is not None:
+        return int(DESCENT_LOG_MIN)
+    return _env_int("MC_DESCENT_LOG_MIN", 0)
+
+
+def pick_min_durability() -> int:
+    """当前生效的镐子耐久阈值（None 时按 `MC_DESCENT_PICK_MIN_DURABILITY` 现读）。"""
+    if DESCENT_PICK_MIN_DURABILITY is not None:
+        return int(DESCENT_PICK_MIN_DURABILITY)
+    return _env_int("MC_DESCENT_PICK_MIN_DURABILITY", 30)
 
 
 def _count_any(state: "State", names) -> int:
@@ -93,12 +123,13 @@ def _best_pick_durability(state: "State"):
 
 def descent_supply_gap(state: "State") -> str:
     """返回下矿备货缺口；空串表示备货充足、可以出发。"""
-    if DESCENT_LOG_MIN <= 0:
+    min_logs = log_min()
+    if min_logs <= 0:
         return ""          # 闸门关闭（默认）：保持既有 blocked() 契约不变
     logs = _count_any(state, LOG_BLOCKS)
-    if logs < DESCENT_LOG_MIN:
+    if logs < min_logs:
         return (
-            f"下矿备货不足：原木 {logs}/{DESCENT_LOG_MIN} 根 —— 镐子断了就无法就地补镐"
+            f"下矿备货不足：原木 {logs}/{min_logs} 根 —— 镐子断了就无法就地补镐"
             "（原木→木板→工作台→镐），只能徒手挖或困在地下；先去 gather_wood 补货"
         )
     picks = _count_any(state, PICKAXES)
@@ -106,7 +137,8 @@ def descent_supply_gap(state: "State") -> str:
         return "下矿备货不足：没有镐子"
     if picks < 2:
         durability = _best_pick_durability(state)
-        if durability is not None and durability <= DESCENT_PICK_MIN_DURABILITY:
+        threshold = pick_min_durability()
+        if durability is not None and durability <= threshold:
             return f"下矿备货不足：唯一镐子耐久仅 {durability}，且无备用镐"
     return ""
 

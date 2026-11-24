@@ -1,4 +1,4 @@
-﻿"""下矿备货闸门（skills/descent_supply.py）的离线单测。
+"""下矿备货闸门（skills/descent_supply.py）的离线单测。
 
 覆盖：闸门关闭时零影响；开启后按原木/镐子/耐久/多树种木材正确判定。
 对应 AGENTS.md §5 DoD：改底层逻辑须补对应单测。
@@ -99,6 +99,52 @@ class DescentSupplyGapTest(unittest.TestCase):
             [_pick("stone_pickaxe", 12), _pick("stone_pickaxe", 100)],
         )
         self.assertEqual(descent_supply_gap(state), "")
+
+
+class DescentSupplyEnvTest(unittest.TestCase):
+    """闸门阈值必须在**调用时**读环境变量，不能 import 时读死（真机事故回归）。"""
+
+    def setUp(self):
+        import os
+        from unittest import mock
+
+        self._os = os
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._orig_min = descent_supply.DESCENT_LOG_MIN
+        self._orig_dur = descent_supply.DESCENT_PICK_MIN_DURABILITY
+        descent_supply.DESCENT_LOG_MIN = None      # 回到"运行时解析"模式
+        descent_supply.DESCENT_PICK_MIN_DURABILITY = None
+        for name in ("MC_DESCENT_LOG_MIN", "MC_DESCENT_PICK_MIN_DURABILITY"):
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        descent_supply.DESCENT_LOG_MIN = self._orig_min
+        descent_supply.DESCENT_PICK_MIN_DURABILITY = self._orig_dur
+
+    def test_env_read_at_call_time_not_import_time(self):
+        """模拟主循环顺序：模块已 import（当时无 env），之后 .env 才灌进 os.environ。"""
+        state = _FakeState({"birch_log": 2, "stone_pickaxe": 1})
+        self.assertEqual(descent_supply_gap(state), "")     # 未设 env：闸门关
+
+        self._os.environ["MC_DESCENT_LOG_MIN"] = "10"        # 相当于 Config.load() 之后
+        self.assertIn("原木 2/10", descent_supply_gap(state))
+
+    def test_env_pick_durability_threshold(self):
+        self._os.environ["MC_DESCENT_LOG_MIN"] = "10"
+        self._os.environ["MC_DESCENT_PICK_MIN_DURABILITY"] = "50"
+        state = _FakeState({"oak_log": 12, "stone_pickaxe": 1}, [_pick("stone_pickaxe", 12)])
+        self.assertIn("耐久仅 12", descent_supply_gap(state))
+
+    def test_invalid_env_falls_back_to_disabled(self):
+        self._os.environ["MC_DESCENT_LOG_MIN"] = "abc"
+        self.assertEqual(descent_supply_gap(_FakeState({"birch_log": 0})), "")
+
+    def test_explicit_module_override_still_wins(self):
+        self._os.environ["MC_DESCENT_LOG_MIN"] = "10"
+        descent_supply.DESCENT_LOG_MIN = 0
+        self.assertEqual(descent_supply_gap(_FakeState({"birch_log": 0})), "")
 
 
 if __name__ == "__main__":
