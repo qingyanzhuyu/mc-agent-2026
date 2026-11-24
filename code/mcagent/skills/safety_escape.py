@@ -220,9 +220,12 @@ class EmergencyEscape(Skill):
                 if key in st and st[key] is not None:
                     oxygen = st[key]
                     break
-            if (not in_water and not submerged) or (not submerged and _is_number(oxygen) and oxygen >= 15):
+            # 判据必须与 escape.py 本体一致（not in_water and not submerged）：
+            # 原来"浮在水面 + 氧气 >= 15"也算完成，导致泡在水里位移 0 格也报成功，
+            # 判定器记 completed → 不打冷却 → 下一拍又被重选，形成假完成死循环。
+            if not in_water and not submerged:
                 return ""
-            return "上浮未完成：仍处于水下或氧气未恢复"
+            return "上浮未完成：仍处于水下"
 
         if intent == "douse":
             if not st.get("on_fire") and not st.get("in_lava"):

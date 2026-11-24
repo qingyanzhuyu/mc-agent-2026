@@ -434,7 +434,9 @@ def return_to_surface_from_mine(
 
     def _at_surface(pt: Sequence[float]) -> bool:
         py_now = float(pt[1])
-        if py_now >= ref_y - 3.0:
+        # 必须同时满足"高度够"和"头顶没有实心岩顶"：山体内部矿洞的 Y 也可能高于参考高度，
+        # 只看 Y 会把"还在地下"判成"已回到地表"，主循环据此放弃回程（原地空转）。
+        if py_now >= ref_y - 3.0 and not _has_solid_mine_ceiling(ex, pt):
             return True
         # 与 is_underground_in_mine 的 Y>56 露天校验保持一致：回到露天矿井口（Y>=57 且头顶无实心岩顶）即已出井，
         # 不得继续强追 Y=73 山顶营地/出生点导致跌入河谷反复超时。
