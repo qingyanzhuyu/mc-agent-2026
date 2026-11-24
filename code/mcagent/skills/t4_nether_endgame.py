@@ -304,7 +304,7 @@ class SummonAndTrapWither(Skill):
                     yield from _approach_block(ex, state, sc, reach=DIG_EYE_REACH); yield from _place_cell(ex, state, sup, sc)
             for sp in ((cx, 125, cz), (cx, 125, cz - 1), (cx - 1, 125, cz - 1), (cx + 1, 125, cz - 1)):
                 yield from _ensure_block(ex, state, sp, "soul_sand" if state.count("soul_sand") >= 1 else "soul_soil", allow=("soul_sand", "soul_soil"))
-            for idx, skp in enumerate(((cx - 1, 125, cz - 2), (cx, 125, cz - 2), (cx + 1, 125, cz - 2))):
+            for idx, skp in enumerate(((cx - 1, 126, cz - 1), (cx, 126, cz - 1), (cx + 1, 126, cz - 1))):  # 头颅须在灵魂沙正上方 Y=126
                 yield from _approach_block(ex, state, skp, reach=DIG_EYE_REACH)
                 if idx < 2: yield from _place_cell(ex, state, "wither_skeleton_skull", skp)
                 else:

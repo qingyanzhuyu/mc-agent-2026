@@ -567,8 +567,13 @@ class DiscoverStructure(Skill):
                 memo.advance_spiral_cursor(dimension=cur_dim, sectors_per_ring=8)
             raise EnvBlocked("扫描周边螺旋扇区未发现新下界群系", missing_predicate="nether_biomes:new", searched_volume=f"4 螺旋扇区半径 {radius} 格", wake_on="chunk_moved")
         candidates = self._collect_targets(ex, state, structure, cur_dim, radius)
-        if structure == "stronghold" and not candidates and not memo.has_landmark("stronghold", dimension=cur_dim):
-            candidates = yield from self._triangulate_stronghold(ex, state, cur_dim, radius)
+        if structure == "stronghold":
+            # 有末影之眼就必须真投一次：`story/follow_ender_eye` 只能靠投眼拿到，
+            # 而旧条件是"记忆里没有 stronghold 地标才投"——`stone_bricks` 随便一次普查
+            # 就会写一条 stronghold 地标，于是投眼分支永远不执行、成就永远拿不到。
+            triangulated = yield from self._triangulate_stronghold(ex, state, cur_dim, radius)
+            if triangulated:
+                candidates = triangulated
         for _ in range(4):
             if candidates: break
             cur_cursor = memo.get_spiral_cursor(dimension=cur_dim)

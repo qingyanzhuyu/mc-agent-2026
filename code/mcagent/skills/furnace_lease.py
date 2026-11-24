@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 import weakref
@@ -18,6 +19,20 @@ from .windows import _positive_count, _put, _take, window_amount, window_section
 from .world_memo import memo_for
 
 SMELTING_STATIONS: tuple[str, ...] = ("furnace", "blast_furnace", "smoker")
+
+
+def _lease_grace_s() -> float:
+    """租约过期宽限秒数（`ready_at + grace` 之后仍未领取即作废）；0 表示关闭过期清理。"""
+    raw = str(os.environ.get("MC_LEASE_GRACE_S", "") or "").strip()
+    if not raw:
+        return 300.0
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    return val if math.isfinite(val) and val >= 0.0 else 300.0
+
+
 STATION_SECONDS_PER_ITEM: dict[str, float] = {"furnace": 10.0, "blast_furnace": 5.0, "smoker": 5.0}
 _WOODS = ("oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "cherry", "mangrove", "pale_oak")
 LOG_TO_PLANK_FUEL: dict[str, str] = {
@@ -167,6 +182,9 @@ class FurnaceLease:
     ready_at: float
     consumer: str
     returns_empty_bucket: bool = False
+    #: 登记时刻（账本时钟）。过期判定只看"登记到现在过了多久"，不看 `ready_at` 绝对值 ——
+    #: 否则那些刻意把 `ready_at` 置 0 表示"已就绪"的调用会被误判为过期。
+    registered_at: float = 0.0
 
 
 class FurnaceLeaseBook:
@@ -199,6 +217,7 @@ class FurnaceLeaseBook:
             pos=cell, dimension=dim, station_kind=kind, input_item=raw_input,
             expected_output=exp_out, count=count, started_at=started, ready_at=ready,
             consumer=str(consumer), returns_empty_bucket=bool(returns_empty_bucket),
+            registered_at=float(self._clock()),
         )
         with self._lock:
             self._leases[(dim, cell)] = lease
@@ -208,9 +227,29 @@ class FurnaceLeaseBook:
                 reservation_book.move_to_container(state, consumer, bare(fuel_item), fuel_count)
         return lease
 
+    def _expire_locked(self, now: float) -> None:
+        """惰性清理过期租约：登记后超过「本批冶炼时长 + 宽限期」仍未领取的租约自动作废。
+
+        没有这一步时，死亡/断线/换维度/炉子被炸都会让租约永久留在账本里：
+        `can_reclaim_station` 永远报"存在活跃熔炉租约暂不回收"（野外熔炉再也收不回），
+        `ready_leases()` 又永远返回它，每次规划都领一条早已失效的租约并失败。
+        宽限期默认 300s（可用 `MC_LEASE_GRACE_S` 覆盖，设 0 关闭）。
+        """
+        grace = _lease_grace_s()
+        if grace <= 0:
+            return
+        for key, lease in list(self._leases.items()):
+            registered = float(lease.registered_at or lease.started_at or 0.0)
+            if registered <= 0.0:
+                continue
+            expected = max(0.0, float(lease.ready_at) - float(lease.started_at))
+            if now - registered > expected + grace:
+                self._leases.pop(key, None)
+
     def _list_leases(self, *, dimension: str | None = None, cutoff: float | None = None) -> list[FurnaceLease]:
         dim = _norm_dim(dimension) if dimension is not None else None
         with self._lock:
+            self._expire_locked(float(self._clock()))
             out = [
                 lease for (ldim, _), lease in self._leases.items()
                 if (dim is None or ldim == dim) and (cutoff is None or lease.ready_at <= cutoff)
@@ -228,8 +267,9 @@ class FurnaceLeaseBook:
         return self._list_leases(dimension=dimension)
 
     def get_lease(self, pos: Sequence[int | float], *, dimension: str = "overworld") -> Optional[FurnaceLease]:
-        """Return the active lease at `(dimension, pos)` if present."""
+        """Return the active lease at `(dimension, pos)` if present（过期租约会被惰性清除）."""
         with self._lock:
+            self._expire_locked(float(self._clock()))
             return self._leases.get((_norm_dim(dimension), _norm_pos(pos)))
 
     def complete_lease(self, pos: Sequence[int | float], *, dimension: str = "overworld") -> Optional[FurnaceLease]:
