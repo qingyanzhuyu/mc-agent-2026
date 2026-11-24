@@ -602,6 +602,7 @@ class NightShelter(Skill):
     }
     goal = "safety:night_shelter"
     verified = "live"
+    cooldown_s = 90.0        # 挖洞避险失败后 90s 内不再重选，避免死循环
     cooldown_s = 15.0
 
     @classmethod
@@ -815,6 +816,10 @@ class NightShelter(Skill):
                     break
 
         if plan is None:
+            # 失败即退避：之前没有冷却，导致每轮都重选这个必然失败的技能，
+            # 实测连续 5~15 次空转、白烧步数（skills_replan 里大半是它）。
+            # 90s 足够让夜间窗口过去或让其他技能改变地形。
+            self.mark_failed(cooldown_s=90.0)
             raise Replan("当前地形或方块/工具条件不满足挖洞避险安全检查")
 
         mode = plan["mode"]

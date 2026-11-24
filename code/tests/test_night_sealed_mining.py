@@ -262,6 +262,7 @@ class ShaftEntranceSealAndUnsealTests(unittest.TestCase):
         reset_all_world_memos()
         skill_base._COOLDOWN.clear()
 
+    @unittest.skip("封矿井口已按需求停用：mine_shaft.seal_shaft_entrance 现在直接返回 []，不再堵洞口")
     def test_seal_entrance_blocks_surface_and_auto_unseals_on_return_and_reentry(self) -> None:
         # 构造从地表 (0, 64, 0) 沿 +X 向下 3 级的阶梯矿道，玩家已下至 (3, 61, 0)
         overrides: dict[tuple[int, int, int], str] = {}

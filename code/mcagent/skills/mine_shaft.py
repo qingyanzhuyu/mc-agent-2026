@@ -772,8 +772,14 @@ def seal_shaft_entrance(
     dimension: str = "overworld",
     shaft: Mapping[str, Any] | None = None,
 ) -> Generator[dict, None, list[list[int]]]:
-    """进入地下矿井后在井口喉道放置 1x2 非重力实心方块隔断地面怪物入侵。"""
-    memo = memo_for(state)
+    """【已按用户要求停用】原本在井口喉道放 1x2 方块封洞防怪。
+
+    停用原因：封洞后 bot 自己回程时井口被自己堵死，`return_to_surface_from_mine`
+    必须先 `_unseal_shaft_from_inside` 拆封，多了一层失败点；实测出现过
+    "明明有矿道却上不去、只能重新挖"的情况。这里直接返回空列表：不封洞、不记账。
+    """
+    return []
+    memo = memo_for(state)      # noqa: unreachable —— 保留原实现作参考
     shaft_rec = shaft or memo.get_mine_shaft(dimension=dimension)
     if not isinstance(shaft_rec, Mapping) or shaft_rec.get("sealed") is True:
         return []

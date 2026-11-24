@@ -166,6 +166,43 @@ def _step_touches_lava(ex: Executor, cells: Sequence[Cell], vc=None, dim: str = 
     return False
 
 
+_PICKAXE_LOG_NAMES = (
+    "oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log",
+    "dark_oak_log", "cherry_log", "mangrove_log", "pale_oak_log",
+)
+_PICKAXE_PLANK_NAMES = (
+    "oak_planks", "birch_planks", "spruce_planks", "jungle_planks", "acacia_planks",
+    "dark_oak_planks", "cherry_planks", "mangrove_planks", "pale_oak_planks",
+)
+
+
+def _pickaxe_craft_feasible(state: State) -> bool:
+    """没镐时判断能否**真的**就地补一把（含工作台约束）。
+
+    石镐 = 3 圆石 + 2 木棍；木镐 = 3 木板 + 2 木棍；两者都要 3x3 工作台。
+    工作台本身 = 4 木板，1 原木可出 4 木板。
+
+    只数"圆石+木棍"是错的：地下没有工作台又凑不出 4 木板时，一样造不出来，
+    此时抛 Replan 只会让主循环反复撞墙 —— 必须把工作台成本一起算进去。
+    """
+    try:
+        if int(state.count("stick") or 0) < 2:
+            return False
+        cobble = int(state.count("cobblestone") or 0)
+        planks = sum(int(state.count(n) or 0) for n in _PICKAXE_PLANK_NAMES)
+        logs = sum(int(state.count(n) or 0) for n in _PICKAXE_LOG_NAMES)
+        plank_eq = planks + logs * 4          # 折成木板当量
+        if int(state.count("crafting_table") or 0) < 1:
+            if plank_eq < 4:
+                return False                  # 连工作台都做不出来
+            plank_eq -= 4                     # 扣掉工作台成本
+        if plank_eq >= 3:
+            return True                       # 木镐够料
+        return cobble >= 3                    # 石镐够料
+    except Exception:
+        return False
+
+
 def _climb_out_stairs(
     ex: Executor,
     state: State,
@@ -486,15 +523,48 @@ def return_to_surface_from_mine(
                     return True
             break
 
-    # 3. 若矿井寻路受阻且仍处地下，安全向上挖有界阶梯脱困（初始已无镐时启用防软锁徒手破岩）
+    # 2.5 先试着"走上去"：不挖任何方块，让寻路器沿**已有阶梯/矿道**上爬。
+    #     现实里 bot 常常已经挖过下行阶梯，却因为轨迹只在内存（重启即丢）而重新挖一条。
+    if is_underground_in_mine(ex, state):
+        for probe_dy in (8.0, 16.0, 28.0):
+            before_y = float(cur[1])
+            walk_wp = [cur[0], before_y + probe_dy, cur[2]]
+            ok_up, cur = yield from _try_move_wp(
+                ex, state, walk_wp, reason="return_walk_up", rng=3, timeout=25.0,
+            )
+            if _at_surface(cur):
+                return True
+            if float(cur[1]) <= before_y + 1.5:
+                break          # 走不上去，别再用更大的 dy 硬试
+
+    # 3. 若矿井寻路受阻且仍处地下，安全向上挖有界阶梯脱困
+    #    镐子损坏时**优先补镐**：徒手挖 stone/deepslate 要 7.5~12.5s/块且零掉落，
+    #    材料够却空手啃石头纯属浪费；徒手破岩只保留"软方块(土/沙/砂砾)绕行"这一档，
+    #    不再因为"没镐"就默认放开硬岩。
     if is_underground_in_mine(ex, state) and max_climb_steps > 0:
+        has_pick = best_pickaxe(state) is not None
+        if not has_pick and _pickaxe_craft_feasible(state):
+            raise Replan("镐子已损坏但材料充足：先合成镐再继续挖掘（禁止徒手破岩脱困）")
+        deep_start = list(cur)          # 记录爬升起点 = 矿井最深处
         if (yield from _climb_out_stairs(
             ex,
             state,
             target_y=ref_y,
             max_steps=max_climb_steps,
-            allow_hand_rock=(best_pickaxe(state) is None),
+            allow_hand_rock=False,
         )):
+            # 自愈登记：把刚挖通的阶梯记成主矿井。下次下行/上行都能沿它走，
+            # 不用每次重新挖 —— 这就是"明明有楼梯却新挖"的根因修复。
+            try:
+                _, after, _ = _cur_status(ex, state)
+                memo.set_mine_shaft(
+                    list(after),
+                    dimension=dim,
+                    lowest_y=int(deep_start[1]),
+                    lowest_pos=list(deep_start),
+                )
+            except Exception:
+                pass
             return True
     _, cur_final, _ = _cur_status(ex, state)
     return float(cur_final[1]) >= ref_y - 3.0 or not is_underground_in_mine(ex, state)

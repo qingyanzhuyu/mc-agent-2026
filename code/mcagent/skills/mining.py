@@ -8,8 +8,10 @@ from typing import Any
 
 from ..runtime import Executor, Replan, State
 from .base import failure, rec
-from .items import AIR, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, block_name
+from .items import (AIR, PICKAXE_ORDER, STONE_OR_BETTER_PICKS, bare, block_name,
+                    record_mine_trail)
 from .sightline import DIG_EYE_REACH
+from .world_memo import memo_for
 from .voxel_cache import client_get_blocks_batch, has_batch_get_blocks, voxel_cache_for
 
 PEEL_SURFACE = frozenset(("grass_block", "dirt", "coarse_dirt", "podzol", "leaf_litter"))
@@ -74,6 +76,35 @@ def prepare_mining_pick(ex: Executor, state: State, *,
             raise Replan(f"挖掘前装备 {pick} 后手持未确认")
 
 
+def _register_descent(state: "State", before: Any, after: Any) -> None:
+    """把本次下行的通道登记成主矿井，并追加到落盘轨迹。
+
+    为什么必须在共享原语里做：`set_mine_shaft` 原本只有 diamond/iron/鱼骨挖矿会调，
+    `mine_stone` 挖出的矿道**没有任何地方记录**。结果 bot 明明两格外就有自己挖的通道，
+    回程时查不到路线，只能从"挖穿头顶岩层"开始想办法 —— 没镐时直接死锁。
+    """
+    try:
+        b = (before or {}).get("pos") or state.pos
+        a = (after or {}).get("pos") or state.pos
+    except Exception:
+        return
+    if not (isinstance(b, (list, tuple)) and isinstance(a, (list, tuple))) or len(b) < 3 or len(a) < 3:
+        return
+    try:
+        if float(a[1]) >= float(b[1]) - 0.5:
+            return                      # 这一挖没下降，不需要登记
+        dim = str((after or {}).get("dimension") or "overworld")
+        memo = memo_for(state)
+        prev = memo.get_mine_shaft(dimension=dim)
+        lowest_y = float(a[1])
+        if isinstance(prev, Mapping) and prev.get("lowest_y") is not None:
+            lowest_y = min(lowest_y, float(prev["lowest_y"]))
+        memo.set_mine_shaft(list(b), dimension=dim, lowest_y=int(lowest_y), lowest_pos=list(a))
+        record_mine_trail([list(b), list(a)])
+    except Exception:
+        return
+
+
 def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
               allowed_picks: frozenset[str] = STONE_OR_BETTER_PICKS,
               solid: frozenset[str] = SOLID_SUPPORT,
@@ -134,6 +165,7 @@ def mine_step(ex: Executor, state: State, pos: Sequence[int], *,
         voxel_cache_for(state).invalidate(target, dimension=str(start.get("dimension") or "overworld"))
         yield rec("dig", result, pos=target)
         after_dig_status = state.refresh_status(ex.client, max_age_s=0)
+        _register_descent(state, start, after_dig_status)   # 下行即登记，保证回程有路可走
         state.refresh_inventory(ex.client)
         if result.get("warning") or _best_allowed_pick(state, allowed_picks) is None:
             raise Replan("探矿工具告警或已无所需镐，停止开凿")
