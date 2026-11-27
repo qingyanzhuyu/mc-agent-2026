@@ -3,3 +3,5 @@
 logs/
 probe/
 __pycache__/
+# 下矿轨迹缓存（跨重启保留，属运行产物）
+.mine_trails.json

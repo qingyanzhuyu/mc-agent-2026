@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+import json
+import os
+
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Optional
 
@@ -54,6 +57,37 @@ STONE_OR_BETTER_PICKS = frozenset({
 })
 #: 下探阶梯的路点栈（起点在地表，终点在井底），供外迁技能在井底受困时沿原阶梯退回井口。
 MINE_TRAILS: list[list[tuple[float, float, float]]] = []
+# 轨迹原本只是进程内存全局，**进程一重启就全丢**：bot 明明刚挖过下行阶梯，
+# 重启后回程就"不记得"了，于是重新挖一条。这里落盘到 code/ 下，跨重启保留。
+_TRAIL_STORE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".mine_trails.json",
+)
+
+
+def _load_mine_trails() -> None:
+    try:
+        with open(_TRAIL_STORE_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return
+    trails: list[list[tuple[float, float, float]]] = []
+    for trail in raw if isinstance(raw, list) else ():
+        if isinstance(trail, list) and len(trail) >= 2:
+            pts = [(float(p[0]), float(p[1]), float(p[2])) for p in trail
+                   if isinstance(p, (list, tuple)) and len(p) >= 3]
+            if len(pts) >= 2:
+                trails.append(pts)
+    if trails:
+        MINE_TRAILS[:] = trails[-6:]
+
+
+def _save_mine_trails() -> None:
+    try:
+        with open(_TRAIL_STORE_PATH, "w", encoding="utf-8") as fh:
+            json.dump([[list(p) for p in trail] for trail in MINE_TRAILS], fh)
+    except Exception:
+        pass
 
 
 def record_mine_trail(waypoints: list[list[float]]) -> None:
@@ -64,6 +98,10 @@ def record_mine_trail(waypoints: list[list[float]]) -> None:
         MINE_TRAILS.append(pts)
         if len(MINE_TRAILS) > 6:
             del MINE_TRAILS[:-6]
+        _save_mine_trails()      # 跨重启保留
+
+
+_load_mine_trails()
 
 
 def bare(name: object) -> str:

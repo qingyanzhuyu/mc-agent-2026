@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..runtime import EnvBlocked, Replan
@@ -40,6 +41,18 @@ def _bounded_move_to(ex: "Executor", pos: Sequence[float], *, rng: int = 2, time
         return ex.move_to(pos=dest, rng=rng, timeout=timeout, retries=0)
     except TypeError:
         return ex.move_to(pos=dest, rng=rng)
+
+def _corpse_move_timeout(
+    state: "State", death_pos: Sequence[float], *, base: float = 30.0, cap: float = 180.0,
+) -> float:
+    """按到死亡点的水平距离放宽单次 `move_to` 超时：远距离捡尸不能沿用 30s 的近距离预算。"""
+    try:
+        cur = point3(_state_snap(state).get("pos"), label="当前坐标")
+        dist = math.dist((float(cur[0]), float(cur[2])), (float(death_pos[0]), float(death_pos[2])))
+    except Exception:
+        return float(base)
+    return float(min(float(cap), max(float(base), dist * 0.4 + 20.0)))
+
 
 def _find_place_spot(
     ex: "Executor", state: "State", *, require_top_air: bool = True, avoid_chests: Sequence[tuple[int, int, int]] = (),
@@ -300,19 +313,23 @@ class ManageCampChest(Skill):
             memo.clear_last_death(dimension=dim)
             raise Replan("缺少有效死亡点坐标，无法捡尸")
         death_pos = point3(last_death["pos"], label="死亡点坐标")
-        yield rec("move_to", _bounded_move_to(ex, death_pos, rng=2, timeout=30.0), pos=list(death_pos))
+        yield rec("move_to", _bounded_move_to(ex, death_pos, rng=2, timeout=_corpse_move_timeout(state, death_pos)), pos=list(death_pos))
         after = state.refresh_status(ex.client, max_age_s=0)
         if after.get("ready") is False or after.get("alive") is False:
             raise Replan("前往死亡点途中角色死亡或世界未就绪")
         refresh_inventory(ex, state)
-        if (scan := scan_entities(ex, state, "item", radius=16, limit=40)).get("ready") is True:
-            lost = {bare(x) for x in (last_death.get("lost_items") or last_death.get("items") or ()) if bare(x)}
-            seen = list(dict.fromkeys(n for ent in scan.get("entities") or () if (n := _drop_name(ent))))
-            for drop_item in [n for n in seen if n in lost] + [n for n in seen if n not in lost]:
-                try:
-                    yield from collect_drops(ex, state, drop_item, count=1, radius=12, max_targets=3)
-                except (EnvBlocked, Replan):
-                    continue
+        scan = scan_entities(ex, state, "item", radius=16, limit=40)
+        if scan.get("ready") is not True:
+            # 区块未就绪（刚重生/切维度）时扫不到掉落物。此时**绝不能**删死亡记录，
+            # 否则"捡尸"会变成"尸体永久消失"：日志报成功，物资一件没捡回来。
+            raise Replan("掉落实体尚未就绪，保留死亡坐标下一拍再捡")
+        lost = {bare(x) for x in (last_death.get("lost_items") or last_death.get("items") or ()) if bare(x)}
+        seen = list(dict.fromkeys(n for ent in scan.get("entities") or () if (n := _drop_name(ent))))
+        for drop_item in [n for n in seen if n in lost] + [n for n in seen if n not in lost]:
+            try:
+                yield from collect_drops(ex, state, drop_item, count=1, radius=12, max_targets=3)
+            except (EnvBlocked, Replan):
+                continue
         memo.clear_last_death(dimension=dim)
         self._op_result = {"mode": "recover_corpse", "death_pos": list(death_pos)}
 

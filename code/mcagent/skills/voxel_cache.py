@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import threading
 import time
 import weakref
@@ -342,11 +343,32 @@ def has_batch_get_blocks(client: Any) -> bool:
     return callable(getattr(client, "get_blocks_batch", None))
 
 
+def _batch_workers(requested: int) -> int:
+    """批量查块并发数：默认 8，可用 `MC_BLOCK_BATCH_WORKERS` 调高。
+
+    实测：`build_spawn_shelter` 选址阶段要探上千格，8 并发下 1 分钟以上才动手；
+    服务端吞吐允许时调高并发能把这段时间压到十几秒（客户端仍有 `MC_MAX_RPS` 兜底）。
+    """
+    raw = str(os.environ.get("MC_BLOCK_BATCH_WORKERS", "") or "").strip()
+    if raw:
+        try:
+            val = int(float(raw))
+        except (TypeError, ValueError):
+            val = 0
+        if val > 0:
+            return min(64, val)
+    try:
+        return max(1, min(64, int(requested)))
+    except (TypeError, ValueError):
+        return 8
+
+
 def client_get_blocks_batch(client: Any, positions: Sequence[Any], *, max_workers: int = 8, use_cache: bool = True) -> dict[Cell, dict]:
     """统一批量查块入口：有 get_blocks_batch 时并发查块，缺该方法时优雅退化为串行 get_block。"""
     cells = list(dict.fromkeys(c for p in positions if (c := _norm_cell(p)) is not None))
     if not cells:
         return {}
+    max_workers = _batch_workers(max_workers)
     if has_batch_get_blocks(client):
         try:
             raw = client.get_blocks_batch(cells, max_workers=max_workers, use_cache=use_cache)

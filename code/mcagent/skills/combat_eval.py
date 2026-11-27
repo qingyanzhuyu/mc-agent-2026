@@ -464,7 +464,9 @@ def counterattack_hostile(
 
             cur_target = next((h for h in hostiles if h.get("id") == target_id), None)
             if cur_target is None:
-                return _num(hostiles[0].get("dist"), 99.0) >= 6.0
+                # 原目标从快照里消失（走到 10 格外 / 换了一波怪）不等于"反杀成功"，
+                # 更不能拿**另一只**怪的距离冒充威胁解除。没确认击杀就是没完成。
+                return False
 
             dist = _num(cur_target.get("dist"), 3.0)
             if dist > 3.2:

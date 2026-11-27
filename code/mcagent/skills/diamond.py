@@ -293,16 +293,18 @@ def collect_bonus_ores(
             )
         except Replan as exc:
             code, _ = failure(exc)
-            if code in {"dig_unconfirmed", "out_of_reach", "protected_region"}:
-                if vc is not None:
-                    vc.mark_unreachable("mine_diamond", pos, dimension="overworld", stance_cell=stand_cell)
-                if memo is not None:
-                    memo.mark_unreachable(pos, dimension="overworld", category=category, error_code=code, block=bname)
-                status = _safe_status(ex, state, "overworld")
-                origin = _cell(status["pos"])
-                yield rec("bonus_ore_skip", pos=list(pos), error_code=code)
-                continue
-            raise
+            # 顺手矿（青金石/红石）只要一次掉落没进背包就会抛 Replan（code 为 "replan"）。
+            # 原来这里只豁免三个 dig 错误码，其它一律 raise —— 于是已经下到 Y≈-58、
+            # 钻石还没采到，整条 mine_diamond 直接作废。顺手矿属于"锦上添花"，
+            # 任何失败都只跳过这一格。
+            if vc is not None:
+                vc.mark_unreachable("mine_diamond", pos, dimension="overworld", stance_cell=stand_cell)
+            if memo is not None:
+                memo.mark_unreachable(pos, dimension="overworld", category=category, error_code=code, block=bname)
+            status = _safe_status(ex, state, "overworld")
+            origin = _cell(status["pos"])
+            yield rec("bonus_ore_skip", pos=list(pos), error_code=code)
+            continue
         if vc is not None:
             vc.invalidate(pos, dimension="overworld")
         if memo is not None:

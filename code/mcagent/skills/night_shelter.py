@@ -602,7 +602,7 @@ class NightShelter(Skill):
     }
     goal = "safety:night_shelter"
     verified = "live"
-    cooldown_s = 15.0
+    cooldown_s = 90.0        # 挖洞避险失败后 90s 内不再重选，避免死循环
 
     @classmethod
     def blocked(cls, state: "State") -> str:
@@ -815,6 +815,10 @@ class NightShelter(Skill):
                     break
 
         if plan is None:
+            # 失败即退避：之前没有冷却，导致每轮都重选这个必然失败的技能，
+            # 实测连续 5~15 次空转、白烧步数（skills_replan 里大半是它）。
+            # 90s 足够让夜间窗口过去或让其他技能改变地形。
+            self.mark_failed(cooldown_s=90.0)
             raise Replan("当前地形或方块/工具条件不满足挖洞避险安全检查")
 
         mode = plan["mode"]
@@ -891,7 +895,11 @@ class NightShelter(Skill):
             yield from self._exit_shelter(ex, state, plan, fx, fy, fz, dim=dim)
             self._exited_cleanly = True
         finally:
-            if callable(setter):
+            # 只有**确认已经出坑**时才清除封口记录。
+            # 真机事故（2026-11-24）：原来无条件 `setter(None)`，一旦 run 中途抛 Replan 或被引擎
+            # abort（GeneratorExit），"被封在洞里、封口块在 cap 坐标"这条唯一记录就被抹掉，
+            # 而坑还封着 —— bot 从此在 1×1 洞里原地撞墙，日志里只剩 path_not_found。
+            if callable(setter) and getattr(self, "_exited_cleanly", False):
                 setter(None)
 
     def verify_done(self, state: "State", before_counts: Optional[dict[str, int]] = None) -> str:

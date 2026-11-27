@@ -204,15 +204,16 @@ def _place_shelter_facilities(ex: "Executor", state: "State", bp: Mapping[str, A
                 placed_stations["bed"] = list(bpos)
                 memo.record_station("bed", bpos, dimension=dim)
 
-    # 4. 门口装门或 2 格圆石临时封口
+    # 4. 门口装门；没有门就**保持敞开**，绝不用圆石把唯一的出入口砌死。
+    #    实测事故（2026-11-24 真机）：背包里从来没有门（`RECIPES` 里没有门配方，
+    #    T1 也拿不到门），旧逻辑走 else 分支把门口两格圆石封死 —— 避难所变成没有门的盒子，
+    #    bot 只能自己挖墙出去，等于自己把自己关起来。
     refresh_inventory(ex, state)
     door_item = next((d for d in _DOORS if state.count(d) >= 1), None)
     if door_item is not None:
         yield from _place_structural(ex, state, bp["door_cells"][0], door_item, memo=memo, dim=dim)
     else:
-        for dcell in bp["door_cells"]:
-            if (blk := _pick_blast_block(state)) is not None:
-                yield from _place_structural(ex, state, dcell, blk, memo=memo, dim=dim)
+        yield rec("doorway_open", pos=list(bp["door_cells"][0]), reason="没有门可用，保留敞开出入口避免自封")
 
     return placed_chests, placed_stations
 

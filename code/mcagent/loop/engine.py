@@ -123,6 +123,75 @@ def _roadside_structure_blocks(dimension: str) -> list[str]:
     return blocks
 
 
+_NO_PROGRESS_MIN_STEPS = 1          # 一次"完成"里最多走了几步仍算零进度
+_NO_PROGRESS_MIN_MOVE = 1.0         # 位移小于该值仍算零进度
+_NO_PROGRESS_STREAK_BEFORE_COOLDOWN = 2   # 连续几次才开始冷却（避免误伤首轮）
+_NO_PROGRESS_BASE_COOLDOWN_S = 30.0
+_NO_PROGRESS_COOLDOWN_CAP_S = 300.0
+
+
+_RESCUE_OFFSETS: tuple[tuple[int, int, int], ...] = (
+    (0, 2, 0),                                    # 头顶两格：夜间"挖三填一"的封口块
+    (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1),  # 脚部四向：自封墙
+    (1, 1, 0), (-1, 1, 0), (0, 1, 1), (0, 1, -1),  # 头部四向
+)
+_AIR_NAMES = frozenset({"", "air", "cave_air", "void_air"})
+
+
+def rescue_breach_cell(read_block: Callable[[tuple[int, int, int]], Optional[str]], pos: Any) -> Optional[tuple[int, int, int]]:
+    """被困自救：返回最该挖掉的那一格（优先头顶封口块，其次脚/头四向），无可挖则 None。
+
+    真机事故（2026-11-24）：bot 夜间挖洞封口后，逃敌技能每次冲撞还能挤出 0.4~0.57 格，
+    于是"零位移"判定永不成立、破墙分支永不执行，17 次冲撞都困在原地。
+    """
+    try:
+        fx, fy, fz = (math.floor(float(v)) for v in list(pos)[:3])
+    except Exception:
+        return None
+    for dx, dy, dz in _RESCUE_OFFSETS:
+        cell = (fx + dx, fy + dy, fz + dz)
+        name = read_block(cell)
+        if name is None:
+            continue
+        lowered = bare(name).strip().lower()
+        if lowered in _AIR_NAMES or lowered in ("bedrock", "obsidian", "crying_obsidian", "water", "lava", "flowing_water", "flowing_lava"):
+            continue
+        return cell
+    return None
+
+
+def note_no_progress(
+    book: dict[tuple[str, str], int],
+    skill: Any,
+    *,
+    steps: int,
+    moved: Optional[float],
+    cap_s: float = _NO_PROGRESS_COOLDOWN_CAP_S,
+) -> int:
+    """记录"完成但零进度"，返回当前连续次数；达到阈值就给该技能打冷却。
+
+    真机事故（2026-11-24）：`discover_structure` 把"已知地标"当成本轮成果，
+    每次启动只走 1 步就自称完成，目标 `follow_ender_eye` 永远不推进，
+    20 分钟内被策略重选 1879 次，整轮空转。这里做通用护栏：
+    同一 (技能, 目标) 连续零进度完成 >= 2 次后，按 30s→60s→120s… 指数退避（上限 cap）。
+    """
+    key = (getattr(skill, "name", ""), getattr(skill, "goal", ""))
+    if steps <= _NO_PROGRESS_MIN_STEPS and (moved is None or moved < _NO_PROGRESS_MIN_MOVE):
+        streak = int(book.get(key, 0)) + 1
+        book[key] = streak
+        if streak >= _NO_PROGRESS_STREAK_BEFORE_COOLDOWN:
+            delay = min(
+                float(cap_s),
+                _NO_PROGRESS_BASE_COOLDOWN_S * (2 ** (streak - _NO_PROGRESS_STREAK_BEFORE_COOLDOWN)),
+            )
+            marker = getattr(skill, "mark_failed", None)
+            if callable(marker):
+                marker(cooldown_s=delay)
+        return streak
+    book.pop(key, None)
+    return 0
+
+
 @dataclass
 class RunResult:
     steps: int
@@ -161,6 +230,12 @@ class MainLoop:
         self.log = log
         self.recent_failures: deque[str] = deque(maxlen=12)
         self._path_failures: dict[str, int] = {}
+        # 零进度完成护栏：同一 (技能, 目标) 反复"报告完成但没走一步、也没挪窝"的计数。
+        # 真机事故（2026-11-24）：discover_structure 在 20 分钟里被启动 1879 次，
+        # 每次只做 1 个动作就自称完成，策略立刻重选 —— 整轮空转。
+        self._no_progress: dict[tuple[str, str], int] = {}
+        # 连续"技能结束时净位移 < 1.5 格"的次数，达到阈值就自救破一格
+        self._stuck_streak: int = 0
         self._seen_deaths_len = 0
         self._server_advancements: set[str] = set()
         self._custom_sleep = sleep
@@ -235,6 +310,45 @@ class MainLoop:
             except (TypeError, ValueError):
                 return None
         return None
+
+    def _note_stuck_progress(self, start_pos: Optional[tuple[float, float, float]]) -> None:
+        """按技能起止位移累计"被困"计数，连续两次没挪出 1.5 格就自救破一格。"""
+        end_pos = self._pos_tuple(self.state)
+        if start_pos is None or end_pos is None:
+            return
+        if math.dist(start_pos, end_pos) < 1.5:
+            self._stuck_streak += 1
+        else:
+            self._stuck_streak = 0
+        if self._stuck_streak >= 2:
+            self._try_self_rescue_breach()
+
+    def _try_self_rescue_breach(self) -> bool:
+        """连续被困时主动挖一格脱困（头顶封口块优先），成功返回 True。"""
+        pos = self._pos_tuple(self.state)
+        if pos is None:
+            return False
+
+        def _read(cell: tuple[int, int, int]) -> Optional[str]:
+            try:
+                block = self.client.get_block(list(cell))
+            except Exception:
+                return None
+            return bare((block or {}).get("name")) if isinstance(block, dict) else None
+
+        cell = rescue_breach_cell(_read, pos)
+        if cell is None:
+            self._stuck_streak = 0
+            return False
+        try:
+            self.executor.dig(list(cell))
+        except Exception as exc:  # 挖不动就算了，下一拍再试
+            self.log(f"[loop] 自救破格 {list(cell)} 失败：{exc}")
+            self._stuck_streak = 0
+            return False
+        self.log(f"[loop] 连续 {self._stuck_streak} 次技能净位移不足，自救破 {list(cell)} 脱困")
+        self._stuck_streak = 0
+        return True
 
     @classmethod
     def _cell_key(cls, state: State) -> tuple[str, int, int]:
@@ -1104,6 +1218,7 @@ class MainLoop:
 
                 active_skill = decision.skill
                 skill_start_pos = self._pos_tuple(self.state)
+                steps_at_skill_start = steps
                 self.log(f"[loop] -> {active_skill} ({decision.source}: {decision.reason})")
                 if self.observer is not None:
                     self.observer.on_skill_start(active_skill, decision.source, decision.reason, self.state)
@@ -1266,6 +1381,10 @@ class MainLoop:
                                     else set(self._server_advancements)
                                 ),
                             )
+                        # 失败分支也要算"被困"：逃敌技能往往是被 Replan 打断而不是正常完成，
+                        # 只有完成分支计数的话，被封在洞里时自救永远不会触发。
+                        if not is_death_err:
+                            self._note_stuck_progress(skill_start_pos)
                         active_skill = None
                         if is_death_err:
                             init_api_err = e if isinstance(e, ApiError) else None
@@ -1324,6 +1443,24 @@ class MainLoop:
                     )
                     if moved_away or finished_name not in ("scout_island", "emergency_escape"):
                         self._reset_failure_tier(end_pos)
+                    # 零进度完成护栏：完成但没走一步、也没挪窝 → 指数退避，防止空转死循环
+                    moved_dist = (
+                        math.dist(skill_start_pos, end_pos)
+                        if (skill_start_pos is not None and end_pos is not None)
+                        else None
+                    )
+                    streak = note_no_progress(
+                        self._no_progress,
+                        finished_skill,
+                        steps=steps - steps_at_skill_start,
+                        moved=moved_dist,
+                    )
+                    if streak >= _NO_PROGRESS_STREAK_BEFORE_COOLDOWN:
+                        self.log(
+                            f"[loop] {finished_skill} 连续 {streak} 次零进度完成，已冷却抑制空转"
+                        )
+                    # 被困自救：连续两次技能跑完都没挪出 1.5 格 → 主动挖一格（头顶封口块优先）
+                    self._note_stuck_progress(skill_start_pos)
                     skills_ok += 1
                     goal_specs = list(self._resolve_target_goal_specs())
                     active_rules_goals = getattr(getattr(self.planner, "rules", None), "active_goals", ()) or ()

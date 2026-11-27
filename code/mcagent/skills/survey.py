@@ -567,8 +567,13 @@ class DiscoverStructure(Skill):
                 memo.advance_spiral_cursor(dimension=cur_dim, sectors_per_ring=8)
             raise EnvBlocked("扫描周边螺旋扇区未发现新下界群系", missing_predicate="nether_biomes:new", searched_volume=f"4 螺旋扇区半径 {radius} 格", wake_on="chunk_moved")
         candidates = self._collect_targets(ex, state, structure, cur_dim, radius)
-        if structure == "stronghold" and not candidates and not memo.has_landmark("stronghold", dimension=cur_dim):
-            candidates = yield from self._triangulate_stronghold(ex, state, cur_dim, radius)
+        if structure == "stronghold":
+            # 有末影之眼就必须真投一次：`story/follow_ender_eye` 只能靠投眼拿到，
+            # 而旧条件是"记忆里没有 stronghold 地标才投"——`stone_bricks` 随便一次普查
+            # 就会写一条 stronghold 地标，于是投眼分支永远不执行、成就永远拿不到。
+            triangulated = yield from self._triangulate_stronghold(ex, state, cur_dim, radius)
+            if triangulated:
+                candidates = triangulated
         for _ in range(4):
             if candidates: break
             cur_cursor = memo.get_spiral_cursor(dimension=cur_dim)
@@ -592,7 +597,10 @@ class DiscoverStructure(Skill):
             return "" if (cur >= NETHER_BIOMES or (self._done and len(cur) > len(self._before_biomes))) else "尚未在下界发现新的下界群系"
         req_dim = _REQUIRED_DIM[structure]
         if not memo.has_landmark(structure, dimension=req_dim): return f"尚未记录 {structure} 结构地标"
-        if self._done: return ""
+        # 注意：**不能**只看 `self._done` 就判完成。真机事故（2026-11-24）：记忆里已有
+        # stronghold 地标时，run() 每轮把同一个地标再记一次就置 `_done=True`，于是
+        # verify_done 立刻返回 ""，策略下一拍又选它 —— 20 分钟内被启动 1879 次、目标
+        # follow_ender_eye 却一步没推进。这里改为必须真的走到结构跟前才算完成。
         try:
             if any(eye_to_block_dist(_state_dict(state), cell) <= 16.0 for cell in memo.landmarks(structure, dimension=req_dim)): return ""
         except Replan:

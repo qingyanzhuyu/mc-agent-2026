@@ -1101,9 +1101,26 @@ class RulePlanner:
                 except (TypeError, ValueError):
                     hdist_cur = 99.0
                 if math.isfinite(hdist_cur) and hdist_cur < effective_hostile_flee_dist(state, hname_cur):
+                    # 夜间怪贴脸时**改为下矿脱敌**：向下开阶梯既是逃离也是产出。
+                    # 原来的"挖洞封口"会把自己关进 1×1 洞里（实测被困后原地撞墙 17 次，
+                    # 每次都挤出 0.4 格却出不来，最后整轮空转），所以只在没镐时才退回挖洞。
+                    try:
+                        cur_y = (
+                            float(st_cur["pos"][1])
+                            if isinstance(st_cur.get("pos"), (list, tuple)) and len(st_cur["pos"]) >= 3
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        cur_y = None
+                    nm = self._choose_night_mining_skill(
+                        state, hp=hp, hdist=hdist_cur, cur_pos_y=cur_y
+                    )
+                    if nm is not None:
+                        nm_sk, nm_reason = nm
+                        return PlanDecision(nm_sk, "rule", f"夜间怪贴脸改为下矿脱敌（{nm_reason}）")
                     ns = self._try_make("night_shelter", {}, state)
                     if ns is not None:
-                        return PlanDecision(ns, "rule", f"夜间怪群压近优先挖洞封口避险 ({ns_why})")
+                        return PlanDecision(ns, "rule", f"夜间怪群压近且无镐，退回挖洞封口避险 ({ns_why})")
 
         escape = self._choose_safety_escape(state)
         if escape is not None:
@@ -1222,8 +1239,10 @@ class RulePlanner:
                 return PlanDecision(setup_sk, "rule", "冷启动石镐与熔炉就绪，自动建出生点营地箱(Tier 0)")
 
         # 6.6 Tier 1 Blast-Proof Spawn Shelter Auto Upgrade
+        # 选址要为每个候选打上百次 /get_block（实测 100 秒还没放第一块砖），
+        # 所以要求周边 24 格内无敌对生物：怪贴脸时先逃/先打，别站在原地慢慢选址。
         shelter_tier = int(camp.get("shelter_tier", 0)) if isinstance(camp, Mapping) else 0
-        if dim == "overworld" and safe_12 and near_surface_for_camp and shelter_tier < 1 and total_cobble(state) >= 48:
+        if dim == "overworld" and safe_12 and hdist >= 24.0 and near_surface_for_camp and shelter_tier < 1 and total_cobble(state) >= 48:
             sh_sk = self._try_make("build_spawn_shelter", {"mode": "tier1_shelter"}, state)
             if sh_sk is not None:
                 return PlanDecision(sh_sk, "rule", "圆石充足，建造出生点 5x5 圆石防爆避难所(Tier 1)")
@@ -1527,13 +1546,14 @@ class RulePlanner:
         if callable(is_sealed) and is_sealed():
             return None
         get_hurt = getattr(state, "get_recent_hurt", None)
-        if callable(get_hurt) and get_hurt(max_age_s=2.0):
+        if callable(get_hurt) and get_hurt(max_age_s=0.8):
             return None
         pick = best_pickaxe(state)
         if pick is None:
             return None
         on_surface = cur_pos_y is None or cur_pos_y >= 52.0
-        if on_surface and hdist < 10.0:
+        # 怪贴脸时不再拒绝下矿：向下开阶梯本身就是最快的脱敌方式（只要还没到肉搏距离）。
+        if on_surface and hdist < 6.0:
             return None
 
         candidates: list[tuple[str, dict[str, Any], str]] = []

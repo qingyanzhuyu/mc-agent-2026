@@ -88,6 +88,17 @@ def _dig_and_record(
     voxel_cache_for(state).invalidate(pos, dimension=dim)
     yield rec("dig", res, pos=pos, **rec_fields)
     state.refresh_inventory(ex.client)
+    # 服务端 /dig 会"报成功但方块还在"（也曾出现挖掉却不给掉落），所以必须复核：
+    # 有 warning 直接判失败；再读一次目标格，仍是实心方块也判失败。
+    # 否则调用方会把"已采"记进台账，同一矿点整轮不再回来，东西却没到手。
+    if isinstance(res, Mapping) and res.get("warning"):
+        return False
+    try:
+        still = block_name(ex, pos)
+    except Exception:
+        still = None
+    if still is not None and still not in AIR:
+        return False
     return True
 
 
@@ -772,8 +783,14 @@ def seal_shaft_entrance(
     dimension: str = "overworld",
     shaft: Mapping[str, Any] | None = None,
 ) -> Generator[dict, None, list[list[int]]]:
-    """进入地下矿井后在井口喉道放置 1x2 非重力实心方块隔断地面怪物入侵。"""
-    memo = memo_for(state)
+    """【已按用户要求停用】原本在井口喉道放 1x2 方块封洞防怪。
+
+    停用原因：封洞后 bot 自己回程时井口被自己堵死，`return_to_surface_from_mine`
+    必须先 `_unseal_shaft_from_inside` 拆封，多了一层失败点；实测出现过
+    "明明有矿道却上不去、只能重新挖"的情况。这里直接返回空列表：不封洞、不记账。
+    """
+    return []
+    memo = memo_for(state)      # noqa: unreachable —— 保留原实现作参考
     shaft_rec = shaft or memo.get_mine_shaft(dimension=dimension)
     if not isinstance(shaft_rec, Mapping) or shaft_rec.get("sealed") is True:
         return []

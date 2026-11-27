@@ -301,6 +301,32 @@ def _is_valuable_lost_item(name: str) -> bool:
     return b.startswith(("iron_", "diamond", "netherite_")) or b in _CORPSE_VALUABLE_ITEMS
 
 
+_DEFAULT_CORPSE_MAX_DIST = 80.0
+_DEFAULT_CORPSE_MAX_AGE_S = 240.0
+
+
+def _env_limit(name: str, default: float) -> float:
+    """读取捡尸窗口的环境变量覆盖值；空值、非数字、非正数一律回落到默认值。"""
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(val) or val <= 0.0:
+        return float(default)
+    return val
+
+
+def corpse_recovery_limits() -> tuple[float, float]:
+    """返回当前生效的（最大距离, 最大时效秒数），支持 `MC_CORPSE_MAX_DIST`/`MC_CORPSE_MAX_AGE_S` 覆盖。"""
+    return (
+        _env_limit("MC_CORPSE_MAX_DIST", _DEFAULT_CORPSE_MAX_DIST),
+        _env_limit("MC_CORPSE_MAX_AGE_S", _DEFAULT_CORPSE_MAX_AGE_S),
+    )
+
+
 def _origin_dist(origin: Any, cell: Cell) -> float:
     """复用 `sightline` 计算玩家/参考坐标到方块几何中心的欧氏距离。"""
     if isinstance(origin, Mapping) or hasattr(origin, "snapshot"):
@@ -1271,10 +1297,18 @@ class WorldResourceMemo:
         *,
         dimension: str = "overworld",
         now: Optional[float] = None,
-        max_dist: float = 80.0,
-        max_age_s: float = 240.0,
+        max_dist: Optional[float] = None,
+        max_age_s: Optional[float] = None,
     ) -> tuple[bool, str]:
-        """判断是否应当尝试可控捡尸：校验记录存在、非岩浆/虚空/火焰死因、时效、距离与铁级以上高价值掉落。"""
+        """判断是否应当尝试可控捡尸：校验记录存在、非岩浆/虚空/火焰死因、时效、距离与铁级以上高价值掉落。
+
+        `max_dist`/`max_age_s` 省略时取 `corpse_recovery_limits()`（默认 80 格 / 240s，
+        可用环境变量 `MC_CORPSE_MAX_DIST`/`MC_CORPSE_MAX_AGE_S` 放宽）。
+        """
+        if max_dist is None or max_age_s is None:
+            env_dist, env_age = corpse_recovery_limits()
+            max_dist = env_dist if max_dist is None else max_dist
+            max_age_s = env_age if max_age_s is None else max_age_s
         dim = _norm_dim(dimension)
         with self._lock:
             death = self._last_deaths.get(dim)

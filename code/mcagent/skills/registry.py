@@ -100,4 +100,7 @@ def load_all() -> list[str]:
             continue
         importlib.import_module(f"{__package__}.{info.name}")
         loaded.append(info.name)
+    # 注册完成后再挂"下矿备货闸门"（此时 GATED_SKILLS 一定已注册）
+    from .descent_supply import install_descent_gates
+    install_descent_gates()
     return loaded

@@ -1257,8 +1257,10 @@ class SummonAndTrapWitherTests(_WaveBTestBase):
                 # Exact horizontal T of 4 soul_sand at Y=125
                 for sp in ((0, 125, 0), (0, 125, -1), (-1, 125, -1), (1, 125, -1)):
                     self.assertEqual(world.blocks.get(sp), "soul_sand")
-                # Exact 3 wither_skeleton_skull positions at Y=125
-                self.assertEqual(skull_attempts, [(-1, 125, -2), (0, 125, -2), (1, 125, -2)])
+                # Exact 3 wither_skeleton_skull positions：必须在三连排灵魂沙**正上方**（Y=126）
+                # 行为修正说明（2026-11-24 审计）：原实现把头颅也放 Y=125、cz-2（隔壁列），
+                # 原版判定不成立 → 凋灵永不生成，summon_wither(+100) 整条链不可达。
+                self.assertEqual(skull_attempts, [(-1, 126, -1), (0, 126, -1), (1, 126, -1)])
                 # Retreated to [cx+0.5, 124.0, cz+3.5] = [0.5, 124.0, 3.5]
                 self.assertEqual(world.st["pos"], [0.5, 124.0, 3.5])
 
